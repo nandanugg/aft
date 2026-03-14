@@ -1,10 +1,13 @@
+pub mod add_import;
 pub mod batch;
 pub mod checkpoint;
 pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod list_checkpoints;
+pub mod organize_imports;
 pub mod outline;
+pub mod remove_import;
 pub mod restore_checkpoint;
 pub mod undo;
 pub mod write;

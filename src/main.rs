@@ -66,6 +66,9 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "edit_symbol" => aft::commands::edit_symbol::handle_edit_symbol(&req, ctx),
         "edit_match" => aft::commands::edit_match::handle_edit_match(&req, ctx),
         "batch" => aft::commands::batch::handle_batch(&req, ctx),
+        "add_import" => aft::commands::add_import::handle_add_import(&req, ctx),
+        "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
+        "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         // Test-only: populate the backup store through the protocol (no write/edit_symbol yet)
         "snapshot" => handle_snapshot(&req, ctx),
         _ => {

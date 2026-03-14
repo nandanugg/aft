@@ -140,13 +140,13 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R013 — Import management (6 languages)
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: `add_import` adds imports with language-aware placement (TS named/default/type imports, Rust use tree merging, Python isort groups, Go goimports groups). `remove_import` cleans up after refactors. `organize_imports` re-sorts and re-groups all imports.
 - Why it matters: Import management is high-error-rate (~15% wrong group, duplicates) and high-frequency. Language-aware automation eliminates these errors.
 - Source: user
 - Primary owning slice: M002/S01
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S01 — 26 integration tests prove add_import group placement, dedup, alphabetization across all 6 languages; remove_import full-statement and partial-name removal; organize_imports re-grouping, sorting, dedup, and Rust use-tree merging. 43 unit tests cover parsing and classification. Plugin registration verified by 22 bun tests.
 - Notes: Must handle deduplication, alphabetization, and group separation per language convention.
 
 ### R014 — Scope-aware member insertion
@@ -477,7 +477,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R010 | quality-attribute | validated | M001/S05 | none | S05 |
 | R011 | quality-attribute | validated | M001/S05 | M001/S03 | S05 |
 | R012 | launchability | validated | M001/S07 | none | S07 |
-| R013 | core-capability | active | M002/S01 | none | unmapped |
+| R013 | core-capability | validated | M002/S01 | none | S01 |
 | R014 | core-capability | active | M002/S02 | none | unmapped |
 | R015 | differentiator | active | M002/S03 | none | unmapped |
 | R016 | quality-attribute | active | M002/S04 | none | unmapped |
@@ -509,7 +509,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 22
+- Active requirements: 21
 - Mapped to slices: 34
-- Validated: 13
+- Validated: 14
 - Unmapped active requirements: 0

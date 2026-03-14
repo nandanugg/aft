@@ -155,7 +155,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
 }
 
 /// Returns the tree-sitter Language grammar for a given LangId.
-fn grammar_for(lang: LangId) -> Language {
+pub fn grammar_for(lang: LangId) -> Language {
     match lang {
         LangId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         LangId::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),

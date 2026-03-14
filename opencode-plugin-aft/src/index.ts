@@ -4,11 +4,12 @@ import { findBinary } from "./resolver.js";
 import { readingTools } from "./tools/reading.js";
 import { editingTools } from "./tools/editing.js";
 import { safetyTools } from "./tools/safety.js";
+import { importTools } from "./tools/imports.js";
 
 /**
  * OpenCode plugin for AFT (Agent File Tools).
  *
- * Spawns the `aft` binary as a persistent child process and exposes all 11
+ * Spawns the `aft` binary as a persistent child process and exposes all
  * agent-facing commands as OpenCode tools. The binary communicates via NDJSON
  * over stdin/stdout.
  *
@@ -16,6 +17,7 @@ import { safetyTools } from "./tools/safety.js";
  * - Reading: outline, zoom
  * - Editing: write, edit_symbol, edit_match, batch
  * - Safety: undo, edit_history, checkpoint, restore_checkpoint, list_checkpoints
+ * - Imports: add_import, remove_import, organize_imports
  */
 const plugin: Plugin = async (input) => {
   const binaryPath = findBinary();
@@ -26,6 +28,7 @@ const plugin: Plugin = async (input) => {
       ...readingTools(bridge),
       ...editingTools(bridge),
       ...safetyTools(bridge),
+      ...importTools(bridge),
     },
   };
 };

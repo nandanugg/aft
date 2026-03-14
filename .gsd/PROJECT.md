@@ -12,7 +12,7 @@ One-call semantic file operations that eliminate mechanical token waste — agen
 
 ## Current State
 
-**M001 (Foundation) complete.** The `aft` Rust binary runs as a persistent process with NDJSON protocol, embeds tree-sitter grammars for 6 languages (TypeScript, JavaScript, TSX, Python, Rust, Go), and handles 11 domain commands: `outline`, `zoom`, `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `undo`, `edit_history`, `write`, `edit_symbol`, `edit_match`, and `batch`. All four mutation commands auto-backup before modification, validate syntax via tree-sitter re-parse, and return structured disambiguation when targets are ambiguous. The OpenCode TypeScript plugin (`@aft/core`) registers all 11 commands as tools with Zod schemas, managing binary lifecycle through a BinaryBridge class with crash recovery. Binary distribution uses 5 npm platform packages with a CI cross-compilation pipeline and `cargo install aft` fallback. 155 tests pass (98 Rust unit + 35 Rust integration + 22 plugin). Next: M002 (Language Intelligence).
+**M001 (Foundation) complete. M002/S01 (Import Management) complete.** The `aft` Rust binary runs as a persistent process with NDJSON protocol, embeds tree-sitter grammars for 6 languages (TypeScript, JavaScript, TSX, Python, Rust, Go), and handles 14 domain commands: the original 11 from M001 (`outline`, `zoom`, `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `undo`, `edit_history`, `write`, `edit_symbol`, `edit_match`, `batch`) plus 3 new import commands (`add_import`, `remove_import`, `organize_imports`). Import management supports language-aware group placement, deduplication, alphabetization, and Rust use-tree merging across all 6 languages. The OpenCode TypeScript plugin registers all 14 commands as tools with Zod schemas. 202 tests pass (141 Rust unit + 61 Rust integration + 22 plugin). Next: M002/S02 (Scope-aware Insertion) or S03 (Auto-format).
 
 ## Architecture / Key Patterns
 
@@ -30,6 +30,6 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
 ## Milestone Sequence
 
 - [x] M001: Foundation — Rust binary, tree-sitter for 6 languages, three-layer editing, safety system, OpenCode plugin, binary distribution (155 tests, all passing)
-- [ ] M002: Language Intelligence — Import management, scope-aware insertion, compound operations, auto-format, transactions
+- [ ] M002: Language Intelligence — Import management (S01 ✅), scope-aware insertion, compound operations, auto-format, transactions
 - [ ] M003: Call Graph Navigation — Lazy/incremental call graph, forward/reverse traces, impact analysis, data flow tracking
 - [ ] M004: Refactoring Primitives — Move symbol, extract function, inline symbol, LSP integration

@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod edit;
 pub mod error;
+pub mod imports;
 pub mod language;
 pub mod parser;
 pub mod protocol;
