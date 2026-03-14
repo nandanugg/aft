@@ -289,7 +289,7 @@ impl FileParser {
 }
 
 /// Build a Range from a tree-sitter Node.
-fn node_range(node: &Node) -> Range {
+pub(crate) fn node_range(node: &Node) -> Range {
     let start = node.start_position();
     let end = node.end_position();
     Range {
@@ -301,7 +301,7 @@ fn node_range(node: &Node) -> Range {
 }
 
 /// Extract the text of a node from source.
-fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
+pub(crate) fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
     &source[node.byte_range()]
 }
 

@@ -5,6 +5,7 @@ import { readingTools } from "./tools/reading.js";
 import { editingTools } from "./tools/editing.js";
 import { safetyTools } from "./tools/safety.js";
 import { importTools } from "./tools/imports.js";
+import { structureTools } from "./tools/structure.js";
 
 /**
  * OpenCode plugin for AFT (Agent File Tools).
@@ -18,6 +19,7 @@ import { importTools } from "./tools/imports.js";
  * - Editing: write, edit_symbol, edit_match, batch
  * - Safety: undo, edit_history, checkpoint, restore_checkpoint, list_checkpoints
  * - Imports: add_import, remove_import, organize_imports
+ * - Structure: add_member, add_derive, wrap_try_catch, add_decorator, add_struct_tags
  */
 const plugin: Plugin = async (input) => {
   const binaryPath = findBinary();
@@ -29,6 +31,7 @@ const plugin: Plugin = async (input) => {
       ...editingTools(bridge),
       ...safetyTools(bridge),
       ...importTools(bridge),
+      ...structureTools(bridge),
     },
   };
 };

@@ -151,25 +151,25 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R014 — Scope-aware member insertion
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: `add_member` inserts methods, fields, or functions into the correct scope of a class/struct/impl with correct indentation. Supports positioning: after/before specific member, first, or last.
 - Why it matters: Manual member insertion requires calculating indentation and finding the right insertion point — error-prone for agents.
 - Source: user
 - Primary owning slice: M002/S02
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Rust must distinguish between `impl Struct` and `impl Trait for Struct`. Python uses indentation as scope delimiter.
+- Validation: S02 — 14 integration tests prove add_member across TS/JS classes, Python classes (4-space indent verified), Rust impl blocks/structs, and Go structs with all 4 position modes (first, last, before:name, after:name), empty containers, and structured error responses (scope_not_found with available list, member_not_found). Plugin round-trip verified by bun tests.
+- Notes: Rust must distinguish between `impl Struct` and `impl Trait for Struct`. Python uses indentation as scope delimiter. Impl blocks preferred over struct items when both share a name (D060).
 
 ### R015 — Language-specific compound operations
 - Class: differentiator
-- Status: active
+- Status: validated
 - Description: Structural transforms that are idiomatic per language: add_derive (Rust), wrap_try_catch (TS/JS), add_decorator (Python), add_struct_tags (Go). Each modifies the AST structurally rather than string-matching.
 - Why it matters: These are the operations agents do most clumsily — adding a derive to an existing attribute list, wrapping a function body in try/catch without breaking indentation.
 - Source: user
 - Primary owning slice: M002/S02
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Hardcoded per language for now. Extensibility is deferred (R036).
+- Validation: S02 — 21 integration tests prove all 4 compound operations through binary protocol: add_derive append/create/dedup (5 tests), wrap_try_catch simple/class/custom-catch (4 tests), add_decorator plain/nested/positioned (5 tests), add_struct_tags add/update/preserve (7 tests). Plugin round-trip verified by bun tests. All return structured error codes (target_not_found, field_not_found) with available target lists.
+- Notes: Hardcoded per language for now. Extensibility is deferred (R036). wrap_try_catch limited to statement_block bodies (D058).
 
 ### R016 — Auto-format on save
 - Class: quality-attribute
@@ -475,8 +475,8 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R011 | quality-attribute | validated | M001/S05 | M001/S03 | S05 |
 | R012 | launchability | validated | M001/S07 | none | S07 |
 | R013 | core-capability | validated | M002/S01 | none | S01 |
-| R014 | core-capability | active | M002/S02 | none | unmapped |
-| R015 | differentiator | active | M002/S02 | none | unmapped |
+| R014 | core-capability | validated | M002/S02 | none | S02 |
+| R015 | differentiator | validated | M002/S02 | none | S02 |
 | R016 | quality-attribute | active | M002/S03 | none | unmapped |
 | R017 | quality-attribute | active | M002/S03 | none | unmapped |
 | R018 | failure-visibility | active | M002/S04 | none | unmapped |
@@ -506,7 +506,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 21
+- Active requirements: 19
 - Mapped to slices: 34
-- Validated: 14
+- Validated: 16
 - Unmapped active requirements: 0

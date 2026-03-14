@@ -33,6 +33,16 @@ pub enum AftError {
         pattern: String,
         count: usize,
     },
+    ScopeNotFound {
+        scope: String,
+        available: Vec<String>,
+        file: String,
+    },
+    MemberNotFound {
+        member: String,
+        scope: String,
+        file: String,
+    },
 }
 
 impl AftError {
@@ -47,6 +57,8 @@ impl AftError {
             AftError::CheckpointNotFound { .. } => "checkpoint_not_found",
             AftError::NoUndoHistory { .. } => "no_undo_history",
             AftError::AmbiguousMatch { .. } => "ambiguous_match",
+            AftError::ScopeNotFound { .. } => "scope_not_found",
+            AftError::MemberNotFound { .. } => "member_not_found",
         }
     }
 
@@ -95,6 +107,34 @@ impl fmt::Display for AftError {
                     f,
                     "pattern '{}' matches {} occurrences, expected exactly 1",
                     pattern, count
+                )
+            }
+            AftError::ScopeNotFound {
+                scope,
+                available,
+                file,
+            } => {
+                if available.is_empty() {
+                    write!(f, "scope '{}' not found in {} (no scopes available)", scope, file)
+                } else {
+                    write!(
+                        f,
+                        "scope '{}' not found in {}, available: [{}]",
+                        scope,
+                        file,
+                        available.join(", ")
+                    )
+                }
+            }
+            AftError::MemberNotFound {
+                member,
+                scope,
+                file,
+            } => {
+                write!(
+                    f,
+                    "member '{}' not found in scope '{}' in {}",
+                    member, scope, file
                 )
             }
         }

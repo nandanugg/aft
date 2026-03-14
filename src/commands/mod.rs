@@ -1,4 +1,8 @@
+pub mod add_decorator;
+pub mod add_derive;
 pub mod add_import;
+pub mod add_member;
+pub mod add_struct_tags;
 pub mod batch;
 pub mod checkpoint;
 pub mod edit_history;
@@ -10,5 +14,6 @@ pub mod outline;
 pub mod remove_import;
 pub mod restore_checkpoint;
 pub mod undo;
+pub mod wrap_try_catch;
 pub mod write;
 pub mod zoom;
