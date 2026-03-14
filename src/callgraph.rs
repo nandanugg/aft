@@ -485,6 +485,11 @@ impl CallGraph {
         }
     }
 
+    /// Get the project root directory.
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
     /// Get or build the call data for a file.
     pub fn build_file(&mut self, path: &Path) -> Result<&FileCallData, AftError> {
         let canon = self.canonicalize(path)?;

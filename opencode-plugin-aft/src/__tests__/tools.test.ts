@@ -4,8 +4,10 @@ import { readingTools } from "../tools/reading.js";
 import { editingTools } from "../tools/editing.js";
 import { safetyTools } from "../tools/safety.js";
 import { transactionTools } from "../tools/transaction.js";
+import { navigationTools } from "../tools/navigation.js";
+import { refactoringTools } from "../tools/refactoring.js";
 import { resolve } from "node:path";
-import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, mkdir, cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../target/debug/aft");
@@ -254,4 +256,90 @@ describe("Tool round-trips", () => {
     const restoredContent = await readFile(existingFile, "utf-8");
     expect(restoredContent).toBe(originalContent);
   });
+});
+
+describe("move_symbol round-trip", () => {
+  let bridge: BinaryBridge;
+  let tmpDir: string;
+
+  const TEST_TIMEOUT_MS = 15_000;
+
+  afterEach(async () => {
+    if (bridge) await bridge.shutdown();
+    if (tmpDir) await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  test("aft_move_symbol moves a function and rewires consumer import", async () => {
+    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
+      timeoutMs: TEST_TIMEOUT_MS,
+    });
+
+    // Create temp project with source, consumer, and destination
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-move-"));
+
+    const sourceFile = resolve(tmpDir, "service.ts");
+    const consumerFile = resolve(tmpDir, "consumer.ts");
+    const destFile = resolve(tmpDir, "utils.ts");
+
+    await writeFile(
+      sourceFile,
+      [
+        'export function formatDate(date: Date): string {',
+        '  return date.toISOString();',
+        '}',
+        '',
+        'export function otherFn(): void {}',
+        '',
+      ].join('\n'),
+    );
+
+    await writeFile(
+      consumerFile,
+      [
+        "import { formatDate } from './service';",
+        '',
+        'export function render(d: Date): string {',
+        '  return formatDate(d);',
+        '}',
+        '',
+      ].join('\n'),
+    );
+
+    // Configure the bridge with the temp dir as project root
+    const navTools = navigationTools(bridge);
+    const configResult = JSON.parse(
+      await navTools.aft_configure.execute({ project_root: tmpDir }),
+    );
+    expect(configResult.ok).toBe(true);
+
+    // Move formatDate from service.ts to utils.ts
+    const refTools = refactoringTools(bridge);
+    const moveResult = JSON.parse(
+      await refTools.aft_move_symbol.execute({
+        file: sourceFile,
+        symbol: "formatDate",
+        destination: destFile,
+      }),
+    );
+
+    expect(moveResult.ok).toBe(true);
+    expect(moveResult.files_modified).toBeGreaterThanOrEqual(2);
+
+    // Verify response structure includes expected diagnostic fields
+    expect(moveResult.consumers_updated).toBeDefined();
+    expect(moveResult.checkpoint_name).toBeDefined();
+
+    // Verify symbol was actually moved on disk
+    const sourceContent = await readFile(sourceFile, "utf-8");
+    expect(sourceContent).not.toContain("formatDate");
+    expect(sourceContent).toContain("otherFn");
+
+    const destContent = await readFile(destFile, "utf-8");
+    expect(destContent).toContain("formatDate");
+
+    // Verify consumer import was rewired
+    const consumerContent = await readFile(consumerFile, "utf-8");
+    expect(consumerContent).toContain("./utils");
+    expect(consumerContent).not.toContain("./service");
+  }, TEST_TIMEOUT_MS);
 });

@@ -85,6 +85,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
+        "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),
         // Test-only: populate the backup store through the protocol (no write/edit_symbol yet)
         "snapshot" => handle_snapshot(&req, ctx),
         _ => {

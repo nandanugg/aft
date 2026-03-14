@@ -53,7 +53,7 @@ This milestone is complete only when all are true:
 
 ## Slices
 
-- [ ] **S01: Move Symbol with Import Rewiring** `risk:high` `depends:[]`
+- [x] **S01: Move Symbol with Import Rewiring** `risk:high` `depends:[]`
   > After this: agent calls `aft_move_symbol` to move a function from one file to another — all import statements across the workspace are updated automatically, verified by integration tests with multi-file fixtures spanning 5+ files
 - [ ] **S02: Extract Function & Inline Symbol** `risk:medium` `depends:[]`
   > After this: agent calls `aft_extract_function` to extract a code range into a new function with auto-detected parameters and return type, and `aft_inline_symbol` to replace a function call with its body — both verified by integration tests across TS/JS/Python

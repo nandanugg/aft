@@ -303,14 +303,14 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R028 — Move symbol with import rewiring
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: `move_symbol` moves a function/class/type from one file to another, updates all import statements that reference it across the workspace, and adds necessary exports.
 - Why it matters: Manual symbol moves require 5-10 steps (cut, paste, update imports in every consuming file). Single-call operation eliminates the most error-prone refactor.
 - Source: user
 - Primary owning slice: M004/S01
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Depends on call graph (knows all consumers) and import management (knows how to update imports).
+- Validation: S01 — 28 Rust tests (19 unit + 9 integration) prove move_symbol across 5+ consumer files including aliased imports, dry-run preview, checkpoint/rollback, and error paths (not_configured, symbol_not_found, non-top-level, file_not_found) through binary protocol. Plugin round-trip verified by bun test (40 tests).
+- Notes: Depends on call graph (knows all consumers) and import management (knows how to update imports). Import rewriting scoped to TS/JS/TSX (D110).
 
 ### R029 — Extract function
 - Class: core-capability
@@ -490,7 +490,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R025 | differentiator | validated | M003/S04 | none | S04 |
 | R026 | core-capability | validated | M003/S03 | none | S03 |
 | R027 | quality-attribute | validated | M003/S01 | M001/S01 | S01 |
-| R028 | core-capability | active | M004/S01 | none | unmapped |
+| R028 | core-capability | validated | M004/S01 | none | S01 |
 | R029 | core-capability | active | M004/S02 | none | unmapped |
 | R030 | core-capability | active | M004/S02 | none | unmapped |
 | R031 | constraint | active | M001/S01 | M004/S03 | S01 (partial) |
@@ -507,7 +507,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 7
+- Active requirements: 6
 - Mapped to slices: 34
-- Validated: 28
+- Validated: 29
 - Unmapped active requirements: 0
