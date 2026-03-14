@@ -12,7 +12,7 @@ One-call semantic file operations that eliminate mechanical token waste — agen
 
 ## Current State
 
-Greenfield. Empty repository with git initialized.
+M001/S01 complete. The `aft` Rust binary runs as a persistent process with NDJSON protocol — accepts commands (ping, version, echo) on stdin, writes JSON responses to stdout, recovers from malformed input, shuts down cleanly on EOF. 17 tests pass (13 unit + 4 integration). LanguageProvider trait defined with stub implementation, ready for S02's tree-sitter backing.
 
 ## Architecture / Key Patterns
 

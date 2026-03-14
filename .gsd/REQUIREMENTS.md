@@ -8,13 +8,13 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R001 — Persistent binary architecture
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: The aft Rust binary runs as a persistent process, receiving JSON commands on stdin and writing JSON responses to stdout. Keeps parse state, caches, and edit history in memory between calls.
 - Why it matters: Per-command spawning would re-parse grammars and lose all cached state on every call, defeating incremental parsing and call graph caching.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S01 — 120 sequential commands without restart, malformed JSON recovery, clean shutdown on EOF
 - Notes: Process must handle graceful shutdown, crash recovery signaling to the plugin.
 
 ### R002 — Multi-language tree-sitter parsing
@@ -344,18 +344,18 @@ Use it to track what is actively in scope, what has been validated by completed 
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: M004/S03
-- Validation: unmapped
+- Validation: S01 — LanguageProvider trait defined, optional lsp_hints field in RawRequest protocol type. Full validation deferred to M004/S03.
 - Notes: M001 ships with tree-sitter only. LSP enrichment wired in M004.
 
 ### R032 — Structured JSON I/O (no shell escaping)
 - Class: constraint
-- Status: active
+- Status: validated
 - Description: All communication between plugin and binary uses JSON over stdin/stdout. File content, code snippets, and edit payloads are JSON string values — never shell arguments. Eliminates all shell escaping issues.
 - Why it matters: Shell escaping is a persistent source of bugs in agent tools. JSON I/O makes content handling unambiguous.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S01 — all 120 sequential commands and 8 malformed scenarios flow through JSON stdin/stdout, no shell escaping in any path
 - Notes: Every request is one JSON object per line. Every response is one JSON object per line.
 
 ### R033 — LSP integration via plugin mediation
@@ -465,7 +465,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 | ID | Class | Status | Primary owner | Supporting | Proof |
 |---|---|---|---|---|---|
-| R001 | core-capability | active | M001/S01 | none | unmapped |
+| R001 | core-capability | validated | M001/S01 | none | S01 |
 | R002 | core-capability | active | M001/S02 | none | unmapped |
 | R003 | primary-user-loop | active | M001/S03 | none | unmapped |
 | R004 | core-capability | active | M001/S05 | none | unmapped |
@@ -495,8 +495,8 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R028 | core-capability | active | M004/S01 | none | unmapped |
 | R029 | core-capability | active | M004/S02 | none | unmapped |
 | R030 | core-capability | active | M004/S02 | none | unmapped |
-| R031 | constraint | active | M001/S01 | M004/S03 | unmapped |
-| R032 | constraint | active | M001/S01 | none | unmapped |
+| R031 | constraint | active | M001/S01 | M004/S03 | S01 (partial) |
+| R032 | constraint | validated | M001/S01 | none | S01 |
 | R033 | integration | active | M004/S03 | none | unmapped |
 | R034 | constraint | active | M001/S02 | M002/S01 | unmapped |
 | R035 | core-capability | deferred | none | none | unmapped |
@@ -509,7 +509,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 34
+- Active requirements: 32
 - Mapped to slices: 34
-- Validated: 0
+- Validated: 2
 - Unmapped active requirements: 0

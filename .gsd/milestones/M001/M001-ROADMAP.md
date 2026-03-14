@@ -51,7 +51,7 @@ This milestone is complete only when all are true:
 
 ## Slices
 
-- [ ] **S01: Binary Scaffold & Persistent Protocol** `risk:high` `depends:[]`
+- [x] **S01: Binary Scaffold & Persistent Protocol** `risk:high` `depends:[]`
   > After this: binary starts as a persistent process, accepts JSON commands on stdin (ping, version, echo), responds on stdout, stays alive between commands. Verified by integration test sending 100+ commands sequentially.
 
 - [ ] **S02: Tree-sitter Multi-Language Engine** `risk:high` `depends:[S01]`
