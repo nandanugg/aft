@@ -105,28 +105,35 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         content = edit::replace_byte_range(&content, r.byte_start, r.byte_end, &r.replacement);
     }
 
-    // Phase 5: Write and validate
-    if let Err(e) = std::fs::write(path, &content) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("batch: failed to write file: {}", e),
-        );
-    }
+    // Phase 5: Write, format, and validate via shared pipeline
+    let write_result = match edit::write_format_validate(path, &content, ctx.config(), &req.params) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     eprintln!("[aft] batch: {} edits in {}", edits.len(), file);
 
-    let syntax_valid = match edit::validate_syntax(path) {
-        Ok(Some(valid)) => valid,
-        Ok(None) => true,
-        Err(_) => false,
-    };
+    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
 
     let mut result = serde_json::json!({
         "file": file,
         "edits_applied": edits.len(),
         "syntax_valid": syntax_valid,
+        "formatted": write_result.formatted,
     });
+
+    if let Some(ref reason) = write_result.format_skipped_reason {
+        result["format_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if write_result.validate_requested {
+        result["validation_errors"] = serde_json::json!(write_result.validation_errors);
+    }
+    if let Some(ref reason) = write_result.validate_skipped_reason {
+        result["validate_skipped_reason"] = serde_json::json!(reason);
+    }
 
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);

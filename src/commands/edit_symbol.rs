@@ -203,23 +203,15 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Write modified content
-    if let Err(e) = std::fs::write(path, &new_source) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("edit_symbol: failed to write file: {}", e),
-        );
-    }
+    // Write, format, and validate via shared pipeline
+    let write_result = match edit::write_format_validate(path, &new_source, ctx.config(), &req.params) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     eprintln!("[aft] edit_symbol: {} in {}", symbol_name, file);
-
-    // Validate syntax
-    let syntax_valid = match edit::validate_syntax(path) {
-        Ok(Some(valid)) => valid,
-        Ok(None) => true, // unsupported language — assume valid
-        Err(_) => false,
-    };
 
     // Compute new range for replace and insert operations
     let new_range = match operation {
@@ -241,13 +233,27 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         _ => None,
     };
 
+    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
+
     let mut result = serde_json::json!({
         "file": file,
         "symbol": symbol_name,
         "operation": operation,
         "range": original_range,
         "syntax_valid": syntax_valid,
+        "formatted": write_result.formatted,
     });
+
+    if let Some(ref reason) = write_result.format_skipped_reason {
+        result["format_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if write_result.validate_requested {
+        result["validation_errors"] = serde_json::json!(write_result.validation_errors);
+    }
+    if let Some(ref reason) = write_result.validate_skipped_reason {
+        result["validate_skipped_reason"] = serde_json::json!(reason);
+    }
 
     if let Some(nr) = new_range {
         result["new_range"] = serde_json::to_value(&nr).unwrap();

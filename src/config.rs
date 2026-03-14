@@ -14,6 +14,10 @@ pub struct Config {
     pub checkpoint_ttl_hours: u32,
     /// Maximum depth for recursive symbol resolution (default: 10).
     pub max_symbol_depth: u32,
+    /// Seconds before killing a formatter subprocess (default: 10).
+    pub formatter_timeout_secs: u32,
+    /// Seconds before killing a type-checker subprocess (default: 30).
+    pub type_checker_timeout_secs: u32,
 }
 
 impl Default for Config {
@@ -23,6 +27,8 @@ impl Default for Config {
             validation_depth: 1,
             checkpoint_ttl_hours: 24,
             max_symbol_depth: 10,
+            formatter_timeout_secs: 10,
+            type_checker_timeout_secs: 30,
         }
     }
 }

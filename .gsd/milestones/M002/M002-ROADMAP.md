@@ -58,7 +58,7 @@ This milestone is complete only when all are true:
   > After this: agent calls `add_import` on a TypeScript file with 3 import groups and the new import lands in the correct group, alphabetized and deduplicated — proven by integration tests across all 6 languages
 - [x] **S02: Scope-aware Insertion & Compound Operations** `risk:medium` `depends:[]`
   > After this: agent calls `add_member` to insert a method into a Python class and it appears at the correct indentation; `add_derive` appends to an existing Rust derive attribute — proven by integration tests
-- [ ] **S03: Auto-format & Validation** `risk:medium` `depends:[S01]`
+- [x] **S03: Auto-format & Validation** `risk:medium` `depends:[S01]`
   > After this: every mutation command auto-formats via the project's formatter when available, and `validate: "full"` invokes the project's type checker — proven by integration tests including formatter-not-found graceful degradation
 - [ ] **S04: Dry-run & Transactions** `risk:low` `depends:[]`
   > After this: agent previews any edit as a unified diff without modifying the file, and applies multi-file edits atomically with rollback on failure — proven by integration tests including the 3-file rollback acceptance scenario

@@ -1,0 +1,1050 @@
+//! External tool runner and auto-formatter detection.
+//!
+//! Provides subprocess execution with timeout protection, language-to-formatter
+//! mapping, and the `auto_format` entry point used by `write_format_validate`.
+
+use std::io::ErrorKind;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::config::Config;
+use crate::parser::{detect_language, LangId};
+
+/// Result of running an external tool subprocess.
+#[derive(Debug)]
+pub struct ExternalToolResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+/// Errors from external tool execution.
+#[derive(Debug)]
+pub enum FormatError {
+    /// The tool binary was not found on PATH.
+    NotFound { tool: String },
+    /// The tool exceeded its timeout and was killed.
+    Timeout { tool: String, timeout_secs: u32 },
+    /// The tool exited with a non-zero status.
+    Failed { tool: String, stderr: String },
+    /// No formatter is configured for this language.
+    UnsupportedLanguage,
+}
+
+impl std::fmt::Display for FormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormatError::NotFound { tool } => write!(f, "formatter not found: {}", tool),
+            FormatError::Timeout { tool, timeout_secs } => {
+                write!(f, "formatter '{}' timed out after {}s", tool, timeout_secs)
+            }
+            FormatError::Failed { tool, stderr } => {
+                write!(f, "formatter '{}' failed: {}", tool, stderr)
+            }
+            FormatError::UnsupportedLanguage => write!(f, "unsupported language for formatting"),
+        }
+    }
+}
+
+/// Spawn a subprocess and wait for completion with timeout protection.
+///
+/// Polls `try_wait()` at 50ms intervals. On timeout, kills the child process
+/// and waits for it to exit. Returns `FormatError::NotFound` when the binary
+/// isn't on PATH.
+pub fn run_external_tool(
+    command: &str,
+    args: &[&str],
+    working_dir: Option<&Path>,
+    timeout_secs: u32,
+) -> Result<ExternalToolResult, FormatError> {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(FormatError::NotFound {
+                tool: command.to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(FormatError::Failed {
+                tool: command.to_string(),
+                stderr: e.to_string(),
+            });
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
+                    .unwrap_or_default();
+
+                let exit_code = status.code().unwrap_or(-1);
+                if exit_code != 0 {
+                    return Err(FormatError::Failed {
+                        tool: command.to_string(),
+                        stderr,
+                    });
+                }
+
+                return Ok(ExternalToolResult {
+                    stdout,
+                    stderr,
+                    exit_code,
+                });
+            }
+            Ok(None) => {
+                // Still running
+                if Instant::now() >= deadline {
+                    // Kill the process and reap it
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(FormatError::Timeout {
+                        tool: command.to_string(),
+                        timeout_secs,
+                    });
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(FormatError::Failed {
+                    tool: command.to_string(),
+                    stderr: format!("try_wait error: {}", e),
+                });
+            }
+        }
+    }
+}
+
+/// Check if a command exists on PATH by attempting to spawn it with `--version`.
+///
+/// Returns true if the binary is found (regardless of exit code).
+fn tool_available(command: &str) -> bool {
+    match Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let _ = child.wait();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Check if `ruff format` is available with a stable formatter.
+///
+/// Ruff's formatter became stable in v0.1.2. Versions before that output
+/// `NOT_YET_IMPLEMENTED_*` stubs instead of formatted code. We parse the
+/// version from `ruff --version` (format: "ruff X.Y.Z") and require >= 0.1.2.
+/// Falls back to false if ruff is not found or version cannot be parsed.
+fn ruff_format_available() -> bool {
+    let output = match Command::new("ruff")
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+
+    let version_str = String::from_utf8_lossy(&output.stdout);
+    // Parse "ruff X.Y.Z" or just "X.Y.Z"
+    let version_part = version_str
+        .trim()
+        .strip_prefix("ruff ")
+        .unwrap_or(version_str.trim());
+
+    let parts: Vec<&str> = version_part.split('.').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+
+    let major: u32 = match parts[0].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let minor: u32 = match parts[1].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let patch: u32 = match parts[2].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Require >= 0.1.2 where ruff format became stable
+    (major, minor, patch) >= (0, 1, 2)
+}
+
+/// Detect the appropriate formatter command and arguments for a file.
+///
+/// Priority per language:
+/// - TypeScript/JavaScript/TSX: `prettier --write <file>`
+/// - Python: `ruff format <file>` (fallback: `black <file>`)
+/// - Rust: `rustfmt <file>`
+/// - Go: `gofmt -w <file>`
+///
+/// Returns `None` if no formatter is available for the language.
+pub fn detect_formatter(path: &Path, lang: LangId) -> Option<(String, Vec<String>)> {
+    let file_str = path.to_string_lossy().to_string();
+
+    match lang {
+        LangId::TypeScript | LangId::JavaScript | LangId::Tsx => {
+            if tool_available("prettier") {
+                Some(("prettier".to_string(), vec!["--write".to_string(), file_str]))
+            } else {
+                None
+            }
+        }
+        LangId::Python => {
+            if ruff_format_available() {
+                Some(("ruff".to_string(), vec!["format".to_string(), file_str]))
+            } else if tool_available("black") {
+                Some(("black".to_string(), vec![file_str]))
+            } else {
+                None
+            }
+        }
+        LangId::Rust => {
+            if tool_available("rustfmt") {
+                Some(("rustfmt".to_string(), vec![file_str]))
+            } else {
+                None
+            }
+        }
+        LangId::Go => {
+            if tool_available("gofmt") {
+                Some(("gofmt".to_string(), vec!["-w".to_string(), file_str]))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Auto-format a file using the detected formatter for its language.
+///
+/// Returns `(formatted, skip_reason)`:
+/// - `(true, None)` — file was successfully formatted
+/// - `(false, Some(reason))` — formatting was skipped, reason explains why
+///
+/// Skip reasons: `"unsupported_language"`, `"not_found"`, `"timeout"`, `"error"`
+pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
+    let lang = match detect_language(path) {
+        Some(l) => l,
+        None => {
+            eprintln!(
+                "[aft] format: {} (skipped: unsupported_language)",
+                path.display()
+            );
+            return (false, Some("unsupported_language".to_string()));
+        }
+    };
+
+    let (cmd, args) = match detect_formatter(path, lang) {
+        Some(pair) => pair,
+        None => {
+            eprintln!("[aft] format: {} (skipped: not_found)", path.display());
+            return (false, Some("not_found".to_string()));
+        }
+    };
+
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    match run_external_tool(&cmd, &arg_refs, None, config.formatter_timeout_secs) {
+        Ok(_) => {
+            eprintln!("[aft] format: {} ({})", path.display(), cmd);
+            (true, None)
+        }
+        Err(FormatError::Timeout { .. }) => {
+            eprintln!("[aft] format: {} (skipped: timeout)", path.display());
+            (false, Some("timeout".to_string()))
+        }
+        Err(FormatError::NotFound { .. }) => {
+            eprintln!("[aft] format: {} (skipped: not_found)", path.display());
+            (false, Some("not_found".to_string()))
+        }
+        Err(FormatError::Failed { stderr, .. }) => {
+            eprintln!(
+                "[aft] format: {} (skipped: error: {})",
+                path.display(),
+                stderr.lines().next().unwrap_or("unknown")
+            );
+            (false, Some("error".to_string()))
+        }
+        Err(FormatError::UnsupportedLanguage) => {
+            eprintln!(
+                "[aft] format: {} (skipped: unsupported_language)",
+                path.display()
+            );
+            (false, Some("unsupported_language".to_string()))
+        }
+    }
+}
+
+/// Spawn a subprocess and capture output regardless of exit code.
+///
+/// Unlike `run_external_tool`, this does NOT treat non-zero exit as an error —
+/// type checkers return non-zero when they find issues, which is expected.
+/// Returns `FormatError::NotFound` when the binary isn't on PATH, and
+/// `FormatError::Timeout` if the deadline is exceeded.
+pub fn run_external_tool_capture(
+    command: &str,
+    args: &[&str],
+    working_dir: Option<&Path>,
+    timeout_secs: u32,
+) -> Result<ExternalToolResult, FormatError> {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(FormatError::NotFound {
+                tool: command.to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(FormatError::Failed {
+                tool: command.to_string(),
+                stderr: e.to_string(),
+            });
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|s| std::io::read_to_string(s).unwrap_or_default())
+                    .unwrap_or_default();
+
+                return Ok(ExternalToolResult {
+                    stdout,
+                    stderr,
+                    exit_code: status.code().unwrap_or(-1),
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(FormatError::Timeout {
+                        tool: command.to_string(),
+                        timeout_secs,
+                    });
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(FormatError::Failed {
+                    tool: command.to_string(),
+                    stderr: format!("try_wait error: {}", e),
+                });
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Type-checker validation (R017)
+// ============================================================================
+
+/// A structured error from a type checker.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ValidationError {
+    pub line: u32,
+    pub column: u32,
+    pub message: String,
+    pub severity: String,
+}
+
+/// Detect the appropriate type checker command and arguments for a file.
+///
+/// Returns `(command, args)` for the type checker. The `--noEmit` / equivalent
+/// flags ensure no output files are produced.
+///
+/// Supported:
+/// - TypeScript/JavaScript/TSX → `npx tsc --noEmit` (fallback: `tsc --noEmit`)
+/// - Python → `pyright`
+/// - Rust → `cargo check`
+/// - Go → `go vet`
+pub fn detect_type_checker(path: &Path, lang: LangId) -> Option<(String, Vec<String>)> {
+    let file_str = path.to_string_lossy().to_string();
+
+    match lang {
+        LangId::TypeScript | LangId::JavaScript | LangId::Tsx => {
+            // Prefer npx tsc (uses project's typescript), fall back to global tsc
+            if tool_available("npx") {
+                Some((
+                    "npx".to_string(),
+                    vec![
+                        "tsc".to_string(),
+                        "--noEmit".to_string(),
+                        "--pretty".to_string(),
+                        "false".to_string(),
+                    ],
+                ))
+            } else if tool_available("tsc") {
+                Some((
+                    "tsc".to_string(),
+                    vec![
+                        "--noEmit".to_string(),
+                        "--pretty".to_string(),
+                        "false".to_string(),
+                    ],
+                ))
+            } else {
+                None
+            }
+        }
+        LangId::Python => {
+            if tool_available("pyright") {
+                Some((
+                    "pyright".to_string(),
+                    vec!["--outputjson".to_string(), file_str],
+                ))
+            } else {
+                None
+            }
+        }
+        LangId::Rust => {
+            if tool_available("cargo") {
+                Some((
+                    "cargo".to_string(),
+                    vec![
+                        "check".to_string(),
+                        "--message-format=json".to_string(),
+                    ],
+                ))
+            } else {
+                None
+            }
+        }
+        LangId::Go => {
+            if tool_available("go") {
+                Some((
+                    "go".to_string(),
+                    vec!["vet".to_string(), file_str],
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Parse type checker output into structured validation errors.
+///
+/// Handles output formats from tsc, pyright (JSON), cargo check (JSON), and go vet.
+/// Filters to errors related to the edited file where feasible.
+pub fn parse_checker_output(
+    stdout: &str,
+    stderr: &str,
+    file: &Path,
+    checker: &str,
+) -> Vec<ValidationError> {
+    match checker {
+        "npx" | "tsc" => parse_tsc_output(stdout, stderr, file),
+        "pyright" => parse_pyright_output(stdout, file),
+        "cargo" => parse_cargo_output(stdout, stderr, file),
+        "go" => parse_go_vet_output(stderr, file),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse tsc output lines like: `path(line,col): error TSxxxx: message`
+fn parse_tsc_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let file_str = file.to_string_lossy();
+    // tsc writes diagnostics to stdout (with --pretty false)
+    let combined = format!("{}{}", stdout, stderr);
+    for line in combined.lines() {
+        // Format: path(line,col): severity TSxxxx: message
+        // or: path(line,col): severity: message
+        if let Some((loc, rest)) = line.split_once("): ") {
+            // Check if this error is for our file (compare filename part)
+            let file_part = loc.split('(').next().unwrap_or("");
+            if !file_str.ends_with(file_part)
+                && !file_part.ends_with(&*file_str)
+                && file_part != &*file_str
+            {
+                continue;
+            }
+
+            // Parse (line,col) from the location part
+            let coords = loc.split('(').last().unwrap_or("");
+            let parts: Vec<&str> = coords.split(',').collect();
+            let line_num: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let col_num: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+            // Parse severity and message
+            let (severity, message) = if let Some(msg) = rest.strip_prefix("error ") {
+                ("error".to_string(), msg.to_string())
+            } else if let Some(msg) = rest.strip_prefix("warning ") {
+                ("warning".to_string(), msg.to_string())
+            } else {
+                ("error".to_string(), rest.to_string())
+            };
+
+            errors.push(ValidationError {
+                line: line_num,
+                column: col_num,
+                message,
+                severity,
+            });
+        }
+    }
+    errors
+}
+
+/// Parse pyright JSON output.
+fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let file_str = file.to_string_lossy();
+
+    // pyright --outputjson emits JSON with generalDiagnostics array
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout) {
+        if let Some(diags) = json
+            .get("generalDiagnostics")
+            .and_then(|d| d.as_array())
+        {
+            for diag in diags {
+                // Filter to our file
+                let diag_file = diag.get("file").and_then(|f| f.as_str()).unwrap_or("");
+                if !diag_file.is_empty()
+                    && !file_str.ends_with(diag_file)
+                    && !diag_file.ends_with(&*file_str)
+                    && diag_file != &*file_str
+                {
+                    continue;
+                }
+
+                let line_num = diag
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(0) as u32;
+                let col_num = diag
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("character"))
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0) as u32;
+                let message = diag
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string();
+                let severity = diag
+                    .get("severity")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("error")
+                    .to_lowercase();
+
+                errors.push(ValidationError {
+                    line: line_num + 1, // pyright uses 0-indexed lines
+                    column: col_num,
+                    message,
+                    severity,
+                });
+            }
+        }
+    }
+    errors
+}
+
+/// Parse cargo check JSON output, filtering to errors in the target file.
+fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let file_str = file.to_string_lossy();
+
+    for line in stdout.lines() {
+        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+            if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+                continue;
+            }
+            let message_obj = match msg.get("message") {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let level = message_obj
+                .get("level")
+                .and_then(|l| l.as_str())
+                .unwrap_or("error");
+
+            // Only include errors and warnings, skip notes/help
+            if level != "error" && level != "warning" {
+                continue;
+            }
+
+            let text = message_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+
+            // Find the primary span for our file
+            if let Some(spans) = message_obj.get("spans").and_then(|s| s.as_array()) {
+                for span in spans {
+                    let span_file = span
+                        .get("file_name")
+                        .and_then(|f| f.as_str())
+                        .unwrap_or("");
+                    let is_primary = span
+                        .get("is_primary")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
+
+                    if !is_primary {
+                        continue;
+                    }
+
+                    // Filter to our file
+                    if !file_str.ends_with(span_file)
+                        && !span_file.ends_with(&*file_str)
+                        && span_file != &*file_str
+                    {
+                        continue;
+                    }
+
+                    let line_num = span
+                        .get("line_start")
+                        .and_then(|l| l.as_u64())
+                        .unwrap_or(0) as u32;
+                    let col_num = span
+                        .get("column_start")
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0) as u32;
+
+                    errors.push(ValidationError {
+                        line: line_num,
+                        column: col_num,
+                        message: text.clone(),
+                        severity: level.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// Parse go vet output lines like: `path:line:col: message`
+fn parse_go_vet_output(stderr: &str, file: &Path) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let file_str = file.to_string_lossy();
+
+    for line in stderr.lines() {
+        // Format: path:line:col: message  OR  path:line: message
+        let parts: Vec<&str> = line.splitn(4, ':').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let err_file = parts[0].trim();
+        if !file_str.ends_with(err_file)
+            && !err_file.ends_with(&*file_str)
+            && err_file != &*file_str
+        {
+            continue;
+        }
+
+        let line_num: u32 = parts[1].trim().parse().unwrap_or(0);
+        let (col_num, message) = if parts.len() >= 4 {
+            if let Ok(col) = parts[2].trim().parse::<u32>() {
+                (col, parts[3].trim().to_string())
+            } else {
+                // parts[2] is part of the message, not a column
+                (0, format!("{}:{}", parts[2].trim(), parts[3].trim()))
+            }
+        } else {
+            (0, parts[2].trim().to_string())
+        };
+
+        errors.push(ValidationError {
+            line: line_num,
+            column: col_num,
+            message,
+            severity: "error".to_string(),
+        });
+    }
+    errors
+}
+
+/// Run the project's type checker and return structured validation errors.
+///
+/// Returns `(errors, skip_reason)`:
+/// - `(errors, None)` — checker ran, errors may be empty (= valid code)
+/// - `([], Some(reason))` — checker was skipped
+///
+/// Skip reasons: `"unsupported_language"`, `"not_found"`, `"timeout"`, `"error"`
+pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Option<String>) {
+    let lang = match detect_language(path) {
+        Some(l) => l,
+        None => {
+            eprintln!(
+                "[aft] validate: {} (skipped: unsupported_language)",
+                path.display()
+            );
+            return (Vec::new(), Some("unsupported_language".to_string()));
+        }
+    };
+
+    let (cmd, args) = match detect_type_checker(path, lang) {
+        Some(pair) => pair,
+        None => {
+            eprintln!("[aft] validate: {} (skipped: not_found)", path.display());
+            return (Vec::new(), Some("not_found".to_string()));
+        }
+    };
+
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    // Type checkers may need to run from the project root
+    let working_dir = path.parent();
+
+    match run_external_tool_capture(&cmd, &arg_refs, working_dir, config.type_checker_timeout_secs) {
+        Ok(result) => {
+            let errors = parse_checker_output(&result.stdout, &result.stderr, path, &cmd);
+            eprintln!("[aft] validate: {} ({}, {} errors)", path.display(), cmd, errors.len());
+            (errors, None)
+        }
+        Err(FormatError::Timeout { .. }) => {
+            eprintln!("[aft] validate: {} (skipped: timeout)", path.display());
+            (Vec::new(), Some("timeout".to_string()))
+        }
+        Err(FormatError::NotFound { .. }) => {
+            eprintln!("[aft] validate: {} (skipped: not_found)", path.display());
+            (Vec::new(), Some("not_found".to_string()))
+        }
+        Err(FormatError::Failed { stderr, .. }) => {
+            eprintln!(
+                "[aft] validate: {} (skipped: error: {})",
+                path.display(),
+                stderr.lines().next().unwrap_or("unknown")
+            );
+            (Vec::new(), Some("error".to_string()))
+        }
+        Err(FormatError::UnsupportedLanguage) => {
+            eprintln!(
+                "[aft] validate: {} (skipped: unsupported_language)",
+                path.display()
+            );
+            (Vec::new(), Some("unsupported_language".to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    fn run_external_tool_not_found() {
+        let result = run_external_tool("__nonexistent_tool_xyz__", &[], None, 5);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FormatError::NotFound { tool } => {
+                assert_eq!(tool, "__nonexistent_tool_xyz__");
+            }
+            other => panic!("expected NotFound, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_external_tool_timeout_kills_subprocess() {
+        // Use `sleep 60` as a long-running process, timeout after 1 second
+        let result = run_external_tool("sleep", &["60"], None, 1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FormatError::Timeout { tool, timeout_secs } => {
+                assert_eq!(tool, "sleep");
+                assert_eq!(timeout_secs, 1);
+            }
+            other => panic!("expected Timeout, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_external_tool_success() {
+        let result = run_external_tool("echo", &["hello"], None, 5);
+        assert!(result.is_ok());
+        let res = result.unwrap();
+        assert_eq!(res.exit_code, 0);
+        assert!(res.stdout.contains("hello"));
+    }
+
+    #[test]
+    fn run_external_tool_nonzero_exit() {
+        // `false` always exits with code 1
+        let result = run_external_tool("false", &[], None, 5);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FormatError::Failed { tool, .. } => {
+                assert_eq!(tool, "false");
+            }
+            other => panic!("expected Failed, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_format_unsupported_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let config = Config::default();
+        let (formatted, reason) = auto_format(&path, &config);
+        assert!(!formatted);
+        assert_eq!(reason.as_deref(), Some("unsupported_language"));
+    }
+
+    #[test]
+    fn detect_formatter_rust_when_rustfmt_available() {
+        // This test checks the mapping — it will only find a formatter if rustfmt is installed
+        let path = Path::new("test.rs");
+        let result = detect_formatter(path, LangId::Rust);
+        if tool_available("rustfmt") {
+            let (cmd, args) = result.unwrap();
+            assert_eq!(cmd, "rustfmt");
+            assert!(args.contains(&"test.rs".to_string()));
+        } else {
+            assert!(result.is_none());
+        }
+    }
+
+    #[test]
+    fn detect_formatter_go_mapping() {
+        let path = Path::new("main.go");
+        let result = detect_formatter(path, LangId::Go);
+        if tool_available("gofmt") {
+            let (cmd, args) = result.unwrap();
+            assert_eq!(cmd, "gofmt");
+            assert!(args.contains(&"-w".to_string()));
+        } else {
+            assert!(result.is_none());
+        }
+    }
+
+    #[test]
+    fn detect_formatter_python_mapping() {
+        let path = Path::new("main.py");
+        let result = detect_formatter(path, LangId::Python);
+        if ruff_format_available() {
+            let (cmd, args) = result.unwrap();
+            assert_eq!(cmd, "ruff");
+            assert!(args.contains(&"format".to_string()));
+        } else if tool_available("black") {
+            let (cmd, _) = result.unwrap();
+            assert_eq!(cmd, "black");
+        } else {
+            assert!(result.is_none());
+        }
+    }
+
+    #[test]
+    fn auto_format_happy_path_rustfmt() {
+        if !tool_available("rustfmt") {
+            eprintln!("skipping: rustfmt not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.rs");
+
+        // Write poorly-formatted Rust code
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "fn    main()   {{  println!(\"hello\");  }}").unwrap();
+        drop(f);
+
+        let config = Config::default();
+        let (formatted, reason) = auto_format(&path, &config);
+        assert!(formatted, "expected formatting to succeed");
+        assert!(reason.is_none());
+
+        // Verify the file was reformatted
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("fn    main"),
+            "expected rustfmt to fix spacing"
+        );
+    }
+
+    // --- parse_checker_output unit tests ---
+
+    #[test]
+    fn parse_tsc_output_basic() {
+        let stdout = "src/app.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.\nsrc/app.ts(20,1): error TS2304: Cannot find name 'foo'.\n";
+        let file = Path::new("src/app.ts");
+        let errors = parse_tsc_output(stdout, "", file);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert_eq!(errors[0].severity, "error");
+        assert!(errors[0].message.contains("TS2322"));
+        assert_eq!(errors[1].line, 20);
+    }
+
+    #[test]
+    fn parse_tsc_output_filters_other_files() {
+        let stdout = "other.ts(1,1): error TS2322: wrong file\nsrc/app.ts(5,3): error TS1234: our file\n";
+        let file = Path::new("src/app.ts");
+        let errors = parse_tsc_output(stdout, "", file);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 5);
+    }
+
+    #[test]
+    fn parse_cargo_output_basic() {
+        let json_line = r#"{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","spans":[{"file_name":"src/main.rs","line_start":10,"column_start":5,"is_primary":true}]}}"#;
+        let file = Path::new("src/main.rs");
+        let errors = parse_cargo_output(json_line, "", file);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert_eq!(errors[0].severity, "error");
+        assert!(errors[0].message.contains("mismatched types"));
+    }
+
+    #[test]
+    fn parse_cargo_output_skips_notes() {
+        // Notes and help messages should be filtered out
+        let json_line = r#"{"reason":"compiler-message","message":{"level":"note","message":"expected this","spans":[{"file_name":"src/main.rs","line_start":10,"column_start":5,"is_primary":true}]}}"#;
+        let file = Path::new("src/main.rs");
+        let errors = parse_cargo_output(json_line, "", file);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn parse_cargo_output_filters_other_files() {
+        let json_line = r#"{"reason":"compiler-message","message":{"level":"error","message":"err","spans":[{"file_name":"src/other.rs","line_start":1,"column_start":1,"is_primary":true}]}}"#;
+        let file = Path::new("src/main.rs");
+        let errors = parse_cargo_output(json_line, "", file);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn parse_go_vet_output_basic() {
+        let stderr = "main.go:10:5: unreachable code\nmain.go:20: another issue\n";
+        let file = Path::new("main.go");
+        let errors = parse_go_vet_output(stderr, file);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].line, 10);
+        assert_eq!(errors[0].column, 5);
+        assert!(errors[0].message.contains("unreachable code"));
+        assert_eq!(errors[1].line, 20);
+        assert_eq!(errors[1].column, 0);
+    }
+
+    #[test]
+    fn parse_pyright_output_basic() {
+        let stdout = r#"{"generalDiagnostics":[{"file":"test.py","range":{"start":{"line":4,"character":10}},"message":"Type error here","severity":"error"}]}"#;
+        let file = Path::new("test.py");
+        let errors = parse_pyright_output(stdout, file);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 5); // 0-indexed → 1-indexed
+        assert_eq!(errors[0].column, 10);
+        assert_eq!(errors[0].severity, "error");
+        assert!(errors[0].message.contains("Type error here"));
+    }
+
+    #[test]
+    fn validate_full_unsupported_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "hello").unwrap();
+
+        let config = Config::default();
+        let (errors, reason) = validate_full(&path, &config);
+        assert!(errors.is_empty());
+        assert_eq!(reason.as_deref(), Some("unsupported_language"));
+    }
+
+    #[test]
+    fn detect_type_checker_rust() {
+        let path = Path::new("src/main.rs");
+        let result = detect_type_checker(path, LangId::Rust);
+        if tool_available("cargo") {
+            let (cmd, args) = result.unwrap();
+            assert_eq!(cmd, "cargo");
+            assert!(args.contains(&"check".to_string()));
+        } else {
+            assert!(result.is_none());
+        }
+    }
+
+    #[test]
+    fn detect_type_checker_go() {
+        let path = Path::new("main.go");
+        let result = detect_type_checker(path, LangId::Go);
+        if tool_available("go") {
+            let (cmd, args) = result.unwrap();
+            assert_eq!(cmd, "go");
+            assert!(args.contains(&"vet".to_string()));
+        } else {
+            assert!(result.is_none());
+        }
+    }
+
+    #[test]
+    fn run_external_tool_capture_nonzero_not_error() {
+        // `false` exits with code 1 — capture should still return Ok
+        let result = run_external_tool_capture("false", &[], None, 5);
+        assert!(result.is_ok(), "capture should not error on non-zero exit");
+        assert_eq!(result.unwrap().exit_code, 1);
+    }
+
+    #[test]
+    fn run_external_tool_capture_not_found() {
+        let result = run_external_tool_capture("__nonexistent_xyz__", &[], None, 5);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FormatError::NotFound { tool } => assert_eq!(tool, "__nonexistent_xyz__"),
+            other => panic!("expected NotFound, got: {:?}", other),
+        }
+    }
+}

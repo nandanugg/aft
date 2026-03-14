@@ -5,8 +5,10 @@
 
 use std::path::Path;
 
+use crate::config::Config;
 use crate::context::AppContext;
 use crate::error::AftError;
+use crate::format;
 use crate::parser::FileParser;
 
 /// Convert 0-indexed line/col to a byte offset within `source`.
@@ -73,6 +75,74 @@ pub fn auto_backup(
         store.snapshot(path, description)?
     }; // borrow dropped here
     Ok(Some(backup_id))
+}
+
+/// Result of the write → format → validate pipeline.
+///
+/// Returned by `write_format_validate` to give callers a single struct
+/// with all post-write signals for the response JSON.
+pub struct WriteResult {
+    /// Whether tree-sitter syntax validation passed. `None` if unsupported language.
+    pub syntax_valid: Option<bool>,
+    /// Whether the file was auto-formatted.
+    pub formatted: bool,
+    /// Why formatting was skipped, if it was. Values: "not_found", "timeout", "error", "unsupported_language".
+    pub format_skipped_reason: Option<String>,
+    /// Whether full validation was requested (controls whether validation_errors is included in response).
+    pub validate_requested: bool,
+    /// Structured type-checker errors (only populated when validate:"full" is requested).
+    pub validation_errors: Vec<format::ValidationError>,
+    /// Why validation was skipped, if it was. Values: "not_found", "timeout", "error", "unsupported_language".
+    pub validate_skipped_reason: Option<String>,
+}
+
+/// Write content to disk, auto-format, then validate syntax.
+///
+/// This is the shared tail for all mutation commands. The pipeline order is:
+/// 1. `fs::write` — persist content
+/// 2. `auto_format` — run the project formatter (reads the written file, writes back)
+/// 3. `validate_syntax` — parse the (potentially formatted) file
+/// 4. `validate_full` — run type checker if `params.validate == "full"`
+///
+/// The `params` argument carries the original request parameters. When it
+/// contains `"validate": "full"`, the project's type checker is invoked after
+/// syntax validation and the results are included in `WriteResult`.
+pub fn write_format_validate(
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+) -> Result<WriteResult, AftError> {
+    // Step 1: Write
+    std::fs::write(path, content).map_err(|e| AftError::InvalidRequest {
+        message: format!("failed to write file: {}", e),
+    })?;
+
+    // Step 2: Format (before validate so we validate the formatted content)
+    let (formatted, format_skipped_reason) = format::auto_format(path, config);
+
+    // Step 3: Validate syntax
+    let syntax_valid = match validate_syntax(path) {
+        Ok(sv) => sv,
+        Err(_) => None,
+    };
+
+    // Step 4: Full validation (type checker) — only when requested
+    let validate_requested = params.get("validate").and_then(|v| v.as_str()) == Some("full");
+    let (validation_errors, validate_skipped_reason) = if validate_requested {
+        format::validate_full(path, config)
+    } else {
+        (Vec::new(), None)
+    };
+
+    Ok(WriteResult {
+        syntax_valid,
+        formatted,
+        format_skipped_reason,
+        validate_requested,
+        validation_errors,
+        validate_skipped_reason,
+    })
 }
 
 #[cfg(test)]

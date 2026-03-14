@@ -69,31 +69,35 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // Write content to file
-    if let Err(e) = std::fs::write(path, content) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("write: failed to write file: {}", e),
-        );
-    }
+    // Write, format, and validate via shared pipeline
+    let write_result = match edit::write_format_validate(path, content, ctx.config(), &req.params) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     eprintln!("[aft] write: {}", file);
-
-    // Attempt syntax validation
-    let syntax_valid = match edit::validate_syntax(path) {
-        Ok(Some(valid)) => Some(valid),
-        Ok(None) => None, // unsupported language
-        Err(_) => None,   // validation failed, don't report
-    };
 
     let mut result = serde_json::json!({
         "file": file,
         "created": !existed,
+        "formatted": write_result.formatted,
     });
 
-    if let Some(valid) = syntax_valid {
+    if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
+    }
+
+    if let Some(ref reason) = write_result.format_skipped_reason {
+        result["format_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if write_result.validate_requested {
+        result["validation_errors"] = serde_json::json!(write_result.validation_errors);
+    }
+    if let Some(ref reason) = write_result.validate_skipped_reason {
+        result["validate_skipped_reason"] = serde_json::json!(reason);
     }
 
     if let Some(ref id) = backup_id {

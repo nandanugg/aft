@@ -173,21 +173,22 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R016 — Auto-format on save
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: After every edit, detect and invoke the project's canonical formatter (prettier, rustfmt, black/ruff, gofmt) if available. Response indicates "applied" or "not_found". Agent never thinks about code style.
 - Why it matters: Inconsistent formatting creates noise in diffs and wastes agent attention on style.
 - Source: user
 - Primary owning slice: M002/S03
+- Validation: S03 — 6 format integration tests prove formatter detection/invocation/not-found across all 12 mutation commands via binary protocol. Response includes `formatted` (bool) and `format_skipped_reason`. 10 unit tests cover subprocess timeout/kill/not-found/happy-path.
 
 ### R017 — Full validation mode (opt-in type checkers)
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: Opt-in `validate: "full"` mode invokes external type checkers (tsc, pyright, cargo check, go vet) after an edit. Returns type errors with line numbers and messages. Default remains syntax-only (fast).
 - Why it matters: Gives agents a one-stop validation option for critical edits — e.g., after multi-file transactions where confirming type safety matters.
 - Source: user
 - Primary owning slice: M002/S03
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S03 — 4 validation integration tests prove validate:"full" through binary protocol, structured ValidationError output (line/column/message/severity), not-found graceful degradation, and lean default responses (validation_errors omitted when not requested). 8 unit tests cover per-checker output parsers (tsc, pyright, cargo, go vet).
 - Notes: Synchronous — command blocks until type checker returns. Acceptable because it's opt-in and the agent explicitly requested it.
 
 ### R018 — Dry-run mode on all mutations
@@ -477,8 +478,8 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R013 | core-capability | validated | M002/S01 | none | S01 |
 | R014 | core-capability | validated | M002/S02 | none | S02 |
 | R015 | differentiator | validated | M002/S02 | none | S02 |
-| R016 | quality-attribute | active | M002/S03 | none | unmapped |
-| R017 | quality-attribute | active | M002/S03 | none | unmapped |
+| R016 | quality-attribute | validated | M002/S03 | none | S03 |
+| R017 | quality-attribute | validated | M002/S03 | none | S03 |
 | R018 | failure-visibility | active | M002/S04 | none | unmapped |
 | R019 | core-capability | active | M002/S04 | none | unmapped |
 | R020 | core-capability | active | M003/S01 | none | unmapped |
@@ -506,7 +507,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 19
+- Active requirements: 17
 - Mapped to slices: 34
-- Validated: 16
+- Validated: 18
 - Unmapped active requirements: 0

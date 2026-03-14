@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod edit;
 pub mod error;
+pub mod format;
 pub mod imports;
 pub mod indent;
 pub mod language;
@@ -176,5 +177,7 @@ mod tests {
         assert_eq!(cfg.validation_depth, 1);
         assert_eq!(cfg.checkpoint_ttl_hours, 24);
         assert_eq!(cfg.max_symbol_depth, 10);
+        assert_eq!(cfg.formatter_timeout_secs, 10);
+        assert_eq!(cfg.type_checker_timeout_secs, 30);
     }
 }

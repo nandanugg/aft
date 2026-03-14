@@ -12,7 +12,7 @@ One-call semantic file operations that eliminate mechanical token waste — agen
 
 ## Current State
 
-**M001 (Foundation) complete. M002/S01 (Import Management) and M002/S02 (Scope-aware Insertion) complete.** The `aft` Rust binary runs as a persistent process with NDJSON protocol, embeds tree-sitter grammars for 6 languages (TypeScript, JavaScript, TSX, Python, Rust, Go), and handles 19 domain commands: the original 11 from M001 (`outline`, `zoom`, `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `undo`, `edit_history`, `write`, `edit_symbol`, `edit_match`, `batch`), 3 import commands (`add_import`, `remove_import`, `organize_imports`), and 5 structure commands (`add_member`, `add_derive`, `wrap_try_catch`, `add_decorator`, `add_struct_tags`). Scope-aware member insertion supports TS/JS classes, Python classes (4-space indent), Rust impl blocks/structs, and Go structs with 4 position modes. Compound operations handle Rust derive manipulation, TS/JS try-catch wrapping, Python decorator insertion, and Go struct tag management. The OpenCode TypeScript plugin registers all 19 commands as tools with Zod schemas. 249 Rust tests + 36 plugin tests pass. Next: M002/S03 (Auto-format & Validation) or S04 (Dry-run & Transactions).
+**M001 (Foundation) complete. M002/S01 (Import Management), M002/S02 (Scope-aware Insertion), and M002/S03 (Auto-format & Validation) complete.** The `aft` Rust binary runs as a persistent process with NDJSON protocol, embeds tree-sitter grammars for 6 languages (TypeScript, JavaScript, TSX, Python, Rust, Go), and handles 19 domain commands: the original 11 from M001 (`outline`, `zoom`, `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `undo`, `edit_history`, `write`, `edit_symbol`, `edit_match`, `batch`), 3 import commands (`add_import`, `remove_import`, `organize_imports`), and 5 structure commands (`add_member`, `add_derive`, `wrap_try_catch`, `add_decorator`, `add_struct_tags`). All 12 mutation commands auto-format via project formatter when available (prettier, rustfmt, ruff/black, gofmt) with graceful degradation. Opt-in `validate:"full"` invokes type checkers (tsc, pyright, cargo check, go vet) returning structured errors. The OpenCode TypeScript plugin registers all 19 commands as tools with Zod schemas. 280 Rust tests + 36 plugin tests pass. Next: M002/S04 (Dry-run & Transactions).
 
 ## Architecture / Key Patterns
 
@@ -30,6 +30,6 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
 ## Milestone Sequence
 
 - [x] M001: Foundation — Rust binary, tree-sitter for 6 languages, three-layer editing, safety system, OpenCode plugin, binary distribution (155 tests, all passing)
-- [ ] M002: Language Intelligence — Import management (S01 ✅), scope-aware insertion & compound ops (S02 ✅), auto-format, transactions
+- [ ] M002: Language Intelligence — Import management (S01 ✅), scope-aware insertion & compound ops (S02 ✅), auto-format & validation (S03 ✅), transactions
 - [ ] M003: Call Graph Navigation — Lazy/incremental call graph, forward/reverse traces, impact analysis, data flow tracking
 - [ ] M004: Refactoring Primitives — Move symbol, extract function, inline symbol, LSP integration

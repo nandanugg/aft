@@ -170,23 +170,15 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Insert ---
     let new_source = edit::replace_byte_range(&source, insert_offset, insert_offset, &insert_text);
 
-    // --- Write ---
-    if let Err(e) = std::fs::write(path, &new_source) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("add_import: failed to write file: {}", e),
-        );
-    }
+    // --- Write, format, and validate ---
+    let write_result = match edit::write_format_validate(path, &new_source, ctx.config(), &req.params) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     eprintln!("[aft] add_import: {}", file);
-
-    // --- Validate syntax ---
-    let syntax_valid = match edit::validate_syntax(path) {
-        Ok(Some(valid)) => Some(valid),
-        Ok(None) => None,
-        Err(_) => None,
-    };
 
     // --- Build response ---
     let mut result = serde_json::json!({
@@ -194,10 +186,22 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         "added": true,
         "module": module,
         "group": group.label(),
+        "formatted": write_result.formatted,
     });
 
-    if let Some(valid) = syntax_valid {
+    if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
+    }
+
+    if let Some(ref reason) = write_result.format_skipped_reason {
+        result["format_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if write_result.validate_requested {
+        result["validation_errors"] = serde_json::json!(write_result.validation_errors);
+    }
+    if let Some(ref reason) = write_result.validate_skipped_reason {
+        result["validate_skipped_reason"] = serde_json::json!(reason);
     }
 
     if let Some(ref id) = backup_id {

@@ -29,7 +29,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
   return {
     write: {
       description:
-        "Write content to a file, creating it if it doesn't exist. Backs up existing files automatically. Returns syntax validation result and backup ID for undo.",
+        "Write content to a file, creating it if it doesn't exist. Backs up existing files automatically. Returns syntax validation result, backup ID for undo, and format/validation status. Response fields: `formatted` (bool), `format_skipped_reason` (string), `validation_errors` (array of {line, column, message, severity}), `validate_skipped_reason` (string).",
       args: {
         file: z.string().describe("Path to the file to write (relative to project root or absolute)"),
         content: z.string().describe("Complete file content to write"),
@@ -37,6 +37,10 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
           .boolean()
           .optional()
           .describe("Create parent directories if they don't exist (default: false)"),
+        validate: z
+          .enum(["syntax", "full"])
+          .optional()
+          .describe("Validation level: 'syntax' (default, tree-sitter only) or 'full' (invoke project type checker)"),
       },
       execute: async (args): Promise<string> => {
         const params: Record<string, unknown> = {
@@ -44,6 +48,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
           content: args.content,
         };
         if (args.create_dirs !== undefined) params.create_dirs = args.create_dirs;
+        if (args.validate !== undefined) params.validate = args.validate;
         const response = await bridge.send("write", params);
         return JSON.stringify(response);
       },
@@ -51,7 +56,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
 
     edit_symbol: {
       description:
-        "Edit a named symbol (function, class, type, etc.) by operation: replace its body, delete it, or insert content before/after it. Uses tree-sitter for precise symbol location. Returns ambiguous_symbol error with candidates if the name matches multiple symbols.",
+        "Edit a named symbol (function, class, type, etc.) by operation: replace its body, delete it, or insert content before/after it. Uses tree-sitter for precise symbol location. Returns ambiguous_symbol error with candidates if the name matches multiple symbols. Response includes `formatted`, `format_skipped_reason`, `validation_errors`, `validate_skipped_reason`.",
       args: {
         file: z.string().describe("Path to the file containing the symbol"),
         symbol: z.string().describe("Name of the symbol to edit"),
@@ -64,6 +69,10 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
           .string()
           .optional()
           .describe("Qualified scope to disambiguate symbols with the same name (e.g. 'ClassName.method')"),
+        validate: z
+          .enum(["syntax", "full"])
+          .optional()
+          .describe("Validation level: 'syntax' (default, tree-sitter only) or 'full' (invoke project type checker)"),
       },
       execute: async (args): Promise<string> => {
         const params: Record<string, unknown> = {
@@ -73,6 +82,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         };
         if (args.content !== undefined) params.content = args.content;
         if (args.scope !== undefined) params.scope = args.scope;
+        if (args.validate !== undefined) params.validate = args.validate;
         const response = await bridge.send("edit_symbol", params);
         return JSON.stringify(response);
       },
@@ -80,7 +90,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
 
     edit_match: {
       description:
-        "Find and replace a text pattern in a file. If the pattern matches multiple locations, returns ambiguous_match with occurrence indices — resubmit with an occurrence number to target a specific match.",
+        "Find and replace a text pattern in a file. If the pattern matches multiple locations, returns ambiguous_match with occurrence indices — resubmit with an occurrence number to target a specific match. Response includes `formatted`, `format_skipped_reason`, `validation_errors`, `validate_skipped_reason`.",
       args: {
         file: z.string().describe("Path to the file to edit"),
         match: z.string().describe("Exact text to find in the file"),
@@ -89,6 +99,10 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
           .number()
           .optional()
           .describe("Zero-based index of the specific occurrence to replace when multiple matches exist"),
+        validate: z
+          .enum(["syntax", "full"])
+          .optional()
+          .describe("Validation level: 'syntax' (default, tree-sitter only) or 'full' (invoke project type checker)"),
       },
       execute: async (args): Promise<string> => {
         const params: Record<string, unknown> = {
@@ -97,6 +111,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
           replacement: args.replacement,
         };
         if (args.occurrence !== undefined) params.occurrence = args.occurrence;
+        if (args.validate !== undefined) params.validate = args.validate;
         const response = await bridge.send("edit_match", params);
         return JSON.stringify(response);
       },
@@ -104,18 +119,24 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
 
     batch: {
       description:
-        "Apply multiple edits to a single file atomically. If any edit fails, all changes are rolled back. Each edit can be a match-replace or a line-range replacement.",
+        "Apply multiple edits to a single file atomically. If any edit fails, all changes are rolled back. Each edit can be a match-replace or a line-range replacement. Response includes `formatted`, `format_skipped_reason`, `validation_errors`, `validate_skipped_reason`.",
       args: {
         file: z.string().describe("Path to the file to edit"),
         edits: z
           .array(batchEditItem)
           .describe("Array of edit operations to apply atomically"),
+        validate: z
+          .enum(["syntax", "full"])
+          .optional()
+          .describe("Validation level: 'syntax' (default, tree-sitter only) or 'full' (invoke project type checker)"),
       },
       execute: async (args): Promise<string> => {
-        const response = await bridge.send("batch", {
+        const params: Record<string, unknown> = {
           file: args.file,
           edits: args.edits,
-        });
+        };
+        if (args.validate !== undefined) params.validate = args.validate;
+        const response = await bridge.send("batch", params);
         return JSON.stringify(response);
       },
     },
