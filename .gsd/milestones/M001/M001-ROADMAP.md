@@ -63,7 +63,7 @@ This milestone is complete only when all are true:
 - [x] **S04: Safety & Recovery System** `risk:medium` `depends:[S01]`
   > After this: `checkpoint` creates named workspace snapshots, `restore_checkpoint` rolls back, `undo` reverts a single file's last edit, `edit_history` shows the per-file edit stack. Verified by checkpoint → modify files → restore → diff shows no changes.
 
-- [ ] **S05: Three-Layer Editing Engine** `risk:medium` `depends:[S02,S04]`
+- [x] **S05: Three-Layer Editing Engine** `risk:medium` `depends:[S02,S04]`
   > After this: `edit_symbol`, `edit_match`, `write`, and `batch` all work with auto-backup, syntax validation, and symbol disambiguation. Verified by editing real code files using all three edit modes and confirming syntax validation catches intentional errors.
 
 - [ ] **S06: OpenCode Plugin Bridge** `risk:medium` `depends:[S01,S02,S03,S04,S05]`

@@ -12,7 +12,7 @@ One-call semantic file operations that eliminate mechanical token waste — agen
 
 ## Current State
 
-M001/S01–S04 complete. The `aft` Rust binary runs as a persistent process with NDJSON protocol, embeds tree-sitter grammars for 6 languages (TypeScript, JavaScript, TSX, Python, Rust, Go), and handles `outline`, `zoom`, `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `undo`, and `edit_history` commands. AppContext threads shared state (LanguageProvider, BackupStore, CheckpointStore, Config) through dispatch. BackupStore provides per-file undo with snapshot/restore. CheckpointStore provides named workspace snapshots with create/restore/list/cleanup. 105 tests pass (86 unit + 19 integration). Next: S05 (three-layer editing engine — edit_symbol, edit_match, write, batch with auto-backup and syntax validation).
+M001/S01–S05 complete. The `aft` Rust binary runs as a persistent process with NDJSON protocol, embeds tree-sitter grammars for 6 languages (TypeScript, JavaScript, TSX, Python, Rust, Go), and handles `outline`, `zoom`, `checkpoint`, `restore_checkpoint`, `list_checkpoints`, `undo`, `edit_history`, `write`, `edit_symbol`, `edit_match`, and `batch` commands. All four mutation commands auto-backup before modification, validate syntax via tree-sitter re-parse, and return structured disambiguation when targets are ambiguous. AppContext threads shared state (LanguageProvider, BackupStore, CheckpointStore, Config) through dispatch. 133 tests pass (98 unit + 35 integration). Next: S06 (OpenCode plugin bridge — TypeScript plugin spawns binary, registers tools with Zod schemas).
 
 ## Architecture / Key Patterns
 

@@ -62,6 +62,10 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "checkpoint" => aft::commands::checkpoint::handle_checkpoint(&req, ctx),
         "restore_checkpoint" => aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx),
         "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
+        "write" => aft::commands::write::handle_write(&req, ctx),
+        "edit_symbol" => aft::commands::edit_symbol::handle_edit_symbol(&req, ctx),
+        "edit_match" => aft::commands::edit_match::handle_edit_match(&req, ctx),
+        "batch" => aft::commands::batch::handle_batch(&req, ctx),
         // Test-only: populate the backup store through the protocol (no write/edit_symbol yet)
         "snapshot" => handle_snapshot(&req, ctx),
         _ => {

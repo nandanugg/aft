@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod commands;
 pub mod config;
 pub mod context;
+pub mod edit;
 pub mod error;
 pub mod language;
 pub mod parser;
@@ -139,6 +140,19 @@ mod tests {
         };
         assert_eq!(err.to_string(), "no undo history for: src/main.rs");
         assert_eq!(err.code(), "no_undo_history");
+    }
+
+    #[test]
+    fn error_display_ambiguous_match() {
+        let err = AftError::AmbiguousMatch {
+            pattern: "TODO".into(),
+            count: 5,
+        };
+        assert_eq!(
+            err.to_string(),
+            "pattern 'TODO' matches 5 occurrences, expected exactly 1"
+        );
+        assert_eq!(err.code(), "ambiguous_match");
     }
 
     #[test]

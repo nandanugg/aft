@@ -29,6 +29,10 @@ pub enum AftError {
     NoUndoHistory {
         path: String,
     },
+    AmbiguousMatch {
+        pattern: String,
+        count: usize,
+    },
 }
 
 impl AftError {
@@ -42,6 +46,7 @@ impl AftError {
             AftError::InvalidRequest { .. } => "invalid_request",
             AftError::CheckpointNotFound { .. } => "checkpoint_not_found",
             AftError::NoUndoHistory { .. } => "no_undo_history",
+            AftError::AmbiguousMatch { .. } => "ambiguous_match",
         }
     }
 
@@ -84,6 +89,13 @@ impl fmt::Display for AftError {
             }
             AftError::NoUndoHistory { path } => {
                 write!(f, "no undo history for: {}", path)
+            }
+            AftError::AmbiguousMatch { pattern, count } => {
+                write!(
+                    f,
+                    "pattern '{}' matches {} occurrences, expected exactly 1",
+                    pattern, count
+                )
             }
         }
     }

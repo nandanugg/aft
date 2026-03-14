@@ -41,58 +41,58 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R004 — Semantic editing (edit by symbol name)
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: `edit_symbol` accepts a symbol name and operation (replace, delete, insert_before, insert_after) and applies the edit to the resolved symbol's range. Returns the new range, syntax validation result, and backup ID.
 - Why it matters: Agents think "change function X" but current tools require translation to line numbers. Symbol-level addressing eliminates that translation and its error rate.
 - Source: user
 - Primary owning slice: M001/S05
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S05 — integration tests prove edit_symbol replace/delete operations, auto-backup with undo round-trip, syntax validation (valid and intentional errors), and structured disambiguation with candidates (name, qualified, line, kind) using ambiguous.ts fixture.
 - Notes: Must handle disambiguation when multiple symbols match (return candidates with qualified names).
 
 ### R005 — Structural editing (edit by content match)
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: `edit_match` targets lines by their content — single line match/replace or range match (from/to markers). When match is ambiguous (appears multiple times), returns all occurrences with ±2 lines context for the agent to choose by index.
 - Why it matters: Useful when the agent already knows what the code looks like from earlier reads or conversation context. Faster than symbol-level for simple constant changes.
 - Source: user
 - Primary owning slice: M001/S05
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S05 — integration tests prove single match replacement, multiple occurrence disambiguation with context lines, occurrence index selection, no-match error, and empty-match rejection.
 - Notes: Complements edit_symbol — agent picks whichever is more natural for the specific edit.
 
 ### R006 — Bulk and batch editing
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: `write` does full file write via JSON stdin (new files or complete rewrites). `batch` applies multiple edits to one file in a single call, auto-sorted bottom-to-top to prevent line drift. Batch is atomic — all succeed or all roll back.
 - Why it matters: write eliminates shell escaping issues for file content. batch prevents the line-drift problem when making multiple edits in one file.
 - Source: user
 - Primary owning slice: M001/S05
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S05 — integration tests prove write creates/overwrites files, batch applies multiple match and line-range edits atomically, batch rolls back on any edit failure (file unchanged), and batch undo restores original via single backup.
 - Notes: All content passes through JSON — no shell argument strings.
 
 ### R007 — Per-file auto-backup and undo
 - Class: failure-visibility
-- Status: active
+- Status: validated
 - Description: Every mutation operation automatically snapshots the affected file before modifying it. `undo` restores the previous version. `edit_history` shows the stack of edits per file with timestamps and operation descriptions.
 - Why it matters: Agents make mistakes. A one-step undo per file means recovery costs ~50 tokens instead of ~1500 (re-read + re-edit).
 - Source: user
 - Primary owning slice: M001/S04
 - Supporting slices: M001/S05
-- Validation: S04 — BackupStore with snapshot/restore_latest/history, undo and edit_history commands wired through protocol, integration tests prove undo round-trip and history ordering. Auto-snapshot on mutation deferred to S05.
-- Notes: Undo stack is in-memory in the persistent process. Full validation (auto-snapshot before every mutation) requires S05.
+- Validation: S04 built BackupStore with snapshot/restore/history and protocol commands. S05 proves every mutation (write, edit_symbol, edit_match, batch) auto-snapshots before modification. Integration tests confirm undo restores pre-mutation state for all four commands.
+- Notes: Undo stack is in-memory in the persistent process.
 
 ### R008 — Workspace-wide checkpoints
 - Class: failure-visibility
-- Status: active
+- Status: validated
 - Description: `checkpoint` creates a named snapshot of all tracked files. `restore_checkpoint` rolls back to a named checkpoint. `list_checkpoints` shows available checkpoints with file counts. Auto-cleanup after 24h (configurable).
 - Why it matters: Agents need "save game" before risky multi-file changes. Workspace-level rollback is the safety net for experimental refactors.
 - Source: user
 - Primary owning slice: M001/S04
 - Supporting slices: none
-- Validation: S04 — CheckpointStore with create/restore/list/cleanup, all 5 commands wired through protocol, integration tests prove checkpoint→modify→restore cycle, name overwrite, TTL cleanup, and error paths. In-memory stores only (D001).
-- Notes: Stored in-memory (persistent process). TTL cleanup unit tested. Full end-to-end proof with mutation commands in S05.
+- Validation: S04 — CheckpointStore with create/restore/list/cleanup, all 5 commands wired through protocol, integration tests prove checkpoint→modify→restore cycle, name overwrite, TTL cleanup, and error paths. S05 mutation commands now provide the file-modification surface that checkpoints protect against.
+- Notes: Stored in-memory (persistent process). TTL cleanup unit tested.
 
 ### R009 — OpenCode plugin bridge
 - Class: integration
@@ -107,24 +107,24 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R010 — Post-edit syntax validation
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: Every edit response includes a `syntax_valid` field from a tree-sitter re-parse (~1ms). This is the default validation level. Catches malformed code immediately after edit.
 - Why it matters: Agents often produce syntax errors. Immediate feedback prevents cascading failures from building on broken code.
 - Source: user
 - Primary owning slice: M001/S05
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S05 — all four mutation commands return `syntax_valid` boolean. Integration tests prove valid code returns true, intentionally broken syntax returns false, unsupported languages return null. Fresh FileParser used per validation (D023).
 - Notes: This is only tree-sitter syntax checking. Full type-checker validation is R017 (M002).
 
 ### R011 — Symbol disambiguation
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: When edit_symbol or zoom targets a symbol name that matches multiple symbols (e.g., two `validate` functions in different scopes), the response returns an `ambiguous_symbol` error with a candidates list showing qualified names, files, and line numbers. Agent reissues with the qualified name.
 - Why it matters: Ambiguous symbols are a common source of wrong-target edits. Explicit disambiguation prevents silent wrong-function edits.
 - Source: user
 - Primary owning slice: M001/S05
 - Supporting slices: M001/S03
-- Validation: unmapped
+- Validation: S05 — integration test with ambiguous.ts fixture proves disambiguation returns structured candidates with name, qualified name, line, and kind. Agent can reissue with scope parameter to select specific symbol.
 - Notes: Qualified names use scope chain: `ClassName.methodName`, `module::function`.
 
 ### R012 — Binary distribution
@@ -468,14 +468,14 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R001 | core-capability | validated | M001/S01 | none | S01 |
 | R002 | core-capability | validated | M001/S02 | none | S02 |
 | R003 | primary-user-loop | validated | M001/S03 | none | S03 |
-| R004 | core-capability | active | M001/S05 | none | unmapped |
-| R005 | core-capability | active | M001/S05 | none | unmapped |
-| R006 | core-capability | active | M001/S05 | none | unmapped |
-| R007 | failure-visibility | active | M001/S04 | M001/S05 | unmapped |
-| R008 | failure-visibility | active | M001/S04 | none | unmapped |
+| R004 | core-capability | validated | M001/S05 | none | S05 |
+| R005 | core-capability | validated | M001/S05 | none | S05 |
+| R006 | core-capability | validated | M001/S05 | none | S05 |
+| R007 | failure-visibility | validated | M001/S04 | M001/S05 | S04+S05 |
+| R008 | failure-visibility | validated | M001/S04 | none | S04 |
 | R009 | integration | active | M001/S06 | none | unmapped |
-| R010 | quality-attribute | active | M001/S05 | none | unmapped |
-| R011 | quality-attribute | active | M001/S05 | M001/S03 | unmapped |
+| R010 | quality-attribute | validated | M001/S05 | none | S05 |
+| R011 | quality-attribute | validated | M001/S05 | M001/S03 | S05 |
 | R012 | launchability | active | M001/S07 | none | unmapped |
 | R013 | core-capability | active | M002/S01 | none | unmapped |
 | R014 | core-capability | active | M002/S02 | none | unmapped |
@@ -509,7 +509,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 30
+- Active requirements: 23
 - Mapped to slices: 34
-- Validated: 4
+- Validated: 11
 - Unmapped active requirements: 0
