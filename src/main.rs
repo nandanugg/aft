@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, BufRead, BufWriter, Write};
 
 use aft::config::Config;
@@ -30,7 +31,10 @@ fn main() {
         }
 
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
-            Ok(req) => dispatch(req, &ctx),
+            Ok(req) => {
+                drain_watcher_events(&ctx);
+                dispatch(req, &ctx)
+            }
             Err(e) => {
                 eprintln!("[aft] parse error: {} — input: {}", e, trimmed);
                 Response::error(
@@ -77,6 +81,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
+        "callers" => aft::commands::callers::handle_callers(&req, ctx),
         // Test-only: populate the backup store through the protocol (no write/edit_symbol yet)
         "snapshot" => handle_snapshot(&req, ctx),
         _ => {
@@ -136,4 +141,53 @@ fn write_response(writer: &mut BufWriter<io::StdoutLock>, response: &Response) -
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+/// Source file extensions that the call graph supports.
+const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "rs", "go"];
+
+/// Drain pending file watcher events and invalidate changed source files
+/// in the call graph.
+///
+/// Borrows the watcher receiver and callgraph in separate phases to avoid
+/// RefCell borrow conflicts. Events are deduplicated by PathBuf — notify
+/// fires multiple events per file write (Create, Modify, etc.).
+fn drain_watcher_events(ctx: &AppContext) {
+    // Phase 1: collect changed paths from the receiver
+    let changed: HashSet<std::path::PathBuf> = {
+        let rx_ref = ctx.watcher_rx().borrow();
+        let rx = match rx_ref.as_ref() {
+            Some(rx) => rx,
+            None => return, // No watcher configured
+        };
+
+        let mut paths = HashSet::new();
+        while let Ok(event_result) = rx.try_recv() {
+            if let Ok(event) = event_result {
+                for path in event.paths {
+                    // Filter to supported source extensions
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if SOURCE_EXTENSIONS.contains(&ext) {
+                            paths.insert(path);
+                        }
+                    }
+                }
+            }
+        }
+        paths
+    }; // receiver borrow dropped here
+
+    if changed.is_empty() {
+        return;
+    }
+
+    // Phase 2: invalidate each changed file in the call graph
+    let mut graph_ref = ctx.callgraph().borrow_mut();
+    if let Some(graph) = graph_ref.as_mut() {
+        for path in &changed {
+            graph.invalidate_file(path);
+        }
+    }
+
+    eprintln!("[aft] invalidated {} files", changed.len());
 }

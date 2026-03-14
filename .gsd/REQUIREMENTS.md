@@ -215,13 +215,13 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R020 — Call graph construction (lazy, incremental, file watcher)
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: Static call graph built lazily — first query scans outward from the target, caching results. File watcher invalidates/rebuilds graph nodes for changed files. Graph respects worktree boundaries.
 - Why it matters: Eager full-workspace scan is too slow for large codebases. Lazy construction with incremental updates gives fast first results and improves over time.
 - Source: user
 - Primary owning slice: M003/S01
-- Supporting slices: none
-- Validation: S01 — Lazy per-file construction with `HashMap<PathBuf, FileCallData>`, cross-file resolution via import chains, worktree-scoped file walking via `ignore` crate. File watcher invalidation deferred to S02.
+- Supporting slices: M003/S02
+- Validation: S01 — Lazy per-file construction with `HashMap<PathBuf, FileCallData>`, cross-file resolution via import chains, worktree-scoped file walking via `ignore` crate. S02 — File watcher using `notify` v8 with drain-at-dispatch pattern, `invalidate_file()` clears stale data, integration tests prove modify-then-query and remove-then-query cycles reflect changes.
 - Notes: File watcher runs in the persistent process background. Must exclude node_modules, target/, venv/, etc.
 
 ### R021 — Forward call tree
@@ -237,13 +237,13 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R022 — Reverse caller tree
 - Class: primary-user-loop
-- Status: active
+- Status: validated
 - Description: `callers` shows all call sites for a function, grouped by file, with each caller expandable to its own callers up to specified depth.
 - Why it matters: "What calls this function?" is a fundamental navigation question that currently requires grep + manual tracing.
 - Source: user
 - Primary owning slice: M003/S02
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S02 — 4 integration tests prove cross-file callers grouped by file, recursive depth expansion with cycle detection, empty result handling (total_callers: 0), not_configured guard, symbol_not_found error. 2 watcher cycle tests prove modify-then-query and remove-then-query reflect changes. Plugin tool registration verified by bun tests.
 - Notes: None.
 
 ### R023 — Reverse trace to entry points
@@ -482,9 +482,9 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R017 | quality-attribute | validated | M002/S03 | none | S03 |
 | R018 | failure-visibility | validated | M002/S04 | none | S04 |
 | R019 | core-capability | validated | M002/S04 | none | S04 |
-| R020 | core-capability | active | M003/S01 | none | S01 (partial) |
+| R020 | core-capability | validated | M003/S01 | M003/S02 | S01+S02 |
 | R021 | primary-user-loop | validated | M003/S01 | none | S01 |
-| R022 | primary-user-loop | active | M003/S02 | none | unmapped |
+| R022 | primary-user-loop | validated | M003/S02 | none | S02 |
 | R023 | differentiator | active | M003/S03 | none | unmapped |
 | R024 | differentiator | active | M003/S04 | none | unmapped |
 | R025 | differentiator | active | M003/S04 | none | unmapped |
@@ -507,7 +507,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 13
+- Active requirements: 11
 - Mapped to slices: 34
-- Validated: 22
+- Validated: 24
 - Unmapped active requirements: 0

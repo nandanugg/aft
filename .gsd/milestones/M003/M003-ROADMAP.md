@@ -56,7 +56,7 @@ This milestone is complete only when all are true:
 
 - [x] **S01: Call Graph Infrastructure + Forward Call Tree** `risk:high` `depends:[]`
   > After this: agent calls `aft_call_tree` on a function in a multi-file TypeScript project and receives a cross-file call tree with resolved paths, signatures, and depth-limited traversal — proven by integration tests with multi-file fixtures and plugin tool round-trip
-- [ ] **S02: Reverse Callers + File Watcher** `risk:high` `depends:[S01]`
+- [x] **S02: Reverse Callers + File Watcher** `risk:high` `depends:[S01]`
   > After this: agent calls `aft_callers` on a function and sees all call sites grouped by file; after modifying a calling file on disk, a subsequent query reflects the change — proven by integration tests exercising the file watcher invalidation cycle
 - [ ] **S03: Trace to Entry Points** `risk:medium` `depends:[S02]`
   > After this: agent calls `aft_trace_to` on a deeply-nested utility and receives all paths from entry points (exported functions, main, test functions) rendered top-down — proven by integration tests with multi-layer call chains

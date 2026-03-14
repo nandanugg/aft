@@ -5,6 +5,7 @@ pub mod add_member;
 pub mod add_struct_tags;
 pub mod batch;
 pub mod call_tree;
+pub mod callers;
 pub mod checkpoint;
 pub mod configure;
 pub mod edit_history;

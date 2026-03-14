@@ -57,6 +57,52 @@ pub enum EdgeResolution {
     Unresolved { callee_name: String },
 }
 
+/// A single caller site: who calls a given symbol and from where.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallerSite {
+    /// File containing the caller.
+    pub caller_file: PathBuf,
+    /// Symbol that makes the call.
+    pub caller_symbol: String,
+    /// 0-based line number of the call.
+    pub line: u32,
+    /// 0-based column (byte start within file, kept for future use).
+    pub col: u32,
+    /// Whether the edge was resolved via import chain.
+    pub resolved: bool,
+}
+
+/// A group of callers from a single file.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallerGroup {
+    /// File path (relative to project root).
+    pub file: String,
+    /// Individual call sites in this file.
+    pub callers: Vec<CallerEntry>,
+}
+
+/// A single caller entry within a CallerGroup.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallerEntry {
+    pub symbol: String,
+    pub line: u32,
+}
+
+/// Result of a `callers_of` query.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallersResult {
+    /// Target symbol queried.
+    pub symbol: String,
+    /// Target file queried.
+    pub file: String,
+    /// Caller groups, one per calling file.
+    pub callers: Vec<CallerGroup>,
+    /// Total number of call sites found.
+    pub total_callers: usize,
+    /// Number of files scanned to build the reverse index.
+    pub scanned_files: usize,
+}
+
 /// A node in the forward call tree.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallTreeNode {
@@ -90,6 +136,9 @@ pub struct CallGraph {
     project_root: PathBuf,
     /// All files discovered in the worktree (lazily populated).
     project_files: Option<Vec<PathBuf>>,
+    /// Reverse index: (target_file, target_symbol) → callers.
+    /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
+    reverse_index: Option<HashMap<(PathBuf, String), Vec<CallerSite>>>,
 }
 
 impl CallGraph {
@@ -99,6 +148,7 @@ impl CallGraph {
             data: HashMap::new(),
             project_root,
             project_files: None,
+            reverse_index: None,
         }
     }
 
@@ -354,6 +404,212 @@ impl CallGraph {
             self.project_files = Some(walk_project_files(&self.project_root).collect());
         }
         self.project_files.as_ref().unwrap()
+    }
+
+    /// Build the reverse index by scanning all project files.
+    ///
+    /// For each file, builds the call data (if not cached), then for each
+    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
+    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
+    fn build_reverse_index(&mut self) {
+        // Discover all project files first
+        if self.project_files.is_none() {
+            self.project_files = Some(walk_project_files(&self.project_root).collect());
+        }
+        let all_files: Vec<PathBuf> = self.project_files.as_ref().unwrap().clone();
+
+        // Build file data for all project files
+        for f in &all_files {
+            if !self.data.contains_key(f) {
+                if let Ok(fd) = build_file_data(f) {
+                    self.data.insert(f.clone(), fd);
+                }
+            }
+        }
+
+        // Now build the reverse map
+        let mut reverse: HashMap<(PathBuf, String), Vec<CallerSite>> = HashMap::new();
+
+        for caller_file in &all_files {
+            // Canonicalize the caller file path for consistent lookups
+            let canon_caller = std::fs::canonicalize(caller_file)
+                .unwrap_or_else(|_| caller_file.clone());
+            let file_data = match self.data.get(caller_file).or_else(|| self.data.get(&canon_caller)) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+
+            for (symbol_name, call_sites) in &file_data.calls_by_symbol {
+                for call_site in call_sites {
+                    let edge = self.resolve_cross_file_edge(
+                        &call_site.full_callee,
+                        &call_site.callee_name,
+                        caller_file,
+                        &file_data.import_block,
+                    );
+
+                    match edge {
+                        EdgeResolution::Resolved {
+                            file: ref target_file,
+                            ref symbol,
+                        } => {
+                            let key = (target_file.clone(), symbol.clone());
+                            reverse.entry(key).or_default().push(CallerSite {
+                                caller_file: canon_caller.clone(),
+                                caller_symbol: symbol_name.clone(),
+                                line: call_site.line,
+                                col: 0,
+                                resolved: true,
+                            });
+                        }
+                        EdgeResolution::Unresolved { ref callee_name } => {
+                            // For unresolved edges, index by (caller_file, callee_name)
+                            // so same-file calls are still findable
+                            let key = (canon_caller.clone(), callee_name.clone());
+                            reverse.entry(key).or_default().push(CallerSite {
+                                caller_file: canon_caller.clone(),
+                                caller_symbol: symbol_name.clone(),
+                                line: call_site.line,
+                                col: 0,
+                                resolved: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        self.reverse_index = Some(reverse);
+    }
+
+    /// Get callers of a symbol in a file, grouped by calling file.
+    ///
+    /// Builds the reverse index on first call (scans all project files).
+    /// Supports recursive depth expansion: depth=1 returns direct callers,
+    /// depth=2 returns callers-of-callers, etc. depth=0 is treated as 1.
+    pub fn callers_of(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<CallersResult, AftError> {
+        let canon = self.canonicalize(file)?;
+
+        // Ensure file is built (may already be cached)
+        self.build_file(&canon)?;
+
+        // Build the reverse index if not cached
+        if self.reverse_index.is_none() {
+            self.build_reverse_index();
+        }
+
+        let scanned_files = self.project_files.as_ref().map(|f| f.len()).unwrap_or(0);
+        let effective_depth = if depth == 0 { 1 } else { depth };
+
+        let mut visited = HashSet::new();
+        let mut all_sites: Vec<CallerSite> = Vec::new();
+        self.collect_callers_recursive(
+            &canon,
+            symbol,
+            effective_depth,
+            0,
+            &mut visited,
+            &mut all_sites,
+        );
+
+        // Group by file
+        let mut groups_map: HashMap<PathBuf, Vec<CallerEntry>> = HashMap::new();
+        for site in &all_sites {
+            groups_map
+                .entry(site.caller_file.clone())
+                .or_default()
+                .push(CallerEntry {
+                    symbol: site.caller_symbol.clone(),
+                    line: site.line,
+                });
+        }
+
+        let total_callers = all_sites.len();
+        let mut callers: Vec<CallerGroup> = groups_map
+            .into_iter()
+            .map(|(file_path, entries)| CallerGroup {
+                file: self.relative_path(&file_path),
+                callers: entries,
+            })
+            .collect();
+
+        // Sort groups by file path for deterministic output
+        callers.sort_by(|a, b| a.file.cmp(&b.file));
+
+        Ok(CallersResult {
+            symbol: symbol.to_string(),
+            file: self.relative_path(&canon),
+            callers,
+            total_callers,
+            scanned_files,
+        })
+    }
+
+    /// Recursively collect callers up to the given depth.
+    fn collect_callers_recursive(
+        &self,
+        file: &Path,
+        symbol: &str,
+        max_depth: usize,
+        current_depth: usize,
+        visited: &mut HashSet<(PathBuf, String)>,
+        result: &mut Vec<CallerSite>,
+    ) {
+        if current_depth >= max_depth {
+            return;
+        }
+
+        // Canonicalize for consistent reverse index lookup
+        let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let key = (canon.clone(), symbol.to_string());
+        if visited.contains(&key) {
+            return; // cycle detection
+        }
+        visited.insert(key);
+
+        let reverse_index = match &self.reverse_index {
+            Some(ri) => ri,
+            None => return,
+        };
+
+        let lookup_key = (canon, symbol.to_string());
+        if let Some(sites) = reverse_index.get(&lookup_key) {
+            for site in sites {
+                result.push(site.clone());
+                // Recurse: find callers of the caller
+                if current_depth + 1 < max_depth {
+                    self.collect_callers_recursive(
+                        &site.caller_file,
+                        &site.caller_symbol,
+                        max_depth,
+                        current_depth + 1,
+                        visited,
+                        result,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Invalidate a file: remove its cached data and clear the reverse index.
+    ///
+    /// Called by the file watcher when a file changes on disk. The reverse
+    /// index is rebuilt lazily on the next `callers_of` call.
+    pub fn invalidate_file(&mut self, path: &Path) {
+        // Remove from data cache (try both as-is and canonicalized)
+        self.data.remove(path);
+        if let Ok(canon) = self.canonicalize(path) {
+            self.data.remove(&canon);
+        }
+        // Clear the reverse index — it's stale
+        self.reverse_index = None;
+        // Clear project_files cache for create/remove events
+        self.project_files = None;
     }
 
     /// Return a path relative to the project root, or the absolute path if
@@ -1157,5 +1413,112 @@ export function funcB() {
     fn callgraph_find_alias_no_match() {
         let raw = "import { foo } from './utils';";
         assert_eq!(find_alias_original(raw, "foo"), None);
+    }
+
+    // --- Reverse callers ---
+
+    #[test]
+    fn callgraph_callers_of_direct() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        // helpers.ts:double is called by utils.ts:helper
+        let result = graph
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1)
+            .unwrap();
+
+        assert_eq!(result.symbol, "double");
+        assert!(result.total_callers > 0, "double should have callers");
+        assert!(result.scanned_files > 0, "should have scanned files");
+
+        // Find the caller from utils.ts
+        let utils_group = result.callers.iter().find(|g| g.file.contains("utils.ts"));
+        assert!(
+            utils_group.is_some(),
+            "double should be called from utils.ts, groups: {:?}",
+            result.callers.iter().map(|g| &g.file).collect::<Vec<_>>()
+        );
+
+        let group = utils_group.unwrap();
+        let helper_caller = group.callers.iter().find(|c| c.symbol == "helper");
+        assert!(
+            helper_caller.is_some(),
+            "double should be called by helper, callers: {:?}",
+            group.callers.iter().map(|c| &c.symbol).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn callgraph_callers_of_no_callers() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        // main.ts:main is the entry point — nothing calls it
+        let result = graph
+            .callers_of(&dir.path().join("main.ts"), "main", 1)
+            .unwrap();
+
+        assert_eq!(result.symbol, "main");
+        assert_eq!(result.total_callers, 0, "main should have no callers");
+        assert!(result.callers.is_empty());
+    }
+
+    #[test]
+    fn callgraph_callers_recursive_depth() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        // helpers.ts:double is called by utils.ts:helper
+        // utils.ts:helper is called by main.ts:main
+        // With depth=2, we should see both direct and transitive callers
+        let result = graph
+            .callers_of(&dir.path().join("helpers.ts"), "double", 2)
+            .unwrap();
+
+        assert!(
+            result.total_callers >= 2,
+            "with depth 2, double should have >= 2 callers (direct + transitive), got {}",
+            result.total_callers
+        );
+
+        // Should include caller from main.ts (transitive: main → helper → double)
+        let main_group = result.callers.iter().find(|g| g.file.contains("main.ts"));
+        assert!(
+            main_group.is_some(),
+            "recursive callers should include main.ts, groups: {:?}",
+            result.callers.iter().map(|g| &g.file).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn callgraph_invalidate_file_clears_reverse_index() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        // Build callers to populate the reverse index
+        let _ = graph
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1)
+            .unwrap();
+        assert!(graph.reverse_index.is_some(), "reverse index should be built");
+
+        // Invalidate a file
+        graph.invalidate_file(&dir.path().join("utils.ts"));
+
+        // Reverse index should be cleared
+        assert!(
+            graph.reverse_index.is_none(),
+            "invalidate_file should clear reverse index"
+        );
+        // Data cache for the file should be cleared
+        let canon = std::fs::canonicalize(dir.path().join("utils.ts")).unwrap();
+        assert!(
+            !graph.data.contains_key(&canon),
+            "invalidate_file should remove file from data cache"
+        );
+        // Project files should be cleared
+        assert!(
+            graph.project_files.is_none(),
+            "invalidate_file should clear project_files"
+        );
     }
 }

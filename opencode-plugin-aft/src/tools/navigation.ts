@@ -5,13 +5,13 @@ import type { BinaryBridge } from "../bridge.js";
 const z = tool.schema;
 
 /**
- * Tool definitions for navigation commands: configure and call_tree.
+ * Tool definitions for navigation commands: configure, call_tree, and callers.
  */
 export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
   return {
     aft_configure: {
       description:
-        "Configure the AFT binary with the project root directory. Must be called before using call_tree. Sets the worktree scope for call graph analysis.",
+        "Configure the AFT binary with the project root directory. Must be called before using call_tree or callers. Sets the worktree scope for call graph analysis.",
       args: {
         project_root: z.string().describe("Absolute path to the project root directory"),
       },
@@ -39,6 +39,28 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
         };
         if (args.depth !== undefined) params.depth = args.depth;
         const response = await bridge.send("call_tree", params);
+        return JSON.stringify(response);
+      },
+    },
+
+    aft_callers: {
+      description:
+        "Find all callers of a symbol across the project. Returns call sites grouped by file, showing which functions call the target symbol. Scans all project files and resolves cross-file edges via import chains. Supports recursive depth expansion (callers of callers). Use after aft_configure.",
+      args: {
+        file: z.string().describe("Path to the source file containing the target symbol (relative to project root or absolute)"),
+        symbol: z.string().describe("Name of the symbol to find callers for"),
+        depth: z
+          .number()
+          .optional()
+          .describe("Recursive depth: 1 = direct callers only, 2+ = callers of callers (default: 1)"),
+      },
+      execute: async (args): Promise<string> => {
+        const params: Record<string, unknown> = {
+          file: args.file,
+          symbol: args.symbol,
+        };
+        if (args.depth !== undefined) params.depth = args.depth;
+        const response = await bridge.send("callers", params);
         return JSON.stringify(response);
       },
     },

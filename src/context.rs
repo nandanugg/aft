@@ -1,4 +1,7 @@
 use std::cell::{Ref, RefCell, RefMut};
+use std::sync::mpsc;
+
+use notify::RecommendedWatcher;
 
 use crate::backup::BackupStore;
 use crate::callgraph::CallGraph;
@@ -21,6 +24,8 @@ pub struct AppContext {
     checkpoint: RefCell<CheckpointStore>,
     config: RefCell<Config>,
     callgraph: RefCell<Option<CallGraph>>,
+    watcher: RefCell<Option<RecommendedWatcher>>,
+    watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
 }
 
 impl AppContext {
@@ -31,6 +36,8 @@ impl AppContext {
             checkpoint: RefCell::new(CheckpointStore::new()),
             config: RefCell::new(config),
             callgraph: RefCell::new(None),
+            watcher: RefCell::new(None),
+            watcher_rx: RefCell::new(None),
         }
     }
 
@@ -62,5 +69,15 @@ impl AppContext {
     /// Access the call graph engine.
     pub fn callgraph(&self) -> &RefCell<Option<CallGraph>> {
         &self.callgraph
+    }
+
+    /// Access the file watcher handle (kept alive to continue watching).
+    pub fn watcher(&self) -> &RefCell<Option<RecommendedWatcher>> {
+        &self.watcher
+    }
+
+    /// Access the watcher event receiver.
+    pub fn watcher_rx(&self) -> &RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>> {
+        &self.watcher_rx
     }
 }

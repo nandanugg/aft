@@ -223,3 +223,319 @@ fn callgraph_aliased_import_resolution() {
 
     aft.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// callers command
+// ---------------------------------------------------------------------------
+
+/// `callers` without prior `configure` returns not_configured error.
+#[test]
+fn callgraph_callers_without_configure() {
+    let mut aft = AftProcess::spawn();
+
+    let resp = aft.send(
+        r#"{"id":"1","command":"callers","file":"helpers.ts","symbol":"validate"}"#,
+    );
+
+    assert_eq!(resp["ok"], false);
+    assert_eq!(resp["code"], "not_configured");
+
+    aft.shutdown();
+}
+
+/// `callers` for a known cross-file call chain returns grouped results.
+///
+/// helpers.ts:validate is called by utils.ts:processData
+#[test]
+fn callgraph_callers_cross_file() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    // Configure first
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true);
+
+    // Get callers of validate in helpers.ts
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
+        root
+    ));
+
+    assert_eq!(resp["ok"], true, "callers should succeed: {:?}", resp);
+    assert_eq!(resp["symbol"], "validate");
+    assert!(
+        resp["total_callers"].as_u64().unwrap() > 0,
+        "validate should have callers"
+    );
+    assert!(
+        resp["scanned_files"].as_u64().unwrap() > 0,
+        "should report scanned files"
+    );
+
+    // Callers should include processData from utils.ts
+    let callers = resp["callers"].as_array().expect("callers array");
+    let utils_group = callers
+        .iter()
+        .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
+    assert!(
+        utils_group.is_some(),
+        "validate should be called from utils.ts, groups: {:?}",
+        callers
+    );
+
+    let group = utils_group.unwrap();
+    let entries = group["callers"].as_array().expect("callers entries");
+    let process_data_caller = entries
+        .iter()
+        .find(|e| e["symbol"].as_str().unwrap_or("") == "processData");
+    assert!(
+        process_data_caller.is_some(),
+        "validate should be called by processData, entries: {:?}",
+        entries
+    );
+
+    aft.shutdown();
+}
+
+/// `callers` for a symbol with no callers returns empty result.
+#[test]
+fn callgraph_callers_empty_result() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+
+    // main is an entry point — nothing calls it
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/main.ts","symbol":"main"}}"#,
+        root
+    ));
+
+    assert_eq!(resp["ok"], true, "callers should succeed: {:?}", resp);
+    assert_eq!(resp["total_callers"], 0, "main should have no callers");
+    let callers = resp["callers"].as_array().expect("callers array");
+    assert!(callers.is_empty(), "callers should be empty for entry point");
+
+    aft.shutdown();
+}
+
+/// `callers` with recursive depth finds transitive callers.
+#[test]
+fn callgraph_callers_recursive() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+
+    // checkFormat is called by validate (same file), validate called by processData (utils.ts)
+    // With depth 2, we should see transitive callers
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":2}}"#,
+        root
+    ));
+
+    assert_eq!(resp["ok"], true, "recursive callers should succeed: {:?}", resp);
+
+    // With depth 2, should find transitive callers from main.ts
+    // (main → processData → validate)
+    let total = resp["total_callers"].as_u64().unwrap();
+    assert!(
+        total >= 2,
+        "with depth 2, validate should have >= 2 callers (direct + transitive), got {}",
+        total
+    );
+
+    aft.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// file watcher invalidation cycle
+// ---------------------------------------------------------------------------
+
+/// Helper: copy a fixture directory into a temp dir for watcher tests.
+/// Returns the temp dir (auto-cleaned on drop) and its path as a String.
+fn setup_watcher_fixture() -> (tempfile::TempDir, String) {
+    let fixtures = fixture_path("callgraph");
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    // Copy all fixture files into the temp dir
+    for entry in std::fs::read_dir(&fixtures).expect("read fixtures dir") {
+        let entry = entry.expect("read entry");
+        let src = entry.path();
+        if src.is_file() {
+            let dst = tmp.path().join(entry.file_name());
+            std::fs::copy(&src, &dst).expect("copy fixture file");
+        }
+    }
+
+    let root = tmp.path().display().to_string();
+    (tmp, root)
+}
+
+/// File watcher: modify a file to add a new caller, verify it appears.
+///
+/// configure → callers for validate → add new caller in a new file →
+/// wait for OS event delivery → send command (triggers drain) →
+/// callers again → assert new caller appears.
+#[test]
+fn callgraph_watcher_add_caller() {
+    let (_tmp, root) = setup_watcher_fixture();
+    let mut aft = AftProcess::spawn();
+
+    // Configure with temp dir
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true, "configure should succeed: {:?}", resp);
+
+    // Query callers of validate — should show processData from utils.ts
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true, "initial callers should succeed: {:?}", resp);
+    let initial_total = resp["total_callers"].as_u64().unwrap();
+    assert!(initial_total > 0, "validate should have initial callers");
+
+    // Write a new file that calls validate
+    let new_file = std::path::Path::new(&root).join("extra_caller.ts");
+    std::fs::write(
+        &new_file,
+        r#"import { validate } from './helpers';
+
+export function extraCheck(input: string): boolean {
+    return validate(input);
+}
+"#,
+    )
+    .expect("write new caller file");
+
+    // Wait for OS file events to be delivered
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Send ping to trigger drain_watcher_events
+    aft.send(r#"{"id":"3","command":"ping"}"#);
+
+    // Query callers again — should include the new caller
+    let resp = aft.send(&format!(
+        r#"{{"id":"4","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true, "callers after add should succeed: {:?}", resp);
+    let new_total = resp["total_callers"].as_u64().unwrap();
+    assert!(
+        new_total > initial_total,
+        "adding a caller should increase total_callers: initial={}, new={}",
+        initial_total,
+        new_total
+    );
+
+    // Verify the new caller file appears in the results
+    let callers = resp["callers"].as_array().expect("callers array");
+    let extra_group = callers
+        .iter()
+        .find(|g| {
+            g["file"]
+                .as_str()
+                .unwrap_or("")
+                .contains("extra_caller.ts")
+        });
+    assert!(
+        extra_group.is_some(),
+        "new caller from extra_caller.ts should appear, callers: {:?}",
+        callers
+    );
+
+    aft.shutdown();
+}
+
+/// File watcher: remove a call from a file, verify it disappears.
+///
+/// configure → callers for validate → modify utils.ts to remove the validate
+/// call → wait for OS event delivery → send command (triggers drain) →
+/// callers again → assert the removed caller is gone.
+#[test]
+fn callgraph_watcher_remove_caller() {
+    let (_tmp, root) = setup_watcher_fixture();
+    let mut aft = AftProcess::spawn();
+
+    // Configure with temp dir
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true, "configure should succeed: {:?}", resp);
+
+    // Query callers of validate — processData from utils.ts should be there
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true, "initial callers should succeed: {:?}", resp);
+    let callers = resp["callers"].as_array().expect("callers array");
+    let utils_group = callers
+        .iter()
+        .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
+    assert!(
+        utils_group.is_some(),
+        "validate should initially be called from utils.ts"
+    );
+
+    // Rewrite utils.ts to remove the validate() call
+    let utils_path = std::path::Path::new(&root).join("utils.ts");
+    std::fs::write(
+        &utils_path,
+        r#"export function processData(input: string): string {
+    // validate call removed
+    return input.toUpperCase();
+}
+"#,
+    )
+    .expect("rewrite utils.ts");
+
+    // Wait for OS file events to be delivered
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Send ping to trigger drain_watcher_events
+    aft.send(r#"{"id":"3","command":"ping"}"#);
+
+    // Query callers again — utils.ts should no longer appear
+    let resp = aft.send(&format!(
+        r#"{{"id":"4","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
+        root
+    ));
+    assert_eq!(resp["ok"], true, "callers after remove should succeed: {:?}", resp);
+
+    let callers = resp["callers"].as_array().expect("callers array");
+    let utils_group = callers
+        .iter()
+        .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
+
+    // utils.ts no longer imports or calls validate, so it should not appear
+    if let Some(group) = utils_group {
+        let entries = group["callers"].as_array().expect("callers entries");
+        let validate_caller = entries
+            .iter()
+            .find(|e| e["callee"].as_str().unwrap_or("") == "validate");
+        assert!(
+            validate_caller.is_none(),
+            "validate call should be removed from utils.ts, entries: {:?}",
+            entries
+        );
+    }
+
+    aft.shutdown();
+}
