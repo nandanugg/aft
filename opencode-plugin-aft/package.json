@@ -1,9 +1,15 @@
 {
-  "name": "opencode-plugin-aft",
+  "name": "@aft/core",
   "version": "0.1.0",
   "type": "module",
+  "description": "OpenCode plugin for Agent File Tools (AFT) — tree-sitter powered code analysis",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nichochar/opencode-sfm"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
@@ -13,6 +19,13 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.2.26",
     "zod": "^4.1.8"
+  },
+  "optionalDependencies": {
+    "@aft/darwin-arm64": "0.1.0",
+    "@aft/darwin-x64": "0.1.0",
+    "@aft/linux-arm64": "0.1.0",
+    "@aft/linux-x64": "0.1.0",
+    "@aft/win32-x64": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

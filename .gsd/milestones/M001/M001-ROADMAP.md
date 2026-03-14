@@ -69,7 +69,7 @@ This milestone is complete only when all are true:
 - [x] **S06: OpenCode Plugin Bridge** `risk:medium` `depends:[S01,S02,S03,S04,S05]`
   > After this: all M001 commands are available as OpenCode tools — plugin spawns the binary, manages its lifecycle, and registers tools with Zod schemas. Verified by an agent using AFT tools in a real OpenCode session.
 
-- [ ] **S07: Binary Distribution Pipeline** `risk:low` `depends:[S06]`
+- [x] **S07: Binary Distribution Pipeline** `risk:low` `depends:[S06]`
   > After this: `npm install @aft/core` installs the correct platform binary on macOS ARM/Intel, Linux ARM/x64, and Windows x64. `cargo install aft` works as fallback. Verified by CI builds passing on all 5 platforms and npm install test on at least 2 platforms.
 
 ## Boundary Map

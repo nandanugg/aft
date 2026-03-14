@@ -129,13 +129,13 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R012 — Binary distribution
 - Class: launchability
-- Status: active
+- Status: validated
 - Description: npm optional dependency packages per platform (darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64) following the esbuild/turbo pattern. CI pipeline cross-compiles for all 5 platforms. Fallback to `cargo install aft`.
 - Why it matters: Users must be able to install AFT with a single `npm install` or `bun install`. Manual binary management is a non-starter for adoption.
 - Source: user
 - Primary owning slice: M001/S07
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S07 — 5 platform npm packages with correct os/cpu fields verified by validate-packages.mjs, resolver unit tests (13/13) prove platform mapping and fallback chain (npm → PATH → cargo), CI workflow defines 5-platform cross-compilation pipeline with ordered npm publish, Cargo.toml has crates.io metadata for cargo install fallback, release profile produces optimized 6.4MB binary.
 - Notes: @aft/core declares optionalDependencies on all platform packages. npm resolves the correct one at install time.
 
 ### R013 — Import management (6 languages)
@@ -476,7 +476,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R009 | integration | validated | M001/S06 | none | S06 |
 | R010 | quality-attribute | validated | M001/S05 | none | S05 |
 | R011 | quality-attribute | validated | M001/S05 | M001/S03 | S05 |
-| R012 | launchability | active | M001/S07 | none | unmapped |
+| R012 | launchability | validated | M001/S07 | none | S07 |
 | R013 | core-capability | active | M002/S01 | none | unmapped |
 | R014 | core-capability | active | M002/S02 | none | unmapped |
 | R015 | differentiator | active | M002/S03 | none | unmapped |
@@ -509,7 +509,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 23
+- Active requirements: 22
 - Mapped to slices: 34
-- Validated: 12
+- Validated: 13
 - Unmapped active requirements: 0

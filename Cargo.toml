@@ -2,6 +2,11 @@
 name = "aft"
 version = "0.1.0"
 edition = "2021"
+description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
+license = "MIT"
+repository = "https://github.com/nichochar/opencode-sfm"
+keywords = ["tree-sitter", "code-analysis", "ai-agent", "ast"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "aft"
@@ -17,3 +22,9 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-go = "0.23"
 streaming-iterator = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

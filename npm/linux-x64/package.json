@@ -1,0 +1,16 @@
+{
+  "name": "@aft/linux-x64",
+  "version": "0.1.0",
+  "description": "AFT binary for Linux x64",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "preferUnplugged": true,
+  "bin": {
+    "aft": "bin/aft"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nichochar/opencode-sfm"
+  }
+}
