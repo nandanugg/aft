@@ -14,6 +14,7 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         }
         LangId::Python => vec!["call"],
         LangId::Rust => vec!["call_expression", "macro_invocation"],
+        LangId::Markdown => vec![],
     }
 }
 
@@ -130,7 +131,7 @@ pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<St
     let child_count = node.child_count();
     // Walk children from the end looking for an identifier-like node
     for i in (0..child_count).rev() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             match child.kind() {
                 "property_identifier" | "field_identifier" | "identifier" => {
                     return Some(source[child.byte_range()].to_string());

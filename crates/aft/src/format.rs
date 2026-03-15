@@ -220,6 +220,7 @@ pub fn detect_formatter(
         LangId::Python => "python",
         LangId::Rust => "rust",
         LangId::Go => "go",
+        LangId::Markdown => "markdown",
     };
     if let Some(preferred) = config.formatter.get(lang_key) {
         return resolve_explicit_formatter(preferred, &file_str, lang);
@@ -309,6 +310,7 @@ pub fn detect_formatter(
                 None
             }
         }
+        LangId::Markdown => None,
     }
 }
 
@@ -567,6 +569,7 @@ pub fn detect_type_checker(
         LangId::Python => "python",
         LangId::Rust => "rust",
         LangId::Go => "go",
+        LangId::Markdown => "markdown",
     };
     if let Some(preferred) = config.checker.get(lang_key) {
         return resolve_explicit_checker(preferred, &file_str, lang);
@@ -657,6 +660,7 @@ pub fn detect_type_checker(
                 None
             }
         }
+        LangId::Markdown => None,
     }
 }
 

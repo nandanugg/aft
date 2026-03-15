@@ -417,7 +417,7 @@ fn find_node_at<'a>(
 
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             if child.start_byte() <= byte_pos && byte_pos < child.end_byte() {
                 if let Some(found) = find_node_at(&child, byte_pos, kinds) {
                     return Some(found);
@@ -432,7 +432,7 @@ fn find_node_at<'a>(
             // Look for arrow_function inside
             let child_count = node.child_count();
             for i in 0..child_count {
-                if let Some(child) = node.child(i) {
+                if let Some(child) = node.child(i as u32) {
                     if child.kind() == "variable_declarator" {
                         if let Some(value) = child.child_by_field_name("value") {
                             if value.kind() == "arrow_function" {
@@ -461,7 +461,7 @@ fn extract_fn_params_and_body(
     if let Some(params) = params_node {
         let child_count = params.child_count();
         for i in 0..child_count {
-            if let Some(child) = params.child(i) {
+            if let Some(child) = params.child(i as u32) {
                 match lang {
                     LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
                         if child.kind() == "required_parameter"
@@ -594,7 +594,7 @@ fn find_call_recursive<'a>(
     // Recurse depth-first
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             if let Some(found) =
                 find_call_recursive(&child, symbol, source, start_byte, end_byte, call_kinds)
             {
@@ -680,7 +680,7 @@ fn extract_call_arguments(
     if let Some(args_parent) = args_node {
         let child_count = args_parent.child_count();
         for i in 0..child_count {
-            if let Some(child) = args_parent.child(i) {
+            if let Some(child) = args_parent.child(i as u32) {
                 // Skip punctuation: ( ) ,
                 if child.kind() != "("
                     && child.kind() != ")"

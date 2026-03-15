@@ -11,6 +11,8 @@ pub enum SymbolKind {
     Interface,
     Enum,
     TypeAlias,
+    /// Markdown heading (h1, h2, h3, etc.)
+    Heading,
 }
 
 /// Location range within a source file (line/column, 0-indexed).

@@ -447,6 +447,7 @@ fn find_scope_container(
                 }
             }
         }
+        LangId::Markdown => {}
     }
 
     (None, available)

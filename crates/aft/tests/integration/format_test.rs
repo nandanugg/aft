@@ -253,7 +253,7 @@ fn format_integration_fields_always_present() {
         resp
     );
     assert_eq!(resp["formatted"], false);
-    assert_eq!(resp["format_skipped_reason"], "unsupported_language");
+    assert_eq!(resp["format_skipped_reason"], "not_found");
 
     // Test 2: write to a .rs file — formatted field present with value true (if rustfmt available)
     let rs_target = dir.join("format_fields_check.rs");

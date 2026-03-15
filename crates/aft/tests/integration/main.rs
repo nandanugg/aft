@@ -9,6 +9,7 @@ mod format_test;
 mod import_test;
 mod inline_symbol_test;
 mod lsp_hints_test;
+mod markdown_test;
 mod member_test;
 mod move_symbol_test;
 mod protocol_test;

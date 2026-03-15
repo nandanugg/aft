@@ -395,7 +395,7 @@ fn find_deepest_ancestor<'a>(node: &Node<'a>, byte_pos: usize, kinds: &[&str]) -
 
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             if child.start_byte() <= byte_pos && byte_pos < child.end_byte() {
                 if let Some(deeper) = find_deepest_ancestor(&child, byte_pos, kinds) {
                     result = Some(deeper);
@@ -878,7 +878,7 @@ fn count_return_statements(node: &Node, source: &str) -> usize {
 
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             // Skip nested function definitions
             if nested_fn_kinds.contains(&child.kind()) {
                 continue;
@@ -960,7 +960,7 @@ fn collect_param_replacements(
     // Recurse into children
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             collect_param_replacements(&child, source, param_to_arg, lang, out);
         }
     }

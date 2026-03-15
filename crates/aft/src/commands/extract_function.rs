@@ -372,7 +372,7 @@ fn find_deepest_ancestor<'a>(
 
     let child_count = node.child_count();
     for i in 0..child_count {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             if child.start_byte() <= byte_pos && byte_pos < child.end_byte() {
                 if let Some(deeper) = find_deepest_ancestor(&child, byte_pos, kinds) {
                     result = Some(deeper);

@@ -138,6 +138,7 @@ pub enum LangId {
     Python,
     Rust,
     Go,
+    Markdown,
 }
 
 /// Maps file extension to language identifier.
@@ -150,6 +151,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "py" => Some(LangId::Python),
         "rs" => Some(LangId::Rust),
         "go" => Some(LangId::Go),
+        "md" | "markdown" | "mdx" => Some(LangId::Markdown),
         _ => None,
     }
 }
@@ -163,6 +165,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Python => tree_sitter_python::LANGUAGE.into(),
         LangId::Rust => tree_sitter_rust::LANGUAGE.into(),
         LangId::Go => tree_sitter_go::LANGUAGE.into(),
+        LangId::Markdown => tree_sitter_md::LANGUAGE.into(),
     }
 }
 
@@ -174,6 +177,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Python => Some(PY_QUERY),
         LangId::Rust => Some(RS_QUERY),
         LangId::Go => Some(GO_QUERY),
+        LangId::Markdown => None,
     }
 }
 
@@ -264,6 +268,11 @@ impl FileParser {
         let (tree, lang) = self.parse(path)?;
         let root = tree.root_node();
 
+        // Markdown uses direct tree walking, not query patterns
+        if lang == LangId::Markdown {
+            return extract_md_symbols(&source, &root);
+        }
+
         let query_src = query_for(lang).ok_or_else(|| AftError::InvalidRequest {
             message: format!("no query patterns implemented for {:?} yet", lang),
         })?;
@@ -282,6 +291,7 @@ impl FileParser {
             LangId::Python => extract_py_symbols(&source, &root, &query),
             LangId::Rust => extract_rs_symbols(&source, &root, &query),
             LangId::Go => extract_go_symbols(&source, &root, &query),
+            LangId::Markdown => unreachable!(),
         }
     }
 }
@@ -335,6 +345,7 @@ pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId
                 // Decorators are handled by decorated_definition capture
                 false
             }
+            LangId::Markdown => false,
         };
 
         if should_include {
@@ -1219,6 +1230,100 @@ fn find_type_identifier_recursive(node: &Node, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract markdown headings as symbols.
+/// Each heading becomes a symbol with kind `Heading`, and its range covers the entire
+/// section (from the heading to the next heading at the same or higher level, or EOF).
+fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    extract_md_sections(source, root, &mut symbols, &[]);
+    Ok(symbols)
+}
+
+/// Recursively walk `section` nodes to build the heading hierarchy.
+fn extract_md_sections(
+    source: &str,
+    node: &Node,
+    symbols: &mut Vec<Symbol>,
+    scope_chain: &[String],
+) {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            "section" => {
+                // A section contains an atx_heading as its first child,
+                // followed by content and possibly nested sections.
+                let mut section_cursor = child.walk();
+                let mut heading_name = String::new();
+                let mut heading_level: u8 = 0;
+
+                if section_cursor.goto_first_child() {
+                    loop {
+                        let section_child = section_cursor.node();
+                        if section_child.kind() == "atx_heading" {
+                            // Extract heading level from marker type
+                            let mut h_cursor = section_child.walk();
+                            if h_cursor.goto_first_child() {
+                                loop {
+                                    let h_child = h_cursor.node();
+                                    let kind = h_child.kind();
+                                    if kind.starts_with("atx_h") && kind.ends_with("_marker") {
+                                        // "atx_h1_marker" → level 1, "atx_h2_marker" → level 2, etc.
+                                        heading_level = kind
+                                            .strip_prefix("atx_h")
+                                            .and_then(|s| s.strip_suffix("_marker"))
+                                            .and_then(|s| s.parse::<u8>().ok())
+                                            .unwrap_or(1);
+                                    } else if h_child.kind() == "inline" {
+                                        heading_name =
+                                            node_text(source, &h_child).trim().to_string();
+                                    }
+                                    if !h_cursor.goto_next_sibling() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !section_cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+
+                if !heading_name.is_empty() {
+                    let range = node_range(&child);
+                    let signature =
+                        format!("{} {}", "#".repeat(heading_level as usize), heading_name);
+
+                    symbols.push(Symbol {
+                        name: heading_name.clone(),
+                        kind: SymbolKind::Heading,
+                        range,
+                        signature: Some(signature),
+                        scope_chain: scope_chain.to_vec(),
+                        exported: false,
+                        parent: scope_chain.last().cloned(),
+                    });
+
+                    // Recurse into the section for nested headings
+                    let mut new_scope = scope_chain.to_vec();
+                    new_scope.push(heading_name);
+                    extract_md_sections(source, &child, symbols, &new_scope);
+                }
+            }
+            _ => {}
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
 }
 
 /// Remove duplicate symbols based on (name, kind, start_line).

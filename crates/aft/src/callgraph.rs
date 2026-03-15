@@ -181,6 +181,7 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
             // starts with Test (case-sensitive)
             name.starts_with("Test")
         }
+        LangId::Markdown => false,
     }
 }
 
@@ -2734,8 +2735,8 @@ export function funcB() {
 
         assert!(file_names.contains(&"main.ts".to_string()));
         assert!(
-            !file_names.contains(&"readme.md".to_string()),
-            "Should not include non-source files"
+            file_names.contains(&"readme.md".to_string()),
+            "Markdown is now a supported source language"
         );
         assert!(
             !file_names.contains(&"data.json".to_string()),
