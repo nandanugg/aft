@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::context::AppContext;
 use crate::edit;
 use crate::imports;
+use crate::lsp_hints;
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::SymbolKind;
@@ -135,6 +136,13 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     } else {
         matches
+    };
+
+    // LSP-enhanced disambiguation (S03)
+    let filtered = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
+        lsp_hints::apply_lsp_disambiguation(filtered, &hints)
+    } else {
+        filtered
     };
 
     if filtered.is_empty() {

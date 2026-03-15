@@ -1,7 +1,7 @@
 // Fixture with duplicate symbol names for disambiguation testing
 
-export function process(data: string): string {
-  return data.toUpperCase();
+export export export export export export export function process(data: string): string {
+  return data.toLowerCase();
 }
 
 export class DataHandler {

@@ -2,6 +2,7 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { BinaryBridge } from "../bridge.js";
 import { structureTools } from "../tools/structure.js";
 import { editingTools } from "../tools/editing.js";
+import type { ToolContext } from "../types.js";
 import { resolve } from "node:path";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,11 +12,29 @@ const PROJECT_CWD = resolve(import.meta.dir, "../../..");
 
 const TEST_TIMEOUT_MS = 10_000;
 
+/** Creates a mock client that returns no connected LSP servers. */
+function createMockClient(): any {
+  return {
+    lsp: { status: async () => ({ data: [] }) },
+    find: { symbols: async () => ({ data: [] }) },
+  };
+}
+
+/** Helper to create a ToolContext with a mock (no-op LSP) client. */
+function createToolContext(bridge: BinaryBridge): ToolContext {
+  return { bridge, client: createMockClient() };
+}
+
+/** Create a fake ToolContext for registration-only tests (no real bridge). */
+function fakeToolContext(): ToolContext {
+  return { bridge: {} as BinaryBridge, client: createMockClient() };
+}
+
 describe("Structure tool registrations", () => {
   test("structureTools returns all 5 tool definitions", () => {
     // Use a dummy bridge — we're only checking registration, not execution
-    const fakeBridge = {} as BinaryBridge;
-    const tools = structureTools(fakeBridge);
+    const fakeCtx = fakeToolContext();
+    const tools = structureTools(fakeCtx);
 
     const names = Object.keys(tools);
     expect(names).toContain("add_member");
@@ -27,8 +46,8 @@ describe("Structure tool registrations", () => {
   });
 
   test("each tool has a description and args", () => {
-    const fakeBridge = {} as BinaryBridge;
-    const tools = structureTools(fakeBridge);
+    const fakeCtx = fakeToolContext();
+    const tools = structureTools(fakeCtx);
 
     for (const [name, def] of Object.entries(tools)) {
       expect(def.description).toBeTruthy();
@@ -39,8 +58,8 @@ describe("Structure tool registrations", () => {
   });
 
   test("add_member args include file, scope, code, and optional position", () => {
-    const fakeBridge = {} as BinaryBridge;
-    const tools = structureTools(fakeBridge);
+    const fakeCtx = fakeToolContext();
+    const tools = structureTools(fakeCtx);
     const args = tools.add_member.args;
 
     expect(args.file).toBeDefined();
@@ -50,8 +69,8 @@ describe("Structure tool registrations", () => {
   });
 
   test("add_derive args include file, target, derives", () => {
-    const fakeBridge = {} as BinaryBridge;
-    const tools = structureTools(fakeBridge);
+    const fakeCtx = fakeToolContext();
+    const tools = structureTools(fakeCtx);
     const args = tools.add_derive.args;
 
     expect(args.file).toBeDefined();
@@ -60,8 +79,8 @@ describe("Structure tool registrations", () => {
   });
 
   test("add_struct_tags args include file, target, field, tag, value", () => {
-    const fakeBridge = {} as BinaryBridge;
-    const tools = structureTools(fakeBridge);
+    const fakeCtx = fakeToolContext();
+    const tools = structureTools(fakeCtx);
     const args = tools.add_struct_tags.args;
 
     expect(args.file).toBeDefined();
@@ -95,8 +114,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_member inserts a method into a TypeScript class", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "example.ts");
@@ -120,8 +139,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_member with position=first inserts at top of class", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "pos.ts");
@@ -146,8 +165,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_derive adds a derive to a Rust struct", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "example.rs");
@@ -173,8 +192,8 @@ describe("Structure tool round-trips", () => {
 
   test("wrap_try_catch wraps a function body", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "wrap.ts");
@@ -197,8 +216,8 @@ describe("Structure tool round-trips", () => {
 
   test("wrap_try_catch with custom catch_body", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "wrap2.ts");
@@ -220,8 +239,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_decorator inserts a Python decorator", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "example.py");
@@ -244,8 +263,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_struct_tags adds a Go struct tag", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "example.go");
@@ -271,8 +290,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_member returns scope_not_found for missing scope", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "missing.ts");
@@ -294,8 +313,8 @@ describe("Structure tool round-trips", () => {
 
   test("add_derive returns target_not_found for missing struct", async () => {
     createBridge();
-    const writeTools = editingTools(bridge);
-    const tools = structureTools(bridge);
+    const writeTools = editingTools(createToolContext(bridge));
+    const tools = structureTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-structure-"));
 
     const filePath = resolve(tmpDir, "missing.rs");

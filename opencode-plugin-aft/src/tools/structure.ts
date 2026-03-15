@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
 
 const z = tool.schema;
 
@@ -9,7 +9,7 @@ const z = tool.schema;
  * add_member, add_derive, wrap_try_catch, add_decorator, add_struct_tags.
  */
 export function structureTools(
-  bridge: BinaryBridge,
+  ctx: ToolContext,
 ): Record<string, ToolDefinition> {
   return {
     add_member: {
@@ -48,7 +48,7 @@ export function structureTools(
         if (args.position !== undefined) params.position = args.position;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("add_member", params);
+        const response = await ctx.bridge.send("add_member", params);
         return JSON.stringify(response);
       },
     },
@@ -79,7 +79,7 @@ export function structureTools(
         };
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("add_derive", params);
+        const response = await ctx.bridge.send("add_derive", params);
         return JSON.stringify(response);
       },
     },
@@ -113,7 +113,7 @@ export function structureTools(
         if (args.catch_body !== undefined) params.catch_body = args.catch_body;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("wrap_try_catch", params);
+        const response = await ctx.bridge.send("wrap_try_catch", params);
         return JSON.stringify(response);
       },
     },
@@ -151,7 +151,7 @@ export function structureTools(
         if (args.position !== undefined) params.position = args.position;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("add_decorator", params);
+        const response = await ctx.bridge.send("add_decorator", params);
         return JSON.stringify(response);
       },
     },
@@ -186,7 +186,7 @@ export function structureTools(
         };
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("add_struct_tags", params);
+        const response = await ctx.bridge.send("add_struct_tags", params);
         return JSON.stringify(response);
       },
     },

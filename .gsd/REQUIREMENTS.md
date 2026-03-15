@@ -336,14 +336,14 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R031 — LSP-aware architecture (provider interface)
 - Class: constraint
-- Status: active
+- Status: validated
 - Description: Symbol resolution has a provider interface from M001 onward. Tree-sitter is the default provider. Command JSON schema includes optional `lsp_hints` fields. When the plugin has LSP data available, it enriches commands with precise symbol locations, type info, and resolved references.
 - Why it matters: Pure tree-sitter resolution is ~80% accurate. LSP data pushes it to ~99%. The architecture must be ready for this upgrade path without refactoring.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: M004/S03
-- Validation: S01 — LanguageProvider trait defined, optional lsp_hints field in RawRequest protocol type. Full validation deferred to M004/S03.
-- Notes: M001 ships with tree-sitter only. LSP enrichment wired in M004.
+- Validation: S01 — LanguageProvider trait defined, optional lsp_hints field in RawRequest protocol type. M004/S03 — LspHints struct parsed from req.lsp_hints, apply_lsp_disambiguation wired into 4 command handlers (edit_symbol, zoom, move_symbol, inline_symbol). 13 unit tests + 4 integration tests prove parsing, disambiguation, fallback, and malformed hints handling. Plugin populates lsp_hints via queryLspHints for 5 commands, verified by 13 mock client tests.
+- Notes: Full LSP integration complete. Tree-sitter is default; LSP hints enhance disambiguation when plugin provides them.
 
 ### R032 — Structured JSON I/O (no shell escaping)
 - Class: constraint
@@ -358,13 +358,13 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ### R033 — LSP integration via plugin mediation
 - Class: integration
-- Status: active
+- Status: validated
 - Description: The TypeScript plugin queries OpenCode's LSP infrastructure and passes enhanced resolution data to the Rust binary as part of command JSON `lsp_hints` fields. Binary uses LSP data when available, falls back to tree-sitter when not.
 - Why it matters: Completes the accuracy story — tree-sitter handles structure, LSP provides precise type-level resolution for ambiguous cases.
 - Source: user
 - Primary owning slice: M004/S03
 - Supporting slices: none
-- Validation: unmapped
+- Validation: M004/S03 — Plugin queryLspHints checks lsp.status() → find.symbols() → maps SymbolKind → populates lsp_hints in bridge params for edit_symbol, zoom, move_symbol, inline_symbol, extract_function. Binary parses and applies disambiguation. 13 plugin mock client tests prove connected/disconnected/error paths. 4 binary integration tests prove protocol-level disambiguation and fallback. 55 total bun tests pass.
 - Notes: Plugin mediates — binary never connects to language servers directly.
 
 ### R034 — Web-first language priority
@@ -493,9 +493,9 @@ Use it to track what is actively in scope, what has been validated by completed 
 | R028 | core-capability | validated | M004/S01 | none | S01 |
 | R029 | core-capability | validated | M004/S02 | none | S02 |
 | R030 | core-capability | validated | M004/S02 | none | S02 |
-| R031 | constraint | active | M001/S01 | M004/S03 | S01 (partial) |
+| R031 | constraint | validated | M001/S01 | M004/S03 | S01+S03 |
 | R032 | constraint | validated | M001/S01 | none | S01 |
-| R033 | integration | active | M004/S03 | none | unmapped |
+| R033 | integration | validated | M004/S03 | none | S03 |
 | R034 | constraint | active | M001/S02 | M002/S01 | unmapped |
 | R035 | core-capability | deferred | none | none | unmapped |
 | R036 | differentiator | deferred | none | none | unmapped |
@@ -507,7 +507,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 4
+- Active requirements: 2
 - Mapped to slices: 34
-- Validated: 31
+- Validated: 33
 - Unmapped active requirements: 0

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::context::AppContext;
 use crate::edit;
+use crate::lsp_hints;
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::Range;
 
@@ -113,6 +114,13 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     } else {
         matches
+    };
+
+    // LSP-enhanced disambiguation (S03)
+    let filtered = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
+        lsp_hints::apply_lsp_disambiguation(filtered, &hints)
+    } else {
+        filtered
     };
 
     if filtered.len() > 1 {

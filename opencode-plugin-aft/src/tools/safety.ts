@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
 
 const z = tool.schema;
 
@@ -8,7 +8,7 @@ const z = tool.schema;
  * Tool definitions for safety & recovery commands: undo, edit_history,
  * checkpoint, restore_checkpoint, list_checkpoints.
  */
-export function safetyTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function safetyTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     undo: {
       description:
@@ -17,7 +17,7 @@ export function safetyTools(bridge: BinaryBridge): Record<string, ToolDefinition
         file: z.string().describe("Path to the file to undo the last edit for"),
       },
       execute: async (args): Promise<string> => {
-        const response = await bridge.send("undo", { file: args.file });
+        const response = await ctx.bridge.send("undo", { file: args.file });
         return JSON.stringify(response);
       },
     },
@@ -29,7 +29,7 @@ export function safetyTools(bridge: BinaryBridge): Record<string, ToolDefinition
         file: z.string().describe("Path to the file to get history for"),
       },
       execute: async (args): Promise<string> => {
-        const response = await bridge.send("edit_history", { file: args.file });
+        const response = await ctx.bridge.send("edit_history", { file: args.file });
         return JSON.stringify(response);
       },
     },
@@ -47,7 +47,7 @@ export function safetyTools(bridge: BinaryBridge): Record<string, ToolDefinition
       execute: async (args): Promise<string> => {
         const params: Record<string, unknown> = { name: args.name };
         if (args.files !== undefined) params.files = args.files;
-        const response = await bridge.send("checkpoint", params);
+        const response = await ctx.bridge.send("checkpoint", params);
         return JSON.stringify(response);
       },
     },
@@ -59,7 +59,7 @@ export function safetyTools(bridge: BinaryBridge): Record<string, ToolDefinition
         name: z.string().describe("Name of the checkpoint to restore"),
       },
       execute: async (args): Promise<string> => {
-        const response = await bridge.send("restore_checkpoint", {
+        const response = await ctx.bridge.send("restore_checkpoint", {
           name: args.name,
         });
         return JSON.stringify(response);
@@ -71,7 +71,7 @@ export function safetyTools(bridge: BinaryBridge): Record<string, ToolDefinition
         "List all available checkpoints with their names, file counts, and creation timestamps.",
       args: {},
       execute: async (): Promise<string> => {
-        const response = await bridge.send("list_checkpoints", {});
+        const response = await ctx.bridge.send("list_checkpoints", {});
         return JSON.stringify(response);
       },
     },

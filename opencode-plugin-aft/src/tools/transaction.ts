@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
 
 const z = tool.schema;
 
@@ -27,7 +27,7 @@ const transactionOperation = z.object({
 /**
  * Tool definition for the transaction command: multi-file atomic edits with rollback.
  */
-export function transactionTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function transactionTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     transaction: {
       description:
@@ -51,7 +51,7 @@ export function transactionTools(bridge: BinaryBridge): Record<string, ToolDefin
         };
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
         if (args.validate !== undefined) params.validate = args.validate;
-        const response = await bridge.send("transaction", params);
+        const response = await ctx.bridge.send("transaction", params);
         return JSON.stringify(response);
       },
     },

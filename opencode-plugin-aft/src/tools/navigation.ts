@@ -1,13 +1,13 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
 
 const z = tool.schema;
 
 /**
  * Tool definitions for navigation commands: configure, call_tree, callers, trace_to, impact, and trace_data.
  */
-export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function navigationTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     aft_configure: {
       description:
@@ -16,7 +16,7 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
         project_root: z.string().describe("Absolute path to the project root directory"),
       },
       execute: async (args): Promise<string> => {
-        const response = await bridge.send("configure", { project_root: args.project_root });
+        const response = await ctx.bridge.send("configure", { project_root: args.project_root });
         return JSON.stringify(response);
       },
     },
@@ -38,7 +38,7 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
           symbol: args.symbol,
         };
         if (args.depth !== undefined) params.depth = args.depth;
-        const response = await bridge.send("call_tree", params);
+        const response = await ctx.bridge.send("call_tree", params);
         return JSON.stringify(response);
       },
     },
@@ -60,7 +60,7 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
           symbol: args.symbol,
         };
         if (args.depth !== undefined) params.depth = args.depth;
-        const response = await bridge.send("callers", params);
+        const response = await ctx.bridge.send("callers", params);
         return JSON.stringify(response);
       },
     },
@@ -82,7 +82,7 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
           symbol: args.symbol,
         };
         if (args.depth !== undefined) params.depth = args.depth;
-        const response = await bridge.send("trace_to", params);
+        const response = await ctx.bridge.send("trace_to", params);
         return JSON.stringify(response);
       },
     },
@@ -104,7 +104,7 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
           symbol: args.symbol,
         };
         if (args.depth !== undefined) params.depth = args.depth;
-        const response = await bridge.send("impact", params);
+        const response = await ctx.bridge.send("impact", params);
         return JSON.stringify(response);
       },
     },
@@ -128,7 +128,7 @@ export function navigationTools(bridge: BinaryBridge): Record<string, ToolDefini
           expression: args.expression,
         };
         if (args.depth !== undefined) params.depth = args.depth;
-        const response = await bridge.send("trace_data", params);
+        const response = await ctx.bridge.send("trace_data", params);
         return JSON.stringify(response);
       },
     },

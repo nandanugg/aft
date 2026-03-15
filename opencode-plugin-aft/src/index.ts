@@ -9,6 +9,7 @@ import { structureTools } from "./tools/structure.js";
 import { transactionTools } from "./tools/transaction.js";
 import { navigationTools } from "./tools/navigation.js";
 import { refactoringTools } from "./tools/refactoring.js";
+import type { ToolContext } from "./types.js";
 
 /**
  * OpenCode plugin for AFT (Agent File Tools).
@@ -30,17 +31,18 @@ import { refactoringTools } from "./tools/refactoring.js";
 const plugin: Plugin = async (input) => {
   const binaryPath = findBinary();
   const bridge = new BinaryBridge(binaryPath, input.directory);
+  const ctx: ToolContext = { bridge, client: input.client };
 
   return {
     tool: {
-      ...readingTools(bridge),
-      ...editingTools(bridge),
-      ...safetyTools(bridge),
-      ...importTools(bridge),
-      ...structureTools(bridge),
-      ...transactionTools(bridge),
-      ...navigationTools(bridge),
-      ...refactoringTools(bridge),
+      ...readingTools(ctx),
+      ...editingTools(ctx),
+      ...safetyTools(ctx),
+      ...importTools(ctx),
+      ...structureTools(ctx),
+      ...transactionTools(ctx),
+      ...navigationTools(ctx),
+      ...refactoringTools(ctx),
     },
   };
 };

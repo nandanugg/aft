@@ -1,13 +1,14 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
+import { queryLspHints } from "../lsp.js";
 
 const z = tool.schema;
 
 /**
  * Tool definitions for refactoring commands: move_symbol, extract_function, inline_symbol.
  */
-export function refactoringTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function refactoringTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     aft_move_symbol: {
       description:
@@ -33,7 +34,11 @@ export function refactoringTools(bridge: BinaryBridge): Record<string, ToolDefin
         };
         if (args.scope !== undefined) params.scope = args.scope;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("move_symbol", params);
+
+        const hints = await queryLspHints(ctx.client, args.symbol as string);
+        if (hints) params.lsp_hints = hints;
+
+        const response = await ctx.bridge.send("move_symbol", params);
         return JSON.stringify(response);
       },
     },
@@ -59,7 +64,13 @@ export function refactoringTools(bridge: BinaryBridge): Record<string, ToolDefin
           end_line: args.end_line,
         };
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("extract_function", params);
+
+        // extract_function uses `name` as the new function name, which may
+        // collide with existing symbols — query LSP for the extraction name
+        const hints = await queryLspHints(ctx.client, args.name as string);
+        if (hints) params.lsp_hints = hints;
+
+        const response = await ctx.bridge.send("extract_function", params);
         return JSON.stringify(response);
       },
     },
@@ -83,7 +94,11 @@ export function refactoringTools(bridge: BinaryBridge): Record<string, ToolDefin
           call_site_line: args.call_site_line,
         };
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("inline_symbol", params);
+
+        const hints = await queryLspHints(ctx.client, args.symbol as string);
+        if (hints) params.lsp_hints = hints;
+
+        const response = await ctx.bridge.send("inline_symbol", params);
         return JSON.stringify(response);
       },
     },

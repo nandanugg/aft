@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::context::AppContext;
+use crate::lsp_hints;
 use crate::parser::{FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::Range;
@@ -81,6 +82,13 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
+    };
+
+    // LSP-enhanced disambiguation (S03)
+    let matches = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
+        lsp_hints::apply_lsp_disambiguation(matches, &hints)
+    } else {
+        matches
     };
 
     if matches.len() > 1 {

@@ -13,6 +13,7 @@ use tree_sitter::Parser;
 use crate::context::AppContext;
 use crate::edit;
 use crate::extract::{detect_scope_conflicts, substitute_params, validate_single_return};
+use crate::lsp_hints;
 use crate::parser::{detect_language, grammar_for, node_text, LangId};
 use crate::protocol::{RawRequest, Response};
 
@@ -142,6 +143,13 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
+    };
+
+    // LSP-enhanced disambiguation (S03)
+    let matches = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
+        lsp_hints::apply_lsp_disambiguation(matches, &hints)
+    } else {
+        matches
     };
 
     // Find the first function/method match

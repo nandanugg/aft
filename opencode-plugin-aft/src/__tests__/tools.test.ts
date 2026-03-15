@@ -6,6 +6,7 @@ import { safetyTools } from "../tools/safety.js";
 import { transactionTools } from "../tools/transaction.js";
 import { navigationTools } from "../tools/navigation.js";
 import { refactoringTools } from "../tools/refactoring.js";
+import type { ToolContext } from "../types.js";
 import { resolve } from "node:path";
 import { mkdtemp, rm, readFile, writeFile, mkdir, cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,6 +16,26 @@ const PROJECT_CWD = resolve(import.meta.dir, "../../..");
 const FIXTURE_FILE = resolve(PROJECT_CWD, "tests/fixtures/sample.ts");
 
 const TEST_TIMEOUT_MS = 10_000;
+
+/**
+ * Creates a mock client that returns no connected LSP servers.
+ * This ensures queryLspHints returns undefined (no-op) during integration tests.
+ */
+function createMockClient(): any {
+  return {
+    lsp: {
+      status: async () => ({ data: [] }),
+    },
+    find: {
+      symbols: async () => ({ data: [] }),
+    },
+  };
+}
+
+/** Helper to create a ToolContext with the given bridge and a mock client. */
+function createToolContext(bridge: BinaryBridge): ToolContext {
+  return { bridge, client: createMockClient() };
+}
 
 describe("Tool round-trips", () => {
   let bridge: BinaryBridge;
@@ -40,7 +61,7 @@ describe("Tool round-trips", () => {
 
   test("outline tool returns entries for fixture file with known symbols", async () => {
     createBridge();
-    const tools = readingTools(bridge);
+    const tools = readingTools(createToolContext(bridge));
 
     const resultStr = await tools.outline.execute({ file: FIXTURE_FILE });
     const result = JSON.parse(resultStr);
@@ -70,7 +91,7 @@ describe("Tool round-trips", () => {
 
   test("write tool creates a temp file and returns syntax_valid", async () => {
     createBridge();
-    const tools = editingTools(bridge);
+    const tools = editingTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
 
     const filePath = resolve(tmpDir, "written.ts");
@@ -94,7 +115,7 @@ describe("Tool round-trips", () => {
 
   test("edit_symbol replaces a function and returns backup_id and syntax_valid", async () => {
     createBridge();
-    const tools = editingTools(bridge);
+    const tools = editingTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
 
     const filePath = resolve(tmpDir, "editable.ts");
@@ -127,8 +148,8 @@ describe("Tool round-trips", () => {
 
   test("undo restores the file after edit_symbol", async () => {
     createBridge();
-    const editTools = editingTools(bridge);
-    const undoTools = safetyTools(bridge);
+    const editTools = editingTools(createToolContext(bridge));
+    const undoTools = safetyTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
 
     const filePath = resolve(tmpDir, "undoable.ts");
@@ -168,7 +189,7 @@ describe("Tool round-trips", () => {
 
   test("write dry_run returns diff without modifying file", async () => {
     createBridge();
-    const tools = editingTools(bridge);
+    const tools = editingTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
 
     const filePath = resolve(tmpDir, "dryrun.ts");
@@ -200,7 +221,7 @@ describe("Tool round-trips", () => {
 
   test("transaction success applies multiple file writes", async () => {
     createBridge();
-    const tools = transactionTools(bridge);
+    const tools = transactionTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
 
     const file1 = resolve(tmpDir, "a.ts");
@@ -228,8 +249,8 @@ describe("Tool round-trips", () => {
 
   test("transaction rollback on syntax error", async () => {
     createBridge();
-    const editTools = editingTools(bridge);
-    const tools = transactionTools(bridge);
+    const editTools = editingTools(createToolContext(bridge));
+    const tools = transactionTools(createToolContext(bridge));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
 
     // Create a valid file that should be restored on rollback
@@ -306,14 +327,14 @@ describe("move_symbol round-trip", () => {
     );
 
     // Configure the bridge with the temp dir as project root
-    const navTools = navigationTools(bridge);
+    const navTools = navigationTools(createToolContext(bridge));
     const configResult = JSON.parse(
       await navTools.aft_configure.execute({ project_root: tmpDir }),
     );
     expect(configResult.ok).toBe(true);
 
     // Move formatDate from service.ts to utils.ts
-    const refTools = refactoringTools(bridge);
+    const refTools = refactoringTools(createToolContext(bridge));
     const moveResult = JSON.parse(
       await refTools.aft_move_symbol.execute({
         file: sourceFile,
@@ -377,14 +398,14 @@ describe("extract_function round-trip", () => {
     );
 
     // Configure
-    const navTools = navigationTools(bridge);
+    const navTools = navigationTools(createToolContext(bridge));
     const configResult = JSON.parse(
       await navTools.aft_configure.execute({ project_root: tmpDir }),
     );
     expect(configResult.ok).toBe(true);
 
     // Extract lines 1-3 (the filtering and mapping logic)
-    const refTools = refactoringTools(bridge);
+    const refTools = refactoringTools(createToolContext(bridge));
     const result = JSON.parse(
       await refTools.aft_extract_function.execute({
         file: filePath,
@@ -439,14 +460,14 @@ describe("inline_symbol round-trip", () => {
     );
 
     // Configure
-    const navTools = navigationTools(bridge);
+    const navTools = navigationTools(createToolContext(bridge));
     const configResult = JSON.parse(
       await navTools.aft_configure.execute({ project_root: tmpDir }),
     );
     expect(configResult.ok).toBe(true);
 
     // Inline helper at line 5 (const result = helper(10, 20))
-    const refTools = refactoringTools(bridge);
+    const refTools = refactoringTools(createToolContext(bridge));
     const result = JSON.parse(
       await refTools.aft_inline_symbol.execute({
         file: filePath,

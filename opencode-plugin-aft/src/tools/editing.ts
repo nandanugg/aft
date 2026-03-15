@@ -1,6 +1,7 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
+import { queryLspHints } from "../lsp.js";
 
 const z = tool.schema;
 
@@ -25,7 +26,7 @@ const batchEditItem = z.union([
 /**
  * Tool definitions for code editing commands: write, edit_symbol, edit_match, batch.
  */
-export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function editingTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     write: {
       description:
@@ -54,7 +55,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         if (args.create_dirs !== undefined) params.create_dirs = args.create_dirs;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("write", params);
+        const response = await ctx.bridge.send("write", params);
         return JSON.stringify(response);
       },
     },
@@ -93,7 +94,11 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         if (args.scope !== undefined) params.scope = args.scope;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("edit_symbol", params);
+
+        const hints = await queryLspHints(ctx.client, args.symbol as string);
+        if (hints) params.lsp_hints = hints;
+
+        const response = await ctx.bridge.send("edit_symbol", params);
         return JSON.stringify(response);
       },
     },
@@ -127,7 +132,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         if (args.occurrence !== undefined) params.occurrence = args.occurrence;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("edit_match", params);
+        const response = await ctx.bridge.send("edit_match", params);
         return JSON.stringify(response);
       },
     },
@@ -156,7 +161,7 @@ export function editingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         };
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("batch", params);
+        const response = await ctx.bridge.send("batch", params);
         return JSON.stringify(response);
       },
     },

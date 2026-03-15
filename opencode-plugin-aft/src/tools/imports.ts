@@ -1,13 +1,13 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
 
 const z = tool.schema;
 
 /**
  * Tool definitions for import management commands: add_import, remove_import, organize_imports.
  */
-export function importTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function importTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     add_import: {
       description:
@@ -46,7 +46,7 @@ export function importTools(bridge: BinaryBridge): Record<string, ToolDefinition
         if (args.type_only !== undefined) params.type_only = args.type_only;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("add_import", params);
+        const response = await ctx.bridge.send("add_import", params);
         return JSON.stringify(response);
       },
     },
@@ -78,7 +78,7 @@ export function importTools(bridge: BinaryBridge): Record<string, ToolDefinition
         if (args.name !== undefined) params.name = args.name;
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("remove_import", params);
+        const response = await ctx.bridge.send("remove_import", params);
         return JSON.stringify(response);
       },
     },
@@ -103,7 +103,7 @@ export function importTools(bridge: BinaryBridge): Record<string, ToolDefinition
         };
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;
-        const response = await bridge.send("organize_imports", params);
+        const response = await ctx.bridge.send("organize_imports", params);
         return JSON.stringify(response);
       },
     },

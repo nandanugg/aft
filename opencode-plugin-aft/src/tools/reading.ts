@@ -1,13 +1,14 @@
 import { tool } from "@opencode-ai/plugin";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import type { BinaryBridge } from "../bridge.js";
+import type { ToolContext } from "../types.js";
+import { queryLspHints } from "../lsp.js";
 
 const z = tool.schema;
 
 /**
  * Tool definitions for code reading commands: outline and zoom.
  */
-export function readingTools(bridge: BinaryBridge): Record<string, ToolDefinition> {
+export function readingTools(ctx: ToolContext): Record<string, ToolDefinition> {
   return {
     outline: {
       description:
@@ -16,7 +17,7 @@ export function readingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         file: z.string().describe("Path to the source file to outline (relative to project root or absolute)"),
       },
       execute: async (args): Promise<string> => {
-        const response = await bridge.send("outline", { file: args.file });
+        const response = await ctx.bridge.send("outline", { file: args.file });
         return JSON.stringify(response);
       },
     },
@@ -43,7 +44,11 @@ export function readingTools(bridge: BinaryBridge): Record<string, ToolDefinitio
         };
         if (args.context_lines !== undefined) params.context_lines = args.context_lines;
         if (args.scope !== undefined) params.scope = args.scope;
-        const response = await bridge.send("zoom", params);
+
+        const hints = await queryLspHints(ctx.client, args.symbol as string);
+        if (hints) params.lsp_hints = hints;
+
+        const response = await ctx.bridge.send("zoom", params);
         return JSON.stringify(response);
       },
     },

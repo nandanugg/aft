@@ -6,6 +6,7 @@ mod dryrun_test;
 mod edit_test;
 mod format_test;
 mod import_test;
+mod lsp_hints_test;
 mod member_test;
 mod extract_function_test;
 mod inline_symbol_test;
