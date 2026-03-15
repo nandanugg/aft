@@ -74,10 +74,6 @@ echo "→ Syncing versions to $VERSION..."
 node scripts/version-sync.mjs "$VERSION"
 echo ""
 
-# Step 2: Commit
-echo "→ Committing version bump..."
-git add -A
-git commit -m "release: $TAG"
 # Step 2: Commit (skip if versions were already at target)
 echo "→ Committing version bump..."
 git add -A
@@ -86,6 +82,9 @@ if git diff --cached --quiet; then
 else
   git commit -m "release: $TAG"
 fi
+
+# Step 3: Tag
+echo "→ Creating tag $TAG..."
 git tag -a "$TAG" -m "Release $TAG"
 echo ""
 
