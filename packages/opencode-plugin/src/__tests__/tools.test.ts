@@ -514,7 +514,7 @@ describe("inline_symbol round-trip", () => {
         ].join("\n"),
       );
 
-      // Inline helper at line 5 (const result = helper(10, 20))
+      // Inline helper at line 6 (const result = helper(10, 20)) — 1-based
       const refTools = refactoringTools(createPluginContext(pool));
       const result = JSON.parse(
         await refTools.aft_refactor.execute(
@@ -522,7 +522,7 @@ describe("inline_symbol round-trip", () => {
             op: "inline",
             file: filePath,
             symbol: "helper",
-            call_site_line: 5,
+            call_site_line: 6,
           },
           sdkCtx,
         ),
