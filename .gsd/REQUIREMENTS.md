@@ -507,7 +507,7 @@ Use it to track what is actively in scope, what has been validated by completed 
 
 ## Coverage Summary
 
-- Active requirements: 2
+- Active requirements: 1
 - Mapped to slices: 34
 - Validated: 33
 - Unmapped active requirements: 0

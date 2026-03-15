@@ -32,4 +32,4 @@ See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement sta
 - [x] M001: Foundation — Rust binary, tree-sitter for 6 languages, three-layer editing, safety system, OpenCode plugin, binary distribution (155 tests, all passing)
 - [x] M002: Language Intelligence — Import management, scope-aware insertion & compound ops, auto-format & validation, dry-run & transactions (294 Rust tests + 39 plugin tests)
 - [x] M003: Call Graph Navigation — Lazy/incremental call graph, forward/reverse traces, impact analysis, data flow tracking
-- [ ] M004: Refactoring Primitives — Move symbol, extract function, inline symbol, LSP integration (complete)
+- [x] M004: Refactoring Primitives — Move symbol, extract function, inline symbol, LSP integration (463 Rust tests + 55 plugin tests)
