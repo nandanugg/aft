@@ -5,7 +5,7 @@
  *
  * Validates all 6 AFT npm package.json files:
  * - 5 platform packages under npm/{platform}/
- * - 1 root @aft/core package at opencode-plugin-aft/
+ * - 1 root @aft/opencode package at opencode-plugin-aft/
  *
  * Checks: os/cpu fields match directory, preferUnplugged, bin field,
  * optionalDependencies in core, version alignment, required fields.
@@ -14,7 +14,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -48,7 +48,7 @@ function readPkg(path) {
 const platformVersions = [];
 
 for (const { dir, os, cpu } of PLATFORMS) {
-  const pkgPath = join(root, "npm", dir, "package.json");
+  const pkgPath = join(root, "packages", "npm", dir, "package.json");
   const pkg = readPkg(pkgPath);
   if (!pkg) continue;
 
@@ -84,19 +84,19 @@ for (const { dir, os, cpu } of PLATFORMS) {
   if (pkg.version) platformVersions.push({ name: label, version: pkg.version });
 }
 
-// --- Validate @aft/core ---
+// --- Validate @aft/opencode ---
 
-const corePath = join(root, "opencode-plugin-aft", "package.json");
+const corePath = join(root, "packages", "opencode-plugin", "package.json");
 const core = readPkg(corePath);
 
 if (core) {
-  const label = "@aft/core";
+  const label = "@aft/opencode";
 
   // Required fields
   if (!core.name) fail(label, "missing 'name'");
   if (!core.version) fail(label, "missing 'version'");
-  if (core.name && core.name !== "@aft/core") {
-    fail(label, `name should be '@aft/core', got '${core.name}'`);
+  if (core.name && core.name !== "@aft/opencode") {
+    fail(label, `name should be '@aft/opencode', got '${core.name}'`);
   }
 
   // optionalDependencies must list all 5 platform packages
@@ -118,21 +118,18 @@ if (platformVersions.length > 1) {
   for (let i = 1; i < platformVersions.length; i++) {
     const other = platformVersions[i];
     if (other.version !== first.version) {
-      fail(
-        "version-alignment",
-        `${first.name}@${first.version} != ${other.name}@${other.version}`
-      );
+      fail("version-alignment", `${first.name}@${first.version} != ${other.name}@${other.version}`);
     }
   }
 }
 
 // Also check that optionalDependencies versions match the core version
-if (core && core.version && core.optionalDependencies) {
+if (core?.version && core.optionalDependencies) {
   for (const [depName, depVersion] of Object.entries(core.optionalDependencies)) {
     if (depVersion !== core.version) {
       fail(
         "version-alignment",
-        `@aft/core optionalDependencies['${depName}'] is '${depVersion}' but core version is '${core.version}'`
+        `@aft/opencode optionalDependencies['${depName}'] is '${depVersion}' but core version is '${core.version}'`,
       );
     }
   }
@@ -150,11 +147,9 @@ if (errors.length > 0) {
 } else {
   const count = PLATFORMS.length + 1;
   console.log(`✓ All ${count} packages validated successfully.`);
-  console.log(
-    `  Versions aligned at ${platformVersions[0]?.version || "unknown"}`
-  );
+  console.log(`  Versions aligned at ${platformVersions[0]?.version || "unknown"}`);
   console.log("  Platform os/cpu fields correct");
   console.log("  preferUnplugged set on all platform packages");
-  console.log("  optionalDependencies complete in @aft/core");
+  console.log("  optionalDependencies complete in @aft/opencode");
   process.exit(0);
 }

@@ -1,0 +1,649 @@
+//! Integration tests for the write and edit_symbol commands.
+
+use std::fs;
+
+use super::helpers::{fixture_path, AftProcess};
+
+// ============================================================================
+// write command tests
+// ============================================================================
+
+#[test]
+fn write_creates_new_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_new.txt");
+    // Ensure file doesn't exist
+    let _ = fs::remove_file(&target);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"w-1","command":"write","file":"{}","content":"hello world"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["ok"], true, "write should succeed: {:?}", resp);
+    assert_eq!(resp["file"], target.display().to_string());
+    assert_eq!(
+        resp["created"], true,
+        "file was new, created should be true"
+    );
+    // No backup_id for new files
+    assert!(
+        resp.get("backup_id").is_none() || resp["backup_id"].is_null(),
+        "new file should not have backup_id"
+    );
+
+    // Verify content on disk
+    let on_disk = fs::read_to_string(&target).unwrap();
+    assert_eq!(on_disk, "hello world");
+
+    // Cleanup
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_backups_existing_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_backup.txt");
+    fs::write(&target, "original content").unwrap();
+
+    // Overwrite via write command
+    let resp = aft.send(&format!(
+        r#"{{"id":"w-2","command":"write","file":"{}","content":"new content"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["ok"], true, "write should succeed: {:?}", resp);
+    assert_eq!(resp["created"], false);
+    assert!(
+        resp["backup_id"].is_string(),
+        "should have backup_id for existing file"
+    );
+
+    // Verify new content on disk
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
+
+    // Undo — should restore original
+    let undo_resp = aft.send(&format!(
+        r#"{{"id":"w-2u","command":"undo","file":"{}"}}"#,
+        target.display()
+    ));
+    assert_eq!(
+        undo_resp["ok"], true,
+        "undo should succeed: {:?}",
+        undo_resp
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "original content");
+
+    // Cleanup
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_syntax_valid() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_valid.ts");
+    let _ = fs::remove_file(&target);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"w-3","command":"write","file":"{}","content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["ok"], true, "write should succeed: {:?}", resp);
+    assert_eq!(
+        resp["syntax_valid"], true,
+        "valid TS should have syntax_valid: true"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_syntax_invalid() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("write_invalid.ts");
+    let _ = fs::remove_file(&target);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"w-4","command":"write","file":"{}","content":"export function {{ broken syntax"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(
+        resp["ok"], true,
+        "write should succeed even with bad syntax: {:?}",
+        resp
+    );
+    assert_eq!(
+        resp["syntax_valid"], false,
+        "broken TS should have syntax_valid: false"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ============================================================================
+// edit_symbol command tests
+// ============================================================================
+
+#[test]
+fn edit_symbol_replace() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("edit_replace.ts");
+
+    // Copy fixture
+    let fixture = fixture_path("sample.ts");
+    fs::copy(&fixture, &target).unwrap();
+
+    // Build request with serde_json to avoid escaping issues
+    // Note: symbol range starts at `function` (col 7), not at `export`
+    let req = serde_json::json!({
+        "id": "es-1",
+        "command": "edit_symbol",
+        "file": target.display().to_string(),
+        "symbol": "greet",
+        "operation": "replace",
+        "content": "function greet(name: string): string {\n  return `Hey, ${name}!`;\n}"
+    });
+
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["ok"], true,
+        "edit_symbol replace should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["symbol"], "greet");
+    assert_eq!(resp["operation"], "replace");
+    assert_eq!(resp["syntax_valid"], true, "replacement should be valid TS");
+    assert!(resp["backup_id"].is_string(), "should have backup_id");
+    assert!(resp["range"].is_object(), "should have original range");
+
+    // Verify content changed on disk
+    let content = fs::read_to_string(&target).unwrap();
+    assert!(
+        content.contains("Hey,"),
+        "should contain new greeting: {}",
+        content
+    );
+    assert!(
+        !content.contains("Hello,"),
+        "should not contain old greeting"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_symbol_delete() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("edit_delete.ts");
+
+    // Copy fixture
+    let fixture = fixture_path("sample.ts");
+    fs::copy(&fixture, &target).unwrap();
+
+    // Verify internalHelper exists
+    let before = fs::read_to_string(&target).unwrap();
+    assert!(before.contains("internalHelper"));
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"es-2","command":"edit_symbol","file":"{}","symbol":"internalHelper","operation":"delete"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(
+        resp["ok"], true,
+        "edit_symbol delete should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["operation"], "delete");
+
+    // Verify symbol is gone from disk
+    let after = fs::read_to_string(&target).unwrap();
+    assert!(
+        !after.contains("function internalHelper"),
+        "internalHelper should be deleted"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_symbol_ambiguous() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("edit_ambig.ts");
+
+    // Copy ambiguous fixture
+    let fixture = fixture_path("ambiguous.ts");
+    fs::copy(&fixture, &target).unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"es-3","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"// replaced"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(
+        resp["ok"], true,
+        "ambiguous response should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["code"], "ambiguous_symbol");
+    let candidates = resp["candidates"]
+        .as_array()
+        .expect("should have candidates array");
+    assert!(
+        candidates.len() >= 2,
+        "should have at least 2 candidates: {:?}",
+        candidates
+    );
+
+    // Each candidate should have name, qualified, line, kind
+    for c in candidates {
+        assert!(c["name"].is_string(), "candidate should have name: {:?}", c);
+        assert!(
+            c["qualified"].is_string(),
+            "candidate should have qualified: {:?}",
+            c
+        );
+        assert!(c["line"].is_number(), "candidate should have line: {:?}", c);
+        assert!(c["kind"].is_string(), "candidate should have kind: {:?}", c);
+    }
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_symbol_not_found() {
+    let mut aft = AftProcess::spawn();
+    let file = fixture_path("sample.ts");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"es-4","command":"edit_symbol","file":"{}","symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
+        file.display()
+    ));
+
+    assert_eq!(
+        resp["ok"], false,
+        "should fail for nonexistent symbol: {:?}",
+        resp
+    );
+    assert_eq!(resp["code"], "symbol_not_found");
+    assert!(resp["message"]
+        .as_str()
+        .unwrap()
+        .contains("nonexistent_symbol"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ============================================================================
+// edit_match command tests
+// ============================================================================
+
+#[test]
+fn edit_match_single_occurrence() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("match_single.ts");
+
+    // Copy fixture
+    let fixture = fixture_path("sample.ts");
+    fs::copy(&fixture, &target).unwrap();
+
+    // "internalHelper" appears exactly once in sample.ts
+    let req = serde_json::json!({
+        "id": "em-1",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "internalHelper",
+        "replacement": "secretHelper"
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["ok"], true, "edit_match should succeed: {:?}", resp);
+    assert_eq!(resp["replacements"], 1);
+    assert_eq!(resp["syntax_valid"], true);
+    assert!(resp["backup_id"].is_string(), "should have backup_id");
+
+    // Verify content on disk
+    let content = fs::read_to_string(&target).unwrap();
+    assert!(
+        content.contains("secretHelper"),
+        "should contain replacement"
+    );
+    assert!(
+        !content.contains("internalHelper"),
+        "should not contain original match"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_multiple_occurrences_returns_candidates() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("match_ambig.ts");
+
+    // Write a file with a repeated string
+    let content = "const a = \"hello\";\nconst b = \"hello\";\nconst c = \"world\";\n";
+    fs::write(&target, content).unwrap();
+
+    let req = serde_json::json!({
+        "id": "em-2",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "hello",
+        "replacement": "bye"
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["ok"], true,
+        "ambiguous response should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["code"], "ambiguous_match");
+    let occurrences = resp["occurrences"]
+        .as_array()
+        .expect("should have occurrences array");
+    assert_eq!(occurrences.len(), 2, "should have exactly 2 occurrences");
+
+    // Each occurrence should have index, line, context
+    for occ in occurrences {
+        assert!(occ["index"].is_number(), "should have index: {:?}", occ);
+        assert!(occ["line"].is_number(), "should have line: {:?}", occ);
+        assert!(occ["context"].is_string(), "should have context: {:?}", occ);
+    }
+
+    // File should be unchanged
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        content,
+        "file should not be modified"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_with_occurrence_selector() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("match_occ.ts");
+
+    // Write a file with a repeated string
+    let content = "const a = \"hello\";\nconst b = \"hello\";\nconst c = \"world\";\n";
+    fs::write(&target, content).unwrap();
+
+    // Select occurrence index 1 (second match)
+    let req = serde_json::json!({
+        "id": "em-3",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "hello",
+        "replacement": "bye",
+        "occurrence": 1
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["ok"], true,
+        "edit_match with occurrence should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["replacements"], 1);
+
+    // Verify: first "hello" untouched, second replaced
+    let result = fs::read_to_string(&target).unwrap();
+    assert!(
+        result.contains("const a = \"hello\""),
+        "first occurrence should be untouched"
+    );
+    assert!(
+        result.contains("const b = \"bye\""),
+        "second occurrence should be replaced"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_no_match() {
+    let mut aft = AftProcess::spawn();
+    let file = fixture_path("sample.ts");
+
+    let req = serde_json::json!({
+        "id": "em-4",
+        "command": "edit_match",
+        "file": file.display().to_string(),
+        "match": "this_string_does_not_exist_anywhere",
+        "replacement": "nope"
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["ok"], false, "should fail for no match: {:?}", resp);
+    assert_eq!(resp["code"], "match_not_found");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ============================================================================
+// batch command tests
+// ============================================================================
+
+#[test]
+fn batch_multiple_edits() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("batch_multi.ts");
+
+    let content = "const greeting = \"hello\";\nconst farewell = \"goodbye\";\nconst count = 42;\n";
+    fs::write(&target, content).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-1",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "hello", "replacement": "hi" },
+            { "match": "goodbye", "replacement": "bye" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["ok"], true, "batch should succeed: {:?}", resp);
+    assert_eq!(resp["edits_applied"], 2);
+    assert!(resp["backup_id"].is_string(), "should have backup_id");
+
+    let result = fs::read_to_string(&target).unwrap();
+    assert!(
+        result.contains("\"hi\""),
+        "first edit should apply: {}",
+        result
+    );
+    assert!(
+        result.contains("\"bye\""),
+        "second edit should apply: {}",
+        result
+    );
+    assert!(
+        result.contains("count = 42"),
+        "untouched line should remain"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_rollback_on_failure() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("batch_rollback.ts");
+
+    let content = "const greeting = \"hello\";\nconst count = 42;\n";
+    fs::write(&target, content).unwrap();
+
+    // First edit is valid, second has a match that doesn't exist
+    let req = serde_json::json!({
+        "id": "b-2",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "hello", "replacement": "hi" },
+            { "match": "nonexistent_string", "replacement": "nope" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["ok"], false, "batch should fail: {:?}", resp);
+    assert_eq!(resp["code"], "batch_edit_failed");
+
+    // File should be unchanged — no partial application, no backup taken
+    let on_disk = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        on_disk, content,
+        "file should be unchanged after failed batch"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_line_range_edit() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("batch_linerange.ts");
+
+    let content = "line zero\nline one\nline two\nline three\n";
+    fs::write(&target, content).unwrap();
+
+    // Replace line 1 (0-indexed) with new content
+    let req = serde_json::json!({
+        "id": "b-3",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "line_start": 1, "line_end": 1, "content": "replaced line\n" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["ok"], true,
+        "batch line-range should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["edits_applied"], 1);
+
+    let result = fs::read_to_string(&target).unwrap();
+    assert!(result.contains("line zero"), "line 0 untouched");
+    assert!(
+        result.contains("replaced line"),
+        "line 1 should be replaced"
+    );
+    assert!(
+        !result.contains("line one"),
+        "original line 1 should be gone"
+    );
+    assert!(result.contains("line two"), "line 2 untouched");
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_with_undo() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_edit_tests");
+    fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("batch_undo.ts");
+
+    let original = "const x = 1;\nconst y = 2;\n";
+    fs::write(&target, original).unwrap();
+
+    // Apply batch
+    let req = serde_json::json!({
+        "id": "b-4",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "const x = 1", "replacement": "const x = 100" },
+            { "match": "const y = 2", "replacement": "const y = 200" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+    assert_eq!(resp["ok"], true, "batch should succeed: {:?}", resp);
+
+    // Verify edits applied
+    let modified = fs::read_to_string(&target).unwrap();
+    assert!(modified.contains("x = 100"), "should have x = 100");
+    assert!(modified.contains("y = 200"), "should have y = 200");
+
+    // Undo
+    let undo_resp = aft.send(&format!(
+        r#"{{"id":"b-4u","command":"undo","file":"{}"}}"#,
+        target.display()
+    ));
+    assert_eq!(
+        undo_resp["ok"], true,
+        "undo should succeed: {:?}",
+        undo_resp
+    );
+
+    // Verify original restored
+    let restored = fs::read_to_string(&target).unwrap();
+    assert_eq!(restored, original, "undo should restore original content");
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}

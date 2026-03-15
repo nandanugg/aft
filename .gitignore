@@ -37,3 +37,8 @@ tmp/
 # Added by cargo
 
 /target
+.sisyphus/
+local-ignore/
+
+# Nested lockfiles (root bun.lock is the source of truth)
+packages/opencode-plugin/package-lock.json

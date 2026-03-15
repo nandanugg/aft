@@ -17,7 +17,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -25,13 +25,7 @@ const root = join(__dirname, "..");
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/;
 
-const PLATFORM_DIRS = [
-  "darwin-arm64",
-  "darwin-x64",
-  "linux-arm64",
-  "linux-x64",
-  "win32-x64",
-];
+const PLATFORM_DIRS = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64"];
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -65,7 +59,7 @@ function parseArgs(argv) {
   if (!version) {
     console.error(
       "Usage: version-sync.mjs <version> [--dry-run]\n" +
-        "       version-sync.mjs --from-tag [--dry-run]"
+        "       version-sync.mjs --from-tag [--dry-run]",
     );
     process.exit(1);
   }
@@ -103,7 +97,7 @@ function updateJsonFile(filePath, version, updates, dryRun) {
   }
 
   if (!dryRun) {
-    writeFileSync(filePath, JSON.stringify(pkg, null, 2) + "\n", "utf-8");
+    writeFileSync(filePath, `${JSON.stringify(pkg, null, 2)}\n`, "utf-8");
   }
 
   return { path: filePath, changes };
@@ -139,32 +133,28 @@ function updateCargoToml(filePath, version, dryRun) {
 
 const { version, dryRun } = parseArgs(process.argv);
 
-console.log(
-  `${dryRun ? "[DRY RUN] " : ""}Syncing version to ${version}\n`
-);
+console.log(`${dryRun ? "[DRY RUN] " : ""}Syncing version to ${version}\n`);
 
 const results = [];
 
 // 1-5: Platform packages
 for (const dir of PLATFORM_DIRS) {
-  const filePath = join(root, "npm", dir, "package.json");
+  const filePath = join(root, "packages", "npm", dir, "package.json");
   results.push(updateJsonFile(filePath, version, {}, dryRun));
 }
 
-// 6: @aft/core
-const corePath = join(root, "opencode-plugin-aft", "package.json");
-results.push(
-  updateJsonFile(corePath, version, { optionalDependencies: true }, dryRun)
-);
+// 6: @aft/opencode
+const corePath = join(root, "packages", "opencode-plugin", "package.json");
+results.push(updateJsonFile(corePath, version, { optionalDependencies: true }, dryRun));
 
 // 7: Cargo.toml
-const cargoPath = join(root, "Cargo.toml");
+const cargoPath = join(root, "crates", "aft", "Cargo.toml");
 results.push(updateCargoToml(cargoPath, version, dryRun));
 
 // Report
 let updateCount = 0;
 for (const { path, changes } of results) {
-  const relativePath = path.replace(root + "/", "");
+  const relativePath = path.replace(`${root}/`, "");
   console.log(`${relativePath}:`);
   for (const change of changes) {
     console.log(change);
@@ -173,5 +163,5 @@ for (const { path, changes } of results) {
 }
 
 console.log(
-  `\n${dryRun ? "[DRY RUN] " : ""}${updateCount} update(s) across ${results.length} files.`
+  `\n${dryRun ? "[DRY RUN] " : ""}${updateCount} update(s) across ${results.length} files.`,
 );
