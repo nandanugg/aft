@@ -78,10 +78,14 @@ echo ""
 echo "→ Committing version bump..."
 git add -A
 git commit -m "release: $TAG"
-echo ""
-
-# Step 3: Tag
-echo "→ Creating tag $TAG..."
+# Step 2: Commit (skip if versions were already at target)
+echo "→ Committing version bump..."
+git add -A
+if git diff --cached --quiet; then
+  echo "  (no changes — versions already at $VERSION)"
+else
+  git commit -m "release: $TAG"
+fi
 git tag -a "$TAG" -m "Release $TAG"
 echo ""
 
