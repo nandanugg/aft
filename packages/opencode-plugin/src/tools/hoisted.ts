@@ -594,8 +594,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         metadata: {},
       });
 
-      // Process each hunk
+      // Process each hunk, track diffs for metadata
       const results: string[] = [];
+      let totalAdditions = 0;
+      let totalDeletions = 0;
+      let combinedBefore = "";
+      let combinedAfter = "";
 
       for (const hunk of hunks) {
         const filePath = path.resolve(context.directory, hunk.path);
@@ -607,13 +611,20 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               content: hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`,
               create_dirs: true,
             });
+            const lines = hunk.contents.split("\n").length;
+            totalAdditions += lines;
+            combinedAfter += hunk.contents;
             results.push(`Created ${hunk.path}`);
             break;
           }
 
           case "delete": {
             try {
+              const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
               await fs.promises.unlink(filePath);
+              const lines = before.split("\n").length;
+              totalDeletions += lines;
+              combinedBefore += before;
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
               results.push(`Failed to delete ${hunk.path}: ${e instanceof Error ? e.message : e}`);
@@ -636,6 +647,24 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               create_dirs: true,
             });
 
+            // Track diff
+            combinedBefore += original;
+            combinedAfter += newContent;
+            const origLines = original.split("\n");
+            const newLines = newContent.split("\n");
+            // Count changed lines using simple comparison
+            let adds = 0;
+            let dels = 0;
+            const maxLen = Math.max(origLines.length, newLines.length);
+            for (let i = 0; i < maxLen; i++) {
+              if ((origLines[i] ?? "") !== (newLines[i] ?? "")) {
+                if (i < origLines.length) dels++;
+                if (i < newLines.length) adds++;
+              }
+            }
+            totalAdditions += adds;
+            totalDeletions += dels;
+
             if (hunk.move_path) {
               await fs.promises.unlink(filePath);
               results.push(`Updated and moved ${hunk.path} → ${hunk.move_path}`);
@@ -645,6 +674,26 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             break;
           }
         }
+      }
+
+      // Store metadata for tool.execute.after hook
+      const callID = getCallID(context);
+      if (callID) {
+        const title = allPaths.length === 1
+          ? path.relative(context.worktree, path.resolve(context.directory, hunks[0].path))
+          : `${allPaths.length} files`;
+        storeToolMetadata(context.sessionID, callID, {
+          title,
+          metadata: {
+            filediff: {
+              file: allPaths.join(", "),
+              before: combinedBefore,
+              after: combinedAfter,
+              additions: totalAdditions,
+              deletions: totalDeletions,
+            },
+          },
+        });
       }
 
       return results.join("\n");
