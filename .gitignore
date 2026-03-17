@@ -42,3 +42,4 @@ local-ignore/
 
 # Nested lockfiles (root bun.lock is the source of truth)
 packages/opencode-plugin/package-lock.json
+ts-bench/
