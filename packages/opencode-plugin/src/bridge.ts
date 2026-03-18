@@ -199,7 +199,8 @@ export class BinaryBridge {
         const response = JSON.parse(line) as Record<string, unknown>;
         const id = response.id as string | undefined;
         if (id && this.pending.has(id)) {
-          const entry = this.pending.get(id)!;
+          const entry = this.pending.get(id);
+          if (!entry) continue;
           this.pending.delete(id);
           clearTimeout(entry.timer);
           entry.resolve(response);

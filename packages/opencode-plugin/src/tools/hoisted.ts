@@ -447,7 +447,11 @@ function createEditTool(ctx: PluginContext): ToolDefinition {
         // Batch mode
         command = "batch";
         params.edits = args.edits;
-      } else if (typeof args.symbol === "string" && typeof args.oldString !== "string" && args.content !== undefined) {
+      } else if (
+        typeof args.symbol === "string" &&
+        typeof args.oldString !== "string" &&
+        args.content !== undefined
+      ) {
         // Symbol replace — only when content is provided and oldString is NOT present
         // (agents often pass symbol as "what to search for", not "replace whole symbol")
         command = "edit_symbol";
@@ -575,7 +579,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
     description: APPLY_PATCH_DESCRIPTION,
     args: {
       patch: z.string().optional(),
-      patchText: z.string().optional(),  // backward compat with opencode's apply_patch
+      patchText: z.string().optional(), // backward compat with opencode's apply_patch
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
@@ -608,8 +612,6 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 
       // Process each hunk, track diffs for metadata
       const results: string[] = [];
-      let totalAdditions = 0;
-      let totalDeletions = 0;
       let combinedBefore = "";
       let combinedAfter = "";
 
@@ -624,8 +626,6 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               create_dirs: true,
               diagnostics: true,
             });
-            const lines = hunk.contents.split("\n").length;
-            totalAdditions += lines;
             combinedAfter += hunk.contents;
             results.push(`Created ${hunk.path}`);
             break;
@@ -635,8 +635,6 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             try {
               const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
               await fs.promises.unlink(filePath);
-              const lines = before.split("\n").length;
-              totalDeletions += lines;
               combinedBefore += before;
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
@@ -672,23 +670,9 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               }
             }
 
-            // Track diff
+            // Track diff for metadata
             combinedBefore += original;
             combinedAfter += newContent;
-            const origLines = original.split("\n");
-            const newLines = newContent.split("\n");
-            // Count changed lines using simple comparison
-            let adds = 0;
-            let dels = 0;
-            const maxLen = Math.max(origLines.length, newLines.length);
-            for (let i = 0; i < maxLen; i++) {
-              if ((origLines[i] ?? "") !== (newLines[i] ?? "")) {
-                if (i < origLines.length) dels++;
-                if (i < newLines.length) adds++;
-              }
-            }
-            totalAdditions += adds;
-            totalDeletions += dels;
 
             if (hunk.move_path) {
               await fs.promises.unlink(filePath);
@@ -715,10 +699,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         });
 
         // Build title matching built-in: "Success. Updated the following files:\nM path/to/file.ts"
-        const fileList = files.map((f) => {
-          const prefix = f.type === "add" ? "A" : f.type === "delete" ? "D" : "M";
-          return `${prefix} ${f.relativePath}`;
-        }).join("\n");
+        const fileList = files
+          .map((f) => {
+            const prefix = f.type === "add" ? "A" : f.type === "delete" ? "D" : "M";
+            return `${prefix} ${f.relativePath}`;
+          })
+          .join("\n");
         const title = `Success. Updated the following files:\n${fileList}`;
 
         storeToolMetadata(context.sessionID, callID, {

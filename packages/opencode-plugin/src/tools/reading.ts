@@ -1,20 +1,45 @@
+import { readdir } from "node:fs/promises";
+import { extname, join, resolve } from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { readdir } from "node:fs/promises";
-import { join, resolve, extname } from "node:path";
 import type { PluginContext } from "../types.js";
 
 /** File extensions that aft_outline supports via tree-sitter or markdown parser */
 const OUTLINE_EXTENSIONS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-  ".rs", ".go", ".py", ".rb",
-  ".c", ".cpp", ".h", ".hpp", ".cs",
-  ".java", ".kt", ".scala",
-  ".swift", ".lua", ".ex", ".exs",
-  ".hs", ".sol", ".nix",
-  ".md", ".mdx",
-  ".css", ".html", ".json", ".yaml", ".yml",
-  ".sh", ".bash",
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".rs",
+  ".go",
+  ".py",
+  ".rb",
+  ".c",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".cs",
+  ".java",
+  ".kt",
+  ".scala",
+  ".swift",
+  ".lua",
+  ".ex",
+  ".exs",
+  ".hs",
+  ".sol",
+  ".nix",
+  ".md",
+  ".mdx",
+  ".css",
+  ".html",
+  ".json",
+  ".yaml",
+  ".yml",
+  ".sh",
+  ".bash",
 ]);
 
 const z = tool.schema;
@@ -59,7 +84,10 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           const dirPath = resolve(context.directory, args.directory);
           const files = await discoverSourceFiles(dirPath);
           if (files.length === 0) {
-            return JSON.stringify({ success: false, message: `No source files found under ${args.directory}` });
+            return JSON.stringify({
+              success: false,
+              message: `No source files found under ${args.directory}`,
+            });
           }
           const response = await bridge.send("outline", { files });
           return JSON.stringify(response);
@@ -75,8 +103,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     },
 
     aft_zoom: {
-      description:
-        `Inspect code symbols with call-graph annotations. Returns the full source of named symbols with what they call and what calls them.
+      description: `Inspect code symbols with call-graph annotations. Returns the full source of named symbols with what they call and what calls them.
 
 Use this when you need to understand a specific function, class, or type in detail — not for reading entire files (use read for that).
 
@@ -143,9 +170,22 @@ For Markdown files, use heading text as symbol name (e.g., symbol: "Architecture
 
 /** Recursively discover source files under a directory, skipping common noise directories */
 const SKIP_DIRS = new Set([
-  "node_modules", ".git", "dist", "build", "out", ".next", ".nuxt",
-  "target", "__pycache__", ".venv", "venv", "vendor", ".turbo",
-  "coverage", ".nyc_output", ".cache",
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  "out",
+  ".next",
+  ".nuxt",
+  "target",
+  "__pycache__",
+  ".venv",
+  "venv",
+  "vendor",
+  ".turbo",
+  "coverage",
+  ".nyc_output",
+  ".cache",
 ]);
 
 async function discoverSourceFiles(dir: string, maxFiles = 200): Promise<string[]> {
@@ -154,7 +194,7 @@ async function discoverSourceFiles(dir: string, maxFiles = 200): Promise<string[
   async function walk(current: string): Promise<void> {
     if (files.length >= maxFiles) return;
 
-    let entries;
+    let entries: import("node:fs").Dirent[];
     try {
       entries = await readdir(current, { withFileTypes: true });
     } catch {
