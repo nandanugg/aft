@@ -142,15 +142,15 @@ For Markdown files, use heading text as symbol name (e.g., symbol: "Architecture
         const bridge = ctx.pool.getBridge(context.directory);
         const file = args.filePath as string;
 
-        // Multi-symbol mode: make separate zoom calls and combine results
+        // Multi-symbol mode: make separate zoom calls in parallel and combine results
         if (Array.isArray(args.symbols) && args.symbols.length > 0) {
-          const results = [];
-          for (const sym of args.symbols as string[]) {
-            const params: Record<string, unknown> = { file, symbol: sym };
-            if (args.context_lines !== undefined) params.context_lines = args.context_lines;
-            const data = await bridge.send("zoom", params);
-            results.push(data);
-          }
+          const results = await Promise.all(
+            (args.symbols as string[]).map((sym) => {
+              const params: Record<string, unknown> = { file, symbol: sym };
+              if (args.context_lines !== undefined) params.context_lines = args.context_lines;
+              return bridge.send("zoom", params);
+            }),
+          );
           return JSON.stringify(results);
         }
 

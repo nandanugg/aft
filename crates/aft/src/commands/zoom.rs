@@ -385,7 +385,14 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         },
     };
 
-    Response::success(&req.id, serde_json::to_value(&resp).unwrap())
+    match serde_json::to_value(&resp) {
+        Ok(resp_json) => Response::success(&req.id, resp_json),
+        Err(err) => Response::error(
+            &req.id,
+            "internal_error",
+            format!("zoom: failed to serialize response: {err}"),
+        ),
+    }
 }
 
 /// Convert a 0-based line + column to a byte offset in the source.

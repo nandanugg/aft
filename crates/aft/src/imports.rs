@@ -99,6 +99,14 @@ impl ImportBlock {
     }
 }
 
+fn import_byte_range(imports: &[ImportStatement]) -> Option<Range<usize>> {
+    imports.first().zip(imports.last()).map(|(first, last)| {
+        let start = first.byte_range.start;
+        let end = last.byte_range.end;
+        start..end
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Core API
 // ---------------------------------------------------------------------------
@@ -223,7 +231,9 @@ pub fn find_insertion_point(
         }
 
         // Shouldn't reach here if block is non-empty, but handle gracefully
-        let first_byte = block.imports.first().unwrap().byte_range.start;
+        let first_byte = import_byte_range(&block.imports)
+            .map(|range| range.start)
+            .unwrap_or(0);
         return (first_byte, false, true);
     }
 
@@ -251,7 +261,15 @@ pub fn find_insertion_point(
     }
 
     // Module path sorts after all existing imports in this group — insert at end
-    let last = group_imports.last().unwrap();
+    let Some(last) = group_imports.last() else {
+        return (
+            import_byte_range(&block.imports)
+                .map(|range| range.end)
+                .unwrap_or(0),
+            false,
+            false,
+        );
+    };
     let end = last.byte_range.end;
     let insert_at = skip_newline(source, end);
     (insert_at, false, false)
@@ -366,13 +384,7 @@ fn parse_ts_imports(source: &str, tree: &Tree) -> ImportBlock {
         }
     }
 
-    let byte_range = if imports.is_empty() {
-        None
-    } else {
-        let start = imports.first().unwrap().byte_range.start;
-        let end = imports.last().unwrap().byte_range.end;
-        Some(start..end)
-    };
+    let byte_range = import_byte_range(&imports);
 
     ImportBlock {
         imports,
@@ -876,13 +888,7 @@ fn parse_py_imports(source: &str, tree: &Tree) -> ImportBlock {
         }
     }
 
-    let byte_range = if imports.is_empty() {
-        None
-    } else {
-        let start = imports.first().unwrap().byte_range.start;
-        let end = imports.last().unwrap().byte_range.end;
-        Some(start..end)
-    };
+    let byte_range = import_byte_range(&imports);
 
     ImportBlock {
         imports,
@@ -1060,13 +1066,7 @@ fn parse_rs_imports(source: &str, tree: &Tree) -> ImportBlock {
         }
     }
 
-    let byte_range = if imports.is_empty() {
-        None
-    } else {
-        let start = imports.first().unwrap().byte_range.start;
-        let end = imports.last().unwrap().byte_range.end;
-        Some(start..end)
-    };
+    let byte_range = import_byte_range(&imports);
 
     ImportBlock {
         imports,
@@ -1207,13 +1207,7 @@ fn parse_go_imports(source: &str, tree: &Tree) -> ImportBlock {
         }
     }
 
-    let byte_range = if imports.is_empty() {
-        None
-    } else {
-        let start = imports.first().unwrap().byte_range.start;
-        let end = imports.last().unwrap().byte_range.end;
-        Some(start..end)
-    };
+    let byte_range = import_byte_range(&imports);
 
     ImportBlock {
         imports,

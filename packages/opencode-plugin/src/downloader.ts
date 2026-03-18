@@ -14,18 +14,10 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { PLATFORM_ASSET_MAP } from "./platform.js";
 
 const REPO = "ualtinok/aft";
 const TAG = "[aft-downloader]";
-
-/** Platform → GitHub release asset suffix */
-const PLATFORM_MAP: Record<string, string> = {
-  "darwin-arm64": "aft-darwin-arm64",
-  "darwin-x64": "aft-darwin-x64",
-  "linux-arm64": "aft-linux-arm64",
-  "linux-x64": "aft-linux-x64",
-  "win32-x64": "aft-win32-x64.exe",
-};
 
 /** Get the cache directory, respecting XDG_CACHE_HOME / LOCALAPPDATA. */
 export function getCacheDir(): string {
@@ -59,7 +51,7 @@ export function getCachedBinaryPath(): string | null {
  */
 export async function downloadBinary(version?: string): Promise<string | null> {
   const platformKey = `${process.platform}-${process.arch}`;
-  const assetName = PLATFORM_MAP[platformKey];
+  const assetName = PLATFORM_ASSET_MAP[platformKey];
 
   if (!assetName) {
     console.error(`${TAG} Unsupported platform: ${platformKey}`);
@@ -83,6 +75,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   }
 
   const downloadUrl = `https://github.com/${REPO}/releases/download/${tag}/${assetName}`;
+  const checksumUrl = `https://github.com/${REPO}/releases/download/${tag}/checksums.sha256`;
 
   console.error(`${TAG} Downloading AFT binary (${tag}) for ${platformKey}...`);
 
@@ -92,13 +85,40 @@ export async function downloadBinary(version?: string): Promise<string | null> {
       mkdirSync(cacheDir, { recursive: true });
     }
 
-    // Download
-    const response = await fetch(downloadUrl, { redirect: "follow" });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText} (${downloadUrl})`);
+    // Download binary and checksum file in parallel
+    const [binaryResponse, checksumResponse] = await Promise.all([
+      fetch(downloadUrl, { redirect: "follow" }),
+      fetch(checksumUrl, { redirect: "follow" }),
+    ]);
+
+    if (!binaryResponse.ok) {
+      throw new Error(
+        `HTTP ${binaryResponse.status}: ${binaryResponse.statusText} (${downloadUrl})`,
+      );
     }
 
-    const arrayBuffer = await response.arrayBuffer();
+    const arrayBuffer = await binaryResponse.arrayBuffer();
+
+    // Verify checksum if available
+    if (checksumResponse.ok) {
+      const checksumText = await checksumResponse.text();
+      const expectedHash = parseChecksumForAsset(checksumText, assetName);
+      if (expectedHash) {
+        const { createHash } = await import("node:crypto");
+        const actualHash = createHash("sha256").update(Buffer.from(arrayBuffer)).digest("hex");
+        if (actualHash !== expectedHash) {
+          throw new Error(
+            `Checksum mismatch for ${assetName}: expected ${expectedHash}, got ${actualHash}. ` +
+              "The binary may have been tampered with.",
+          );
+        }
+        console.error(`${TAG} Checksum verified (SHA-256: ${actualHash.slice(0, 16)}...)`);
+      } else {
+        console.error(`${TAG} Warning: checksums.sha256 found but no entry for ${assetName}`);
+      }
+    } else {
+      console.error(`${TAG} Warning: no checksums.sha256 found for ${tag}, skipping verification`);
+    }
 
     // Write to a temp file first, then rename (atomic-ish)
     const tmpPath = `${binaryPath}.tmp`;
@@ -142,6 +162,25 @@ export async function ensureBinary(version?: string): Promise<string | null> {
   const cached = getCachedBinaryPath();
   if (cached) return cached;
   return downloadBinary(version);
+}
+
+/**
+ * Parse a checksums.sha256 file (GNU coreutils format) and return the hash
+ * for the given asset name, or null if not found.
+ *
+ * Expected format: `<hex-hash>  <filename>` (two spaces between hash and name)
+ */
+function parseChecksumForAsset(checksumText: string, assetName: string): string | null {
+  for (const line of checksumText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // Format: "abc123...  aft-darwin-arm64"
+    const match = trimmed.match(/^([0-9a-f]{64})\s+(.+)$/);
+    if (match && match[2] === assetName) {
+      return match[1];
+    }
+  }
+  return null;
 }
 
 /** Fetch the latest release tag from GitHub API. */

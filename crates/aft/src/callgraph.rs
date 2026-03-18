@@ -742,9 +742,10 @@ impl CallGraph {
     /// Get all project files (lazily discovered).
     pub fn project_files(&mut self) -> &[PathBuf] {
         if self.project_files.is_none() {
-            self.project_files = Some(walk_project_files(&self.project_root).collect());
+            let project_root = self.project_root.clone();
+            self.project_files = Some(walk_project_files(&project_root).collect());
         }
-        self.project_files.as_ref().unwrap()
+        self.project_files.as_deref().unwrap_or(&[])
     }
 
     /// Build the reverse index by scanning all project files.
@@ -754,10 +755,7 @@ impl CallGraph {
     /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
     fn build_reverse_index(&mut self) {
         // Discover all project files first
-        if self.project_files.is_none() {
-            self.project_files = Some(walk_project_files(&self.project_root).collect());
-        }
-        let all_files: Vec<PathBuf> = self.project_files.as_ref().unwrap().clone();
+        let all_files = self.project_files().to_vec();
 
         // Build file data for all project files
         for f in &all_files {
@@ -918,6 +916,12 @@ impl CallGraph {
 
         let target_rel = self.relative_path(&canon);
         let effective_max = if max_depth == 0 { 10 } else { max_depth };
+        let reverse_index = self.reverse_index.as_ref().ok_or_else(|| AftError::ParseError {
+            message: format!(
+                "reverse index unavailable after building callers for {}",
+                canon.display()
+            ),
+        })?;
 
         // Get line/signature for the target symbol
         let (target_line, target_sig) = get_symbol_meta(&canon, symbol);
@@ -956,7 +960,9 @@ impl CallGraph {
                 continue;
             }
 
-            let (ref current_file, ref current_symbol, _, _) = path.last().unwrap().clone();
+            let Some((current_file, current_symbol, _, _)) = path.last().cloned() else {
+                continue;
+            };
 
             // Build per-path visited set from path elements
             let path_visited: HashSet<(PathBuf, String)> = path
@@ -965,7 +971,6 @@ impl CallGraph {
                 .collect();
 
             // Look up callers in reverse index
-            let reverse_index = self.reverse_index.as_ref().unwrap();
             let lookup_key = (current_file.clone(), current_symbol.clone());
             let callers = match reverse_index.get(&lookup_key) {
                 Some(sites) => sites.clone(),
@@ -1719,7 +1724,9 @@ impl CallGraph {
                 if has_local {
                     // Same-file call — get param info
                     let (params, _target_lang) = {
-                        let fd = self.data.get(file).unwrap();
+                        let Some(fd) = self.data.get(file) else {
+                            return;
+                        };
                         let meta = fd.symbol_metadata.get(&callee_name);
                         let sig = meta.and_then(|m| m.signature.clone());
                         let params = sig

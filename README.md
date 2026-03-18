@@ -40,8 +40,8 @@ ceremony required.
 ## How it Helps Agents
 
 **The token problem.** A 500-line file costs ~375 tokens to read. Most of the time, the agent
-needs one function. `read` with a `symbol` param returns that function plus a few lines of context:
-~40 tokens. Over a multi-step task, the savings compound fast.
+needs one function. `aft_zoom` with a `symbol` param returns that function plus a few lines of
+context: ~40 tokens. Over a multi-step task, the savings compound fast.
 
 **The fragile-edit problem.** Line-number edits break the moment anything above the target moves.
 `edit` in symbol mode addresses the function by name. The agent writes the new body; AFT finds
@@ -55,7 +55,7 @@ the symbol, replaces it, validates syntax, and runs the formatter. Nothing to co
 
 ## Features
 
-- **Unified read** — file read, symbol zoom, directory listing, and image/PDF detection in one tool
+- **File read** — line-numbered file content, directory listing, and image/PDF detection
 - **Semantic outline** — list all symbols in a file (or several files at once) with kind, name, line range, visibility
 - **Symbol editing** — replace a named symbol by name with auto-format and syntax validation
 - **Match editing** — find-and-replace by content with fuzzy fallback (4-pass: exact → trim trailing → trim both → normalize Unicode)
@@ -118,7 +118,7 @@ Here's a typical agent workflow:
 **2. Read the specific function:**
 
 ```json
-// read
+// aft_zoom
 { "filePath": "src/auth/session.ts", "symbol": "validateToken" }
 ```
 
@@ -154,7 +154,7 @@ These replace opencode's built-ins. Registered under the same names by default. 
 
 | Tool | Replaces | Description | Key Params |
 |------|----------|-------------|------------|
-| `read` | opencode read | File read, symbol zoom, directory listing, image/PDF detection | `filePath`, `symbol`, `symbols[]`, `start_line`, `end_line` |
+| `read` | opencode read | File read, directory listing, image/PDF detection | `filePath`, `start_line`, `end_line`, `offset`, `limit` |
 | `write` | opencode write | Write file with auto-dirs, backup, format, inline diagnostics | `filePath`, `content` |
 | `edit` | opencode edit | Find/replace, symbol replace, batch, transaction, glob | `filePath`, `oldString`, `newString`, `symbol`, `content`, `edits[]` |
 | `apply_patch` | opencode apply_patch | `*** Begin Patch` multi-file patch format | `patch` |
@@ -182,18 +182,28 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 
 ### read
 
-Unified file access. Four modes determined by the parameters you pass:
+Plain file reading and directory listing. Pass `filePath` to read a file, or a directory path to
+list its entries. Paginate large files with `start_line`/`end_line` or `offset`/`limit`.
 
-- **Read file** — `{ "filePath": "src/app.ts" }` — line-numbered content, paginates with `start_line`/`end_line`
-- **Inspect symbol** — `{ "filePath": "src/app.ts", "symbol": "handleRequest" }` — full source + call-graph annotations (`calls_out`, `called_by`)
-- **Inspect multiple symbols** — `{ "filePath": "src/app.ts", "symbols": ["Config", "createApp"] }` — more efficient than separate calls
-- **List directory** — `{ "filePath": "src/" }` — sorted entries, directories get trailing `/`
+```json
+// Read full file
+{ "filePath": "src/app.ts" }
 
-Binary files are auto-detected and return a size-only message. Image and PDF files return metadata
-suitable for UI preview. Output is capped at 50KB — use `start_line`/`end_line` to page.
+// Read lines 50-100
+{ "filePath": "src/app.ts", "start_line": 50, "end_line": 100 }
 
-For **Markdown**: use the heading text as the symbol name (e.g. `"symbol": "Architecture"`) to
-read the entire section.
+// Read 30 lines from line 200
+{ "filePath": "src/app.ts", "offset": 200, "limit": 30 }
+
+// List directory
+{ "filePath": "src/" }
+```
+
+Returns line-numbered content (e.g. `1: const x = 1`). Directories return sorted entries with
+trailing `/` for subdirectories. Binary files return a size-only message. Image and PDF files
+return metadata suitable for UI preview. Output is capped at 50KB.
+
+For symbol inspection with call-graph annotations, use `aft_zoom`.
 
 ---
 

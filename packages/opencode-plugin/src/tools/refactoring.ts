@@ -2,6 +2,14 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { queryLspHints } from "../lsp.js";
 import type { PluginContext } from "../types.js";
+import {
+  askEditPermission,
+  permissionDeniedResponse,
+  resolveAbsolutePath,
+  resolveRelativePattern,
+  resolveRelativePatterns,
+  workspacePattern,
+} from "./permissions.js";
 
 const z = tool.schema;
 
@@ -66,6 +74,23 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
+        const isDryRun = args.dry_run === true;
+
+        if (!isDryRun) {
+          const filePath = resolveAbsolutePath(context, args.file as string);
+          const patterns =
+            op === "move"
+              ? resolveRelativePatterns(context, [
+                  workspacePattern(context),
+                  args.file as string,
+                  ...(typeof args.destination === "string" ? [args.destination] : []),
+                ])
+              : [resolveRelativePattern(context, args.file as string)];
+          const metadata = patterns.length === 1 ? { filepath: filePath } : {};
+          const permissionError = await askEditPermission(context, patterns, metadata);
+          if (permissionError) return permissionDeniedResponse(permissionError);
+        }
+
         const commandMap: Record<string, string> = {
           move: "move_symbol",
           extract: "extract_function",

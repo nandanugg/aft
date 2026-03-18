@@ -1,3 +1,4 @@
+/// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
 import { LSP_SYMBOL_KIND_MAP, queryLspHints } from "../lsp.js";
 
@@ -20,7 +21,7 @@ function createMockClient(options: {
   }>;
   lspError?: Error;
   symbolsError?: Error;
-}) {
+}): any {
   return {
     lsp: {
       status: async () => {
@@ -29,12 +30,12 @@ function createMockClient(options: {
       },
     },
     find: {
-      symbols: async (_opts: any) => {
+      symbols: async (_opts: unknown) => {
         if (options.symbolsError) throw options.symbolsError;
         return { data: options.symbols ?? [] };
       },
     },
-  } as any;
+  };
 }
 
 describe("queryLspHints", () => {
@@ -256,16 +257,16 @@ describe("queryLspHints", () => {
   });
 
   test("passes directory parameter when provided", async () => {
-    let capturedQuery: any = null;
-    const client = {
+    let capturedQuery: Record<string, unknown> | null = null;
+    const client: any = {
       lsp: {
         status: async () => ({
           data: [{ id: "ts", name: "typescript", root: "/project", status: "connected" }],
         }),
       },
       find: {
-        symbols: async (opts: any) => {
-          capturedQuery = opts.query;
+        symbols: async (opts: { query: { query: string; directory?: string } }) => {
+          capturedQuery = opts;
           return {
             data: [
               {
@@ -280,10 +281,12 @@ describe("queryLspHints", () => {
           };
         },
       },
-    } as any;
+    };
 
     await queryLspHints(client, "hello", "/project/src");
-    expect(capturedQuery).toEqual({ query: "hello", directory: "/project/src" });
+    expect(capturedQuery).toEqual({
+      query: { query: "hello", directory: "/project/src" },
+    });
   });
 });
 

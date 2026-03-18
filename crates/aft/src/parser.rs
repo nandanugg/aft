@@ -268,7 +268,9 @@ impl FileParser {
             );
         }
 
-        let cached = self.cache.get(&canon).unwrap();
+        let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
+            message: format!("parser cache missing entry for {}", path.display()),
+        })?;
         Ok((&cached.tree, lang))
     }
 

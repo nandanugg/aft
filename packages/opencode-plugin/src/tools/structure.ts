@@ -1,6 +1,12 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
+import {
+  askEditPermission,
+  permissionDeniedResponse,
+  resolveAbsolutePath,
+  resolveRelativePattern,
+} from "./permissions.js";
 
 const z = tool.schema;
 
@@ -88,6 +94,18 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
+        const isDryRun = args.dry_run === true;
+
+        if (!isDryRun) {
+          const filePath = resolveAbsolutePath(context, args.file as string);
+          const permissionError = await askEditPermission(
+            context,
+            [resolveRelativePattern(context, args.file as string)],
+            { filepath: filePath },
+          );
+          if (permissionError) return permissionDeniedResponse(permissionError);
+        }
+
         const params: Record<string, unknown> = { file: args.file };
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dry_run !== undefined) params.dry_run = args.dry_run;

@@ -140,7 +140,18 @@ function parseUpdateFileChunks(
   return { chunks, nextIdx: i };
 }
 
+/** Maximum patch text size in bytes to prevent memory exhaustion. */
+const MAX_PATCH_SIZE = 1024 * 1024; // 1 MB
+/** Maximum number of hunks (file operations) per patch. */
+const MAX_HUNKS = 500;
+
 export function parsePatch(patchText: string): Hunk[] {
+  if (patchText.length > MAX_PATCH_SIZE) {
+    throw new Error(
+      `Patch too large: ${patchText.length} bytes exceeds limit of ${MAX_PATCH_SIZE} bytes`,
+    );
+  }
+
   const cleaned = stripHeredoc(patchText.trim());
   const lines = cleaned.split("\n");
   const hunks: Hunk[] = [];
@@ -159,6 +170,10 @@ export function parsePatch(patchText: string): Hunk[] {
     if (!header) {
       i++;
       continue;
+    }
+
+    if (hunks.length >= MAX_HUNKS) {
+      throw new Error(`Patch exceeds maximum of ${MAX_HUNKS} file operations`);
     }
 
     if (lines[i].startsWith("*** Add File:")) {

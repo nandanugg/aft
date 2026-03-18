@@ -181,19 +181,48 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let end_byte = edit::line_col_to_byte(&source, target.range.end_line, target.range.end_col);
 
     // Apply operation
+    let replacement_content = if operation == "replace" {
+        match content {
+            Some(content) => Some(content),
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "edit_symbol: 'content' is required for operation 'replace'",
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let insertion_content = if operation == "insert_before" || operation == "insert_after" {
+        match content {
+            Some(content) => Some(content),
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!("edit_symbol: 'content' is required for operation '{}'", operation),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let new_source = match operation {
         "replace" => {
-            let replacement = content.unwrap();
+            let replacement = replacement_content.unwrap_or_default();
             edit::replace_byte_range(&source, start_byte, end_byte, replacement)
         }
         "delete" => edit::replace_byte_range(&source, start_byte, end_byte, ""),
         "insert_before" => {
-            let insertion = content.unwrap();
+            let insertion = insertion_content.unwrap_or_default();
             let insert_text = format!("{}\n", insertion);
             edit::replace_byte_range(&source, start_byte, start_byte, &insert_text)
         }
         "insert_after" => {
-            let insertion = content.unwrap();
+            let insertion = insertion_content.unwrap_or_default();
             let insert_text = format!("\n{}", insertion);
             edit::replace_byte_range(&source, end_byte, end_byte, &insert_text)
         }
@@ -241,7 +270,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Compute new range for replace and insert operations
     let new_range = match operation {
         "replace" => {
-            let replacement = content.unwrap();
+            let replacement = replacement_content.unwrap_or_default();
             let new_lines = replacement.lines().count() as u32;
             let last_line_len = replacement
                 .lines()
@@ -285,7 +314,9 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if let Some(ref nr) = new_range {
-        result["new_range"] = serde_json::to_value(&nr).unwrap();
+        if let Ok(new_range_json) = serde_json::to_value(nr) {
+            result["new_range"] = new_range_json;
+        }
     }
 
     if let Some(ref id) = backup_id {

@@ -110,7 +110,11 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             aft::commands::lsp_prepare_rename::handle_lsp_prepare_rename(&req, ctx)
         }
         "lsp_rename" => aft::commands::lsp_rename::handle_lsp_rename(&req, ctx),
-        // Test-only: populate the backup store through the protocol (no write/edit_symbol yet)
+        // NOTE: "snapshot" must remain in the production binary because integration tests in
+        // crates/aft/tests/integration/ spawn the compiled binary as a subprocess and send
+        // "snapshot" commands through the stdin/stdout protocol. A #[cfg(test)] gate would
+        // only affect unit-test compilation and would not exclude this arm from the binary
+        // that integration tests execute. See: crates/aft/tests/integration/safety_test.rs
         "snapshot" => handle_snapshot(&req, ctx),
         _ => {
             eprintln!("[aft] unknown command: {}", req.command);

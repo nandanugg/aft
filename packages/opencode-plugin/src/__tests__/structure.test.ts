@@ -1,3 +1,4 @@
+/// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,7 +25,7 @@ function createMockClient(): any {
 
 /** Helper to create a ToolContext with a mock (no-op LSP) client. */
 function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient() };
+  return { pool, client: createMockClient(), config: {} as any };
 }
 
 /** Mock SDK ToolContext for test execute calls. */
@@ -43,7 +44,7 @@ function createMockSdkContext(directory: string): ToolContext {
 
 /** Create a fake PluginContext for registration-only tests (no real pool). */
 function fakePluginContext(): PluginContext {
-  return { pool: {} as BridgePool, client: createMockClient() };
+  return { pool: {} as BridgePool, client: createMockClient(), config: {} as any };
 }
 
 describe("Structure tool registrations", () => {

@@ -1,15 +1,10 @@
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ensureBinary, getCachedBinaryPath } from "./downloader.js";
-
-/** Supported platform package mapping: `process.platform`-`process.arch` → npm package suffix. */
-const PLATFORM_MAP: Record<string, Record<string, string>> = {
-  darwin: { arm64: "darwin-arm64", x64: "darwin-x64" },
-  linux: { arm64: "linux-arm64", x64: "linux-x64" },
-  win32: { x64: "win32-x64" },
-};
+import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 /**
  * Map the current `process.platform` and `process.arch` to the npm platform
@@ -25,11 +20,11 @@ export function platformKey(
   platform: string = process.platform,
   arch: string = process.arch,
 ): string {
-  const archMap = PLATFORM_MAP[platform];
+  const archMap = PLATFORM_ARCH_MAP[platform];
   if (!archMap) {
     throw new Error(
       `Unsupported platform: ${platform} (arch: ${arch}). ` +
-        `Supported platforms: ${Object.keys(PLATFORM_MAP).join(", ")}`,
+        `Supported platforms: ${Object.keys(PLATFORM_ARCH_MAP).join(", ")}`,
     );
   }
   const key = archMap[arch];
@@ -62,7 +57,8 @@ export function findBinarySync(): string | null {
   try {
     const key = platformKey();
     const packageBin = `@cortexkit/aft-${key}/bin/aft${ext}`;
-    const resolved = require.resolve(packageBin);
+    const req = createRequire(import.meta.url);
+    const resolved = req.resolve(packageBin);
     if (existsSync(resolved)) return resolved;
   } catch {
     // npm package not installed or resolution failed

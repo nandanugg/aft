@@ -1,3 +1,4 @@
+/// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -33,7 +34,7 @@ function createMockClient(): any {
 
 /** Helper to create a PluginContext with a pool and a mock client. */
 function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient() };
+  return { pool, client: createMockClient(), config: {} as any };
 }
 
 /** Mock SDK ToolContext for test execute calls. */
@@ -85,7 +86,7 @@ describe("Tool round-trips", () => {
     expect(result.entries.length).toBeGreaterThan(0);
 
     // Verify known symbols from the fixture
-    const names = result.entries.map((e: any) => e.name);
+    const names = result.entries.map((e: { name: string }) => e.name);
     expect(names).toContain("greet");
     expect(names).toContain("add");
     expect(names).toContain("UserService");
@@ -95,7 +96,7 @@ describe("Tool round-trips", () => {
     expect(names).toContain("internalHelper");
 
     // Verify structure of an entry
-    const greetEntry = result.entries.find((e: any) => e.name === "greet");
+    const greetEntry = result.entries.find((e: { name: string }) => e.name === "greet");
     expect(greetEntry.kind).toBe("function");
     expect(greetEntry.exported).toBe(true);
     expect(greetEntry.range).toBeDefined();

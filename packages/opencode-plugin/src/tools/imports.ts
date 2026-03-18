@@ -1,6 +1,12 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
+import {
+  askEditPermission,
+  permissionDeniedResponse,
+  resolveAbsolutePath,
+  resolveRelativePattern,
+} from "./permissions.js";
 
 const z = tool.schema;
 
@@ -55,6 +61,18 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
+        const isDryRun = args.dry_run === true;
+
+        if (!isDryRun) {
+          const filePath = resolveAbsolutePath(context, args.file as string);
+          const permissionError = await askEditPermission(
+            context,
+            [resolveRelativePattern(context, args.file as string)],
+            { filepath: filePath },
+          );
+          if (permissionError) return permissionDeniedResponse(permissionError);
+        }
+
         const commandMap: Record<string, string> = {
           add: "add_import",
           remove: "remove_import",

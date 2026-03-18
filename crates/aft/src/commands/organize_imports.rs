@@ -114,7 +114,19 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     let new_import_text = generate_organized_block(&grouped, lang);
 
     // --- Replace import region ---
-    let import_range = block.byte_range.as_ref().unwrap();
+    let import_range = match block.byte_range.as_ref() {
+        Some(range) => range,
+        None => {
+            return Response::error(
+                &req.id,
+                "parse_error",
+                format!(
+                    "organize_imports: missing import byte range for {} despite parsed imports",
+                    file
+                ),
+            );
+        }
+    };
     let new_source = format!(
         "{}{}{}",
         &source[..import_range.start],

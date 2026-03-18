@@ -10,6 +10,12 @@ const z = tool.schema;
 
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
+import {
+  askEditPermission,
+  resolveAbsolutePath,
+  resolveRelativePatterns,
+  workspacePattern,
+} from "./permissions.js";
 
 /** Show output in opencode UI via metadata callback. */
 function showOutputToUser(context: unknown, output: string): void {
@@ -175,6 +181,32 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
+      const isDryRun = args.dryRun !== false;
+
+      if (!isDryRun) {
+        const explicitPaths = Array.isArray(args.paths)
+          ? resolveRelativePatterns(context, args.paths as string[])
+          : [];
+        const positiveGlobs = Array.isArray(args.globs)
+          ? (args.globs as string[]).filter((glob) => !glob.startsWith("!"))
+          : [];
+        const patterns = [...explicitPaths, ...positiveGlobs];
+        const metadata =
+          explicitPaths.length === 1 && positiveGlobs.length === 0 && Array.isArray(args.paths)
+            ? { filepath: resolveAbsolutePath(context, (args.paths as string[])[0] as string) }
+            : {};
+        const permissionError = await askEditPermission(
+          context,
+          patterns.length > 0 ? patterns : [workspacePattern(context)],
+          metadata,
+        );
+        if (permissionError) {
+          const output = `Permission denied: ${permissionError}`;
+          showOutputToUser(context, output);
+          return output;
+        }
+      }
+
       const params: Record<string, unknown> = {
         pattern: args.pattern,
         rewrite: args.rewrite,
@@ -192,7 +224,6 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         files_searched?: number;
       };
 
-      const isDryRun = args.dryRun !== false;
       const matchCount = data.total_matches ?? data.matches?.length ?? 0;
       const filesSearched = data.files_searched ?? 0;
 

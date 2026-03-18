@@ -284,6 +284,12 @@ jobs:
           cp artifacts/win32-x64/aft.exe release-assets/aft-win32-x64.exe
           chmod +x release-assets/aft-*
 
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          shasum -a 256 aft-* > checksums.sha256
+          cat checksums.sha256
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

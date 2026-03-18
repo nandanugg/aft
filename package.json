@@ -2,7 +2,7 @@
   "private": true,
   "workspaces": ["packages/*", "benchmarks"],
   "author": "ualtinok",
-  "license": "SUL-1.0",
+  "license": "MIT",
   "scripts": {
     "build": "bun run --filter '*' build",
     "build:rust": "cargo build --release",
