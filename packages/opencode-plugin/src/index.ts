@@ -1,6 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { loadAftConfig } from "./config.js";
 import { consumeToolMetadata } from "./metadata-store.js";
+import { normalizeToolMap } from "./normalize-schemas.js";
 import { BridgePool } from "./pool.js";
 import { findBinary } from "./resolver.js";
 import { astTools } from "./tools/ast.js";
@@ -52,7 +53,9 @@ const plugin: Plugin = async (input) => {
   const ctx: PluginContext = { pool, client: input.client, config: aftConfig };
 
   return {
-    tool: {
+    // normalizeToolMap patches _zod.toJSONSchema so that .describe() and .meta()
+    // survive cross-Zod-instance serialization (host Zod ≠ plugin Zod).
+    tool: normalizeToolMap({
       // When hoisting enabled (default): override opencode built-ins (read, write, edit, apply_patch)
       // When disabled: register with aft_ prefix (aft_read, aft_write, aft_edit, aft_apply_patch)
       ...(aftConfig.hoist_builtin_tools !== false ? hoistedTools(ctx) : aftPrefixedTools(ctx)),
@@ -65,7 +68,7 @@ const plugin: Plugin = async (input) => {
       ...astTools(ctx),
       ...refactoringTools(ctx),
       ...lspTools(ctx),
-    },
+    }),
     // Restore metadata that fromPlugin() overwrites (opencode bug workaround)
     "tool.execute.after": async (
       input: { tool: string; sessionID: string; callID: string },
