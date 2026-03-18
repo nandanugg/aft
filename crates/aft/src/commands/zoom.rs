@@ -84,7 +84,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let lines: Vec<&str> = source.lines().collect();
+    let lines: Vec<String> = source.lines().map(|l| l.to_string()).collect();
 
     // Line-range mode: read arbitrary lines without requiring a symbol.
     match (start_line, end_line) {
@@ -245,17 +245,30 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     let start = target.range.start_line as usize;
     let end = target.range.end_line as usize;
 
-    // Extract symbol body (0-based line indices)
-    let content = if end < lines.len() {
-        lines[start..=end].join("\n")
+    // When re-export following resolved to a different file, re-read that file's lines
+    let resolved_file_path = std::path::Path::new(&matches[0].file);
+    let resolved_lines: Vec<String>;
+    let effective_lines: &[String] = if resolved_file_path != path {
+        resolved_lines = match std::fs::read_to_string(resolved_file_path) {
+            Ok(src) => src.lines().map(|l| l.to_string()).collect(),
+            Err(_) => lines.clone(),
+        };
+        &resolved_lines
     } else {
-        lines[start..].join("\n")
+        &lines
+    };
+
+    // Extract symbol body (0-based line indices)
+    let content = if end < effective_lines.len() {
+        effective_lines[start..=end].join("\n")
+    } else {
+        effective_lines[start..].join("\n")
     };
 
     // Context before
     let ctx_start = start.saturating_sub(context_lines);
     let context_before: Vec<String> = if ctx_start < start {
-        lines[ctx_start..start]
+        effective_lines[ctx_start..start]
             .iter()
             .map(|l| l.to_string())
             .collect()
@@ -264,9 +277,9 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Context after
-    let ctx_end = (end + 1 + context_lines).min(lines.len());
-    let context_after: Vec<String> = if end + 1 < lines.len() {
-        lines[(end + 1)..ctx_end]
+    let ctx_end = (end + 1 + context_lines).min(effective_lines.len());
+    let context_after: Vec<String> = if end + 1 < effective_lines.len() {
+        effective_lines[(end + 1)..ctx_end]
             .iter()
             .map(|l| l.to_string())
             .collect()
@@ -274,8 +287,8 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         vec![]
     };
 
-    // Get all symbols in file for call matching
-    let all_symbols = match ctx.provider().list_symbols(path) {
+    // Get all symbols in the resolved file for call matching
+    let all_symbols = match ctx.provider().list_symbols(resolved_file_path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -284,9 +297,9 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
 
-    // Parse AST for call extraction
+    // Parse AST for call extraction (use resolved file for cross-file re-exports)
     let mut parser = FileParser::new();
-    let (tree, lang) = match parser.parse(path) {
+    let (tree, lang) = match parser.parse(resolved_file_path) {
         Ok(r) => r,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -294,12 +307,24 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // calls_out: calls within the target symbol's byte range
-    let target_byte_start =
-        line_col_to_byte(&source, target.range.start_line, target.range.start_col);
-    let target_byte_end = line_col_to_byte(&source, target.range.end_line, target.range.end_col);
+    let resolved_source = if resolved_file_path != path {
+        std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.clone())
+    } else {
+        source.clone()
+    };
+    let target_byte_start = line_col_to_byte(
+        &resolved_source,
+        target.range.start_line,
+        target.range.start_col,
+    );
+    let target_byte_end = line_col_to_byte(
+        &resolved_source,
+        target.range.end_line,
+        target.range.end_col,
+    );
 
     let raw_calls = extract_calls_in_range(
-        &source,
+        &resolved_source,
         tree.root_node(),
         target_byte_start,
         target_byte_end,
@@ -317,10 +342,12 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         if sym.name == target.name && sym.range.start_line == target.range.start_line {
             continue; // skip self
         }
-        let sym_byte_start = line_col_to_byte(&source, sym.range.start_line, sym.range.start_col);
-        let sym_byte_end = line_col_to_byte(&source, sym.range.end_line, sym.range.end_col);
+        let sym_byte_start =
+            line_col_to_byte(&resolved_source, sym.range.start_line, sym.range.start_col);
+        let sym_byte_end =
+            line_col_to_byte(&resolved_source, sym.range.end_line, sym.range.end_col);
         let calls = extract_calls_in_range(
-            &source,
+            &resolved_source,
             tree.root_node(),
             sym_byte_start,
             sym_byte_end,
