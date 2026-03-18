@@ -156,7 +156,7 @@ These replace opencode's built-ins. Registered under the same names by default. 
 |------|----------|-------------|------------|
 | `read` | opencode read | File read, symbol zoom, directory listing, image/PDF detection | `filePath`, `symbol`, `symbols[]`, `start_line`, `end_line` |
 | `write` | opencode write | Write file with auto-dirs, backup, format, inline diagnostics | `filePath`, `content` |
-| `edit` | opencode edit | Find/replace, symbol replace, batch, transaction, glob | `filePath`, `match`, `replacement`, `symbol`, `content`, `edits[]` |
+| `edit` | opencode edit | Find/replace, symbol replace, batch, transaction, glob | `filePath`, `oldString`, `newString`, `symbol`, `content`, `edits[]` |
 | `apply_patch` | opencode apply_patch | `*** Begin Patch` multi-file patch format | `patch` |
 | `ast_grep_search` | oh-my-opencode ast_grep_search | AST pattern search with meta-variables | `pattern`, `lang`, `paths[]`, `globs[]` |
 | `ast_grep_replace` | oh-my-opencode ast_grep_replace | AST pattern replace (dry-run by default) | `pattern`, `rewrite`, `lang`, `dryRun` |
@@ -168,7 +168,8 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 
 | Tool | Description | Key Params |
 |------|-------------|------------|
-| `aft_outline` | Structural outline of a file (symbols, Markdown headings) | `file`, `files[]` |
+| `aft_outline` | Structural outline of a file, files, or directory | `file`, `files[]`, `directory` |
+| `aft_zoom` | Inspect symbols with call-graph annotations | `filePath`, `symbol`, `symbols[]`, `start_line`, `end_line` |
 | `aft_delete` | Delete a file with backup | `file` |
 | `aft_move` | Move or rename a file with backup | `file`, `destination` |
 | `aft_navigate` | Call graph and data-flow navigation | `mode`, `file`, `symbol`, `depth` |
@@ -216,15 +217,15 @@ For partial edits (find/replace), use `edit` instead.
 
 The main editing tool. Mode is determined by which parameters you pass:
 
-**Find and replace** — pass `filePath` + `match` + `replacement`:
+**Find and replace** — pass `filePath` + `oldString` + `newString`:
 
 ```json
-{ "filePath": "src/config.ts", "match": "const TIMEOUT = 5000", "replacement": "const TIMEOUT = 10000" }
+{ "filePath": "src/config.ts", "oldString": "const TIMEOUT = 5000", "newString": "const TIMEOUT = 10000" }
 ```
 
 Matching uses a 4-pass fuzzy fallback: exact match first, then trailing-whitespace trim, then
 both-ends trim, then Unicode normalization. Returns an error if multiple matches exist — use
-`occurrence: N` (0-indexed) to pick one, or `replace_all: true` to replace all.
+`occurrence: N` (0-indexed) to pick one, or `replaceAll: true` to replace all.
 
 **Symbol replace** — pass `filePath` + `symbol` + `content`:
 
@@ -244,7 +245,7 @@ Includes decorators, doc comments, and attributes in the replacement range.
 {
   "filePath": "src/constants.ts",
   "edits": [
-    { "match": "VERSION = '1.0'", "replacement": "VERSION = '2.0'" },
+    { "oldString": "VERSION = '1.0'", "newString": "VERSION = '2.0'" },
     { "line_start": 5, "line_end": 7, "content": "// updated header\n" }
   ]
 }
@@ -263,14 +264,15 @@ Set `content` to `""` to delete lines. Per-edit `occurrence` is supported.
 }
 ```
 
-**Glob replace** — use a glob as `filePath` with `replace_all: true`:
+**Glob replace** — use a glob as `filePath` with `replaceAll: true`:
 
 ```json
-{ "filePath": "src/**/*.ts", "match": "oldName", "replacement": "newName", "replace_all": true }
+{ "filePath": "src/**/*.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }
 ```
 
-All modes support `dry_run: true` to preview as a diff without modifying files, and
-`diagnostics: true` to get inline LSP errors after the edit.
+All modes support `dry_run: true` to preview as a diff without modifying files. LSP diagnostics
+are returned automatically after every edit (unless `dry_run` is set) — if type errors are
+introduced, they appear inline in the response.
 
 ---
 
@@ -293,6 +295,7 @@ renames files atomically — if any operation fails, all revert.
 ```
 
 Context anchors (`@@`) use fuzzy matching to handle whitespace and Unicode differences.
+Returns LSP diagnostics inline for any updated files that introduce type errors.
 
 ---
 
@@ -353,8 +356,8 @@ Returns `{ file, line, column, severity, message, code }` per diagnostic.
 ### aft_outline
 
 Returns all top-level symbols in a file with their kind, name, line range, visibility, and nested
-`members` (methods in classes, sub-headings in Markdown). Accepts either a single `file` or a
-`files` array to outline multiple files in one call.
+`members` (methods in classes, sub-headings in Markdown). Accepts a single `file`, a `files`
+array, or a `directory` to outline all source files recursively.
 
 For **Markdown** files (`.md`, `.mdx`): returns heading hierarchy with section ranges — each
 heading becomes a symbol you can read by name.
@@ -362,7 +365,33 @@ heading becomes a symbol you can read by name.
 ```json
 // Outline two files at once
 { "files": ["src/server.ts", "src/router.ts"] }
+
+// Outline all source files in a directory
+{ "directory": "src/auth" }
 ```
+
+---
+
+### aft_zoom
+
+Inspect code symbols with call-graph annotations. Returns the full source of named symbols with
+`calls_out` (what it calls) and `called_by` (what calls it) annotations.
+
+Use this when you need to understand a specific function, class, or type in detail — not for
+reading entire files (use `read` for that). Also supports line-range reads with context.
+
+```json
+// Inspect a single symbol
+{ "filePath": "src/app.ts", "symbol": "handleRequest" }
+
+// Inspect multiple symbols in one call
+{ "filePath": "src/app.ts", "symbols": ["Config", "createApp"] }
+
+// Read a line range with context
+{ "filePath": "src/app.ts", "start_line": 50, "end_line": 100 }
+```
+
+For Markdown files, use the heading text as the symbol name (e.g. `"symbol": "Architecture"`).
 
 ---
 
