@@ -55,7 +55,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "Each entry includes 'name', 'kind' (function/class/struct/heading/etc), 'range', 'signature', and 'members' (nested children like methods in classes or sub-headings in markdown).\n" +
         "For Markdown files (.md, .mdx): returns heading hierarchy — h1/h2/h3 as nested symbols with section ranges covering all content until the next same-level heading.\n\n" +
         "Provide exactly one of 'filePath', 'files', or 'directory'. Use 'files' to batch multiple outlines in one tool call.\n" +
-        "Supported languages: TypeScript, JavaScript, TSX, Python, Rust, Go, Ruby, C, C++, C#, Java, Kotlin, Scala, Swift, Lua, Elixir, Haskell, Solidity, Nix, Markdown, CSS, HTML, JSON, YAML, Bash.\n\n" +
+        "Supported languages: TypeScript, JavaScript, TSX, Python, Rust, Go, Ruby, C, C++, C#, Java, Kotlin, Scala, Swift, Lua, Elixir, Haskell, Solidity, Nix, Markdown, CSS, HTML, JSON, YAML, Bash.\n" +
+        "Directory mode skips node_modules, .git, dist, build, and dot-prefixed directories.\n\n" +
         "Returns: Single file { entries: [{ name, kind, range, signature?, exported, members }] }. Multi-file/directory { results: [{ file, ok, entries? }] }.",
       args: {
         filePath: z
@@ -79,6 +80,11 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
+
+        const filesArg = Array.isArray(args.files) ? (args.files as unknown[]) : undefined;
+        if (!args.filePath && !filesArg?.length && !args.directory) {
+          throw new Error("Provide exactly one of 'filePath', 'files', or 'directory'");
+        }
 
         // Directory mode: discover source files recursively and batch outline
         if (typeof args.directory === "string") {

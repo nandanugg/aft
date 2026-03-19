@@ -101,11 +101,13 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       offset: z
         .number()
         .optional()
-        .describe("1-based line number to start reading from (use with limit)"),
+        .describe(
+          "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+        ),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
-      const file = (args.filePath ?? args.file) as string;
+      const file = args.filePath as string;
 
       // Resolve relative paths
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
@@ -227,7 +229,8 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 // WRITE tool
 // ---------------------------------------------------------------------------
 
-const WRITE_DESCRIPTION = `Write content to a file, creating it (and parent directories) if needed.
+function getWriteDescription(editToolName: string): string {
+  return `Write content to a file, creating it (and parent directories) if needed.
 
 Automatically creates parent directories. Backs up existing files before overwriting.
 If the project has a formatter configured (biome, prettier, rustfmt, etc.), the file
@@ -239,13 +242,14 @@ is auto-formatted after writing. Returns inline LSP diagnostics when available.
 - Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
 - Returns LSP diagnostics inline if type errors are introduced
 - Use this for creating new files or completely replacing file contents
-- For partial edits (find/replace), use the \`edit\` tool instead
+- For partial edits (find/replace), use the \`${editToolName}\` tool instead
 
 Returns: Status message string (for example: "Created new file. Auto-formatted.") with optional inline LSP error lines.`;
+}
 
-function createWriteTool(ctx: PluginContext): ToolDefinition {
+function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
   return {
-    description: WRITE_DESCRIPTION,
+    description: getWriteDescription(editToolName),
     args: {
       filePath: z
         .string()
@@ -254,7 +258,7 @@ function createWriteTool(ctx: PluginContext): ToolDefinition {
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
-      const file = (args.filePath ?? args.file) as string;
+      const file = args.filePath as string;
       const content = args.content as string;
 
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
@@ -326,42 +330,43 @@ function createWriteTool(ctx: PluginContext): ToolDefinition {
 // EDIT tool
 // ---------------------------------------------------------------------------
 
-const EDIT_DESCRIPTION = `Edit a file by finding and replacing text, or by targeting named symbols.
+function getEditDescription(writeToolName: string): string {
+  return `Edit a file by finding and replacing text, or by targeting named symbols.
 
 **Modes** (determined by which parameters you provide):
 
-Mode priority: operations > edits > symbol (without oldString) > oldString (find/replace) > content-only (write)
+Mode priority: operations > edits > symbol (without oldString) > oldString (find/replace) > content-only (${writeToolName})
 
-1. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
-   Finds the exact text in \`oldString\` and replaces it with \`newString\`.
-   Supports fuzzy matching (handles whitespace differences automatically).
-   If multiple matches exist, specify which one with \`occurrence\` or use \`replaceAll: true\`.
-   Example: \`{ "filePath": "src/app.ts", "oldString": "const x = 1", "newString": "const x = 2" }\`
+1. **Multi-file transaction** — pass \`operations\` array
+   Edits across multiple files with checkpoint-based rollback on failure.
+   Each operation: \`{ "file": "path", "command": "edit_match" | "write", ... }\`.
+   For \`edit_match\`: include \`match\`, \`replacement\`. For \`write\`: include \`content\`.
+   Example: \`{ "operations": [{ "file": "a.ts", "command": "edit_match", "match": "old", "replacement": "new" }, { "file": "b.ts", "command": "write", "content": "..." }] }\`
 
-2. **Replace all occurrences** — add \`replaceAll: true\`
-   Replaces every occurrence of \`oldString\` in the file.
-   Example: \`{ "filePath": "src/app.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }\`
-
-3. **Select specific occurrence** — add \`occurrence: N\` (0-indexed)
-   When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).
-   Example: \`{ "filePath": "src/app.ts", "oldString": "TODO", "newString": "DONE", "occurrence": 0 }\`
-
-4. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
-   Replaces an entire named symbol (function, class, type) with new content.
-   Includes decorators, attributes, and doc comments in the replacement range.
-   Example: \`{ "filePath": "src/app.ts", "symbol": "handleRequest", "content": "function handleRequest() { ... }" }\`
-
-5. **Batch edits** — pass \`filePath\` + \`edits\` array
+2. **Batch edits** — pass \`filePath\` + \`edits\` array
    Multiple edits in one file atomically. Each edit is either:
    - \`{ "oldString": "old", "newString": "new" }\` — find/replace
    - \`{ "startLine": 5, "endLine": 7, "content": "new lines" }\` — replace line range (1-based, both inclusive)
    Set content to empty string to delete lines.
 
-6. **Multi-file transaction** — pass \`operations\` array
-   Edits across multiple files with checkpoint-based rollback on failure.
-   Each operation: \`{ "file": "path", "command": "edit_match" | "write", ... }\`.
-   For \`edit_match\`: include \`match\`, \`replacement\`. For \`write\`: include \`content\`.
-   Example: \`{ "operations": [{ "file": "a.ts", "command": "edit_match", "match": "old", "replacement": "new" }, { "file": "b.ts", "command": "write", "content": "..." }] }\`
+3. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
+   Replaces an entire named symbol (function, class, type) with new content.
+   Includes decorators, attributes, and doc comments in the replacement range.
+   Example: \`{ "filePath": "src/app.ts", "symbol": "handleRequest", "content": "function handleRequest() { ... }" }\`
+
+4. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
+   Finds the exact text in \`oldString\` and replaces it with \`newString\`.
+   Supports fuzzy matching (handles whitespace differences automatically).
+   If multiple matches exist, specify which one with \`occurrence\` or use \`replaceAll: true\`.
+   Example: \`{ "filePath": "src/app.ts", "oldString": "const x = 1", "newString": "const x = 2" }\`
+
+5. **Replace all occurrences** — add \`replaceAll: true\`
+   Replaces every occurrence of \`oldString\` in the file.
+   Example: \`{ "filePath": "src/app.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }\`
+
+6. **Select specific occurrence** — add \`occurrence: N\` (0-indexed)
+   When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).
+   Example: \`{ "filePath": "src/app.ts", "oldString": "TODO", "newString": "DONE", "occurrence": 0 }\`
 
 **Behavior:**
 - Backs up files before editing (recoverable via aft_safety undo)
@@ -371,10 +376,11 @@ Mode priority: operations > edits > symbol (without oldString) > oldString (find
 - LSP diagnostics are returned automatically after non-dry-run edits
 
 Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.`;
+}
 
-function createEditTool(ctx: PluginContext): ToolDefinition {
+function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
   return {
-    description: EDIT_DESCRIPTION,
+    description: getEditDescription(writeToolName),
     args: {
       filePath: z
         .string()
@@ -435,11 +441,13 @@ function createEditTool(ctx: PluginContext): ToolDefinition {
             : path.resolve(context.directory, op.file as string),
         }));
 
-        const data = await bridge.send("transaction", { operations: resolvedOps });
+        const params: Record<string, unknown> = { operations: resolvedOps };
+        params.dry_run = args.dryRun === true;
+        const data = await bridge.send("transaction", params);
         return JSON.stringify(data);
       }
 
-      const file = (args.filePath ?? args.file) as string;
+      const file = args.filePath as string;
       if (!file) throw new Error("'filePath' parameter is required");
 
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
@@ -574,6 +582,11 @@ Uses the opencode patch format with \`*** Begin Patch\` / \`*** End Patch\` mark
 -old line to remove
 +new line to add
  context line (unchanged, prefixed with space)
+*** Update File: path/to/old-name.ts
+*** Move to: path/to/new-name.ts
+@@ import { foo }
+-import { foo } from './old'
++import { foo } from './new'
 *** Delete File: path/to/obsolete-file.ts
 *** End Patch
 \`\`\`
@@ -869,8 +882,8 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
 export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition> {
   return {
     read: createReadTool(ctx),
-    write: createWriteTool(ctx),
-    edit: createEditTool(ctx),
+    write: createWriteTool(ctx, "edit"),
+    edit: createEditTool(ctx, "write"),
     apply_patch: createApplyPatchTool(ctx),
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
@@ -881,10 +894,24 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
  * Returns the same tools with aft_ prefix (for when hoisting is disabled).
  */
 export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {
+  const aftEditTool = createEditTool(ctx, "aft_write");
+
   return {
     aft_read: createReadTool(ctx),
-    aft_write: createWriteTool(ctx),
-    aft_edit: createEditTool(ctx),
+    aft_write: createWriteTool(ctx, "aft_edit"),
+    aft_edit: {
+      ...aftEditTool,
+      execute: async (args, context): Promise<string> => {
+        const argRecord = args as Record<string, unknown>;
+        const normalizedArgs =
+          argRecord.mode !== undefined &&
+          argRecord.filePath === undefined &&
+          typeof argRecord.file === "string"
+            ? { ...argRecord, filePath: argRecord.file }
+            : argRecord;
+        return aftEditTool.execute(normalizedArgs, context);
+      },
+    },
     aft_apply_patch: createApplyPatchTool(ctx),
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),

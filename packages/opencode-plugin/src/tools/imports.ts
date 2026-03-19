@@ -22,7 +22,11 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n" +
         "- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n" +
         "- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'filePath'.\n\n" +
-        "Returns: { formatted (string), validation_errors (string[]) }",
+        "Returns:\n" +
+        "- Dry run (any op): { ok, dry_run, diff, syntax_valid? }\n" +
+        "- add: { file, added, module, group?, already_present?, formatted?, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
+        "- remove: { file, removed, module, name?, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
+        "- organize: { file, groups: [{ name, count }], removed_duplicates, formatted?, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }",
       args: {
         op: z.enum(["add", "remove", "organize"]).describe("Import operation"),
         filePath: z.string().describe("Path to the file"),
