@@ -78,7 +78,7 @@ describe("Tool round-trips", () => {
     createBridge();
     const tools = readingTools(createPluginContext(pool));
 
-    const resultStr = await tools.aft_outline.execute({ file: FIXTURE_FILE }, sdkCtx);
+    const resultStr = await tools.aft_outline.execute({ filePath: FIXTURE_FILE }, sdkCtx);
     const result = JSON.parse(resultStr);
 
     expect(result.success).toBe(true);
@@ -208,7 +208,7 @@ describe("Tool round-trips", () => {
 
     // Undo the edit
     const undoResult = JSON.parse(
-      await undoTools.aft_safety.execute({ op: "undo", file: filePath }, sdkCtx),
+      await undoTools.aft_safety.execute({ op: "undo", filePath }, sdkCtx),
     );
     expect(undoResult.success).toBe(true);
     expect(undoResult.backup_id).toBeDefined();
@@ -384,7 +384,7 @@ describe("move_symbol round-trip", () => {
         await refTools.aft_refactor.execute(
           {
             op: "move",
-            file: sourceFile,
+            filePath: sourceFile,
             symbol: "formatDate",
             destination: destFile,
           },
@@ -457,7 +457,7 @@ describe("extract_function round-trip", () => {
         await refTools.aft_refactor.execute(
           {
             op: "extract",
-            file: filePath,
+            filePath,
             name: "filterAndMap",
             startLine: 1,
             endLine: 4,
@@ -521,7 +521,7 @@ describe("inline_symbol round-trip", () => {
         await refTools.aft_refactor.execute(
           {
             op: "inline",
-            file: filePath,
+            filePath,
             symbol: "helper",
             callSiteLine: 6,
           },

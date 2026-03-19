@@ -92,11 +92,13 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
   return {
     description: READ_DESCRIPTION,
     args: {
-      filePath: z.string(),
-      startLine: z.number().optional(),
-      endLine: z.number().optional(),
-      limit: z.number().optional(),
-      offset: z.number().optional(),
+      filePath: z
+        .string()
+        .describe("Path to file or directory (absolute or relative to project root)"),
+      startLine: z.number().optional().describe("1-based line to start reading from"),
+      endLine: z.number().optional().describe("1-based line to stop reading at (inclusive)"),
+      limit: z.number().optional().describe("Max lines to return (default: 2000)"),
+      offset: z.number().optional().describe("Line number to start reading from (use with limit)"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
@@ -242,8 +244,10 @@ function createWriteTool(ctx: PluginContext): ToolDefinition {
   return {
     description: WRITE_DESCRIPTION,
     args: {
-      filePath: z.string(),
-      content: z.string(),
+      filePath: z
+        .string()
+        .describe("Path to the file to write (absolute or relative to project root)"),
+      content: z.string().describe("The full content to write to the file"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
@@ -323,6 +327,8 @@ const EDIT_DESCRIPTION = `Edit a file by finding and replacing text, or by targe
 
 **Modes** (determined by which parameters you provide):
 
+Mode priority: operations > edits > symbol (without oldString) > oldString (find/replace) > content-only (write)
+
 1. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
    Finds the exact text in \`oldString\` and replaces it with \`newString\`.
    Supports fuzzy matching (handles whitespace differences automatically).
@@ -345,13 +351,13 @@ const EDIT_DESCRIPTION = `Edit a file by finding and replacing text, or by targe
 5. **Batch edits** — pass \`filePath\` + \`edits\` array
    Multiple edits in one file atomically. Each edit is either:
    - \`{ "oldString": "old", "newString": "new" }\` — find/replace
-   - \`{ "line_start": 5, "line_end": 7, "content": "new lines" }\` — replace line range (1-based, both inclusive)
+   - \`{ "startLine": 5, "endLine": 7, "content": "new lines" }\` — replace line range (1-based, both inclusive)
    Set content to empty string to delete lines.
 
 6. **Multi-file transaction** — pass \`operations\` array
    Edits across multiple files with checkpoint-based rollback on failure.
-   Each operation: \`{ "file": "path", "command": "edit_match"|"write", ... }\`.
-   For edit_match: include \`match\`, \`replacement\`. For write: include \`content\`.
+   Each operation: \`{ "file": "path", "command": "edit_match" | "write", ... }\`.
+   For \`edit_match\`: include \`match\`, \`replacement\`. For \`write\`: include \`content\`.
    Example: \`{ "operations": [{ "file": "a.ts", "command": "edit_match", "match": "old", "replacement": "new" }, { "file": "b.ts", "command": "write", "content": "..." }] }\`
 
 **Behavior:**
@@ -360,7 +366,6 @@ const EDIT_DESCRIPTION = `Edit a file by finding and replacing text, or by targe
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
 - LSP diagnostics are returned automatically after non-dry-run edits
-- Mode priority: operations > edits > symbol (without oldString) > oldString (find/replace) > content-only (write)
 
 Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.`;
 
@@ -368,16 +373,35 @@ function createEditTool(ctx: PluginContext): ToolDefinition {
   return {
     description: EDIT_DESCRIPTION,
     args: {
-      filePath: z.string().optional(),
-      oldString: z.string().optional(),
-      newString: z.string().optional(),
-      replaceAll: z.boolean().optional(),
-      occurrence: z.number().optional(),
-      symbol: z.string().optional(),
-      content: z.string().optional(),
-      edits: z.array(z.record(z.string(), z.unknown())).optional(),
-      operations: z.array(z.record(z.string(), z.unknown())).optional(),
-      dryRun: z.boolean().optional(),
+      filePath: z
+        .string()
+        .optional()
+        .describe("Path to file, or glob pattern for multi-file operations"),
+      oldString: z.string().optional().describe("Text to find (exact match, with fuzzy fallback)"),
+      newString: z.string().optional().describe("Text to replace with"),
+      replaceAll: z.boolean().optional().describe("Replace all occurrences"),
+      occurrence: z
+        .number()
+        .optional()
+        .describe("0-indexed occurrence to replace when multiple matches exist"),
+      symbol: z.string().optional().describe("Named symbol to replace (function, class, type)"),
+      content: z.string().optional().describe("New content for symbol replace or file write"),
+      edits: z
+        .array(z.record(z.string(), z.unknown()))
+        .optional()
+        .describe(
+          "Batch edits — array of { oldString: string, newString: string } or { startLine: number, endLine: number, content: string }",
+        ),
+      operations: z
+        .array(z.record(z.string(), z.unknown()))
+        .optional()
+        .describe(
+          "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback",
+        ),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe("Preview changes without applying (returns diff, default: false)"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
@@ -408,7 +432,7 @@ function createEditTool(ctx: PluginContext): ToolDefinition {
       }
 
       const file = (args.filePath ?? args.file) as string;
-      if (!file) throw new Error("'file' parameter is required");
+      if (!file) throw new Error("'filePath' parameter is required");
 
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
 
@@ -427,9 +451,19 @@ function createEditTool(ctx: PluginContext): ToolDefinition {
       let command: string;
 
       if (Array.isArray(args.edits)) {
-        // Batch mode
+        // Batch mode — translate camelCase to snake_case for Rust
         command = "batch";
-        params.edits = args.edits;
+        params.edits = (args.edits as Array<Record<string, unknown>>).map((edit) => {
+          const translated: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(edit)) {
+            if (key === "oldString") translated.old_string = value;
+            else if (key === "newString") translated.new_string = value;
+            else if (key === "startLine") translated.line_start = value;
+            else if (key === "endLine") translated.line_end = value;
+            else translated[key] = value;
+          }
+          return translated;
+        });
       } else if (
         typeof args.symbol === "string" &&
         typeof args.oldString !== "string" &&
@@ -560,13 +594,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description: APPLY_PATCH_DESCRIPTION,
     args: {
-      patch: z.string().optional(),
-      patchText: z.string().optional(), // backward compat with opencode's apply_patch
+      patchText: z.string().describe("The full patch text including Begin/End markers"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
-      const patchText = (args.patch ?? args.patchText) as string;
-      if (!patchText) throw new Error("'patch' or 'patchText' is required");
+      const patchText = args.patchText as string;
+      if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
       let hunks: import("../patch-parser.js").Hunk[];
@@ -751,13 +784,15 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
   return {
     description: DELETE_DESCRIPTION,
     args: {
-      file: z.string(),
+      filePath: z
+        .string()
+        .describe("Path to file to delete. Relative paths resolved from project root."),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
-      const filePath = path.isAbsolute(args.file as string)
-        ? (args.file as string)
-        : path.resolve(context.directory, args.file as string);
+      const filePath = path.isAbsolute(args.filePath as string)
+        ? (args.filePath as string)
+        : path.resolve(context.directory, args.filePath as string);
 
       await context.ask({
         permission: "edit",
@@ -787,14 +822,14 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {
     description: MOVE_DESCRIPTION,
     args: {
-      file: z.string(),
-      destination: z.string(),
+      filePath: z.string().describe("Source file path to move"),
+      destination: z.string().describe("Destination file path"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
-      const filePath = path.isAbsolute(args.file as string)
-        ? (args.file as string)
-        : path.resolve(context.directory, args.file as string);
+      const filePath = path.isAbsolute(args.filePath as string)
+        ? (args.filePath as string)
+        : path.resolve(context.directory, args.filePath as string);
       const destPath = path.isAbsolute(args.destination as string)
         ? (args.destination as string)
         : path.resolve(context.directory, args.destination as string);

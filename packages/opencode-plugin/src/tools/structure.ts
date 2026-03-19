@@ -20,22 +20,25 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
       description:
         "Scope-aware structural code transformations with correct indentation.\n\n" +
         "Ops:\n" +
-        "- 'add_member': Insert method/field into class, struct, or impl block. Requires 'scope' (container name) and 'code'. Optional 'position'.\n" +
+        "- 'add_member': Insert method/field into class, struct, or impl block. Requires 'container' (container name) and 'code'. Optional 'position'.\n" +
         "- 'add_derive': Add Rust derive macros to a struct/enum. Requires 'target' and 'derives' array. Deduplicates existing derives.\n" +
         "- 'wrap_try_catch': Wrap a TS/JS function body in try/catch. Requires 'target' (function name). Optional 'catchBody'.\n" +
         "- 'add_decorator': Add Python decorator to function/class. Requires 'target' and 'decorator' (without @). Optional 'position'.\n" +
         "- 'add_struct_tags': Add/update Go struct field tags. Requires 'target' (struct name), 'field', 'tag', 'value'.\n\n" +
+        "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
         "Returns: { formatted (string), validation_errors (string[]) }",
       args: {
         op: z
           .enum(["add_member", "add_derive", "wrap_try_catch", "add_decorator", "add_struct_tags"])
           .describe("Transformation operation"),
-        file: z.string().describe("Path to the source file"),
+        filePath: z.string().describe("Path to the source file"),
         // add_member
-        scope: z
+        container: z
           .string()
           .optional()
-          .describe("Container name to insert into (add_member — class, struct, or impl block)"),
+          .describe(
+            "Container name for add_member — the class, struct, or impl block to insert into",
+          ),
         code: z.string().optional().describe("Member code to insert (add_member)"),
         position: z
           .string()
@@ -74,7 +77,10 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
           .enum(["syntax", "full"])
           .optional()
           .describe("Validation level: 'syntax' (default) or 'full'"),
-        dryRun: z.boolean().optional().describe("Preview without modifying the file"),
+        dryRun: z
+          .boolean()
+          .optional()
+          .describe("Preview without modifying the file (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
@@ -82,22 +88,22 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         const isDryRun = args.dryRun === true;
 
         if (!isDryRun) {
-          const filePath = resolveAbsolutePath(context, args.file as string);
+          const filePath = resolveAbsolutePath(context, args.filePath as string);
           const permissionError = await askEditPermission(
             context,
-            [resolveRelativePattern(context, args.file as string)],
+            [resolveRelativePattern(context, args.filePath as string)],
             { filepath: filePath },
           );
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
 
-        const params: Record<string, unknown> = { file: args.file };
+        const params: Record<string, unknown> = { file: args.filePath };
         if (args.validate !== undefined) params.validate = args.validate;
         if (args.dryRun !== undefined) params.dry_run = args.dryRun;
 
         switch (op) {
           case "add_member":
-            params.scope = args.scope;
+            params.scope = args.container;
             params.code = args.code;
             if (args.position !== undefined) params.position = args.position;
             break;

@@ -54,24 +54,28 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "Get a structural outline of a source file, multiple files, or an entire directory — lists all top-level symbols with their kind, name, line range, and visibility. Use this to understand file structure before editing.\n" +
         "Each entry includes 'name', 'kind' (function/class/struct/heading/etc), 'range', 'signature', and 'members' (nested children like methods in classes or sub-headings in markdown).\n" +
         "For Markdown files (.md, .mdx): returns heading hierarchy — h1/h2/h3 as nested symbols with section ranges covering all content until the next same-level heading.\n\n" +
-        "Provide either 'file', 'files', or 'directory', not both. Use 'files' to batch multiple outlines in one tool call.\n" +
+        "Provide either 'filePath', 'files', or 'directory', not both. Use 'files' to batch multiple outlines in one tool call.\n" +
         "Supported languages: TypeScript, JavaScript, TSX, Python, Rust, Go, Ruby, C, C++, C#, Java, Kotlin, Scala, Swift, Lua, Elixir, Haskell, Solidity, Nix, Markdown, CSS, HTML, JSON, YAML, Bash.\n\n" +
         "Returns: Single file { entries: [{ name, kind, range, signature?, exported, members }] }. Multi-file/directory { results: [{ file, ok, entries? }] }.",
       args: {
-        file: z
+        filePath: z
           .string()
           .optional()
           .describe(
-            "Path to a single source file to outline (relative to project root or absolute)",
+            "Path to a single file to outline (ignored if 'files' or 'directory' is also provided)",
           ),
         files: z
           .array(z.string())
           .optional()
-          .describe("Array of file paths to outline in one call — returns per-file results"),
+          .describe(
+            "Array of file paths to outline in one call (ignored if 'directory' is also provided)",
+          ),
         directory: z
           .string()
           .optional()
-          .describe("Path to a directory — outlines all source files under it recursively"),
+          .describe(
+            "Path to a directory — outlines all source files under it recursively (capped at 200 files, takes priority over 'filePath' and 'files')",
+          ),
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
@@ -94,7 +98,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           const response = await bridge.send("outline", { files: args.files });
           return JSON.stringify(response);
         }
-        const response = await bridge.send("outline", { file: args.file });
+        const response = await bridge.send("outline", { file: args.filePath });
         return JSON.stringify(response);
       },
     },
@@ -122,12 +126,21 @@ For Markdown files, use heading text as symbol name (e.g., symbol: "Architecture
 
 Returns: Symbol mode { name, kind, range, content, context_before, context_after, annotations: { calls_out, called_by } }. Multi-symbol mode returns an array of these.`,
       args: {
-        filePath: z.string(),
-        symbol: z.string().optional(),
-        symbols: z.array(z.string()).optional(),
-        startLine: z.number().optional(),
-        endLine: z.number().optional(),
-        contextLines: z.number().optional(),
+        filePath: z.string().describe("Path to file"),
+        symbol: z.string().optional().describe("Name of a single symbol to inspect"),
+        symbols: z
+          .array(z.string())
+          .optional()
+          .describe("Array of symbol names to inspect in one call"),
+        startLine: z.number().optional().describe("1-based start line for line-range mode"),
+        endLine: z
+          .number()
+          .optional()
+          .describe("1-based end line for line-range mode (required with startLine)"),
+        contextLines: z
+          .number()
+          .optional()
+          .describe("Lines of context around symbols (default: 3)"),
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);

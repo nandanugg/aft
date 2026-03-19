@@ -2,8 +2,20 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { loadAftConfig } from "./config.js";
 import { consumeToolMetadata } from "./metadata-store.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
+import { createRequire } from "node:module";
 import { BridgePool } from "./pool.js";
+import { ensureBinary } from "./downloader.js";
 import { findBinary } from "./resolver.js";
+
+/** Read the plugin's own version from package.json at build time. */
+const PLUGIN_VERSION: string = (() => {
+  try {
+    const req = createRequire(import.meta.url);
+    return (req("../package.json") as { version: string }).version;
+  } catch {
+    return "0.0.0";
+  }
+})();
 import { astTools } from "./tools/ast.js";
 
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
@@ -49,7 +61,32 @@ const plugin: Plugin = async (input) => {
   if (aftConfig.formatter !== undefined) configOverrides.formatter = aftConfig.formatter;
   if (aftConfig.checker !== undefined) configOverrides.checker = aftConfig.checker;
 
-  const pool = new BridgePool(binaryPath, {}, configOverrides);
+  const pool = new BridgePool(
+    binaryPath,
+    {
+      minVersion: PLUGIN_VERSION,
+      onVersionMismatch: (binaryVersion, minVersion) => {
+        console.error(
+          `[aft-plugin] WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
+            "Some features may not work. Attempting to download a compatible binary...",
+        );
+        // Fire-and-forget: try to download matching version in background
+        ensureBinary(`v${minVersion}`).then(
+          (path) => {
+            if (path) {
+              console.error(`[aft-plugin] Downloaded compatible binary to ${path}. Restart OpenCode to use it.`);
+            }
+          },
+          () => {
+            console.error(
+              `[aft-plugin] Auto-download failed. Install manually: cargo install agent-file-tools@${minVersion}`,
+            );
+          },
+        );
+      },
+    },
+    configOverrides,
+  );
   const ctx: PluginContext = { pool, client: input.client, config: aftConfig };
 
   // Build full tool map, then filter out disabled tools

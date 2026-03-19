@@ -22,17 +22,18 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "File safety and recovery operations.\n\n" +
         "IMPORTANT: All backups are in-memory only — lost if the AFT process restarts. Per-file undo stack is capped at 20 entries (oldest evicted).\n\n" +
         "Ops:\n" +
-        "- 'undo': Undo the last edit to a file. Requires 'file'.\n" +
-        "- 'history': List all edit snapshots for a file. Requires 'file'.\n" +
+        "- 'undo': Undo the last edit to a file. Requires 'filePath'.\n" +
+        "- 'history': List all edit snapshots for a file. Requires 'filePath'.\n" +
         "- 'checkpoint': Save a named snapshot of tracked files. Requires 'name'. Optional 'files' to snapshot specific files only.\n" +
         "- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n" +
         "- 'list': List all available named checkpoints. No extra params needed.\n\n" +
+        "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
         "Use checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
       args: {
         op: z
           .enum(["undo", "history", "checkpoint", "restore", "list"])
           .describe("Safety operation"),
-        file: z.string().optional().describe("File path (required for undo, history)"),
+        filePath: z.string().optional().describe("File path (required for undo, history)"),
         name: z.string().optional().describe("Checkpoint name (required for checkpoint, restore)"),
         files: z
           .array(z.string())
@@ -45,11 +46,11 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
 
-        if (op === "undo" && typeof args.file === "string") {
-          const filePath = resolveAbsolutePath(context, args.file);
+        if (op === "undo" && typeof args.filePath === "string") {
+          const filePath = resolveAbsolutePath(context, args.filePath);
           const permissionError = await askEditPermission(
             context,
-            [resolveRelativePattern(context, args.file)],
+            [resolveRelativePattern(context, args.filePath)],
             { filepath: filePath },
           );
           if (permissionError) return permissionDeniedResponse(permissionError);
@@ -70,7 +71,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           list: "list_checkpoints",
         };
         const params: Record<string, unknown> = {};
-        if (args.file !== undefined) params.file = args.file;
+        if (args.filePath !== undefined) params.file = args.filePath;
         if (args.name !== undefined) params.name = args.name;
         if (args.files !== undefined) params.files = args.files;
         const response = await bridge.send(commandMap[op], params);

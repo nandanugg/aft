@@ -15,15 +15,28 @@ export function lspTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Lazily spawns the appropriate server on first use.\n\n" +
       "Returns: { diagnostics: Array<{ file, line, column, end_line, end_column, severity, message, code }>, total: number, files_with_errors: number }.",
     args: {
-      file: z.string().optional(),
-      directory: z.string().optional(),
-      severity: z.enum(["error", "warning", "information", "hint", "all"]).optional(),
-      waitMs: z.number().optional(),
+      filePath: z.string().optional().describe("Path to file to get diagnostics for"),
+      directory: z
+        .string()
+        .optional()
+        .describe("Path to directory to get diagnostics for all files under it"),
+      severity: z
+        .enum(["error", "warning", "information", "hint", "all"])
+        .optional()
+        .describe(
+          "Filter by severity — 'error', 'warning', 'information', 'hint', 'all' (default: 'all')",
+        ),
+      waitMs: z
+        .number()
+        .optional()
+        .describe(
+          "Wait N ms for fresh diagnostics before returning (max 10000, default: 0). Use after edits to let the server re-analyze.",
+        ),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
       const params: Record<string, unknown> = {};
-      if (args.file !== undefined) params.file = args.file;
+      if (args.filePath !== undefined) params.file = args.filePath;
       if (args.directory !== undefined) params.directory = args.directory;
       if (args.severity !== undefined) params.severity = args.severity;
       if (args.waitMs !== undefined) params.wait_ms = args.waitMs;

@@ -65,7 +65,10 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
       globs: z.array(z.string()).optional().describe("Include/exclude globs (prefix ! to exclude)"),
-      context: z.number().optional().describe("Context lines around match"),
+      contextLines: z
+        .number()
+        .optional()
+        .describe("Number of context lines to show around each match"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
@@ -75,7 +78,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       };
       if (args.paths) params.paths = args.paths;
       if (args.globs) params.globs = args.globs;
-      if (args.context !== undefined) params.context = Number(args.context);
+      if (args.contextLines !== undefined) params.context = Number(args.contextLines);
       const response = await bridge.send("ast_search", params);
 
       // Format output for readability
@@ -130,7 +133,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
 
   const replaceTool: ToolDefinition = {
     description:
-      "Replace code patterns across filesystem with AST-aware rewriting. Dry-run by default — set dryRun=false to apply.\n\n" +
+      "Replace code patterns across filesystem with AST-aware rewriting. Set dryRun=true to preview before applying changes (default: false).\n\n" +
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
       "Returns: Dry run { files: [{ file, diff, replacements }], total_replacements, total_files, dry_run }. Apply { files: [{ file, replacements, backup_id? }], total_replacements, total_files, dry_run: false }.",
@@ -140,11 +143,16 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search"),
       globs: z.array(z.string()).optional().describe("Include/exclude globs"),
-      dryRun: z.boolean().optional().describe("Preview changes without applying (default: true)"),
+      dryRun: z
+        .boolean()
+        .optional()
+        .describe(
+          "Preview changes without applying. Set to true to preview before applying (default: false)",
+        ),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
-      const isDryRun = args.dryRun !== false;
+      const isDryRun = args.dryRun === true;
 
       if (!isDryRun) {
         const explicitPaths = Array.isArray(args.paths)
@@ -177,7 +185,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       };
       if (args.paths) params.paths = args.paths;
       if (args.globs) params.globs = args.globs;
-      params.dry_run = args.dryRun !== false;
+      params.dry_run = args.dryRun === true;
       const response = await bridge.send("ast_replace", params);
 
       const data = response as {

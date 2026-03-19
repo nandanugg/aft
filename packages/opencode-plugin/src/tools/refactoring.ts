@@ -24,13 +24,14 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         "Ops:\n" +
         "- 'move': Move a top-level symbol to another file, updating all imports workspace-wide. Requires 'symbol', 'destination'. Creates a checkpoint before mutating. Only works on top-level exports (not nested functions or class methods).\n" +
         "   Note: This moves code symbols between files. To rename/move an entire file, use aft_move instead.\n" +
-        "- 'extract': Extract a line range into a new function with auto-detected parameters. Requires 'name', 'startLine', 'endLine' (1-based, endLine is exclusive). Supports TS/JS/TSX and Python.\n" +
+        "- 'extract': Extract a line range into a new function with auto-detected parameters. Requires 'name', 'startLine', 'endLine' (1-based, both inclusive). Supports TS/JS/TSX and Python.\n" +
         "- 'inline': Replace a function call with the function's body, substituting args for params. Requires 'symbol', 'callSiteLine' (1-based). Validates single-return constraint.\n\n" +
-        "All ops need 'file'. Use dryRun to preview before applying.\n\n" +
+        "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
+        "All ops need 'filePath'. Use dryRun to preview before applying.\n\n" +
         "Returns: move dry-run { ok, dry_run, diffs }; move apply { ok, files_modified, consumers_updated, checkpoint_name, results }. extract returns { file, name, parameters, return_type, syntax_valid, formatted, ... }. inline returns { file, symbol, call_context, substitutions, conflicts, syntax_valid, formatted, ... }.",
       args: {
         op: z.enum(["move", "extract", "inline"]).describe("Refactoring operation"),
-        file: z.string().describe("Path to the source file"),
+        filePath: z.string().describe("Path to the source file"),
         symbol: z
           .string()
           .optional()
@@ -47,14 +48,17 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         endLine: z
           .number()
           .optional()
-          .describe("1-based end line (exclusive) — required for 'extract' op"),
+          .describe("1-based end line (inclusive) — required for 'extract' op"),
         // inline
         callSiteLine: z
           .number()
           .optional()
           .describe("1-based call site line — required for 'inline' op"),
         // common
-        dryRun: z.boolean().optional().describe("Preview as diff without modifying files"),
+        dryRun: z
+          .boolean()
+          .optional()
+          .describe("Preview changes as diff without modifying files (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
@@ -62,15 +66,15 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         const isDryRun = args.dryRun === true;
 
         if (!isDryRun) {
-          const filePath = resolveAbsolutePath(context, args.file as string);
+          const filePath = resolveAbsolutePath(context, args.filePath as string);
           const patterns =
             op === "move"
               ? resolveRelativePatterns(context, [
                   workspacePattern(context),
-                  args.file as string,
+                  args.filePath as string,
                   ...(typeof args.destination === "string" ? [args.destination] : []),
                 ])
-              : [resolveRelativePattern(context, args.file as string)];
+              : [resolveRelativePattern(context, args.filePath as string)];
           const metadata = patterns.length === 1 ? { filepath: filePath } : {};
           const permissionError = await askEditPermission(context, patterns, metadata);
           if (permissionError) return permissionDeniedResponse(permissionError);
@@ -81,7 +85,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           extract: "extract_function",
           inline: "inline_symbol",
         };
-        const params: Record<string, unknown> = { file: args.file };
+        const params: Record<string, unknown> = { file: args.filePath };
         if (args.dryRun !== undefined) params.dry_run = args.dryRun;
 
         switch (op) {
@@ -93,7 +97,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           case "extract":
             params.name = args.name;
             params.start_line = Number(args.startLine);
-            params.end_line = Number(args.endLine);
+            params.end_line = Number(args.endLine) + 1; // Agent uses inclusive, Rust expects exclusive
             break;
           case "inline":
             params.symbol = args.symbol;

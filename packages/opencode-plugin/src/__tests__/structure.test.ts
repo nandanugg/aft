@@ -70,14 +70,14 @@ describe("Structure tool registrations", () => {
     }
   });
 
-  test("aft_transform args include op, file, scope, code, and optional position", () => {
+  test("aft_transform args include op, filePath, container, code, and optional position", () => {
     const fakeCtx = fakePluginContext();
     const tools = structureTools(fakeCtx);
     const args = tools.aft_transform.args;
 
     expect(args.op).toBeDefined();
-    expect(args.file).toBeDefined();
-    expect(args.scope).toBeDefined();
+    expect(args.filePath).toBeDefined();
+    expect(args.container).toBeDefined();
     expect(args.code).toBeDefined();
     expect(args.position).toBeDefined();
   });
@@ -87,7 +87,7 @@ describe("Structure tool registrations", () => {
     const tools = structureTools(fakeCtx);
     const args = tools.aft_transform.args;
 
-    expect(args.file).toBeDefined();
+    expect(args.filePath).toBeDefined();
     expect(args.target).toBeDefined();
     expect(args.derives).toBeDefined();
   });
@@ -97,7 +97,7 @@ describe("Structure tool registrations", () => {
     const tools = structureTools(fakeCtx);
     const args = tools.aft_transform.args;
 
-    expect(args.file).toBeDefined();
+    expect(args.filePath).toBeDefined();
     expect(args.target).toBeDefined();
     expect(args.field).toBeDefined();
     expect(args.tag).toBeDefined();
@@ -141,8 +141,8 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_member",
-        file: filePath,
-        scope: "Greeter",
+        filePath,
+        container: "Greeter",
         code: "greet() { return 'hello'; }",
       },
       sdkCtx,
@@ -171,8 +171,8 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_member",
-        file: filePath,
-        scope: "Foo",
+        filePath,
+        container: "Foo",
         code: "first() {}",
         position: "first",
       },
@@ -202,7 +202,7 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_derive",
-        file: filePath,
+        filePath,
         target: "Foo",
         derives: ["Clone", "PartialEq"],
       },
@@ -234,7 +234,7 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "wrap_try_catch",
-        file: filePath,
+        filePath,
         target: "doWork",
       },
       sdkCtx,
@@ -263,7 +263,7 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "wrap_try_catch",
-        file: filePath,
+        filePath,
         target: "risky",
         catchBody: 'console.error("failed:", error);',
       },
@@ -291,7 +291,7 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_decorator",
-        file: filePath,
+        filePath,
         target: "method",
         decorator: "staticmethod",
       },
@@ -320,7 +320,7 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_struct_tags",
-        file: filePath,
+        filePath,
         target: "User",
         field: "Name",
         tag: "json",
@@ -349,7 +349,7 @@ describe("Structure tool round-trips", () => {
     await editTools.aft_edit.execute(
       {
         mode: "write",
-        file: filePath,
+        filePath,
         content: `class Real {\n  x: number;\n}\n`,
       },
       sdkCtx,
@@ -358,8 +358,8 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_member",
-        file: filePath,
-        scope: "NonExistent",
+        filePath,
+        container: "NonExistent",
         code: "y: string;",
       },
       sdkCtx,
@@ -381,7 +381,7 @@ describe("Structure tool round-trips", () => {
     await editTools.aft_edit.execute(
       {
         mode: "write",
-        file: filePath,
+        filePath,
         content: `struct Real {\n    x: i32,\n}\n`,
       },
       sdkCtx,
@@ -390,7 +390,7 @@ describe("Structure tool round-trips", () => {
     const resultStr = await tools.aft_transform.execute(
       {
         op: "add_derive",
-        file: filePath,
+        filePath,
         target: "Fake",
         derives: ["Clone"],
       },

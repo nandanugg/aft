@@ -36,7 +36,12 @@ export class BridgePool {
     this.binaryPath = binaryPath;
     this.maxPoolSize = options.maxPoolSize ?? DEFAULT_MAX_POOL_SIZE;
     this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-    this.bridgeOptions = { timeoutMs: options.timeoutMs, maxRestarts: options.maxRestarts };
+    this.bridgeOptions = {
+      timeoutMs: options.timeoutMs,
+      maxRestarts: options.maxRestarts,
+      minVersion: options.minVersion,
+      onVersionMismatch: options.onVersionMismatch,
+    };
     this.configOverrides = configOverrides;
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
   }

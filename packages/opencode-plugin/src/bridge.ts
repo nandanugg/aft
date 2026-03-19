@@ -3,6 +3,20 @@ import { type ChildProcess, spawn } from "node:child_process";
 /** Prefix for all bridge diagnostic messages on stderr. */
 const TAG = "[aft-plugin]";
 
+/**
+ * Compare two semver version strings (major.minor.patch).
+ * Returns: negative if a < b, 0 if equal, positive if a > b.
+ */
+function compareSemver(a: string, b: string): number {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
@@ -14,6 +28,10 @@ export interface BridgeOptions {
   timeoutMs?: number;
   /** Maximum restart attempts before giving up. Default: 3 */
   maxRestarts?: number;
+  /** Minimum binary version required (semver). If the binary is older, onVersionMismatch is called. */
+  minVersion?: string;
+  /** Called when binary version is older than minVersion. Receives (binaryVersion, minVersion). */
+  onVersionMismatch?: (binaryVersion: string, minVersion: string) => void;
 }
 
 /**
@@ -34,6 +52,8 @@ export class BinaryBridge {
   private maxRestarts: number;
   private configured = false;
   private configOverrides: Record<string, unknown>;
+  private minVersion: string | undefined;
+  private onVersionMismatch: ((binaryVersion: string, minVersion: string) => void) | undefined;
 
   constructor(
     binaryPath: string,
@@ -46,6 +66,8 @@ export class BinaryBridge {
     this.timeoutMs = options?.timeoutMs ?? 30_000;
     this.maxRestarts = options?.maxRestarts ?? 3;
     this.configOverrides = configOverrides ?? {};
+    this.minVersion = options?.minVersion;
+    this.onVersionMismatch = options?.onVersionMismatch;
   }
 
   /** Number of times the binary has been restarted after a crash. */
@@ -72,14 +94,15 @@ export class BinaryBridge {
 
     this.ensureSpawned();
 
-    // Auto-configure project root + plugin config on first command
+    // Auto-configure project root + plugin config on first command, then check version
     if (!this.configured) {
       this.configured = true;
-      if (command !== "configure") {
+      if (command !== "configure" && command !== "version") {
         await this.send("configure", {
           project_root: this.cwd,
           ...this.configOverrides,
         });
+        await this.checkVersion();
       }
     }
 
@@ -144,6 +167,28 @@ export class BinaryBridge {
   }
 
   // ---- Internal ----
+
+  /** Query binary version and compare against minVersion. Calls onVersionMismatch if outdated. */
+  private async checkVersion(): Promise<void> {
+    if (!this.minVersion) return;
+    try {
+      const resp = await this.send("version");
+      const binaryVersion = resp.version as string | undefined;
+      if (!binaryVersion) {
+        console.error(`${TAG} Binary did not report a version — skipping version check`);
+        return;
+      }
+      if (compareSemver(binaryVersion, this.minVersion) < 0) {
+        console.error(
+          `${TAG} Binary version ${binaryVersion} is older than required ${this.minVersion}`,
+        );
+        this.onVersionMismatch?.(binaryVersion, this.minVersion);
+      }
+    } catch (err) {
+      // Version check is best-effort — don't block tool usage if it fails
+      console.error(`${TAG} Version check failed: ${(err as Error).message}`);
+    }
+  }
 
   private ensureSpawned(): void {
     if (this.isAlive()) return;

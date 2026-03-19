@@ -2,6 +2,12 @@
   <img src="assets/banner.jpeg" alt="AFT — Agent File Toolkit" width="100%" />
 </p>
 
+<p align="center">
+  <a href="https://crates.io/crates/agent-file-tools"><img src="https://img.shields.io/crates/v/agent-file-tools?label=crate&color=blue" alt="crates.io"></a>
+  <a href="https://www.npmjs.com/package/@cortexkit/aft-opencode"><img src="https://img.shields.io/npm/v/@cortexkit/aft-opencode?color=blue" alt="npm"></a>
+  <a href="https://github.com/cortexkit/aft/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+</p>
+
 # AFT — Agent File Toolkit
 
 **Tree-sitter powered code analysis tools for AI coding agents.**
@@ -92,8 +98,7 @@ Add AFT to your OpenCode config:
 
 That's it. On the next session start, the binary downloads if needed and all tools become
 available. AFT replaces opencode's built-in `read`, `write`, `edit`, `apply_patch`,
-`ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` with enhanced versions, plus
-adds the `aft_` family of semantic tools on top.
+`ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` with enhanced versions — all powered natively by AFT — plus adds the `aft_` family of semantic tools on top.
 
 Here's a typical agent workflow:
 
@@ -137,7 +142,7 @@ Here's a typical agent workflow:
 
 ```json
 // aft_navigate
-{ "mode": "callers", "file": "src/auth/session.ts", "symbol": "validateToken", "depth": 2 }
+{ "op": "callers", "file": "src/auth/session.ts", "symbol": "validateToken", "depth": 2 }
 ```
 
 ---
@@ -154,13 +159,13 @@ These replace opencode's built-ins. Registered under the same names by default. 
 
 | Tool | Replaces | Description | Key Params |
 |------|----------|-------------|------------|
-| `read` | opencode read | File read, directory listing, image/PDF detection | `filePath`, `start_line`, `end_line`, `offset`, `limit` |
+| `read` | opencode read | File read, directory listing, image/PDF detection | `filePath`, `startLine`, `endLine`, `offset`, `limit` |
 | `write` | opencode write | Write file with auto-dirs, backup, format, inline diagnostics | `filePath`, `content` |
 | `edit` | opencode edit | Find/replace, symbol replace, batch, transaction, glob | `filePath`, `oldString`, `newString`, `symbol`, `content`, `edits[]` |
 | `apply_patch` | opencode apply_patch | `*** Begin Patch` multi-file patch format | `patch` |
-| `ast_grep_search` | oh-my-opencode ast_grep_search | AST pattern search with meta-variables | `pattern`, `lang`, `paths[]`, `globs[]` |
-| `ast_grep_replace` | oh-my-opencode ast_grep_replace | AST pattern replace (dry-run by default) | `pattern`, `rewrite`, `lang`, `dryRun` |
-| `lsp_diagnostics` | oh-my-opencode lsp_diagnostics | Errors/warnings from language server | `file`, `directory`, `severity`, `wait_ms` |
+| `ast_grep_search` | opencode ast_grep_search | AST pattern search with meta-variables | `pattern`, `lang`, `paths[]`, `globs[]` |
+| `ast_grep_replace` | opencode ast_grep_replace | AST pattern replace (dry-run by default) | `pattern`, `rewrite`, `lang`, `dryRun` |
+| `lsp_diagnostics` | opencode lsp_diagnostics | Errors/warnings from language server | `file`, `directory`, `severity`, `waitMs` |
 
 ### AFT-only tools
 
@@ -169,10 +174,10 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | Tool | Description | Key Params |
 |------|-------------|------------|
 | `aft_outline` | Structural outline of a file, files, or directory | `file`, `files[]`, `directory` |
-| `aft_zoom` | Inspect symbols with call-graph annotations | `filePath`, `symbol`, `symbols[]`, `start_line`, `end_line` |
+| `aft_zoom` | Inspect symbols with call-graph annotations | `filePath`, `symbol`, `symbols[]`, `startLine`, `endLine` |
 | `aft_delete` | Delete a file with backup | `file` |
 | `aft_move` | Move or rename a file with backup | `file`, `destination` |
-| `aft_navigate` | Call graph and data-flow navigation | `mode`, `file`, `symbol`, `depth` |
+| `aft_navigate` | Call graph and data-flow navigation | `op`, `file`, `symbol`, `depth` |
 | `aft_import` | Language-aware import add/remove/organize | `op`, `file`, `module`, `names[]` |
 | `aft_transform` | Structural code transforms (members, derives, decorators) | `op`, `file`, `scope`, `target` |
 | `aft_refactor` | Workspace-wide move, extract, inline | `op`, `file`, `symbol`, `destination` |
@@ -190,7 +195,7 @@ list its entries. Paginate large files with `start_line`/`end_line` or `offset`/
 { "filePath": "src/app.ts" }
 
 // Read lines 50-100
-{ "filePath": "src/app.ts", "start_line": 50, "end_line": 100 }
+{ "filePath": "src/app.ts", "startLine": 50, "endLine": 100 }
 
 // Read 30 lines from line 200
 { "filePath": "src/app.ts", "offset": 200, "limit": 30 }
@@ -280,8 +285,8 @@ Set `content` to `""` to delete lines. Per-edit `occurrence` is supported.
 { "filePath": "src/**/*.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }
 ```
 
-All modes support `dry_run: true` to preview as a diff without modifying files. LSP diagnostics
-are returned automatically after every edit (unless `dry_run` is set) — if type errors are
+All modes support `dryRun: true` to preview as a diff without modifying files. LSP diagnostics
+are returned automatically after every edit (unless `dryRun` is set) — if type errors are
 introduced, they appear inline in the response.
 
 ---
@@ -356,7 +361,7 @@ Get errors, warnings, and hints from the language server. Lazily spawns the appr
 { "directory": "src/", "severity": "all" }
 
 // Wait for fresh diagnostics after an edit
-{ "file": "src/api.ts", "wait_ms": 2000 }
+{ "file": "src/api.ts", "waitMs": 2000 }
 ```
 
 Returns `{ file, line, column, severity, message, code }` per diagnostic.
@@ -398,7 +403,7 @@ reading entire files (use `read` for that). Also supports line-range reads with 
 { "filePath": "src/app.ts", "symbols": ["Config", "createApp"] }
 
 // Read a line range with context
-{ "filePath": "src/app.ts", "start_line": 50, "end_line": 100 }
+{ "filePath": "src/app.ts", "startLine": 50, "endLine": 100 }
 ```
 
 For Markdown files, use the heading text as the symbol name (e.g. `"symbol": "Architecture"`).
@@ -446,7 +451,7 @@ Call graph and data-flow analysis across the workspace.
 ```json
 // Find everything that would break if processPayment changes
 {
-  "mode": "impact",
+  "op": "impact",
   "file": "src/payments/processor.ts",
   "symbol": "processPayment",
   "depth": 3
@@ -500,7 +505,7 @@ Scope-aware structural transformations that handle indentation correctly.
 }
 ```
 
-All ops support `dry_run` and `validate` (`"syntax"` or `"full"`).
+All ops support `dryRun` and `validate` (`"syntax"` or `"full"`).
 
 ---
 
@@ -512,7 +517,7 @@ Workspace-wide refactoring that updates imports and references across all files.
 |----|-------------|
 | `move` | Move a symbol to another file, updating all imports workspace-wide |
 | `extract` | Extract a line range (1-based) into a new function (auto-detects parameters) |
-| `inline` | Replace a call site (1-based `call_site_line`) with the function's body |
+| `inline` | Replace a call site (1-based `callSiteLine`) with the function's body |
 
 ```json
 // Move a utility function to a shared module
@@ -524,7 +529,7 @@ Workspace-wide refactoring that updates imports and references across all files.
 }
 ```
 
-`move` saves a checkpoint before mutating anything. Use `dry_run: true` to preview as a diff.
+`move` saves a checkpoint before mutating anything. Use `dryRun: true` to preview as a diff.
 
 ---
 
@@ -596,7 +601,10 @@ Both files are JSONC (comments allowed).
   // Values: "tsc" | "biome" | "pyright" | "ruff" | "cargo" | "go" | "staticcheck" | "none"
   "checker": {
     "typescript": "biome"
-  }
+  },
+
+  // List of tool names to disable (e.g. ["aft_transform", "aft_refactor"])
+  "disabled_tools": []
 }
 ```
 
@@ -626,7 +634,7 @@ OpenCode agent
      | JSON-over-stdio (newline-delimited)
      v
 aft binary (Rust)
-  - tree-sitter parsing (5 language grammars)
+  - tree-sitter parsing (6 language grammars)
   - Symbol resolution, call graph, diff generation
   - Format-on-edit (shells out to biome / rustfmt / etc.)
   - Backup/checkpoint management
