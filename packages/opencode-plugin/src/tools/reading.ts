@@ -54,9 +54,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "Get a structural outline of a source file, multiple files, or an entire directory — lists all top-level symbols with their kind, name, line range, and visibility. Use this to understand file structure before editing.\n" +
         "Each entry includes 'name', 'kind' (function/class/struct/heading/etc), 'range', 'signature', and 'members' (nested children like methods in classes or sub-headings in markdown).\n" +
         "For Markdown files (.md, .mdx): returns heading hierarchy — h1/h2/h3 as nested symbols with section ranges covering all content until the next same-level heading.\n\n" +
-        "Provide exactly one of 'filePath', 'files', or 'directory'. Use 'files' to batch multiple outlines in one tool call.\n" +
+        "Provide 'filePath', 'files', or 'directory'. Priority: directory > files > filePath. If multiple provided, highest-priority wins.\n" +
         "Supported languages: TypeScript, JavaScript, TSX, Python, Rust, Go, Ruby, C, C++, C#, Java, Kotlin, Scala, Swift, Lua, Elixir, Haskell, Solidity, Nix, Markdown, CSS, HTML, JSON, YAML, Bash.\n" +
-        "Directory mode skips node_modules, .git, dist, build, and dot-prefixed directories.\n\n" +
+        "Directory mode skips commonly ignored directories (node_modules, .git, dist, build, target, __pycache__, venv, vendor, coverage, etc.) and dot-prefixed directories.\n\n" +
         "Returns: Single file { entries: [{ name, kind, range, signature?, exported, members }] }. Multi-file/directory { results: [{ file, ok, entries? }] }.",
       args: {
         filePath: z
@@ -134,7 +134,7 @@ Mode priority: symbols array > single symbol > line range.
 
 Returns: Symbol mode { name, kind, range, content, context_before, context_after, annotations: { calls_out, called_by } }. Multi-symbol mode returns an array of these. Line-range mode returns { content, context_before, context_after, start_line, end_line }.`,
       args: {
-        filePath: z.string().describe("Path to file"),
+        filePath: z.string().describe("Path to file (absolute or relative to project root)"),
         symbol: z.string().optional().describe("Name of a single symbol to inspect"),
         symbols: z
           .array(z.string())

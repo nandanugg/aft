@@ -12,6 +12,7 @@ use crate::symbols::Range;
 #[derive(Debug, Clone, Serialize)]
 pub struct CallRef {
     pub name: String,
+    /// 1-based line number of the call reference.
     pub line: u32,
 }
 

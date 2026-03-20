@@ -30,11 +30,16 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
         "Use checkpoint before risky multi-file changes. Use undo for quick single-file rollback.\n\n" +
         "Returns: undo { path, backup_id }. history { file, entries }. checkpoint { ok, name }. restore { ok, name }. list { checkpoints }.",
+      // Parameters are Zod-optional because different ops need different subsets.
+      // Runtime guards below validate per-op requirements and give clear errors.
       args: {
         op: z
           .enum(["undo", "history", "checkpoint", "restore", "list"])
           .describe("Safety operation"),
-        filePath: z.string().optional().describe("File path (required for undo, history)"),
+        filePath: z
+          .string()
+          .optional()
+          .describe("File path (required for undo, history). Absolute or relative to project root"),
         name: z.string().optional().describe("Checkpoint name (required for checkpoint, restore)"),
         files: z
           .array(z.string())
@@ -46,6 +51,13 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
+
+        if ((op === "undo" || op === "history") && typeof args.filePath !== "string") {
+          throw new Error(`'filePath' is required for '${op}' op`);
+        }
+        if ((op === "checkpoint" || op === "restore") && typeof args.name !== "string") {
+          throw new Error(`'name' is required for '${op}' op`);
+        }
 
         if (op === "undo" && typeof args.filePath === "string") {
           const filePath = resolveAbsolutePath(context, args.filePath);

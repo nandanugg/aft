@@ -23,10 +23,10 @@ use crate::protocol::{RawRequest, Response};
 ///   - `dry_run` (bool, optional, default true) — preview without writing
 ///
 /// Returns (dry_run=true):
-///   `{ ok: true, files: [{ file, diff, replacements }], total_replacements: N, total_files: N }`
+///   `{ ok: true, files: [{ file, diff, replacements }], total_replacements: N, total_files: N, files_with_matches: N, files_searched: N }`
 ///
 /// Returns (dry_run=false):
-///   `{ ok: true, files: [{ file, replacements, backup_id? }], total_replacements: N, total_files: N }`
+///   `{ ok: true, files: [{ file, replacements, backup_id? }], total_replacements: N, total_files: N, files_with_matches: N, files_searched: N }`
 pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
@@ -114,8 +114,11 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut file_results: Vec<serde_json::Value> = Vec::new();
     let mut total_replacements = 0usize;
     let mut total_files = 0usize;
+    let mut files_searched = 0usize;
+    let mut files_with_matches = 0usize;
 
     for file_path in &files {
+        files_searched += 1;
         let original = match std::fs::read_to_string(file_path.as_path()) {
             Ok(s) => s,
             Err(_) => continue,
@@ -130,6 +133,8 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         if replacement_count == 0 {
             continue;
         }
+
+        files_with_matches += 1;
 
         let mut root = lang.ast_grep(&original);
         match root.replace(pattern.as_str(), rewrite.as_str()) {
@@ -192,6 +197,8 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             "files": file_results,
             "total_replacements": total_replacements,
             "total_files": total_files,
+            "files_with_matches": files_with_matches,
+            "files_searched": files_searched,
             "dry_run": dry_run,
         }),
     )

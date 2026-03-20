@@ -18,7 +18,7 @@ use crate::protocol::{RawRequest, Response};
 ///   - `globs` (string[], optional) — include/exclude glob filters; prefix `!` to exclude
 ///   - `context` (integer, optional) — lines of context around each match (default: 0)
 ///
-/// Returns: `{ matches: [{ file, line, column, text, meta_variables, context? }], total_matches, files_searched }`
+/// Returns: `{ matches: [{ file, line, column, text, meta_variables, context? }], total_matches, files_with_matches, files_searched }`
 pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
@@ -110,6 +110,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let extensions = lang.extensions();
     let mut all_matches: Vec<serde_json::Value> = Vec::new();
     let mut files_searched: usize = 0;
+    let mut files_with_matches: usize = 0;
 
     for root in &search_roots {
         let files = collect_files(root, extensions, &globs);
@@ -121,6 +122,9 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
             };
 
             let matches = search_file(&source, &file_path, &pattern, &lang, context_lines);
+            if !matches.is_empty() {
+                files_with_matches += 1;
+            }
             all_matches.extend(matches);
         }
     }
@@ -132,6 +136,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         serde_json::json!({
             "matches": all_matches,
             "total_matches": total_matches,
+            "files_with_matches": files_with_matches,
             "files_searched": files_searched,
         }),
     )

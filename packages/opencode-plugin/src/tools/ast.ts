@@ -91,11 +91,13 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
           meta_variables?: Record<string, string>;
         }>;
         total_matches?: number;
+        files_with_matches?: number;
         files_searched?: number;
       };
 
       const matchCount = data.total_matches ?? data.matches?.length ?? 0;
       const filesSearched = data.files_searched ?? 0;
+      const filesWithMatches = data.files_with_matches ?? filesSearched;
 
       let output: string;
       if (matchCount === 0) {
@@ -106,7 +108,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
           output += `\n\n${hint}`;
         }
       } else {
-        output = `Found ${matchCount} match(es) across ${filesSearched} file(s)\n\n`;
+        output = `Found ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`;
         if (data.matches) {
           for (const m of data.matches) {
             const relFile = m.file ?? "unknown";
@@ -139,7 +141,9 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
       "Returns: Text summary — 'Replaced N match(es) across M file(s)' (or '[DRY RUN] Would replace...') followed by file:line blocks with before/after text.",
     args: {
-      pattern: z.string().describe("AST pattern to match"),
+      pattern: z
+        .string()
+        .describe("AST pattern with meta-variables ($VAR, $$$). Must be complete AST node."),
       rewrite: z.string().describe("Replacement pattern (can use $VAR from pattern)"),
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
@@ -188,19 +192,23 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         ok?: boolean;
         matches?: Array<{ file?: string; line?: number; text?: string; replacement?: string }>;
         total_matches?: number;
+        total_replacements?: number;
+        total_files?: number;
+        files_with_matches?: number;
         files_searched?: number;
       };
 
-      const matchCount = data.total_matches ?? data.matches?.length ?? 0;
-      const filesSearched = data.files_searched ?? 0;
+      const matchCount = data.total_replacements ?? data.total_matches ?? data.matches?.length ?? 0;
+      const filesSearched = data.files_searched ?? data.total_files ?? 0;
+      const filesWithMatches = data.files_with_matches ?? data.total_files ?? filesSearched;
 
       let output: string;
       if (matchCount === 0) {
         output = `No matches found (searched ${filesSearched} files)`;
       } else {
         output = isDryRun
-          ? `[DRY RUN] Would replace ${matchCount} match(es) across ${filesSearched} file(s)\n\n`
-          : `Replaced ${matchCount} match(es) across ${filesSearched} file(s)\n\n`;
+          ? `[DRY RUN] Would replace ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`
+          : `Replaced ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`;
         if (data.matches) {
           for (const m of data.matches) {
             const relFile = m.file ?? "unknown";

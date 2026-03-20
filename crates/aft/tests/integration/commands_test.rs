@@ -254,10 +254,35 @@ fn test_zoom_success_with_annotations() {
     // Each CallRef should have a line number
     for cr in calls_out {
         assert!(cr["line"].is_number(), "CallRef should have line: {:?}", cr);
+        assert!(
+            cr["line"].as_u64().unwrap_or(0) >= 1,
+            "calls_out line should be 1-based: {:?}",
+            cr
+        );
     }
     for cr in called_by {
         assert!(cr["line"].is_number(), "CallRef should have line: {:?}", cr);
+        assert!(
+            cr["line"].as_u64().unwrap_or(0) >= 1,
+            "called_by line should be 1-based: {:?}",
+            cr
+        );
     }
+
+    let helper_call = calls_out
+        .iter()
+        .find(|cr| cr["name"] == "helper")
+        .expect("compute should call helper");
+    assert_eq!(helper_call["line"], 8, "helper call should be 1-based");
+
+    let orchestrate_caller = called_by
+        .iter()
+        .find(|cr| cr["name"] == "orchestrate")
+        .expect("orchestrate should call compute");
+    assert_eq!(
+        orchestrate_caller["line"], 13,
+        "caller annotation should be 1-based"
+    );
 
     // Context lines
     let ctx_before = resp["context_before"]

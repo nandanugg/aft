@@ -39,7 +39,7 @@ pub fn walk_for_calls(
 
     if call_kinds.contains(&node.kind()) && node_start >= byte_start && node_end <= byte_end {
         if let Some(name) = extract_callee_name(&node, source) {
-            results.push((name, node.start_position().row as u32));
+            results.push((name, node.start_position().row as u32 + 1));
         }
     }
 
@@ -216,7 +216,7 @@ fn collect_calls_full(
             extract_full_callee(&node, source),
             extract_callee_name(&node, source),
         ) {
-            results.push((full, short, node.start_position().row as u32));
+            results.push((full, short, node.start_position().row as u32 + 1));
         }
     }
 

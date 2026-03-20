@@ -28,7 +28,7 @@ pub struct CallSite {
     pub callee_name: String,
     /// The full callee expression (e.g. "utils.foo" for `utils.foo()`).
     pub full_callee: String,
-    /// 0-based line number of the call.
+    /// 1-based line number of the call.
     pub line: u32,
     /// Byte range of the call expression in the source.
     pub byte_start: usize,
@@ -79,7 +79,7 @@ pub struct CallerSite {
     pub caller_file: PathBuf,
     /// Symbol that makes the call.
     pub caller_symbol: String,
-    /// 0-based line number of the call.
+    /// 1-based line number of the call.
     pub line: u32,
     /// 0-based column (byte start within file, kept for future use).
     pub col: u32,
@@ -100,6 +100,7 @@ pub struct CallerGroup {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallerEntry {
     pub symbol: String,
+    /// 1-based line number of the call.
     pub line: u32,
 }
 
@@ -125,7 +126,7 @@ pub struct CallTreeNode {
     pub name: String,
     /// File path (relative to project root when possible).
     pub file: String,
-    /// Line number (0-based).
+    /// 1-based line number.
     pub line: u32,
     /// Function signature if available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,7 +197,7 @@ pub struct TraceHop {
     pub symbol: String,
     /// File path (relative to project root).
     pub file: String,
-    /// 0-based line number.
+    /// 1-based line number.
     pub line: u32,
     /// Function signature if available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -242,7 +243,7 @@ pub struct ImpactCaller {
     pub caller_symbol: String,
     /// File containing the caller (relative to project root).
     pub caller_file: String,
-    /// 0-based line number of the call site.
+    /// 1-based line number of the call site.
     pub line: u32,
     /// Caller's function/method signature, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -289,7 +290,7 @@ pub struct DataFlowHop {
     pub symbol: String,
     /// Variable or parameter name being tracked at this hop.
     pub variable: String,
-    /// 0-based line number.
+    /// 1-based line number.
     pub line: u32,
     /// Type of data flow: "assignment", "parameter", or "return".
     pub flow_type: String,
@@ -645,11 +646,12 @@ impl CallGraph {
 
         // Cycle detection
         if visited.contains(&visit_key) {
+            let (line, signature) = get_symbol_meta(&canon, symbol);
             return Ok(CallTreeNode {
                 name: symbol.to_string(),
                 file: self.relative_path(&canon),
-                line: 0,
-                signature: None,
+                line,
+                signature,
                 resolved: true,
                 children: vec![], // cycle — stop recursion
             });
@@ -916,12 +918,15 @@ impl CallGraph {
 
         let target_rel = self.relative_path(&canon);
         let effective_max = if max_depth == 0 { 10 } else { max_depth };
-        let reverse_index = self.reverse_index.as_ref().ok_or_else(|| AftError::ParseError {
-            message: format!(
-                "reverse index unavailable after building callers for {}",
-                canon.display()
-            ),
-        })?;
+        let reverse_index = self
+            .reverse_index
+            .as_ref()
+            .ok_or_else(|| AftError::ParseError {
+                message: format!(
+                    "reverse index unavailable after building callers for {}",
+                    canon.display()
+                ),
+            })?;
 
         // Get line/signature for the target symbol
         let (target_line, target_sig) = get_symbol_meta(&canon, symbol);
@@ -1480,7 +1485,7 @@ impl CallGraph {
         tracked_names: &[String],
     ) -> Option<(String, String, u32, bool)> {
         let kind = node.kind();
-        let line = node.start_position().row as u32;
+        let line = node.start_position().row as u32 + 1;
 
         match kind {
             "variable_declarator" => {
@@ -1607,7 +1612,7 @@ impl CallGraph {
                             file: rel_file.to_string(),
                             symbol: _symbol.to_string(),
                             variable: arg_text,
-                            line: child.start_position().row as u32,
+                            line: child.start_position().row as u32 + 1,
                             flow_type: "parameter".to_string(),
                             approximate: true,
                         });
@@ -1769,7 +1774,7 @@ impl CallGraph {
                             file: self.relative_path(file),
                             symbol: callee_name.clone(),
                             variable: tracked.clone(),
-                            line: node.start_position().row as u32,
+                            line: node.start_position().row as u32 + 1,
                             flow_type: "parameter".to_string(),
                             approximate: true,
                         });
@@ -1779,12 +1784,12 @@ impl CallGraph {
         }
     }
 
-    /// Read a single source line (0-based) from a file, trimmed.
+    /// Read a single source line (1-based) from a file, trimmed.
     fn read_source_line(&self, path: &Path, line: u32) -> Option<String> {
         let content = std::fs::read_to_string(path).ok()?;
         content
             .lines()
-            .nth(line as usize)
+            .nth(line.saturating_sub(1) as usize)
             .map(|l| l.trim().to_string())
     }
 
@@ -2054,12 +2059,12 @@ fn get_symbol_meta(path: &Path, symbol_name: &str) -> (u32, Option<String>) {
         Ok(symbols) => {
             for s in &symbols {
                 if s.name == symbol_name {
-                    return (s.range.start_line, s.signature.clone());
+                    return (s.range.start_line + 1, s.signature.clone());
                 }
             }
-            (0, None)
+            (1, None)
         }
-        Err(_) => (0, None),
+        Err(_) => (1, None),
     }
 }
 

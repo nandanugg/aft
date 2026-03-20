@@ -86,6 +86,7 @@ fn callgraph_cross_file_tree() {
     );
     assert_eq!(resp["name"], "main");
     assert_eq!(resp["resolved"], true);
+    assert_eq!(resp["line"], 3, "main definition line should be 1-based");
 
     // main calls processData
     let children = resp["children"]
@@ -98,6 +99,10 @@ fn callgraph_cross_file_tree() {
 
     // processData should be resolved to utils.ts
     assert_eq!(process_data["resolved"], true);
+    assert_eq!(
+        process_data["line"], 3,
+        "processData line should be 1-based"
+    );
     assert!(
         process_data["file"].as_str().unwrap().contains("utils.ts"),
         "processData should be in utils.ts, got: {}",
@@ -114,6 +119,7 @@ fn callgraph_cross_file_tree() {
         .expect("processData should call validate");
 
     assert_eq!(validate["resolved"], true);
+    assert_eq!(validate["line"], 1, "validate line should be 1-based");
     assert!(
         validate["file"].as_str().unwrap().contains("helpers.ts"),
         "validate should be in helpers.ts, got: {}",
@@ -131,6 +137,11 @@ fn callgraph_cross_file_tree() {
             .iter()
             .map(|c| c["name"].clone())
             .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        check_format.unwrap()["line"],
+        2,
+        "checkFormat line should be 1-based (call site, not definition)"
     );
 
     aft.shutdown();
@@ -313,6 +324,11 @@ fn callgraph_callers_cross_file() {
         "validate should be called by processData, entries: {:?}",
         entries
     );
+    assert_eq!(
+        process_data_caller.unwrap()["line"],
+        4,
+        "call site line should be 1-based"
+    );
 
     aft.shutdown();
 }
@@ -476,6 +492,8 @@ fn callgraph_trace_to_single_path() {
         last["symbol"], "checkFormat",
         "path should end at checkFormat"
     );
+    assert_eq!(hops[0]["line"], 3, "entry point line should be 1-based");
+    assert_eq!(last["line"], 5, "target line should be 1-based");
 
     // Verify diagnostic fields exist
     assert!(resp["total_paths"].as_u64().unwrap() >= 1);
@@ -907,6 +925,11 @@ fn callgraph_impact_multi_caller() {
             caller
         );
         assert!(
+            caller["line"].as_u64().unwrap_or(0) >= 1,
+            "caller line should be 1-based: {:?}",
+            caller
+        );
+        assert!(
             caller.get("is_entry_point").is_some(),
             "caller should have is_entry_point: {:?}",
             caller
@@ -1049,6 +1072,7 @@ fn callgraph_trace_data_assignment_tracking() {
         first["approximate"], false,
         "direct assignment is not approximate"
     );
+    assert_eq!(first["line"], 4, "assignment line should be 1-based");
 
     aft.shutdown();
 }
@@ -1116,6 +1140,7 @@ fn callgraph_trace_data_cross_file() {
             "parameter should be 'input' (processInput's parameter)"
         );
         assert_eq!(ph["approximate"], false);
+        assert_eq!(ph["line"], 1, "parameter line should be 1-based");
     }
 
     aft.shutdown();

@@ -19,6 +19,7 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
     aft_transform: {
       description:
         "Scope-aware structural code transformations with correct indentation.\n\n" +
+        "Language-specific: add_derive (Rust), add_struct_tags (Go), add_decorator (Python), wrap_try_catch (TS/JS), add_member (any language).\n\n" +
         "Ops:\n" +
         "- 'add_member': Insert method/field into class, struct, or impl block. Requires 'container' (container name) and 'code'. Optional 'position'.\n" +
         "- 'add_derive': Add Rust derive macros to a struct/enum. Requires 'target' and 'derives' array. Deduplicates existing derives.\n" +
@@ -33,11 +34,15 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         "- wrap_try_catch: { file, target, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- add_decorator: { file, target, decorator, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- add_struct_tags: { file, target, field, tag_string, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }",
+      // Parameters are Zod-optional because different ops need different subsets.
+      // Runtime guards below validate per-op requirements and give clear errors.
       args: {
         op: z
           .enum(["add_member", "add_derive", "wrap_try_catch", "add_decorator", "add_struct_tags"])
           .describe("Transformation operation"),
-        filePath: z.string().describe("Path to the source file"),
+        filePath: z
+          .string()
+          .describe("Path to the source file (absolute or relative to project root)"),
         // add_member
         container: z
           .string()
@@ -92,6 +97,36 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
         const isDryRun = args.dryRun === true;
+
+        if (op === "add_member") {
+          if (typeof args.container !== "string")
+            throw new Error("'container' is required for 'add_member' op");
+          if (typeof args.code !== "string")
+            throw new Error("'code' is required for 'add_member' op");
+        }
+        if (
+          op === "add_derive" ||
+          op === "wrap_try_catch" ||
+          op === "add_decorator" ||
+          op === "add_struct_tags"
+        ) {
+          if (typeof args.target !== "string")
+            throw new Error(`'target' is required for '${op}' op`);
+        }
+        if (op === "add_derive" && !Array.isArray(args.derives)) {
+          throw new Error("'derives' array is required for 'add_derive' op");
+        }
+        if (op === "add_decorator" && typeof args.decorator !== "string") {
+          throw new Error("'decorator' is required for 'add_decorator' op");
+        }
+        if (op === "add_struct_tags") {
+          if (typeof args.field !== "string")
+            throw new Error("'field' is required for 'add_struct_tags' op");
+          if (typeof args.tag !== "string")
+            throw new Error("'tag' is required for 'add_struct_tags' op");
+          if (typeof args.value !== "string")
+            throw new Error("'value' is required for 'add_struct_tags' op");
+        }
 
         if (!isDryRun) {
           const filePath = resolveAbsolutePath(context, args.filePath as string);

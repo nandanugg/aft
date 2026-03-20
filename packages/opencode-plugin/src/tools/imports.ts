@@ -27,9 +27,11 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "- add: { file, added, module, group?, already_present?, formatted?, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- remove: { file, removed, module, name?, formatted, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }\n" +
         "- organize: { file, groups: [{ name, count }], removed_duplicates, formatted?, syntax_valid?, format_skipped_reason?, validation_errors?, validate_skipped_reason?, backup_id?, lsp_diagnostics? }",
+      // Parameters are Zod-optional because different ops need different subsets.
+      // Runtime guards below validate per-op requirements and give clear errors.
       args: {
         op: z.enum(["add", "remove", "organize"]).describe("Import operation"),
-        filePath: z.string().describe("Path to the file"),
+        filePath: z.string().describe("Path to the file (absolute or relative to project root)"),
         module: z
           .string()
           .optional()
@@ -57,6 +59,10 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         const bridge = ctx.pool.getBridge(context.directory);
         const op = args.op as string;
         const isDryRun = args.dryRun === true;
+
+        if ((op === "add" || op === "remove") && typeof args.module !== "string") {
+          throw new Error(`'module' is required for '${op}' op`);
+        }
 
         if (!isDryRun) {
           const filePath = resolveAbsolutePath(context, args.filePath as string);

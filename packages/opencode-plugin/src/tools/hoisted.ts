@@ -75,6 +75,7 @@ Behavior:
 - Lines longer than 2000 characters are truncated
 - Output capped at 50KB
 - Binary files are auto-detected and return a size-only message
+- Image files (.png, .jpg, .gif, .webp, etc.) and PDFs return a metadata string (format, size, path) — no file content is returned
 - Directories return sorted entries with trailing / for subdirectories
 
 Examples:
@@ -184,7 +185,8 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       const params: Record<string, unknown> = { file: filePath };
       if (startLine !== undefined) params.start_line = startLine;
       if (endLine !== undefined) params.end_line = endLine;
-      if (args.limit !== undefined) params.limit = args.limit;
+      // Only send limit if we did NOT convert offset to startLine/endLine
+      if (args.limit !== undefined && args.offset === undefined) params.limit = args.limit;
 
       const data = await bridge.send("read", params);
 
@@ -240,7 +242,7 @@ is auto-formatted after writing. Returns inline LSP diagnostics when available.
 - Creates parent directories automatically (no need to mkdir first)
 - Existing files are backed up before overwriting (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
-- Returns LSP diagnostics inline if type errors are introduced
+- Returns LSP error-level diagnostics inline if type errors are introduced
 - Use this for creating new files or completely replacing file contents
 - For partial edits (find/replace), use the \`${editToolName}\` tool instead
 
@@ -352,6 +354,7 @@ Mode priority: operations > edits > symbol (without oldString) > oldString (find
 3. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
    Replaces an entire named symbol (function, class, type) with new content.
    Includes decorators, attributes, and doc comments in the replacement range.
+   **Important:** You must NOT provide \`oldString\` when using symbol mode — if present, the tool silently falls back to find/replace mode.
    Example: \`{ "filePath": "src/app.ts", "symbol": "handleRequest", "content": "function handleRequest() { ... }" }\`
 
 4. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
@@ -373,7 +376,7 @@ Mode priority: operations > edits > symbol (without oldString) > oldString (find
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- LSP diagnostics are returned automatically after non-dry-run edits
+- LSP error-level diagnostics are returned automatically after non-dry-run edits
 
 Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.`;
 }
@@ -546,19 +549,21 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         }
       }
 
-      // Append inline diagnostics to output (matching write tool and opencode built-in behavior)
+      let result = JSON.stringify(data);
+
+      // Append inline diagnostics to output (matching write tool pattern)
       if (!args.dryRun) {
         const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
         if (diags && diags.length > 0) {
           const errors = diags.filter((d) => d.severity === "error");
           if (errors.length > 0) {
             const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
-            data.diagnostics_summary = `\n\nLSP errors detected, please fix:\n${diagLines}`;
+            result += `\n\nLSP errors detected, please fix:\n${diagLines}`;
           }
         }
       }
 
-      return JSON.stringify(data);
+      return result;
     },
   };
 }
@@ -668,14 +673,19 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 
         switch (hunk.type) {
           case "add": {
-            await bridge.send("write", {
-              file: filePath,
-              content: hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`,
-              create_dirs: true,
-              diagnostics: true,
-            });
-            combinedAfter += hunk.contents;
-            results.push(`Created ${hunk.path}`);
+            try {
+              await bridge.send("write", {
+                file: filePath,
+                content: hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`,
+                create_dirs: true,
+                diagnostics: true,
+              });
+              combinedAfter += hunk.contents;
+              results.push(`Created ${hunk.path}`);
+            } catch (e) {
+              patchFailed = true;
+              results.push(`Failed to create ${hunk.path}: ${e instanceof Error ? e.message : e}`);
+            }
             break;
           }
 
@@ -686,6 +696,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               combinedBefore += before;
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
+              patchFailed = true;
               results.push(`Failed to delete ${hunk.path}: ${e instanceof Error ? e.message : e}`);
             }
             break;
