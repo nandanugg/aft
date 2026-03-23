@@ -22,7 +22,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "File safety and recovery operations.\n\n" +
         "IMPORTANT: All backups are in-memory only — lost if the AFT process restarts. Per-file undo stack is capped at 20 entries (oldest evicted).\n\n" +
         "Ops:\n" +
-        "- 'undo': Undo the last edit to a file. Requires 'filePath'.\n" +
+        "- 'undo': Undo the last edit to a file. Requires 'filePath'. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect before undoing.\n" +
         "- 'history': List all edit snapshots for a file. Requires 'filePath'.\n" +
         "- 'checkpoint': Save a named snapshot of tracked files. Requires 'name'. Optional 'files' to snapshot specific files only.\n" +
         "- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n" +

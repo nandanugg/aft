@@ -380,7 +380,9 @@ Note: Modes 5 and 6 are options on mode 4 (find/replace) — they require \`oldS
 - Symbol replace includes decorators, attributes, and doc comments in range
 - LSP error-level diagnostics are returned automatically after non-dry-run edits
 
-Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.`;
+Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.
+
+Common response fields: success (boolean), diff (object with before/after), backup_id (string), syntax_valid (boolean). Exact fields vary by mode.`;
   // Note: The Returns section intentionally stays high-level because per-mode JSON shapes
   // vary by Rust command and documenting each would bloat the description for minimal gain.
   // Agents can parse the JSON response generically — key fields include 'success' and 'diff'.
@@ -418,7 +420,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .array(z.record(z.string(), z.unknown()))
         .optional()
         .describe(
-          "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback",
+          "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback. Note: uses 'file'/'match'/'replacement' (not filePath/oldString/newString)",
         ),
       dryRun: z
         .boolean()
@@ -619,7 +621,7 @@ Uses the opencode patch format with \`*** Begin Patch\` / \`*** End Patch\` mark
 - Parent directories are created automatically for new files
 - Fuzzy matching for context anchors (handles whitespace and Unicode differences)
 
-Returns: Status message string listing created, updated, moved, deleted, or failed file operations.`;
+Returns: Status message string listing created, updated, moved, deleted, or failed file operations. May include inline LSP errors if type errors are introduced by the patch.`;
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
@@ -823,7 +825,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
     args: {
       filePath: z
         .string()
-        .describe("Path to file to delete. Relative paths resolved from project root."),
+        .describe("Path to file to delete (absolute or relative to project root)"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);
@@ -859,8 +861,12 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {
     description: MOVE_DESCRIPTION,
     args: {
-      filePath: z.string().describe("Source file path to move"),
-      destination: z.string().describe("Destination file path"),
+      filePath: z
+        .string()
+        .describe("Source file path to move (absolute or relative to project root)"),
+      destination: z
+        .string()
+        .describe("Destination file path (absolute or relative to project root)"),
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory);

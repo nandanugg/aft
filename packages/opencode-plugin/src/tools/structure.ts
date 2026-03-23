@@ -48,7 +48,7 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
           .string()
           .optional()
           .describe(
-            "Container name for add_member — the class, struct, or impl block to insert into",
+            "Container name for add_member — the class, struct, or impl block to insert into. Appears as 'scope' in the response.",
           ),
         code: z.string().optional().describe("Member code to insert (add_member)"),
         position: z

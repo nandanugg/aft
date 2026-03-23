@@ -49,7 +49,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           .string()
           .optional()
           .describe(
-            "Disambiguation scope for 'move' op — e.g. 'MyClass' to select the symbol inside MyClass (when multiple symbols share the same name)",
+            "Disambiguation scope for 'move' op — when multiple top-level symbols share the same name, specify the containing scope to disambiguate (e.g. 'MyClass'). Does NOT enable access to nested symbols or class methods.",
           ),
         // extract
         name: z.string().optional().describe("New function name — required for 'extract' op"),

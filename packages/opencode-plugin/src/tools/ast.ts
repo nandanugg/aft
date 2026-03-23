@@ -141,6 +141,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
+      "**Warning: This tool modifies files directly.** Use dryRun=true to preview. Consider creating an aft_safety checkpoint before bulk replacements.\n\n" +
       "Returns: Text summary — 'Replaced N match(es) across M file(s)' (or '[DRY RUN] Would replace...') followed by file:line blocks with before/after text.",
     args: {
       pattern: z
@@ -149,7 +150,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       rewrite: z.string().describe("Replacement pattern (can use $VAR from pattern)"),
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
-      globs: z.array(z.string()).optional().describe("Include/exclude globs"),
+      globs: z.array(z.string()).optional().describe("Include/exclude globs (prefix ! to exclude)"),
       dryRun: z.boolean().optional().describe("Preview changes without applying (default: false)"),
     },
     execute: async (args, context): Promise<string> => {
