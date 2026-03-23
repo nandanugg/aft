@@ -154,12 +154,10 @@ impl AppContext {
             return Vec::new();
         }
 
-        // Default 300ms is enough for most LSP servers to publish single-file diagnostics.
-        // The old 1500ms default caused significant latency, especially for multi-file edits.
         let wait_ms = params
             .get("wait_ms")
             .and_then(|v| v.as_u64())
-            .unwrap_or(300);
+            .unwrap_or(1500);
         std::thread::sleep(std::time::Duration::from_millis(wait_ms));
 
         let canonical_path =
@@ -220,4 +218,5 @@ impl AppContext {
 
         Ok(resolved)
     }
+
 }
