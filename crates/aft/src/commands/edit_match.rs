@@ -204,10 +204,7 @@ fn handle_glob_edit_match(
     for edit in &pending {
         let file_str = edit.path.display().to_string();
         let formatted = if !dry_run {
-            match edit::write_format_only(&edit.path, &config) {
-                Ok(true) => true,
-                _ => false,
-            }
+            matches!(edit::write_format_only(&edit.path, &config), Ok(true))
         } else {
             false
         };
@@ -259,7 +256,8 @@ fn handle_glob_edit_match(
 
     log::debug!(
         "[aft] edit_match (glob): {} replacements across {} files",
-        total_replacements, total_files
+        total_replacements,
+        total_files
     );
 
     Response::success(
@@ -328,7 +326,9 @@ fn handle_single_file_edit_match(
     if fuzzy_matches[0].pass > 1 {
         log::debug!(
             "[aft] edit_match: fuzzy match (pass {}) for '{}' in {}",
-            fuzzy_matches[0].pass, match_str, file
+            fuzzy_matches[0].pass,
+            match_str,
+            file
         );
     }
 

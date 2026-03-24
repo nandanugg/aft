@@ -270,27 +270,31 @@ fn compute_new_content(op: &ParsedOp) -> Result<String, String> {
                 String::new()
             };
 
-            let positions: Vec<usize> = source.match_indices(match_str).map(|(i, _)| i).collect();
+            let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(&source, match_str);
 
-            if positions.is_empty() {
+            if fuzzy_matches.is_empty() {
                 return Err(format!(
                     "match '{}' not found in {}",
                     match_str,
                     op.file.display()
                 ));
             }
-            if positions.len() > 1 {
+            if fuzzy_matches.len() > 1 {
                 return Err(format!(
                     "match '{}' is ambiguous ({} occurrences) in {}",
                     match_str,
-                    positions.len(),
+                    fuzzy_matches.len(),
                     op.file.display()
                 ));
             }
 
-            let start = positions[0];
-            let end = start + match_str.len();
-            Ok(edit::replace_byte_range(&source, start, end, replacement))
+            let m = &fuzzy_matches[0];
+            Ok(edit::replace_byte_range(
+                &source,
+                m.byte_start,
+                m.byte_start + m.byte_len,
+                replacement,
+            ))
         }
     }
 }
@@ -339,27 +343,31 @@ fn compute_new_content_dry(op: &ParsedOp, original: &str) -> Result<String, Stri
             match_str,
             replacement,
         } => {
-            let positions: Vec<usize> = original.match_indices(match_str).map(|(i, _)| i).collect();
+            let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(original, match_str);
 
-            if positions.is_empty() {
+            if fuzzy_matches.is_empty() {
                 return Err(format!(
                     "match '{}' not found in {}",
                     match_str,
                     op.file.display()
                 ));
             }
-            if positions.len() > 1 {
+            if fuzzy_matches.len() > 1 {
                 return Err(format!(
                     "match '{}' is ambiguous ({} occurrences) in {}",
                     match_str,
-                    positions.len(),
+                    fuzzy_matches.len(),
                     op.file.display()
                 ));
             }
 
-            let start = positions[0];
-            let end = start + match_str.len();
-            Ok(edit::replace_byte_range(original, start, end, replacement))
+            let m = &fuzzy_matches[0];
+            Ok(edit::replace_byte_range(
+                original,
+                m.byte_start,
+                m.byte_start + m.byte_len,
+                replacement,
+            ))
         }
     }
 }

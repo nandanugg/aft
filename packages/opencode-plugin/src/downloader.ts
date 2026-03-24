@@ -36,8 +36,15 @@ export function getBinaryName(): string {
   return process.platform === "win32" ? "aft.exe" : "aft";
 }
 
-/** Return the cached binary path if it exists, otherwise null. */
-export function getCachedBinaryPath(): string | null {
+/** Return the cached binary path if it exists, otherwise null.
+ *  When version is provided, checks the version-specific cache directory.
+ *  When omitted, checks the legacy flat cache for backward compatibility. */
+export function getCachedBinaryPath(version?: string): string | null {
+  if (version) {
+    const binaryPath = join(getCacheDir(), version, getBinaryName());
+    return existsSync(binaryPath) ? binaryPath : null;
+  }
+  // Legacy flat cache (pre-versioned downloads)
   const binaryPath = join(getCacheDir(), getBinaryName());
   return existsSync(binaryPath) ? binaryPath : null;
 }
@@ -58,20 +65,21 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     return null;
   }
 
-  const cacheDir = getCacheDir();
-  const binaryName = getBinaryName();
-  const binaryPath = join(cacheDir, binaryName);
-
-  // Already cached
-  if (existsSync(binaryPath)) {
-    return binaryPath;
-  }
-
   // Resolve version if not provided
   const tag = version ?? (await fetchLatestTag());
   if (!tag) {
     console.error(`${TAG} Could not determine latest release version.`);
     return null;
+  }
+
+  // Version-specific cache: ~/.cache/aft/bin/<tag>/aft
+  const versionedCacheDir = join(getCacheDir(), tag);
+  const binaryName = getBinaryName();
+  const binaryPath = join(versionedCacheDir, binaryName);
+
+  // Already cached for this version
+  if (existsSync(binaryPath)) {
+    return binaryPath;
   }
 
   const downloadUrl = `https://github.com/${REPO}/releases/download/${tag}/${assetName}`;
@@ -80,9 +88,9 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   console.error(`${TAG} Downloading AFT binary (${tag}) for ${platformKey}...`);
 
   try {
-    // Ensure cache directory exists
-    if (!existsSync(cacheDir)) {
-      mkdirSync(cacheDir, { recursive: true });
+    // Ensure versioned cache directory exists
+    if (!existsSync(versionedCacheDir)) {
+      mkdirSync(versionedCacheDir, { recursive: true });
     }
 
     // Download binary and checksum file in parallel
@@ -159,8 +167,13 @@ export async function downloadBinary(version?: string): Promise<string | null> {
  * This is the main entry point called by the resolver.
  */
 export async function ensureBinary(version?: string): Promise<string | null> {
-  const cached = getCachedBinaryPath();
-  if (cached) return cached;
+  // Check version-specific cache first, then legacy flat cache
+  if (version) {
+    const versionCached = getCachedBinaryPath(version);
+    if (versionCached) return versionCached;
+  }
+  const legacyCached = getCachedBinaryPath();
+  if (legacyCached) return legacyCached;
   return downloadBinary(version);
 }
 

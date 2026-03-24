@@ -68,10 +68,18 @@ export async function queryLspHints(
     // Map to wire format
     const hints: LspSymbolHint[] = [];
     for (const sym of symbols) {
-      // Strip file:// prefix from URIs
+      // Convert file URI to path (handles Windows file:///C:/path correctly)
       let file = sym.location.uri;
       if (file.startsWith("file://")) {
-        file = file.slice(7);
+        try {
+          file = new URL(file).pathname;
+          // On Windows, URL.pathname gives /C:/path — strip leading slash
+          if (process.platform === "win32" && /^\/[A-Za-z]:/.test(file)) {
+            file = file.slice(1);
+          }
+        } catch {
+          file = file.slice(7);
+        }
       }
 
       const hint: LspSymbolHint = {

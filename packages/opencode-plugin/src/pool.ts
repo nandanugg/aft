@@ -43,7 +43,11 @@ export class BridgePool {
       onVersionMismatch: options.onVersionMismatch,
     };
     this.configOverrides = configOverrides;
-    this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
+    // Skip cleanup timer when idle timeout is Infinity (no-op) to avoid wasted cycles
+    if (Number.isFinite(this.idleTimeoutMs)) {
+      this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
+      this.cleanupTimer.unref(); // don't prevent Node from exiting
+    }
   }
 
   /**

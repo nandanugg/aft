@@ -660,19 +660,20 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 
       // Checkpoint all affected files for atomic rollback
       const checkpointName = `apply_patch_${Date.now()}`;
+      let checkpointCreated = false;
       try {
         await bridge.send("checkpoint", {
           name: checkpointName,
           files: allPaths.map((p) => path.resolve(context.directory, p)),
         });
+        checkpointCreated = true;
       } catch {
         // Checkpoint failure is non-fatal — proceed without rollback protection
       }
 
-      // Process each hunk, track diffs for metadata
+      // Process each hunk, track per-file diffs for metadata
       const results: string[] = [];
-      let combinedBefore = "";
-      let combinedAfter = "";
+      const perFileDiffs: Array<{ filePath: string; before: string; after: string }> = [];
       let patchFailed = false;
 
       for (const hunk of hunks) {
@@ -687,7 +688,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 create_dirs: true,
                 diagnostics: true,
               });
-              combinedAfter += hunk.contents;
+              perFileDiffs.push({ filePath, before: "", after: hunk.contents });
               results.push(`Created ${hunk.path}`);
             } catch (e) {
               patchFailed = true;
@@ -700,7 +701,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             try {
               const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
               await bridge.send("delete_file", { file: filePath });
-              combinedBefore += before;
+              perFileDiffs.push({ filePath, before, after: "" });
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
               patchFailed = true;
@@ -739,9 +740,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 }
               }
 
-              // Track diff for metadata
-              combinedBefore += original;
-              combinedAfter += newContent;
+              // Track per-file diff for metadata
+              perFileDiffs.push({ filePath, before: original, after: newContent });
 
               if (hunk.move_path) {
                 await bridge.send("delete_file", { file: filePath });
@@ -761,11 +761,17 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 
       // On failure, restore checkpoint to undo partial changes
       if (patchFailed) {
-        try {
-          await bridge.send("restore_checkpoint", { name: checkpointName });
-          results.push("Patch failed — restored files to pre-patch state.");
-        } catch {
-          results.push("Patch failed — checkpoint restore also failed, files may be inconsistent.");
+        if (checkpointCreated) {
+          try {
+            await bridge.send("restore_checkpoint", { name: checkpointName });
+            results.push("Patch failed — restored files to pre-patch state.");
+          } catch {
+            results.push(
+              "Patch failed — checkpoint restore also failed, files may be inconsistent.",
+            );
+          }
+        } else {
+          results.push("Patch failed — no checkpoint was created, files may be inconsistent.");
         }
         return results.join("\n");
       }
@@ -792,14 +798,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           .join("\n");
         const title = `Success. Updated the following files:\n${fileList}`;
 
+        // Build per-file diffs instead of concatenating content across files
+        const diffText = perFileDiffs
+          .map((d) => buildUnifiedDiff(d.filePath, d.before, d.after))
+          .join("\n");
+
         storeToolMetadata(context.sessionID, callID, {
           title,
           metadata: {
-            diff: buildUnifiedDiff(
-              files.length === 1 ? files[0].filePath : "patch",
-              combinedBefore,
-              combinedAfter,
-            ),
+            diff: diffText,
             files,
           },
         });

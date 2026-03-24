@@ -428,8 +428,10 @@ fn uri_for_path(path: &Path) -> Result<lsp_types::Uri, LspError> {
 
 fn language_id_for_extension(ext: &str) -> &'static str {
     match ext {
-        "ts" | "tsx" => "typescript",
-        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "js" | "mjs" | "cjs" => "javascript",
+        "jsx" => "javascriptreact",
         "py" | "pyi" => "python",
         "rs" => "rust",
         "go" => "go",

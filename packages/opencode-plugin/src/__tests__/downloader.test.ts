@@ -119,7 +119,7 @@ describe("downloadBinary error paths", () => {
       { XDG_CACHE_HOME: cacheRoot },
     );
 
-    expect(result.stdout).toBe(join(cacheRoot, "aft", "bin", binaryName));
+    expect(result.stdout).toBe(join(cacheRoot, "aft", "bin", "v2.0.0", binaryName));
     expect(existsSync(result.stdout)).toBe(true);
     expect(result.stderr).toContain(
       "Warning: no checksums.sha256 found for v2.0.0, skipping verification",
@@ -143,7 +143,7 @@ describe("downloadBinary error paths", () => {
       { XDG_CACHE_HOME: cacheRoot },
     );
 
-    expect(result.stdout).toBe(join(cacheRoot, "aft", "bin", binaryName));
+    expect(result.stdout).toBe(join(cacheRoot, "aft", "bin", "v3.0.0", binaryName));
     expect(existsSync(result.stdout)).toBe(true);
     expect(result.stderr).toContain(
       `Warning: checksums.sha256 found but no entry for ${currentAssetName}`,

@@ -11,7 +11,7 @@ use crate::protocol::{RawRequest, Response};
 /// Params:
 ///   - `file` (string, required) — target file path
 ///   - `content` (string, required) — content to write
-///   - `create_dirs` (bool, optional, default false) — create parent dirs if missing
+///   - `create_dirs` (bool, optional, default true) — create parent dirs if missing
 ///
 /// Returns: `{ file, created, syntax_valid?, backup_id? }`
 pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
