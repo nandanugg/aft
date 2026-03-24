@@ -7,9 +7,13 @@ use super::helpers::{fixture_path, AftProcess};
 fn edit_symbol_with_lsp_hints_disambiguates() {
     let mut aft = AftProcess::spawn();
 
-    // Configure project
+    // Copy fixture to temp dir so we don't mutate the original
     let fixture = fixture_path("ambiguous.ts");
-    let dir = fixture.parent().unwrap().parent().unwrap();
+    let dir = std::env::temp_dir().join("aft-lsp-hints-test");
+    let _ = std::fs::create_dir_all(&dir);
+    let target = dir.join("ambiguous.ts");
+    std::fs::copy(&fixture, &target).unwrap();
+
     let resp = aft.send(&format!(
         r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
         dir.display()
@@ -22,14 +26,15 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
     // Send edit_symbol with lsp_hints pointing to the standalone function (line 3 is within range).
     let resp = aft.send(&format!(
         r#"{{"id":"lsp-1","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}","lsp_hints":{{"symbols":[{{"name":"process","file":"{}","line":2}}]}}}}"#,
-        fixture.display(),
-        fixture.display()
+        target.display(),
+        target.display()
     ));
 
     // Should succeed — not ambiguous_symbol
     assert_eq!(resp["success"], true, "expected success, got: {:?}", resp);
     assert_eq!(resp["symbol"], "process");
 
+    let _ = std::fs::remove_dir_all(&dir);
     aft.shutdown();
 }
 
@@ -126,7 +131,11 @@ fn zoom_with_lsp_hints_disambiguates() {
     ));
 
     // Should succeed with the method, not an ambiguous error
-    assert_eq!(resp["success"], true, "expected zoom success, got: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "expected zoom success, got: {:?}",
+        resp
+    );
     assert_eq!(resp["name"], "process");
 
     aft.shutdown();
