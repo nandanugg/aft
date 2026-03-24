@@ -46,3 +46,4 @@ ts-bench/
 
 # Benchmark configs (may contain API keys)
 benchmarks/configs/
+.opencode/dumps
