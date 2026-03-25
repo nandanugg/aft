@@ -72,11 +72,15 @@ const plugin: Plugin = async (input) => {
           `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
             "Some features may not work. Attempting to download a compatible binary...",
         );
-        // Fire-and-forget: try to download matching version in background
+        // Fire-and-forget: try to download matching version and hot-swap
         ensureBinary(`v${minVersion}`).then(
           (path) => {
             if (path) {
-              log(`Downloaded compatible binary to ${path}. Restart OpenCode to use it.`);
+              log(`Downloaded compatible binary to ${path}. Replacing running bridges...`);
+              pool.replaceBinary(path).then(
+                () => log("Binary replaced successfully. New bridges will use the updated binary."),
+                (err) => error("Failed to replace binary:", err),
+              );
             }
           },
           () => {

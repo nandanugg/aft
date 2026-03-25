@@ -8,10 +8,18 @@ use aft::parser::TreeSitterProvider;
 use aft::protocol::{EchoParams, RawRequest, Response};
 
 fn main() {
+    // Handle --version flag before anything else
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("aft {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             use std::io::Write;
-            let prefix = if record.target().starts_with("aft::lsp") || record.target().starts_with("aft_lsp") {
+            let prefix = if record.target().starts_with("aft::lsp")
+                || record.target().starts_with("aft_lsp")
+            {
                 "[aft-lsp]"
             } else {
                 "[aft]"
@@ -72,7 +80,10 @@ fn main() {
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "ping" => Response::success(&req.id, serde_json::json!({ "command": "pong" })),
-        "version" => Response::success(&req.id, serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })),
+        "version" => Response::success(
+            &req.id,
+            serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        ),
         "echo" => handle_echo(&req),
         "outline" => aft::commands::outline::handle_outline(&req, ctx),
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),

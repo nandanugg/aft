@@ -21,7 +21,7 @@ export interface PoolOptions extends BridgeOptions {
  */
 export class BridgePool {
   private readonly bridges = new Map<string, PoolEntry>();
-  private readonly binaryPath: string;
+  private binaryPath: string;
   private readonly maxPoolSize: number;
   private readonly idleTimeoutMs: number;
   private readonly bridgeOptions: BridgeOptions;
@@ -111,6 +111,18 @@ export class BridgePool {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
+    const shutdowns = Array.from(this.bridges.values()).map((e) => e.bridge.shutdown());
+    this.bridges.clear();
+    await Promise.allSettled(shutdowns);
+  }
+
+  /**
+   * Replace the binary path and restart all bridges.
+   * Used after downloading a newer binary version.
+   */
+  async replaceBinary(newPath: string): Promise<void> {
+    this.binaryPath = newPath;
+    // Shut down all existing bridges so they respawn with the new binary on next call
     const shutdowns = Array.from(this.bridges.values()).map((e) => e.bridge.shutdown());
     this.bridges.clear();
     await Promise.allSettled(shutdowns);
