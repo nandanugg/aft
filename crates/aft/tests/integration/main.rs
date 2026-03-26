@@ -1,10 +1,14 @@
+#[path = "../helpers/mod.rs"]
+mod test_helpers;
+
 mod helpers;
 
+mod ast_commands_test;
 mod callgraph_test;
 mod commands_test;
 mod dryrun_test;
-mod error_path_test;
 mod edit_test;
+mod error_path_test;
 mod extract_function_test;
 mod format_test;
 mod import_test;
@@ -18,6 +22,7 @@ mod lsp_rename_test;
 mod markdown_test;
 mod member_test;
 mod move_symbol_test;
+mod outline_zoom_test;
 mod protocol_test;
 mod safety_test;
 mod structure_test;

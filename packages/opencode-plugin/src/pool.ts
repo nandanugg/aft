@@ -16,7 +16,8 @@ export interface PoolOptions extends BridgeOptions {
 }
 
 /**
- * Manages a pool of BinaryBridge instances, one per project directory.
+ * Manages a pool of BinaryBridge instances, one per session.
+ * Each session gets its own binary process with isolated backup/undo history.
  * Handles idle cleanup and LRU eviction when at capacity.
  */
 export class BridgePool {
@@ -51,12 +52,13 @@ export class BridgePool {
   }
 
   /**
-   * Get or create a bridge for the given directory.
-   * Each directory gets its own binary process that auto-configures on first use.
+   * Get or create a bridge for the given session.
+   * Each session gets its own binary process with isolated backup/undo history.
+   * The bridge's working directory is set to `directory`.
    */
-  getBridge(directory: string): BinaryBridge {
-    const normalized = directory.replace(/\/+$/, "");
-    const existing = this.bridges.get(normalized);
+  getBridge(directory: string, sessionID: string): BinaryBridge {
+    const key = sessionID || directory.replace(/\/+$/, "");
+    const existing = this.bridges.get(key);
     if (existing) {
       existing.lastUsed = Date.now();
       return existing.bridge;
@@ -67,13 +69,14 @@ export class BridgePool {
       this.evictLRU();
     }
 
+    const normalized = directory.replace(/\/+$/, "");
     const bridge = new BinaryBridge(
       this.binaryPath,
       normalized,
       this.bridgeOptions,
       this.configOverrides,
     );
-    this.bridges.set(normalized, { bridge, lastUsed: Date.now() });
+    this.bridges.set(key, { bridge, lastUsed: Date.now() });
     return bridge;
   }
 

@@ -105,7 +105,6 @@ impl LspClient {
         let reader_writer = Arc::clone(&writer);
         let reader_kind = kind;
         let reader_root = root.clone();
-    
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -114,7 +113,9 @@ impl LspClient {
                     Ok(Some(ServerMessage::Response(response))) => {
                         if let Ok(mut guard) = reader_pending.lock() {
                             if let Some(tx) = guard.remove(&response.id) {
-                                let _ = tx.send(response);
+                                if tx.send(response).is_err() {
+                                    log::debug!("[aft-lsp] response channel closed");
+                                }
                             }
                         } else {
                             let _ = event_tx.send(LspEvent::ServerExited {

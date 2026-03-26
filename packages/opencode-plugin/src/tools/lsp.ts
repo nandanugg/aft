@@ -38,7 +38,7 @@ export function lspTools(ctx: PluginContext): Record<string, ToolDefinition> {
         ),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       if (args.filePath !== undefined && args.directory !== undefined) {
         throw new Error(
           "'filePath' and 'directory' are mutually exclusive — provide one or neither",

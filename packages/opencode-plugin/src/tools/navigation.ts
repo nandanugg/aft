@@ -43,7 +43,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           .describe("Expression to track through data flow (required for trace_data op)"),
       },
       execute: async (args, context): Promise<string> => {
-        const bridge = ctx.pool.getBridge(context.directory);
+        const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const params: Record<string, unknown> = {
           file: args.filePath,
           symbol: args.symbol,

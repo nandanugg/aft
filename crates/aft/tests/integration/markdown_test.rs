@@ -198,7 +198,7 @@ fn markdown_zoom_by_heading_name() {
 }
 
 #[test]
-fn markdown_zoom_line_range() {
+fn markdown_zoom_heading_not_found() {
     let dir = TempDir::new().unwrap();
     let md_file = dir.path().join("readme.md");
     fs::write(&md_file, SAMPLE_MD).unwrap();
@@ -206,20 +206,16 @@ fn markdown_zoom_line_range() {
     let mut aft = AftProcess::spawn();
     aft.configure(dir.path());
     let resp = aft.send(&format!(
-        r#"{{"id":"md-4","command":"zoom","file":"{}","start_line":1,"end_line":3}}"#,
+        r#"{{"id":"md-4","command":"zoom","file":"{}","symbol":"Missing Heading"}}"#,
         md_file.display()
     ));
 
     assert_eq!(
-        resp["success"], true,
-        "zoom by line range should work: {:?}",
+        resp["success"], false,
+        "missing heading should error: {:?}",
         resp
     );
-    let content = resp["content"].as_str().unwrap();
-    assert!(
-        content.contains("# Project Title"),
-        "should contain first heading"
-    );
+    assert_eq!(resp["code"], "symbol_not_found");
 }
 
 #[test]

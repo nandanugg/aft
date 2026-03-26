@@ -360,7 +360,9 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     log::debug!(
         "[aft] inline_symbol: {} at {}:{}",
-        symbol, file, call_site_line
+        symbol,
+        file,
+        call_site_line
     );
 
     // --- Build response ---

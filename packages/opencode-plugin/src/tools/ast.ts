@@ -71,7 +71,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         .describe("Number of context lines to show around each match"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const params: Record<string, unknown> = {
         pattern: args.pattern,
         lang: args.lang,
@@ -159,7 +159,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       dryRun: z.boolean().optional().describe("Preview changes without applying (default: false)"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const isDryRun = args.dryRun === true;
 
       if (!isDryRun) {

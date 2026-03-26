@@ -58,6 +58,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     }
+    // Restrict file operations to project root (default: false)
+    if let Some(v) = req
+        .params
+        .get("restrict_to_project_root")
+        .and_then(|v| v.as_bool())
+    {
+        ctx.config_mut().restrict_to_project_root = v;
+    }
     // Per-language checker overrides: { "typescript": "tsc", "python": "pyright" }
     if let Some(v) = req.params.get("checker").and_then(|v| v.as_object()) {
         for (lang, tool) in v {

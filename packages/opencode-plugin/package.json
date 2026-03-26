@@ -19,6 +19,7 @@
     "typecheck": "tsc --noEmit",
     "pretest": "cd ../.. && cargo build",
     "test": "bun test",
+    "test:e2e": "bun test src/__tests__/e2e/",
     "prepublishOnly": "tsc"
   },
   "dependencies": {

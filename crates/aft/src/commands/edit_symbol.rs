@@ -232,7 +232,13 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             let insert_text = format!("\n{}", insertion);
             edit::replace_byte_range(&source, end_byte, end_byte, &insert_text)
         }
-        _ => unreachable!(),
+        _ => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("edit_symbol: unsupported operation: {}", operation),
+            )
+        }
     };
     let new_source = match new_source {
         Ok(updated) => updated,

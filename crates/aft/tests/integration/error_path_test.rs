@@ -4,7 +4,10 @@ use std::path::Path;
 use super::helpers::AftProcess;
 
 fn assert_error_code(resp: &serde_json::Value, code: &str) {
-    assert_eq!(resp["success"], false, "expected failure response: {resp:?}");
+    assert_eq!(
+        resp["success"], false,
+        "expected failure response: {resp:?}"
+    );
     assert_eq!(resp["code"], code, "unexpected error response: {resp:?}");
 }
 
@@ -47,8 +50,14 @@ fn write_fails_when_parent_directory_is_missing_and_create_dirs_is_false() {
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
     assert_error_code(&resp, "invalid_request");
-    assert!(resp["message"].as_str().unwrap().contains("failed to write file"));
-    assert!(!target.exists(), "write should not create missing directories");
+    assert!(resp["message"]
+        .as_str()
+        .unwrap()
+        .contains("failed to write file"));
+    assert!(
+        !target.exists(),
+        "write should not create missing directories"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -63,8 +72,20 @@ fn write_rejects_paths_outside_the_configured_project_root() {
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&outside).unwrap();
 
-    let configure = aft.configure(&root);
-    assert_eq!(configure["success"], true, "configure failed: {configure:?}");
+    // Must opt into path restriction (default is false)
+    let configure = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "cfg",
+            "command": "configure",
+            "project_root": root.display().to_string(),
+            "restrict_to_project_root": true,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
 
     let target = outside.join("new.txt");
     let req = serde_json::json!({
@@ -127,7 +148,10 @@ fn edit_match_rejects_empty_match_strings() {
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
     assert_error_code(&resp, "invalid_request");
-    assert_eq!(resp["message"], "edit_match: 'match' must be a non-empty string");
+    assert_eq!(
+        resp["message"],
+        "edit_match: 'match' must be a non-empty string"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -149,7 +173,10 @@ fn edit_match_returns_file_not_found_for_missing_files() {
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
     assert_error_code(&resp, "file_not_found");
-    assert_eq!(resp["message"], format!("file not found: {}", target.display()));
+    assert_eq!(
+        resp["message"],
+        format!("file not found: {}", target.display())
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -217,8 +244,20 @@ fn delete_file_rejects_paths_outside_the_configured_project_root() {
     let target = outside.join("delete-me.txt");
     fs::write(&target, "hello").unwrap();
 
-    let configure = aft.configure(&root);
-    assert_eq!(configure["success"], true, "configure failed: {configure:?}");
+    // Must opt into path restriction (default is false)
+    let configure = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "cfg",
+            "command": "configure",
+            "project_root": root.display().to_string(),
+            "restrict_to_project_root": true,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
 
     let req = serde_json::json!({
         "id": "delete-outside-root",
@@ -231,7 +270,10 @@ fn delete_file_rejects_paths_outside_the_configured_project_root() {
     let message = resp["message"].as_str().unwrap();
     assert!(message.contains(&target.display().to_string()));
     assert!(message.contains(&root.display().to_string()));
-    assert!(target.exists(), "delete_file should not remove files outside the project root");
+    assert!(
+        target.exists(),
+        "delete_file should not remove files outside the project root"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());

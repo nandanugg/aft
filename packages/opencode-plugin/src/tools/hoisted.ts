@@ -30,6 +30,11 @@ function relativeToWorktree(fp: string, worktree: string): string {
 
 /** Build a simple unified diff string from before/after content. */
 function buildUnifiedDiff(fp: string, before: string, after: string): string {
+  // Skip diff for very large files to avoid blocking the event loop
+  const SIZE_CAP = 100 * 1024; // 100KB
+  if (before.length > SIZE_CAP || after.length > SIZE_CAP) {
+    return `Index: ${fp}\n(diff skipped: file exceeds ${SIZE_CAP / 1024}KB)\n`;
+  }
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
   let diff = `Index: ${fp}\n===================================================================\n--- ${fp}\n+++ ${fp}\n`;
@@ -107,7 +112,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         ),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const file = args.filePath as string;
 
       // Resolve relative paths
@@ -264,7 +269,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       content: z.string().describe("The full content to write to the file"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const file = args.filePath as string;
       const content = args.content as string;
 
@@ -438,7 +443,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .describe("Preview changes without applying (returns diff, default: false)"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
 
       // Transaction mode — multi-file
       if (Array.isArray(args.operations)) {
@@ -640,7 +645,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       patchText: z.string().describe("The full patch text including Begin/End markers"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const patchText = args.patchText as string;
       if (!patchText) throw new Error("'patchText' is required");
 
@@ -842,7 +847,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
       filePath: z.string().describe("Path to file to delete"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const filePath = path.isAbsolute(args.filePath as string)
         ? (args.filePath as string)
         : path.resolve(context.directory, args.filePath as string);
@@ -879,7 +884,7 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
       destination: z.string().describe("Destination file path"),
     },
     execute: async (args, context): Promise<string> => {
-      const bridge = ctx.pool.getBridge(context.directory);
+      const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
       const filePath = path.isAbsolute(args.filePath as string)
         ? (args.filePath as string)
         : path.resolve(context.directory, args.filePath as string);

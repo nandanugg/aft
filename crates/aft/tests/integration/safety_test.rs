@@ -113,6 +113,47 @@ fn test_undo_restores_previous_version() {
 }
 
 #[test]
+fn test_undo_restores_file_after_edit_command() {
+    let dir = temp_dir("undo_after_edit_command");
+    let file = dir.join("target.txt");
+
+    fs::write(&file, "hello world\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+
+    let edit = serde_json::json!({
+        "id": "edit-before-undo",
+        "command": "edit_match",
+        "file": file.display().to_string(),
+        "match": "world",
+        "replacement": "rust"
+    });
+    let edit_resp = aft.send(&serde_json::to_string(&edit).unwrap());
+    assert_eq!(
+        edit_resp["success"], true,
+        "edit should succeed: {edit_resp:?}"
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello rust\n");
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-after-edit","command":"undo","file":"{}"}}"#,
+        file.display()
+    ));
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello world\n");
+
+    let history = aft.send(&format!(
+        r#"{{"id":"history-after-undo","command":"edit_history","file":"{}"}}"#,
+        file.display()
+    ));
+    assert_eq!(history["success"], true);
+    assert!(history["entries"].as_array().unwrap().is_empty());
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn test_edit_history_returns_stack() {
     let dir = temp_dir("edit_history");
     let file = dir.join("tracked.txt");
@@ -312,6 +353,63 @@ fn test_checkpoint_overwrite() {
     // Process should still be alive after all this
     let resp = aft.send(r#"{"id":"alive-3","command":"ping"}"#);
     assert_eq!(resp["success"], true);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn test_edit_history_caps_at_twenty_entries_per_file() {
+    let dir = temp_dir("history_cap");
+    let file = dir.join("history_cap.txt");
+    fs::write(&file, "v0").unwrap();
+
+    let mut aft = AftProcess::spawn();
+
+    for i in 1..=21 {
+        let req = serde_json::json!({
+            "id": format!("edit-{i}"),
+            "command": "edit_match",
+            "file": file.display().to_string(),
+            "match": format!("v{}", i - 1),
+            "replacement": format!("v{i}")
+        });
+        let resp = aft.send(&serde_json::to_string(&req).unwrap());
+        assert_eq!(resp["success"], true, "edit {i} failed: {resp:?}");
+    }
+
+    assert_eq!(fs::read_to_string(&file).unwrap(), "v21");
+
+    let history = aft.send(&format!(
+        r#"{{"id":"hist-cap","command":"edit_history","file":"{}"}}"#,
+        file.display()
+    ));
+    assert_eq!(history["success"], true, "history failed: {:?}", history);
+
+    let entries = history["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 20, "history should be capped: {:?}", entries);
+    assert_eq!(entries[0]["description"], "edit_match: v20");
+    assert_eq!(entries[19]["description"], "edit_match: v1");
+    assert!(!entries
+        .iter()
+        .any(|entry| entry["description"] == "edit_match: v0"));
+
+    for expected in (1..=20).rev() {
+        let undo = aft.send(&format!(
+            r#"{{"id":"undo-{expected}","command":"undo","file":"{}"}}"#,
+            file.display()
+        ));
+        assert_eq!(undo["success"], true, "undo {expected} failed: {undo:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), format!("v{expected}"));
+    }
+
+    let no_more_history = aft.send(&format!(
+        r#"{{"id":"undo-empty","command":"undo","file":"{}"}}"#,
+        file.display()
+    ));
+    assert_eq!(no_more_history["success"], false);
+    assert_eq!(no_more_history["code"], "no_undo_history");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
 
     let status = aft.shutdown();
     assert!(status.success());

@@ -184,6 +184,10 @@ impl AppContext {
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let config = self.config();
+        // When restrict_to_project_root is false (default), allow all paths
+        if !config.restrict_to_project_root {
+            return Ok(path.to_path_buf());
+        }
         let root = match &config.project_root {
             Some(r) => r.clone(),
             None => return Ok(path.to_path_buf()), // No root configured, allow all

@@ -86,7 +86,10 @@ pub fn apply_lsp_disambiguation(matches: Vec<SymbolMatch>, hints: &LspHints) -> 
     // If zero or multiple still match, fall back to all original candidates.
     if aligned_indices.len() == 1 {
         let idx = aligned_indices[0];
-        vec![matches.into_iter().nth(idx).unwrap()]
+        matches
+            .into_iter()
+            .nth(idx)
+            .map_or_else(Vec::new, |m| vec![m])
     } else {
         matches
     }

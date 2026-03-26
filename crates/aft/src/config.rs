@@ -29,6 +29,9 @@ pub struct Config {
     /// Per-language type checker overrides. Keys: "typescript", "python", "rust", "go".
     /// Values: "tsc", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none".
     pub checker: std::collections::HashMap<String, String>,
+    /// Whether to restrict file operations to within `project_root` (default: false).
+    /// When true, write-capable commands reject paths outside the project root.
+    pub restrict_to_project_root: bool,
 }
 
 impl Default for Config {
@@ -44,6 +47,7 @@ impl Default for Config {
             validate_on_edit: None,
             formatter: std::collections::HashMap::new(),
             checker: std::collections::HashMap::new(),
+            restrict_to_project_root: false,
         }
     }
 }

@@ -48,7 +48,11 @@ fn configure(aft: &mut AftProcess, root: &str) {
         r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
         root
     ));
-    assert_eq!(resp["success"], true, "configure should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +76,11 @@ fn move_symbol_basic() {
         source, dest
     ));
 
-    assert_eq!(resp["success"], true, "move_symbol should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "move_symbol should succeed: {:?}",
+        resp
+    );
     assert!(
         resp["files_modified"].as_u64().unwrap() >= 2,
         "at least source + dest should be modified"

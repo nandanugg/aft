@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use aft::edit::replace_byte_range;
+
 use super::helpers::{fixture_path, AftProcess};
 
 fn fake_server_path() -> PathBuf {
@@ -784,6 +786,184 @@ fn batch_with_undo() {
     assert_eq!(restored, original, "undo should restore original content");
 
     let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_overlapping_ranges_returns_overlapping_edits_error() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_overlap.txt");
+    let original = "abcdefghij\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-overlap",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "cdef", "replacement": "XXXX" },
+            { "match": "defg", "replacement": "YYYY" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], false, "batch should fail: {:?}", resp);
+    assert_eq!(resp["code"], "overlapping_edits");
+    assert!(resp["message"].as_str().unwrap().contains("overlaps"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_accepts_old_string_new_string_keys() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_old_new.txt");
+    let original = "alpha beta gamma\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-old-new",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "oldString": "alpha", "newString": "ALPHA" },
+            { "oldString": "gamma", "newString": "GAMMA" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {:?}", resp);
+    assert_eq!(resp["edits_applied"], 2);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "ALPHA beta GAMMA\n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_fuzzy_matching_covers_all_progressive_passes() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_fuzzy_passes.txt");
+    let original = concat!(
+        "exact = 1\n",
+        "trailing = 2   \n",
+        "    trimmed = 3   \n",
+        "normalized\u{00a0}space = 4\n"
+    );
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-fuzzy-passes",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "match": "exact = 1\n", "replacement": "exact = 10\n" },
+            { "match": "trailing = 2\n", "replacement": "trailing = 20\n" },
+            { "match": "trimmed = 3\n", "replacement": "trimmed = 30\n" },
+            { "match": "normalized space = 4", "replacement": "normalized space = 40\n" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {:?}", resp);
+    assert_eq!(resp["edits_applied"], 4);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        concat!(
+            "exact = 10\n",
+            "trailing = 20\n",
+            "trimmed = 30\n",
+            "normalized space = 40\n"
+        )
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_replace_all_replaces_multiple_occurrences() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_replace_all.txt");
+    let original = "hello hello hello\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "em-replace-all",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "hello",
+        "replacement": "bye",
+        "replace_all": true,
+        "replaceAll": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "edit_match should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["replacements"], 3);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "bye bye bye\n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn replace_byte_range_invalid_ranges_return_errors() {
+    let aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("replace_invalid.txt");
+    fs::write(&target, "abcdef").unwrap();
+    let source = fs::read_to_string(&target).unwrap();
+
+    let start_after_end = replace_byte_range(&source, 4, 2, "x").unwrap_err();
+    assert_eq!(start_after_end.code(), "invalid_request");
+    assert!(start_after_end.to_string().contains("start must be <= end"));
+
+    let end_out_of_bounds = replace_byte_range(&source, 0, source.len() + 1, "x").unwrap_err();
+    assert_eq!(end_out_of_bounds.code(), "invalid_request");
+    assert!(end_out_of_bounds
+        .to_string()
+        .contains("end exceeds source length"));
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "abcdef");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn replace_byte_range_rejects_non_char_boundaries() {
+    let aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("replace_utf8.txt");
+    fs::write(&target, "aéz").unwrap();
+    let source = fs::read_to_string(&target).unwrap();
+
+    let invalid_end = replace_byte_range(&source, 1, 2, "x").unwrap_err();
+    assert_eq!(invalid_end.code(), "invalid_request");
+    assert!(invalid_end
+        .to_string()
+        .contains("end is not a char boundary"));
+
+    let invalid_start = replace_byte_range(&source, 2, 3, "x").unwrap_err();
+    assert_eq!(invalid_start.code(), "invalid_request");
+    assert!(invalid_start
+        .to_string()
+        .contains("start is not a char boundary"));
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "aéz");
+
     let status = aft.shutdown();
     assert!(status.success());
 }

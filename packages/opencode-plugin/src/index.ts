@@ -62,6 +62,8 @@ const plugin: Plugin = async (input) => {
     configOverrides.validate_on_edit = aftConfig.validate_on_edit;
   if (aftConfig.formatter !== undefined) configOverrides.formatter = aftConfig.formatter;
   if (aftConfig.checker !== undefined) configOverrides.checker = aftConfig.checker;
+  if (aftConfig.restrict_to_project_root !== undefined)
+    configOverrides.restrict_to_project_root = aftConfig.restrict_to_project_root;
 
   const pool = new BridgePool(
     binaryPath,

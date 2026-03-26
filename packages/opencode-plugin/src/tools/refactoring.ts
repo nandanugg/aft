@@ -72,7 +72,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           .describe("Preview changes as diff without modifying files (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
-        const bridge = ctx.pool.getBridge(context.directory);
+        const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const op = args.op as string;
         const isDryRun = args.dryRun === true;
 

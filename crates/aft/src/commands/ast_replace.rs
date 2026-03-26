@@ -153,20 +153,23 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
         files_with_matches += 1;
 
-        let mut root = lang.ast_grep(&original);
-        match root.replace(pattern.as_str(), rewrite.as_str()) {
-            Ok(_) => {}
-            Err(e) => {
-                file_results.push(serde_json::json!({
-                    "file": file_path.display().to_string(),
-                    "ok": false,
-                    "error": e,
-                }));
-                continue;
+        // Use replace_all to get ALL edits — root.replace() only replaces the FIRST match.
+        let root = lang.ast_grep(&original);
+        let mut edits = root.root().replace_all(pattern.as_str(), rewrite.as_str());
+        if edits.is_empty() {
+            continue;
+        }
+        // Apply edits in reverse byte-offset order to preserve positions
+        edits.sort_by(|a, b| b.position.cmp(&a.position));
+        let mut new_bytes = original.as_bytes().to_vec();
+        for edit in &edits {
+            let start = edit.position;
+            let end = start + edit.deleted_length;
+            if start <= new_bytes.len() && end <= new_bytes.len() {
+                new_bytes.splice(start..end, edit.inserted_text.iter().copied());
             }
         }
-
-        let new_content = root.generate();
+        let new_content = String::from_utf8(new_bytes).unwrap_or_else(|_| original.clone());
         total_replacements += replacement_count;
         total_files += 1;
 

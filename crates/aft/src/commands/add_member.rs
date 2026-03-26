@@ -192,7 +192,10 @@ pub fn handle_add_member(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Insert ---
     let new_source =
-        match edit::replace_byte_range(&source, insert_offset, insert_offset, &indented_code) { Ok(s) => s, Err(e) => return Response::error(&req.id, e.code(), e.to_string()) };
+        match edit::replace_byte_range(&source, insert_offset, insert_offset, &indented_code) {
+            Ok(s) => s,
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        };
 
     // Dry-run: return diff without modifying disk
     if edit::is_dry_run(&req.params) {

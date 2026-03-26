@@ -111,11 +111,16 @@ export class BinaryBridge {
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        warn(
+          `Request "${command}" (id=${id}) timed out after ${this.timeoutMs}ms — restarting bridge`,
+        );
         reject(
           new Error(
             `[aft-plugin] Request "${command}" (id=${id}) timed out after ${this.timeoutMs}ms`,
           ),
         );
+        // Kill the hung process so the next request gets a fresh bridge
+        this.handleTimeout();
       }, this.timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
@@ -252,6 +257,20 @@ export class BinaryBridge {
         warn(`Failed to parse stdout line: ${line}`);
       }
     }
+  }
+
+  private handleTimeout(): void {
+    // Kill the hung process and reject remaining pending requests.
+    // Unlike handleCrash, this does NOT auto-restart — the next send() call
+    // will lazy-spawn a fresh process via ensureSpawned().
+    if (this.process) {
+      this.process.kill("SIGKILL");
+      this.process = null;
+    }
+    this.configured = false;
+
+    // Reject any other pending requests (the timed-out one was already rejected)
+    this.rejectAllPending(new Error("[aft-plugin] Bridge restarted after timeout"));
   }
 
   private handleCrash(): void {

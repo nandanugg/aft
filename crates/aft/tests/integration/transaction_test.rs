@@ -27,7 +27,11 @@ fn transaction_success_three_files() {
         f1.display(), f2.display(), f3.display()
     ));
 
-    assert_eq!(resp["success"], true, "transaction should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "transaction should succeed: {:?}",
+        resp
+    );
     assert_eq!(resp["files_modified"], 3);
 
     let results = resp["results"].as_array().expect("results array");
@@ -74,7 +78,11 @@ fn transaction_rollback_syntax_error() {
         f1.display(), f2.display(), f3.display()
     ));
 
-    assert_eq!(resp["success"], false, "transaction should fail: {:?}", resp);
+    assert_eq!(
+        resp["success"], false,
+        "transaction should fail: {:?}",
+        resp
+    );
     assert_eq!(resp["code"], "transaction_failed");
     assert_eq!(
         resp["failed_operation"], 2,
@@ -141,7 +149,11 @@ fn transaction_rollback_new_file() {
         existing.display(), new_file.display(), bad_file.display()
     ));
 
-    assert_eq!(resp["success"], false, "transaction should fail: {:?}", resp);
+    assert_eq!(
+        resp["success"], false,
+        "transaction should fail: {:?}",
+        resp
+    );
     assert_eq!(resp["code"], "transaction_failed");
 
     // Existing file restored
@@ -184,7 +196,11 @@ fn transaction_edit_match_operation() {
         f1.display(), f2.display()
     ));
 
-    assert_eq!(resp["success"], true, "transaction should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "transaction should succeed: {:?}",
+        resp
+    );
     assert_eq!(resp["files_modified"], 2);
 
     assert_eq!(
@@ -196,6 +212,40 @@ fn transaction_edit_match_operation() {
     // Cleanup
     let _ = fs::remove_file(&f1);
     let _ = fs::remove_file(&f2);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn transaction_edit_match_uses_fuzzy_matching() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("txn_fuzzy.txt");
+
+    fs::write(&target, "    hello world   \n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "txn-fuzzy",
+        "command": "transaction",
+        "operations": [
+            {
+                "file": target.display().to_string(),
+                "command": "edit_match",
+                "match": "hello world\n",
+                "replacement": "hello rust\n"
+            }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "transaction should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["files_modified"], 1);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "hello rust\n");
+
     let status = aft.shutdown();
     assert!(status.success());
 }

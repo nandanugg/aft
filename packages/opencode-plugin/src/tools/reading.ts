@@ -79,7 +79,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           ),
       },
       execute: async (args, context): Promise<string> => {
-        const bridge = ctx.pool.getBridge(context.directory);
+        const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
 
         const filesArg = Array.isArray(args.files) ? (args.files as unknown[]) : undefined;
         if (!args.filePath && !filesArg?.length && !args.directory) {
@@ -149,7 +149,7 @@ Mode priority: symbols array > single symbol.`,
           .describe("Lines of context before/after the symbol (default: 3)"),
       },
       execute: async (args, context): Promise<string> => {
-        const bridge = ctx.pool.getBridge(context.directory);
+        const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const file = args.filePath as string;
 
         // Multi-symbol mode: make separate zoom calls in parallel and combine results

@@ -231,7 +231,10 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let dest_symbol_text = prepare_exported_symbol(symbol_text);
 
     // Prepare source with symbol removed
-    let new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) { Ok(s) => s, Err(e) => return Response::error(&req.id, e.code(), e.to_string()) };
+    let new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
+        Ok(s) => s,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
 
     // --- Read destination file (may not exist yet) ---
     let dest_content = if dest_path.exists() {
@@ -456,7 +459,10 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     log::debug!(
         "[aft] move_symbol: {} from {} to {} ({} consumers updated)",
-        symbol_name, file, destination, consumers_updated
+        symbol_name,
+        file,
+        destination,
+        consumers_updated
     );
 
     Response::success(
@@ -628,7 +634,11 @@ fn prepare_exported_symbol(symbol_text: &str) -> String {
 }
 
 /// Remove a symbol from source content, cleaning up surrounding whitespace.
-fn remove_symbol_from_source(source: &str, start_byte: usize, end_byte: usize) -> Result<String, crate::error::AftError> {
+fn remove_symbol_from_source(
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> Result<String, crate::error::AftError> {
     // Extend backwards to include any preceding blank lines
     let mut actual_start = start_byte;
 
@@ -765,8 +775,14 @@ fn rewrite_consumer_imports(
         let type_only = imp.kind == imports::ImportKind::Type;
 
         // Build the replacement text
-        let start = (imp.byte_range.start as isize + offset_delta) as usize;
-        let end = (imp.byte_range.end as isize + offset_delta) as usize;
+        let start = match (imp.byte_range.start as isize).checked_add(offset_delta) {
+            Some(v) if v >= 0 => v as usize,
+            _ => return None, // offset overflow — skip rewrite
+        };
+        let end = match (imp.byte_range.end as isize).checked_add(offset_delta) {
+            Some(v) if v >= 0 => v as usize,
+            _ => return None, // offset overflow — skip rewrite
+        };
 
         if remaining_names.is_empty() && remaining_default.is_none() {
             // All symbols in this import are moving — replace entire import with new path
@@ -870,7 +886,8 @@ fn restore_checkpoint(ctx: &AppContext, name: &str) {
     if let Err(e) = cp_store.restore(name) {
         log::debug!(
             "[aft] move_symbol rollback: failed to restore checkpoint '{}': {}",
-            name, e
+            name,
+            e
         );
     }
 }

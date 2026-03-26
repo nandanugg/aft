@@ -61,6 +61,12 @@ export const AftConfigSchema = z.object({
    * aft-prefixed names both work. Applied after tool_surface filtering.
    */
   disabled_tools: z.array(z.string()).optional(),
+  /**
+   * Restrict file operations to within the project root directory.
+   * When true, write-capable commands reject paths outside project_root.
+   * Default: false (matches OpenCode's built-in behavior).
+   */
+  restrict_to_project_root: z.boolean().optional(),
 });
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;

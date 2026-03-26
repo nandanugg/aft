@@ -49,7 +49,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           ),
       },
       execute: async (args, context): Promise<string> => {
-        const bridge = ctx.pool.getBridge(context.directory);
+        const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const op = args.op as string;
 
         if ((op === "undo" || op === "history") && typeof args.filePath !== "string") {

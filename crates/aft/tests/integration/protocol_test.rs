@@ -101,7 +101,10 @@ fn test_malformed_json_recovery() {
     aft.send_silent("   ");
     let resp = aft.send(r#"{"id":"after-whitespace","command":"ping"}"#);
     assert_eq!(resp["id"], "after-whitespace");
-    assert_eq!(resp["success"], true, "process should survive whitespace line");
+    assert_eq!(
+        resp["success"], true,
+        "process should survive whitespace line"
+    );
 
     // 5. Partial/truncated JSON → parse error
     let resp = aft.send(r#"{"id":"partial","command":"pin"#);
@@ -143,7 +146,10 @@ fn test_unknown_command() {
     // Unknown command → structured error
     let resp = aft.send(r#"{"id":"unk1","command":"nonexistent"}"#);
     assert_eq!(resp["id"], "unk1");
-    assert_eq!(resp["success"], false, "unknown command should return ok: false");
+    assert_eq!(
+        resp["success"], false,
+        "unknown command should return ok: false"
+    );
     assert_eq!(
         resp["code"], "unknown_command",
         "error code should be unknown_command"

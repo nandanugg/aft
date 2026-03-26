@@ -1136,7 +1136,11 @@ impl CallGraph {
         let (target_signature, target_parameters, target_lang) = {
             let file_data = match self.data.get(&canon) {
                 Some(d) => d,
-                None => return Err(AftError::InvalidRequest { message: "file data missing after build".to_string() }),
+                None => {
+                    return Err(AftError::InvalidRequest {
+                        message: "file data missing after build".to_string(),
+                    })
+                }
             };
             let meta = file_data.symbol_metadata.get(symbol);
             let sig = meta.and_then(|m| m.signature.clone());
@@ -1172,7 +1176,13 @@ impl CallGraph {
             // Build the caller's file to get metadata
             let caller_canon = std::fs::canonicalize(&site.caller_file)
                 .unwrap_or_else(|_| site.caller_file.clone());
-            let _ = self.build_file(&caller_canon);
+            if let Err(e) = self.build_file(&caller_canon) {
+                log::debug!(
+                    "callgraph: skipping caller file {}: {}",
+                    caller_canon.display(),
+                    e
+                );
+            }
 
             let (sig, is_ep, params, _lang) = {
                 if let Some(fd) = self.data.get(&caller_canon) {
@@ -1253,7 +1263,11 @@ impl CallGraph {
         {
             let fd = match self.data.get(&canon) {
                 Some(d) => d,
-                None => return Err(AftError::InvalidRequest { message: "file data missing after build".to_string() }),
+                None => {
+                    return Err(AftError::InvalidRequest {
+                        message: "file data missing after build".to_string(),
+                    })
+                }
             };
             let has_symbol = fd.calls_by_symbol.contains_key(symbol)
                 || fd.exported_symbols.contains(&symbol.to_string())
@@ -1677,7 +1691,13 @@ impl CallGraph {
                 }
 
                 // Build target file to get parameter info
-                let _ = self.build_file(&target_file);
+                if let Err(e) = self.build_file(&target_file) {
+                    log::debug!(
+                        "callgraph: skipping target file {}: {}",
+                        target_file.display(),
+                        e
+                    );
+                }
                 let (params, _target_lang) = {
                     match self.data.get(&target_file) {
                         Some(fd) => {

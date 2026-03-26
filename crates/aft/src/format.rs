@@ -389,7 +389,8 @@ fn resolve_explicit_formatter(
         _ => {
             log::debug!(
                 "[aft] format: unknown preferred_formatter '{}' for {:?}, falling back to auto",
-                name, lang
+                name,
+                lang
             );
             None
         }

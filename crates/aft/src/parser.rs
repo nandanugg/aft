@@ -316,7 +316,7 @@ impl FileParser {
             LangId::Python => extract_py_symbols(&source, &root, &query),
             LangId::Rust => extract_rs_symbols(&source, &root, &query),
             LangId::Go => extract_go_symbols(&source, &root, &query),
-            LangId::Markdown => unreachable!(),
+            LangId::Markdown => Ok(vec![]), // handled by extract_md_symbols
         }
     }
 }
@@ -517,7 +517,9 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut var_def_node = None;
 
         for cap in m.captures {
-            let name = capture_names[cap.index as usize];
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
             match name {
                 "fn.name" => fn_name_node = Some(cap.node),
                 "fn.def" => fn_def_node = Some(cap.node),
@@ -690,7 +692,9 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut method_def_node = None;
 
         for cap in m.captures {
-            let name = capture_names[cap.index as usize];
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
             match name {
                 "fn.name" => fn_name_node = Some(cap.node),
                 "fn.def" => fn_def_node = Some(cap.node),
@@ -802,7 +806,9 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             let mut dec_decorator_node = None;
 
             for cap in m.captures {
-                let name = capture_names[cap.index as usize];
+                let Some(&name) = capture_names.get(cap.index as usize) else {
+                    continue;
+                };
                 match name {
                     "dec.def" => dec_def_node = Some(cap.node),
                     "dec.decorator" => dec_decorator_node = Some(cap.node),
@@ -840,7 +846,9 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut class_def_node = None;
 
         for cap in m.captures {
-            let name = capture_names[cap.index as usize];
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
             match name {
                 "fn.name" => fn_name_node = Some(cap.node),
                 "fn.def" => fn_def_node = Some(cap.node),
@@ -1011,7 +1019,9 @@ fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut impl_def_node = None;
 
         for cap in m.captures {
-            let name = capture_names[cap.index as usize];
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
             match name {
                 "fn.name" => fn_name_node = Some(cap.node),
                 "fn.def" => fn_def_node = Some(cap.node),
@@ -1196,7 +1206,9 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut type_def_node = None;
 
         for cap in m.captures {
-            let name = capture_names[cap.index as usize];
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
             match name {
                 "fn.name" => fn_name_node = Some(cap.node),
                 "fn.def" => fn_def_node = Some(cap.node),
@@ -1378,8 +1390,11 @@ fn extract_md_sections(
 
                 if !heading_name.is_empty() {
                     let range = node_range(&child);
-                    let signature =
-                        format!("{} {}", "#".repeat(heading_level as usize), heading_name);
+                    let signature = format!(
+                        "{} {}",
+                        "#".repeat((heading_level as usize).min(6)),
+                        heading_name
+                    );
 
                     symbols.push(Symbol {
                         name: heading_name.clone(),

@@ -96,7 +96,7 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
           .describe("Preview without modifying the file (default: false)"),
       },
       execute: async (args, context): Promise<string> => {
-        const bridge = ctx.pool.getBridge(context.directory);
+        const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const op = args.op as string;
         const isDryRun = args.dryRun === true;
 
