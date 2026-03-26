@@ -78,16 +78,18 @@ const plugin: Plugin = async (input) => {
         ensureBinary(`v${minVersion}`).then(
           (path) => {
             if (path) {
-              log(`Downloaded compatible binary to ${path}. Replacing running bridges...`);
+              log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
               pool.replaceBinary(path).then(
                 () => log("Binary replaced successfully. New bridges will use the updated binary."),
                 (err) => error("Failed to replace binary:", err),
               );
+            } else {
+              warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
             }
           },
-          () => {
+          (err) => {
             error(
-              `Auto-download failed. Install manually: cargo install agent-file-tools@${minVersion}`,
+              `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
             );
           },
         );

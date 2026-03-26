@@ -167,14 +167,26 @@ export async function downloadBinary(version?: string): Promise<string | null> {
  * This is the main entry point called by the resolver.
  */
 export async function ensureBinary(version?: string): Promise<string | null> {
-  // Check version-specific cache first, then legacy flat cache
   if (version) {
+    // When a specific version is requested, ONLY check the versioned cache.
+    // Do NOT fall back to legacy flat cache — it may contain a different version,
+    // causing an infinite spawn-check-replace loop.
     const versionCached = getCachedBinaryPath(version);
-    if (versionCached) return versionCached;
+    if (versionCached) {
+      log(`Found cached binary for ${version}: ${versionCached}`);
+      return versionCached;
+    }
+    log(`No cached binary for ${version}, downloading...`);
+    return downloadBinary(version);
   }
+  // No version requested — check legacy flat cache, then download latest
   const legacyCached = getCachedBinaryPath();
-  if (legacyCached) return legacyCached;
-  return downloadBinary(version);
+  if (legacyCached) {
+    log(`Found cached binary: ${legacyCached}`);
+    return legacyCached;
+  }
+  log("No cached binary found, downloading latest...");
+  return downloadBinary();
 }
 
 /**

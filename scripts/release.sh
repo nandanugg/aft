@@ -102,6 +102,9 @@ else
 fi
 
 # Step 3: Tag
+echo "→ Rebuilding local binary with new version..."
+cargo build --release -p agent-file-tools --quiet 2>&1 || { echo "Error: Release build failed"; exit 1; }
+
 echo "→ Creating tag $TAG..."
 git tag -a "$TAG" -m "Release $TAG"
 echo ""

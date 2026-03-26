@@ -100,7 +100,10 @@ export function findBinarySync(): string | null {
 export async function findBinary(): Promise<string> {
   // Try synchronous resolution first (fast path)
   const syncResult = findBinarySync();
-  if (syncResult) return syncResult;
+  if (syncResult) {
+    log(`Resolved binary: ${syncResult}`);
+    return syncResult;
+  }
 
   // 5. Auto-download from GitHub releases
   log("Binary not found locally, attempting auto-download...");
