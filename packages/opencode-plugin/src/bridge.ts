@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { error, log, warn } from "./logger.js";
+import { error, getLogFilePath, log, warn } from "./logger.js";
 
 // ## Note on TypeScript `as` type assertions
 //
@@ -111,7 +111,9 @@ export class BinaryBridge {
         this._configureDepth = (this._configureDepth ?? 0) + 1;
         if (this._configureDepth > 3) {
           this._configureDepth = 0;
-          throw new Error("[aft-plugin] Failed to configure bridge after 3 attempts");
+          throw new Error(
+            `[aft-plugin] Failed to configure bridge after 3 attempts. Check logs: ${getLogFilePath()}`,
+          );
         }
         try {
           await this.send("configure", {
@@ -330,7 +332,7 @@ export class BinaryBridge {
         }
       }, delay);
     } else {
-      error(`Max restarts (${this.maxRestarts}) reached, giving up`);
+      error(`Max restarts (${this.maxRestarts}) reached, giving up. Logs: ${getLogFilePath()}`);
     }
   }
 

@@ -66,11 +66,23 @@ const plugin: Plugin = async (input) => {
   if (aftConfig.restrict_to_project_root !== undefined)
     configOverrides.restrict_to_project_root = aftConfig.restrict_to_project_root;
 
+  // Track which binary version we already attempted to upgrade from.
+  // Prevents the loop: mismatch → fire-and-forget download → replaceBinary kills bridge →
+  // respawn with same binary → mismatch fires again → kills again → 3-attempt limit.
+  let versionUpgradeAttempted: string | null = null;
+
   const pool = new BridgePool(
     binaryPath,
     {
       minVersion: PLUGIN_VERSION,
       onVersionMismatch: (binaryVersion, minVersion) => {
+        if (versionUpgradeAttempted === binaryVersion) {
+          log(
+            `Version ${binaryVersion} < ${minVersion} but upgrade already attempted — continuing`,
+          );
+          return;
+        }
+        versionUpgradeAttempted = binaryVersion;
         warn(
           `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
             "Some features may not work. Attempting to download a compatible binary...",
@@ -81,7 +93,13 @@ const plugin: Plugin = async (input) => {
             if (path) {
               log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
               pool.replaceBinary(path).then(
-                () => log("Binary replaced successfully. New bridges will use the updated binary."),
+                () => {
+                  // Don't reset versionUpgradeAttempted here — the new binary might also be
+                  // outdated. The tracker resets naturally when a new plugin version loads
+                  // (fresh plugin init creates a new closure). This prevents re-triggering
+                  // the same upgrade attempt on subsequent tool calls.
+                  log("Binary replaced successfully. New bridges will use the updated binary.");
+                },
                 (err) => error("Failed to replace binary:", err),
               );
             } else {
