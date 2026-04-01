@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type ParseError, parse } from "jsonc-parser";
 import { z } from "zod";
 import { error, log, warn } from "./logger.js";
 
@@ -72,24 +71,78 @@ export const AftConfigSchema = z.object({
 export type AftConfig = z.infer<typeof AftConfigSchema>;
 
 // ---------------------------------------------------------------------------
-// JSONC parsing (same approach as oh-my-opencode)
+// JSONC parsing — self-contained, no external dependency
+//
+// jsonc-parser's UMD bundle breaks under both ESM named imports (Node) and
+// createRequire (Bun/OpenCode hybrid runtime). Strip comments + trailing
+// commas ourselves and use JSON.parse.
 // ---------------------------------------------------------------------------
 
-function parseJsonc<T = unknown>(content: string): T {
-  const errors: ParseError[] = [];
-  const result = parse(content, errors, {
-    allowTrailingComma: true,
-    disallowComments: false,
-  }) as T;
+function stripJsoncComments(text: string): string {
+  let result = "";
+  let i = 0;
+  let inString = false;
+  let escaped = false;
 
-  if (errors.length > 0) {
-    const errorMessages = errors
-      .map((e) => `error code ${e.error} at offset ${e.offset}`)
-      .join(", ");
-    throw new SyntaxError(`JSONC parse error: ${errorMessages}`);
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (inString) {
+      result += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+
+    // Start of string
+    if (ch === '"') {
+      inString = true;
+      result += ch;
+      i++;
+      continue;
+    }
+
+    // Line comment
+    if (ch === "/" && text[i + 1] === "/") {
+      // Skip until end of line
+      i += 2;
+      while (i < text.length && text[i] !== "\n") i++;
+      continue;
+    }
+
+    // Block comment
+    if (ch === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i += 2; // skip closing */
+      continue;
+    }
+
+    result += ch;
+    i++;
   }
 
   return result;
+}
+
+function stripTrailingCommas(text: string): string {
+  // Remove commas before ] or } (with optional whitespace between)
+  return text.replace(/,(\s*[}\]])/g, "$1");
+}
+
+function parseJsonc<T = unknown>(content: string): T {
+  const stripped = stripTrailingCommas(stripJsoncComments(content));
+  try {
+    return JSON.parse(stripped) as T;
+  } catch (err) {
+    throw new SyntaxError(`JSONC parse error: ${(err as Error).message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
