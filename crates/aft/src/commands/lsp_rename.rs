@@ -70,11 +70,14 @@ pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let file_path = Path::new(&params.file);
+    let file_path = match ctx.validate_path(&req.id, Path::new(&params.file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     let server_keys = {
         let mut lsp = ctx.lsp();
-        match lsp.ensure_file_open(file_path) {
+        match lsp.ensure_file_open(&file_path) {
             Ok(keys) => keys,
             Err(err) => {
                 return Response::error(
@@ -94,7 +97,7 @@ pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let canonical_path = match std::fs::canonicalize(file_path) {
+    let canonical_path = match std::fs::canonicalize(&file_path) {
         Ok(path) => path,
         Err(err) => {
             return Response::error(
@@ -312,7 +315,7 @@ fn apply_collected_changes(
     let mut results = Vec::with_capacity(file_changes.len());
 
     for (path, edits) in file_changes {
-        let original_content = std::fs::read_to_string(path).map_err(LspError::Io)?;
+        let original_content = std::fs::read_to_string(&path).map_err(LspError::Io)?;
         let updated_content = apply_text_edits(&original_content, edits)?;
 
         std::fs::write(path, &updated_content).map_err(LspError::Io)?;

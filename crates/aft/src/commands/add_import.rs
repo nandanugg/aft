@@ -70,10 +70,10 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(false);
 
     // --- Validate ---
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -82,7 +82,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let lang = match detect_language(path) {
+    let lang = match detect_language(&path) {
         Some(l) => l,
         None => {
             return Response::error(
@@ -113,7 +113,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     // All combinations are valid.
 
     // --- Parse file and imports ---
-    let (source, tree, block) = match imports::parse_file_imports(path, lang) {
+    let (source, tree, block) = match imports::parse_file_imports(&path, lang) {
         Ok(result) => result,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -161,7 +161,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Auto-backup (skip for dry-run) ---
     let backup_id = if !edit::is_dry_run(&req.params) {
-        match edit::auto_backup(ctx, path, "add_import: pre-edit backup") {
+        match edit::auto_backup(ctx, &path, "add_import: pre-edit backup") {
             Ok(id) => id,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -180,7 +180,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Dry-run: return diff without modifying disk
     if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, path);
+        let dr = edit::dry_run_diff(&source, &new_source, &path);
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -191,15 +191,15 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Write, format, and validate ---
     let mut write_result =
-        match edit::write_format_validate(path, &new_source, &ctx.config(), &req.params) {
+        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
             Ok(r) => r,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };
 
-    if let Ok(final_content) = std::fs::read_to_string(path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(path, &final_content, &req.params);
+    if let Ok(final_content) = std::fs::read_to_string(&path) {
+        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("add_import: {}", file);

@@ -74,7 +74,6 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const op = args.op as string;
-        const isDryRun = args.dryRun === true;
 
         if ((op === "move" || op === "inline") && typeof args.symbol !== "string") {
           throw new Error(`'symbol' is required for '${op}' op`);
@@ -92,20 +91,18 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           throw new Error("'callSiteLine' is required for 'inline' op");
         }
 
-        if (!isDryRun) {
-          const filePath = resolveAbsolutePath(context, args.filePath as string);
-          const patterns =
-            op === "move"
-              ? resolveRelativePatterns(context, [
-                  workspacePattern(context),
-                  args.filePath as string,
-                  ...(typeof args.destination === "string" ? [args.destination] : []),
-                ])
-              : [resolveRelativePattern(context, args.filePath as string)];
-          const metadata = patterns.length === 1 ? { filepath: filePath } : {};
-          const permissionError = await askEditPermission(context, patterns, metadata);
-          if (permissionError) return permissionDeniedResponse(permissionError);
-        }
+        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const patterns =
+          op === "move"
+            ? resolveRelativePatterns(context, [
+                workspacePattern(context),
+                args.filePath as string,
+                ...(typeof args.destination === "string" ? [args.destination] : []),
+              ])
+            : [resolveRelativePattern(context, args.filePath as string)];
+        const metadata = patterns.length === 1 ? { filepath: filePath } : {};
+        const permissionError = await askEditPermission(context, patterns, metadata);
+        if (permissionError) return permissionDeniedResponse(permissionError);
 
         const commandMap: Record<string, string> = {
           move: "move_symbol",

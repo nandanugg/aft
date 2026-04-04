@@ -32,6 +32,12 @@ pub struct Config {
     /// Whether to restrict file operations to within `project_root` (default: false).
     /// When true, write-capable commands reject paths outside the project root.
     pub restrict_to_project_root: bool,
+    /// Enable the experimental trigram search index (default: false).
+    pub experimental_search_index: bool,
+    /// Maximum file size to fully index in bytes (default: 1MB).
+    pub search_index_max_file_size: u64,
+    /// Whether grep/glob text output should use compressed summaries (default: true).
+    pub compress_tool_output: bool,
 }
 
 impl Default for Config {
@@ -47,7 +53,12 @@ impl Default for Config {
             validate_on_edit: None,
             formatter: std::collections::HashMap::new(),
             checker: std::collections::HashMap::new(),
+            // Default to false to match OpenCode's existing permission-based model.
+            // The plugin opts into root restriction explicitly when desired.
             restrict_to_project_root: false,
+            experimental_search_index: false,
+            search_index_max_file_size: 1_048_576,
+            compress_tool_output: true,
         }
     }
 }

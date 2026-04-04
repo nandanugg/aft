@@ -10,6 +10,7 @@ use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
+use crate::search_index::SearchIndex;
 
 /// Normalize a path by resolving `.` and `..` components lexically,
 /// without touching the filesystem. This prevents path traversal
@@ -31,6 +32,31 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail_segments = Vec::new();
+
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            tail_segments.push(name.to_owned());
+        } else {
+            break;
+        }
+
+        existing = match existing.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => break,
+        };
+    }
+
+    let mut resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for segment in tail_segments.into_iter().rev() {
+        resolved.push(segment);
+    }
+
+    resolved
+}
+
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, configuration,
@@ -46,6 +72,8 @@ pub struct AppContext {
     checkpoint: RefCell<CheckpointStore>,
     config: RefCell<Config>,
     callgraph: RefCell<Option<CallGraph>>,
+    search_index: RefCell<Option<SearchIndex>>,
+    search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -59,6 +87,8 @@ impl AppContext {
             checkpoint: RefCell::new(CheckpointStore::new()),
             config: RefCell::new(config),
             callgraph: RefCell::new(None),
+            search_index: RefCell::new(None),
+            search_index_rx: RefCell::new(None),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(LspManager::new()),
@@ -93,6 +123,16 @@ impl AppContext {
     /// Access the call graph engine.
     pub fn callgraph(&self) -> &RefCell<Option<CallGraph>> {
         &self.callgraph
+    }
+
+    /// Access the search index.
+    pub fn search_index(&self) -> &RefCell<Option<SearchIndex>> {
+        &self.search_index
+    }
+
+    /// Access the search-index build receiver.
+    pub fn search_index_rx(&self) -> &RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>> {
+        &self.search_index_rx
     }
 
     /// Access the file watcher handle (kept alive to continue watching).
@@ -209,19 +249,8 @@ impl AppContext {
         drop(config);
 
         // Resolve the path (follow symlinks, normalize ..)
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| {
-            // For new files that don't exist yet, resolve parent + filename.
-            // We must fully normalize '..' components to prevent path traversal
-            // (e.g. `root/../outside/file.ts` would lexically pass starts_with).
-            if let Some(parent) = path.parent() {
-                let resolved_parent =
-                    std::fs::canonicalize(parent).unwrap_or_else(|_| normalize_path(parent));
-                if let Some(name) = path.file_name() {
-                    return resolved_parent.join(name);
-                }
-            }
-            normalize_path(path)
-        });
+        let resolved = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| resolve_with_existing_ancestors(&normalize_path(path)));
 
         let resolved_root = std::fs::canonicalize(&root).unwrap_or(root);
 

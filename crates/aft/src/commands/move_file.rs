@@ -36,14 +36,14 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let src_path = Path::new(file);
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(destination)) {
-        return resp;
-    }
-    let dst_path = Path::new(destination);
+    let src_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    let dst_path = match ctx.validate_path(&req.id, Path::new(destination)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     if !src_path.exists() {
         return Response::error(
@@ -70,7 +70,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Backup source before moving
-    let backup_id = match edit::auto_backup(ctx, src_path, "move_file: pre-move backup") {
+    let backup_id = match edit::auto_backup(ctx, src_path.as_path(), "move_file: pre-move backup") {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -92,11 +92,11 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Move the file
     let mut source_delete_failed = false;
-    if let Err(e) = std::fs::rename(src_path, dst_path) {
+    if let Err(e) = std::fs::rename(&src_path, &dst_path) {
         // rename() can fail across filesystems — fallback to copy+delete
-        match std::fs::copy(src_path, dst_path) {
+        match std::fs::copy(&src_path, &dst_path) {
             Ok(_) => {
-                if let Err(e2) = std::fs::remove_file(src_path) {
+                if let Err(e2) = std::fs::remove_file(&src_path) {
                     log::warn!(
                         "[aft] move_file: copied but failed to remove source: {}",
                         e2

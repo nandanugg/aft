@@ -48,6 +48,8 @@ export interface BridgeOptions {
  * with exponential backoff auto-restart.
  */
 export class BinaryBridge {
+  private static readonly RESTART_RESET_MS = 5 * 60 * 1000;
+
   private binaryPath: string;
   private cwd: string;
   private process: ChildProcess | null = null;
@@ -63,6 +65,7 @@ export class BinaryBridge {
   private configOverrides: Record<string, unknown>;
   private minVersion: string | undefined;
   private onVersionMismatch: ((binaryVersion: string, minVersion: string) => void) | undefined;
+  private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     binaryPath: string,
@@ -182,6 +185,7 @@ export class BinaryBridge {
   /** Kill the child process and reject all pending requests. */
   async shutdown(): Promise<void> {
     this._shuttingDown = true;
+    this.clearRestartResetTimer();
     this.rejectAllPending(new Error("[aft-plugin] Bridge shutting down"));
 
     if (this.process) {
@@ -287,6 +291,7 @@ export class BinaryBridge {
           if (!entry) continue;
           this.pending.delete(id);
           clearTimeout(entry.timer);
+          this.scheduleRestartCountReset();
           entry.resolve(response);
         }
       } catch (_err) {
@@ -303,6 +308,7 @@ export class BinaryBridge {
       this.process.kill("SIGKILL");
       this.process = null;
     }
+    this.clearRestartResetTimer();
     this.configured = false;
 
     // Reject any other pending requests (the timed-out one was already rejected)
@@ -311,6 +317,7 @@ export class BinaryBridge {
 
   private handleCrash(): void {
     this.process = null;
+    this.clearRestartResetTimer();
     this.configured = false; // Force reconfigure on next command after restart
 
     // Reject all pending requests
@@ -344,5 +351,20 @@ export class BinaryBridge {
       entry.reject(error);
     }
     this.pending.clear();
+  }
+
+  private scheduleRestartCountReset(): void {
+    this.clearRestartResetTimer();
+    this.restartResetTimer = setTimeout(() => {
+      this._restartCount = 0;
+      this.restartResetTimer = null;
+    }, BinaryBridge.RESTART_RESET_MS);
+  }
+
+  private clearRestartResetTimer(): void {
+    if (this.restartResetTimer) {
+      clearTimeout(this.restartResetTimer);
+      this.restartResetTimer = null;
+    }
   }
 }

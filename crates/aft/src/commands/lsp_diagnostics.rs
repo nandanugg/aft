@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -67,23 +67,41 @@ pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     if wait_ms > 0 {
-        thread::sleep(Duration::from_millis(wait_ms));
-        let mut lsp = ctx.lsp();
-        lsp.drain_events();
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            {
+                let mut lsp = ctx.lsp();
+                lsp.drain_events();
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            thread::sleep(remaining.min(Duration::from_millis(100)));
+        }
     }
 
     let diagnostics: Vec<StoredDiagnostic> = {
         let lsp = ctx.lsp();
         match (&params.file, &params.directory) {
             (Some(file), None) => {
-                let path = normalize_query_path(Path::new(file));
+                let path = match ctx.validate_path(&req.id, Path::new(file)) {
+                    Ok(path) => normalize_query_path(&path),
+                    Err(resp) => return resp,
+                };
                 lsp.get_diagnostics_for_file(&path)
                     .into_iter()
                     .cloned()
                     .collect()
             }
             (None, Some(directory)) => {
-                let path = normalize_query_path(Path::new(directory));
+                let path = match ctx.validate_path(&req.id, Path::new(directory)) {
+                    Ok(path) => normalize_query_path(&path),
+                    Err(resp) => return resp,
+                };
                 lsp.get_diagnostics_for_directory(&path)
                     .into_iter()
                     .cloned()

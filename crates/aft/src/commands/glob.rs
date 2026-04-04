@@ -1,0 +1,315 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::path::{Path, PathBuf};
+
+use crate::context::AppContext;
+use crate::protocol::{RawRequest, Response};
+use crate::search_index::{
+    build_path_filters, resolve_search_scope, sort_paths_by_mtime_desc, walk_project_files_from,
+};
+
+const MAX_GLOB_RESULTS: usize = 100;
+const GLOB_TRUNCATED_MESSAGE: &str =
+    "(Results truncated: showing first 100 results. Consider using a more specific path or pattern.)";
+const MAX_FLAT_FILES: usize = 20;
+const MAX_FILES_PER_DIRECTORY: usize = 7;
+const MAX_DISPLAY_FILES_PER_DIRECTORY: usize = 5;
+const MAX_DIRECTORY_SECTIONS: usize = 8;
+const MAX_DISPLAY_DIRECTORIES: usize = 6;
+
+pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
+    let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
+        Some(pattern) => pattern,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "glob: missing required param 'pattern'",
+            );
+        }
+    };
+
+    if let Err(error) = build_path_filters(&[pattern.to_string()], &[]) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!("glob: invalid pattern: {}", error),
+        );
+    }
+
+    let path = match req.params.get("path").and_then(|value| value.as_str()) {
+        Some(path) => match ctx.validate_path(&req.id, Path::new(path)) {
+            Ok(path) => Some(path.to_string_lossy().to_string()),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let project_root = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or_default());
+    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+    let search_scope = resolve_search_scope(&project_root, path.as_deref());
+
+    let mut files = {
+        let search_index = ctx.search_index().borrow();
+        match search_index.as_ref() {
+            Some(index) if index.ready && search_scope.use_index => {
+                index.glob(pattern, &search_scope.root)
+            }
+            _ => {
+                // For out-of-project paths, try ripgrep first for better performance
+                if !search_scope.use_index {
+                    if let Some(rg_files) =
+                        super::grep::ripgrep_glob(&search_scope.root, pattern, MAX_GLOB_RESULTS + 1)
+                    {
+                        rg_files
+                    } else {
+                        fallback_glob(&project_root, &search_scope.root, pattern)
+                    }
+                } else {
+                    fallback_glob(&project_root, &search_scope.root, pattern)
+                }
+            }
+        }
+    };
+    let total = files.len();
+    let truncated = total > MAX_GLOB_RESULTS;
+    if truncated {
+        files.truncate(MAX_GLOB_RESULTS);
+    }
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "text": format_glob_text(&files, pattern, ctx.config().compress_tool_output, truncated),
+            "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "total": total,
+            "truncated": truncated,
+        }),
+    )
+}
+
+fn fallback_glob(
+    project_root: &std::path::Path,
+    search_root: &std::path::Path,
+    pattern: &str,
+) -> Vec<std::path::PathBuf> {
+    let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
+    let filter_root = if search_root.starts_with(project_root) {
+        project_root
+    } else {
+        search_root
+    };
+    let mut files = walk_project_files_from(filter_root, search_root, &filters);
+    sort_paths_by_mtime_desc(&mut files);
+    files
+}
+
+fn format_glob_text(
+    files: &[PathBuf],
+    pattern: &str,
+    compress_tool_output: bool,
+    truncated: bool,
+) -> String {
+    let text = if compress_tool_output {
+        format_compressed_glob_text(files, pattern)
+    } else {
+        files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    if truncated {
+        if text.is_empty() {
+            GLOB_TRUNCATED_MESSAGE.to_string()
+        } else {
+            format!("{}\n\n{}", text, GLOB_TRUNCATED_MESSAGE)
+        }
+    } else {
+        text
+    }
+}
+
+fn format_compressed_glob_text(files: &[PathBuf], pattern: &str) -> String {
+    let header = format!(
+        "{} {} matching {}",
+        files.len(),
+        if files.len() == 1 { "file" } else { "files" },
+        pattern
+    );
+
+    if files.is_empty() {
+        return header;
+    }
+
+    if files.len() <= MAX_FLAT_FILES {
+        let body = files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("{}\n\n{}", header, body);
+    }
+
+    let grouped = group_files_by_directory(files);
+    let total_directories = grouped.len();
+    let displayed_directories = if total_directories > MAX_DIRECTORY_SECTIONS {
+        MAX_DISPLAY_DIRECTORIES
+    } else {
+        total_directories
+    };
+
+    let mut sections = Vec::new();
+    for (directory, names) in grouped.iter().take(displayed_directories) {
+        let file_word = if names.len() == 1 { "file" } else { "files" };
+        let names_text = if names.len() > MAX_FILES_PER_DIRECTORY {
+            format!(
+                "{}, ...",
+                names
+                    .iter()
+                    .take(MAX_DISPLAY_FILES_PER_DIRECTORY)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            names.join(", ")
+        };
+        sections.push(format!(
+            "{} ({} {})\n  {}",
+            directory,
+            names.len(),
+            file_word,
+            names_text
+        ));
+    }
+
+    let mut text = format!("{}\n\n{}", header, sections.join("\n\n"));
+
+    if total_directories > MAX_DIRECTORY_SECTIONS {
+        let hidden_directories = &grouped[displayed_directories..];
+        let hidden_file_count: usize = hidden_directories
+            .iter()
+            .map(|(_, names)| names.len())
+            .sum();
+        let hidden_directory_count = total_directories - displayed_directories;
+        text.push_str(&format!(
+            "\n\n... and {} more {} in {} {}",
+            hidden_file_count,
+            if hidden_file_count == 1 {
+                "file"
+            } else {
+                "files"
+            },
+            hidden_directory_count,
+            if hidden_directory_count == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
+        ));
+    }
+
+    text
+}
+
+fn group_files_by_directory(files: &[PathBuf]) -> Vec<(String, Vec<String>)> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for file in files {
+        let directory = format_directory_label(file.parent());
+        let file_name = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.display().to_string());
+        grouped.entry(directory).or_default().push(file_name);
+    }
+
+    grouped.into_iter().collect()
+}
+
+fn format_directory_label(directory: Option<&Path>) -> String {
+    match directory {
+        Some(path) if !path.as_os_str().is_empty() && path != Path::new(".") => {
+            format!("{}/", path.display())
+        }
+        _ => "./".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn compressed_glob_uses_flat_list_for_small_results() {
+        let text = format_glob_text(&files(&["src/a.rs", "src/b.rs"]), "**/*.rs", true, false);
+
+        assert_eq!(text, "2 files matching **/*.rs\n\nsrc/a.rs\nsrc/b.rs");
+    }
+
+    #[test]
+    fn compressed_glob_groups_directories_and_summarizes_overflow() {
+        let text = format_glob_text(
+            &files(&[
+                "dir1/a.rs",
+                "dir1/b.rs",
+                "dir1/c.rs",
+                "dir1/d.rs",
+                "dir1/e.rs",
+                "dir1/f.rs",
+                "dir1/g.rs",
+                "dir1/h.rs",
+                "dir2/a.rs",
+                "dir2/b.rs",
+                "dir3/a.rs",
+                "dir3/b.rs",
+                "dir4/a.rs",
+                "dir4/b.rs",
+                "dir5/a.rs",
+                "dir5/b.rs",
+                "dir6/a.rs",
+                "dir6/b.rs",
+                "dir7/a.rs",
+                "dir7/b.rs",
+                "dir8/a.rs",
+                "dir8/b.rs",
+                "dir9/a.rs",
+            ]),
+            "**/*.rs",
+            true,
+            false,
+        );
+
+        assert!(text.starts_with("23 files matching **/*.rs\n\n"));
+        assert!(text.contains("dir1/ (8 files)\n  a.rs, b.rs, c.rs, d.rs, e.rs, ..."));
+        assert!(text.contains("dir6/ (2 files)\n  a.rs, b.rs"));
+        assert!(!text.contains("dir7/ (2 files)\n  a.rs, b.rs"));
+        assert!(text.ends_with("... and 5 more files in 3 directories"));
+    }
+
+    #[test]
+    fn raw_glob_preserves_newline_joined_paths() {
+        let text = format_glob_text(&files(&["src/a.rs", "src/b.rs"]), "**/*.rs", false, false);
+
+        assert_eq!(text, "src/a.rs\nsrc/b.rs");
+    }
+
+    #[test]
+    fn glob_appends_truncation_message() {
+        let text = format_glob_text(&files(&["src/a.rs"]), "**/*.rs", false, true);
+
+        assert_eq!(
+            text,
+            "src/a.rs\n\n(Results truncated: showing first 100 results. Consider using a more specific path or pattern.)"
+        );
+    }
+}

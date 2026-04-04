@@ -59,10 +59,13 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let file_path = Path::new(file);
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     // Build file data first to check if the symbol exists
-    match graph.build_file(file_path) {
+    match graph.build_file(&file_path) {
         Ok(data) => {
             // Check if the symbol exists in the file (as a call-site container or exported symbol)
             let has_symbol = data.calls_by_symbol.contains_key(symbol)
@@ -80,7 +83,7 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.forward_tree(file_path, symbol, depth) {
+    match graph.forward_tree(&file_path, symbol, depth) {
         Ok(tree) => {
             let tree_json = serde_json::to_value(&tree).unwrap_or_default();
             Response::success(&req.id, tree_json)

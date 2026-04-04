@@ -69,7 +69,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
 
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -79,7 +82,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Read source file early because both symbol mode and line-range mode need it.
-    let source = match std::fs::read_to_string(path) {
+    let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -200,7 +203,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Resolve the target symbol
-    let matches = match ctx.provider().resolve_symbol(path, symbol_name) {
+    let matches = match ctx.provider().resolve_symbol(&path, symbol_name) {
         Ok(m) => m,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());

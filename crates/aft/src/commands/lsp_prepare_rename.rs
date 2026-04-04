@@ -45,11 +45,14 @@ pub fn handle_lsp_prepare_rename(req: &RawRequest, ctx: &AppContext) -> Response
         );
     }
 
-    let file_path = Path::new(&params.file);
+    let file_path = match ctx.validate_path(&req.id, Path::new(&params.file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     let server_keys = {
         let mut lsp = ctx.lsp();
-        match lsp.ensure_file_open(file_path) {
+        match lsp.ensure_file_open(&file_path) {
             Ok(keys) => keys,
             Err(err) => {
                 return Response::error(
@@ -69,7 +72,7 @@ pub fn handle_lsp_prepare_rename(req: &RawRequest, ctx: &AppContext) -> Response
         );
     }
 
-    let canonical_path = match std::fs::canonicalize(file_path) {
+    let canonical_path = match std::fs::canonicalize(&file_path) {
         Ok(path) => path,
         Err(err) => {
             return Response::error(

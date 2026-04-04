@@ -1,5 +1,7 @@
 //! Integration tests for the outline command through the binary protocol.
 
+use std::fs::File;
+
 use super::helpers::{fixture_path, AftProcess};
 
 #[test]
@@ -285,6 +287,35 @@ fn test_zoom_success_with_annotations() {
         .expect("context_after array");
     assert!(ctx_before.len() <= 3, "default context_lines is 3");
     assert!(ctx_after.len() <= 3, "default context_lines is 3");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn test_read_rejects_files_larger_than_50mb() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let file = temp_dir.path().join("large.txt");
+    let handle = File::create(&file).expect("create large file");
+    handle
+        .set_len((50 * 1024 * 1024 + 1) as u64)
+        .expect("set sparse file length");
+
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.configure(temp_dir.path());
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"read-large","command":"read","file":"{}"}}"#,
+        file.display()
+    ));
+
+    assert_eq!(resp["success"], false, "read should fail: {:?}", resp);
+    assert_eq!(resp["code"], "invalid_request");
+    assert!(resp["message"]
+        .as_str()
+        .expect("message")
+        .contains("Use start_line/end_line to read sections"));
 
     let status = aft.shutdown();
     assert!(status.success());

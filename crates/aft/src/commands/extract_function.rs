@@ -107,10 +107,10 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Validate file ---
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -120,7 +120,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Language guard (D101) ---
-    let lang = match detect_language(path) {
+    let lang = match detect_language(&path) {
         Some(l) => l,
         None => {
             return Response::error(
@@ -146,7 +146,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Read and parse ---
-    let source = match std::fs::read_to_string(path) {
+    let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(
@@ -291,7 +291,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Dry-run check ---
     if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, path);
+        let dr = edit::dry_run_diff(&source, &new_source, &path);
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -306,7 +306,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Auto-backup before mutation ---
-    let backup_id = match edit::auto_backup(ctx, path, &format!("extract_function: {}", name)) {
+    let backup_id = match edit::auto_backup(ctx, &path, &format!("extract_function: {}", name)) {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -315,15 +315,15 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Write, format, validate ---
     let mut write_result =
-        match edit::write_format_validate(path, &new_source, &ctx.config(), &req.params) {
+        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
             Ok(r) => r,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };
 
-    if let Ok(final_content) = std::fs::read_to_string(path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(path, &final_content, &req.params);
+    if let Ok(final_content) = std::fs::read_to_string(&path) {
+        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     let param_count = free_vars.parameters.len();

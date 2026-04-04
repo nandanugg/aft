@@ -44,16 +44,19 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
                 Some(f) => f,
                 None => continue,
             };
-            let path = Path::new(file);
+            let path = match ctx.validate_path(&req.id, Path::new(file)) {
+                Ok(path) => path,
+                Err(resp) => return resp,
+            };
             if !path.exists() {
                 continue;
             }
-            match ctx.provider().list_symbols(path) {
+            match ctx.provider().list_symbols(&path) {
                 Ok(symbols) => {
                     let entries = build_outline_tree(&symbols);
                     let rel_path = project_root
                         .as_ref()
-                        .and_then(|root| Path::new(file).strip_prefix(root).ok())
+                        .and_then(|root| path.strip_prefix(root).ok())
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| file.to_string());
                     file_outlines.push(FileOutline {
@@ -81,7 +84,10 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -90,7 +96,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let symbols = match ctx.provider().list_symbols(path) {
+    let symbols = match ctx.provider().list_symbols(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -98,7 +104,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let entries = build_outline_tree(&symbols);
-    let filename = Path::new(file)
+    let filename = path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| file.to_string());

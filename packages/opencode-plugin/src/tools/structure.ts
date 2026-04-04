@@ -98,7 +98,6 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
         const op = args.op as string;
-        const isDryRun = args.dryRun === true;
 
         if (op === "add_member") {
           if (typeof args.container !== "string")
@@ -130,15 +129,13 @@ export function structureTools(ctx: PluginContext): Record<string, ToolDefinitio
             throw new Error("'value' is required for 'add_struct_tags' op");
         }
 
-        if (!isDryRun) {
-          const filePath = resolveAbsolutePath(context, args.filePath as string);
-          const permissionError = await askEditPermission(
-            context,
-            [resolveRelativePattern(context, args.filePath as string)],
-            { filepath: filePath },
-          );
-          if (permissionError) return permissionDeniedResponse(permissionError);
-        }
+        const filePath = resolveAbsolutePath(context, args.filePath as string);
+        const permissionError = await askEditPermission(
+          context,
+          [resolveRelativePattern(context, args.filePath as string)],
+          { filepath: filePath },
+        );
+        if (permissionError) return permissionDeniedResponse(permissionError);
 
         const params: Record<string, unknown> = { file: args.filePath };
         if (args.validate !== undefined) params.validate = args.validate;

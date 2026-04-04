@@ -53,6 +53,10 @@ fn main() {
 
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
+                // Drain search index FIRST so watcher events apply to the latest index.
+                // If reversed, watcher updates applied to the old index would be lost
+                // when the background-built index replaces it.
+                drain_search_index_events(&ctx);
                 drain_watcher_events(&ctx);
                 drain_lsp_events(&ctx);
                 dispatch(req, &ctx)
@@ -111,6 +115,8 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "glob" => aft::commands::glob::handle_glob(&req, ctx),
+        "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
         "callers" => aft::commands::callers::handle_callers(&req, ctx),
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
@@ -216,12 +222,7 @@ fn drain_watcher_events(ctx: &AppContext) {
         while let Ok(event_result) = rx.try_recv() {
             if let Ok(event) = event_result {
                 for path in event.paths {
-                    // Filter to supported source extensions
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if SOURCE_EXTENSIONS.contains(&ext) {
-                            paths.insert(path);
-                        }
-                    }
+                    paths.insert(path);
                 }
             }
         }
@@ -236,11 +237,45 @@ fn drain_watcher_events(ctx: &AppContext) {
     let mut graph_ref = ctx.callgraph().borrow_mut();
     if let Some(graph) = graph_ref.as_mut() {
         for path in &changed {
-            graph.invalidate_file(path);
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if SOURCE_EXTENSIONS.contains(&ext) {
+                    graph.invalidate_file(path);
+                }
+            }
+        }
+    }
+
+    let mut index_ref = ctx.search_index().borrow_mut();
+    if let Some(index) = index_ref.as_mut() {
+        for path in &changed {
+            if path.exists() {
+                index.update_file(path);
+            } else {
+                index.remove_file(path);
+            }
         }
     }
 
     log::info!("invalidated {} files", changed.len());
+}
+
+fn drain_search_index_events(ctx: &AppContext) {
+    let latest = {
+        let rx_ref = ctx.search_index_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+
+        let mut latest = None;
+        while let Ok(index) = rx.try_recv() {
+            latest = Some(index);
+        }
+        latest
+    };
+
+    if let Some(index) = latest {
+        *ctx.search_index().borrow_mut() = Some(index);
+    }
 }
 
 fn drain_lsp_events(ctx: &AppContext) {

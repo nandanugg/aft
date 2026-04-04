@@ -30,9 +30,9 @@ fn handle_restore_checkpoint_impl(
     let file_paths = checkpoint_store
         .file_paths(name)
         .map_err(|e| Response::error(&req.id, e.code(), e.to_string()))?;
-    validate_restore_paths(&req.id, ctx, &file_paths)?;
+    let validated_paths = validate_restore_paths(&req.id, ctx, &file_paths)?;
 
-    match checkpoint_store.restore(name) {
+    match checkpoint_store.restore_validated(name, &validated_paths) {
         Ok(info) => Ok(Response::success(
             &req.id,
             serde_json::json!({
@@ -49,9 +49,10 @@ fn validate_restore_paths(
     req_id: &str,
     ctx: &AppContext,
     file_paths: &[std::path::PathBuf],
-) -> Result<(), Response> {
+) -> Result<Vec<std::path::PathBuf>, Response> {
+    let mut validated = Vec::with_capacity(file_paths.len());
     for path in file_paths {
-        ctx.validate_path(req_id, path)?;
+        validated.push(ctx.validate_path(req_id, path)?);
     }
-    Ok(())
+    Ok(validated)
 }

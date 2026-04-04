@@ -76,10 +76,13 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let file_path = Path::new(file);
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     // Build file data first to check if the symbol exists
-    match graph.build_file(file_path) {
+    match graph.build_file(&file_path) {
         Ok(data) => {
             let has_symbol = data.calls_by_symbol.contains_key(symbol)
                 || data.exported_symbols.contains(&symbol.to_string())
@@ -97,7 +100,7 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.trace_data(file_path, symbol, expression, depth) {
+    match graph.trace_data(&file_path, symbol, expression, depth) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)

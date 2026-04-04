@@ -31,6 +31,11 @@
 ### OpenCode
 
 Add AFT to your OpenCode config:
+```
+opencode plugin --global @cortexkit/aft-opencode@latest
+```
+
+or
 
 ```json
 // ~/.config/opencode/config.json
@@ -62,7 +67,9 @@ single line they don't need.
 AFT **hoists** itself into opencode's built-in tool slots. The `read`, `write`, `edit`,
 `apply_patch`, `ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` tools are replaced
 by AFT-enhanced versions — same names the agent already knows, but now backed by the Rust binary
-for backups, formatting, inline diagnostics, and symbol-aware operations.
+for backups, formatting, inline diagnostics, and symbol-aware operations. With the experimental
+search index enabled, `grep` and `glob` are also hoisted with a trigram index for sub-millisecond
+search on any project size.
 
 The toolkit is a two-component system: a Rust binary that does the heavy lifting (parsing,
 analysis, edits, formatting) and a TypeScript plugin that integrates with OpenCode. The binary
@@ -94,11 +101,40 @@ Here's a typical agent workflow:
 { "filePath": "src/auth/session.ts" }
 ```
 
-**2. Read the specific function:**
+```
+src/auth/session.ts
+  E fn    createSession(userId: string, opts?: SessionOpts): Promise<Session> 12:38
+  E fn    validateToken(token: string): boolean 40:52
+  E fn    refreshSession(sessionId: string): Promise<Session> 54:71
+  - fn    signPayload(data: Record<string, unknown>): string 73:80
+  E type  SessionOpts 5:10
+  E var   SESSION_TTL 3:3
+```
+
+**2. Zoom into the specific function:**
 
 ```json
 // aft_zoom
 { "filePath": "src/auth/session.ts", "symbol": "validateToken" }
+```
+
+```
+src/auth/session.ts:40-52
+  calls_out: verifyJwt (src/auth/jwt.ts:8), isExpired (src/auth/utils.ts:15)
+  called_by: authMiddleware (src/middleware/auth.ts:22), handleLogin (src/routes/login.ts:45)
+
+  37: // --- context_before ---
+  38:
+  39: /** Validate a JWT token and check expiration. */
+  40: export function validateToken(token: string): boolean {
+  41:   if (!token) return false;
+  42:   const decoded = verifyJwt(token);
+  43:   if (!decoded) return false;
+  44:   return !isExpired(decoded.exp);
+  45: }
+  46:
+  47: // --- context_after ---
+  48: export function refreshSession(sessionId: string): Promise<Session> {
 ```
 
 **3. Edit it by name:**
@@ -140,6 +176,7 @@ Here's a typical agent workflow:
 - **Safety & recovery** — undo last edit, named checkpoints, restore to any checkpoint
 - **AST pattern search & replace** — structural code search using meta-variables (`$VAR`, `$$$`), powered by ast-grep
 - **Git conflict viewer** — show all merge conflicts across the repository in a single call with line-numbered regions
+- **Indexed search** *(experimental)* — trigram-indexed `grep` and `glob` that hoist opencode's built-ins, with background index building, disk persistence, and compressed output mode
 - **Inline diagnostics** — write and edit return LSP errors detected after the change
 - **UI metadata** — the OpenCode desktop shows file paths and diff previews (`+N/-N`) for every edit
 - **Local tool discovery** — finds biome, prettier, tsc, pyright in `node_modules/.bin` automatically
@@ -165,6 +202,8 @@ These replace opencode's built-ins. Registered under the same names by default. 
 | `ast_grep_search` | oh-my-opencode ast_grep | AST pattern search with meta-variables | `pattern`, `lang`, `paths[]`, `globs[]` |
 | `ast_grep_replace` | oh-my-opencode ast_grep | AST pattern replace (applies by default) | `pattern`, `rewrite`, `lang`, `dryRun` |
 | `lsp_diagnostics` | opencode lsp_diagnostics | Errors/warnings from language server | `filePath`, `directory`, `severity`, `waitMs` |
+| `grep` | opencode grep *(experimental)* | Trigram-indexed regex search with compressed output | `pattern`, `path`, `include`, `exclude` |
+| `glob` | opencode glob *(experimental)* | Indexed file discovery with compressed output | `pattern`, `path` |
 
 ### AFT-only tools
 
@@ -449,6 +488,86 @@ suggesting `aft_conflicts` to the bash output.
 
 ---
 
+### grep *(experimental)*
+
+Trigram-indexed regex search that hoists opencode's built-in `grep`. Requires
+`experimental_search_index: true` in config. The trigram index is built in a background thread
+at session start, persisted to disk for fast cold starts, and kept fresh via file watcher.
+Falls back to direct file scanning when the index isn't ready.
+
+For out-of-project paths, shells out to ripgrep matching opencode's exact flags.
+
+```json
+{ "pattern": "handleRequest", "include": "*.ts" }
+```
+
+Returns matches grouped by file, sorted by modification time (newest first), capped at 100:
+
+```
+/Users/me/project/src/server.ts:
+  Line 42: export async function handleRequest(req: Request) {
+  Line 89:     return handleRequest(retryReq)
+
+/Users/me/project/src/test/server.test.ts:
+  Line 15: import { handleRequest } from "../server"
+
+Found 3 match(es) in 2 file(s).
+```
+
+**Compressed mode** (`compress_tool_output: true`) groups matches by file with overflow
+summarization and 200-char line truncation — reducing token usage by up to 80%:
+
+```
+── src/server.ts (2 matches) ──
+  42: export async function handleRequest(req: Request) {
+  89:     return handleRequest(retryReq)
+
+── src/test/server.test.ts (1 match) ──
+  15: import { handleRequest } from "../server"
+
+Found 3 match(es) across 2 file(s). [index: ready]
+```
+
+Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path),
+`include` (glob filter, e.g. `"*.ts"`), `exclude` (negate glob), `case_sensitive` (default true).
+
+---
+
+### glob *(experimental)*
+
+Indexed file discovery that hoists opencode's built-in `glob`. Requires
+`experimental_search_index: true`. Returns absolute paths sorted by modification time,
+capped at 100 files.
+
+```json
+{ "pattern": "**/*.test.ts" }
+```
+
+Returns:
+```
+/Users/me/project/src/server.test.ts
+/Users/me/project/src/utils.test.ts
+/Users/me/project/src/auth/login.test.ts
+```
+
+**Compressed mode** groups files by directory when there are many results:
+
+```
+20 files matching **/*.test.ts
+
+src/ (8 files)
+  server.test.ts, utils.test.ts, config.test.ts, ...
+
+src/auth/ (4 files)
+  login.test.ts, session.test.ts, token.test.ts, permissions.test.ts
+
+... and 8 more files in 3 directories
+```
+
+Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path).
+
+---
+
 ### aft_delete
 
 Delete a file with an in-memory backup. The backup survives for the session and can be restored
@@ -645,11 +764,28 @@ Both files are JSONC (comments allowed).
   // Tool surface level: "minimal" | "recommended" (default) | "all"
   // minimal:     aft_outline, aft_zoom, aft_safety only (no hoisting)
   // recommended: minimal + hoisted tools + lsp_diagnostics + ast_grep + aft_import + aft_conflicts
+  //              + grep/glob (when experimental_search_index is enabled)
   // all:         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
   "tool_surface": "recommended",
 
   // List of tool names to disable after surface filtering
-  "disabled_tools": []
+  "disabled_tools": [],
+
+  // --- Experimental ---
+
+  // Enable trigram-indexed grep/glob that hoist opencode's built-ins.
+  // Builds a background index on session start, persists to disk, updates via file watcher.
+  // Falls back to direct scanning when the index isn't ready or for out-of-project paths.
+  // Default: false
+  "experimental_search_index": false,
+
+  // Compress grep/glob output to reduce token usage (RTK-style grouping, line truncation).
+  // Default: false
+  "compress_tool_output": false,
+
+  // Restrict all file operations to the project root directory.
+  // Default: false (matches opencode's permission-based model — operations prompt via ctx.ask)
+  "restrict_to_project_root": false
 }
 ```
 
@@ -671,9 +807,9 @@ OpenCode agent
      | tool calls
      v
 @cortexkit/aft-opencode (TypeScript plugin)
-  - Hoists enhanced read/write/edit/apply_patch/ast_grep_*/lsp_diagnostics
+  - Hoists enhanced read/write/edit/apply_patch/ast_grep_*/lsp_diagnostics/grep/glob
   - Registers aft_outline/navigate/import/transform/refactor/safety/delete/move
-  - Manages a BridgePool (one aft process per project directory)
+  - Manages a BridgePool (one aft process per session)
   - Resolves the binary path (cache → npm → PATH → cargo → download)
      |
      | JSON-over-stdio (newline-delimited)
@@ -683,6 +819,7 @@ aft binary (Rust)
   - Symbol resolution, call graph, diff generation
   - Format-on-edit (shells out to biome / rustfmt / etc.)
   - Backup/checkpoint management
+  - Trigram search index (experimental: background thread, disk persistence, file watcher)
   - ~7 MB, zero runtime dependencies
 ```
 

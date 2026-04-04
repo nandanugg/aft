@@ -43,32 +43,46 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     let existed = path.exists();
 
     // Read original content for potential dry-run diff
-    let original = if existed {
-        std::fs::read_to_string(path).unwrap_or_default()
+    let (original, read_warning) = if existed {
+        match std::fs::read_to_string(path.as_path()) {
+            Ok(content) => (content, None),
+            Err(error) => {
+                let warning = format!(
+                    "write: failed to read existing file before diff for {}: {}",
+                    file, error
+                );
+                log::warn!("{}", warning);
+                (String::new(), Some(warning))
+            }
+        }
     } else {
-        String::new()
+        (String::new(), None)
     };
 
     // Dry-run: return diff without modifying disk
     if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&original, content, path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
+        let dr = edit::dry_run_diff(&original, content, path.as_path());
+        let mut result = serde_json::json!({
+            "ok": true,
+            "dry_run": true,
+            "diff": dr.diff,
+            "syntax_valid": dr.syntax_valid,
+        });
+        if let Some(ref warning) = read_warning {
+            result["read_warning"] = serde_json::json!(warning);
+        }
+        return Response::success(&req.id, result);
     }
 
     // Auto-backup existing file before overwriting
-    let backup_id = match edit::auto_backup(ctx, path, "write: pre-write backup") {
+    let backup_id = match edit::auto_backup(ctx, path.as_path(), "write: pre-write backup") {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -92,15 +106,16 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Write, format, and validate via shared pipeline
     let mut write_result =
-        match edit::write_format_validate(path, content, &ctx.config(), &req.params) {
+        match edit::write_format_validate(path.as_path(), content, &ctx.config(), &req.params) {
             Ok(r) => r,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };
 
-    if let Ok(final_content) = std::fs::read_to_string(path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(path, &final_content, &req.params);
+    if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
+        write_result.lsp_diagnostics =
+            ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
     }
 
     log::debug!("write: {}", file);
@@ -130,11 +145,16 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         result["backup_id"] = serde_json::json!(id);
     }
 
+    if let Some(ref warning) = read_warning {
+        result["read_warning"] = serde_json::json!(warning);
+    }
+
     write_result.append_lsp_diagnostics_to(&mut result);
 
     // Include diff info if requested (for UI metadata)
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(path).unwrap_or_else(|_| content.to_string());
+        let final_content =
+            std::fs::read_to_string(path.as_path()).unwrap_or_else(|_| content.to_string());
         result["diff"] = edit::compute_diff_info(&original, &final_content);
     }
 

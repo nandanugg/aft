@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::thread;
 
+use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
 
 use crate::callgraph::CallGraph;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
+use crate::search_index::{current_git_head, resolve_cache_dir, SearchIndex};
 
 /// Handle a `configure` request.
 ///
@@ -76,6 +79,65 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     }
+
+    if let Some(v) = req
+        .params
+        .get("experimental_search_index")
+        .and_then(|v| v.as_bool())
+    {
+        ctx.config_mut().experimental_search_index = v;
+    }
+    if let Some(v) = req
+        .params
+        .get("compress_tool_output")
+        .and_then(|v| v.as_bool())
+    {
+        ctx.config_mut().compress_tool_output = v;
+    }
+    if let Some(v) = req
+        .params
+        .get("search_index_max_file_size")
+        .and_then(|v| v.as_u64())
+    {
+        ctx.config_mut().search_index_max_file_size = v;
+    }
+
+    let experimental_search_index = ctx.config().experimental_search_index;
+    let search_index_max_file_size = ctx.config().search_index_max_file_size;
+
+    *ctx.search_index().borrow_mut() = None;
+    *ctx.search_index_rx().borrow_mut() = None;
+
+    if experimental_search_index {
+        let cache_dir = resolve_cache_dir(&root_path);
+        let current_head = current_git_head(&root_path);
+        let mut baseline = SearchIndex::read_from_disk(&cache_dir);
+
+        if let Some(index) = baseline.as_mut() {
+            if current_head.is_some() && index.stored_git_head() == current_head.as_deref() {
+                *ctx.search_index().borrow_mut() = Some(index.clone());
+            } else {
+                index.set_ready(false);
+                *ctx.search_index().borrow_mut() = Some(index.clone());
+            }
+        }
+
+        let (tx, rx) = unbounded();
+        *ctx.search_index_rx().borrow_mut() = Some(rx);
+
+        let root_clone = root_path.clone();
+        thread::spawn(move || {
+            let index = SearchIndex::rebuild_or_refresh(
+                &root_clone,
+                search_index_max_file_size,
+                current_head,
+                baseline,
+            );
+            index.write_to_disk(&cache_dir, index.stored_git_head());
+            let _ = tx.send(index);
+        });
+    }
+
     // Initialize call graph with the project root
     let graph = CallGraph::new(root_path.clone());
     *ctx.callgraph().borrow_mut() = Some(graph);

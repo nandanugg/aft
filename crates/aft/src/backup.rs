@@ -18,6 +18,10 @@ pub struct BackupEntry {
 /// Keys are canonical paths (resolved via `std::fs::canonicalize` with fallback
 /// to cleaned relative path). Each file maps to a stack of `BackupEntry` values
 /// ordered oldest-first so `restore_latest` pops from the end.
+///
+/// No global cap is enforced on total tracked files because session-scoped
+/// bridges bound memory growth to a single OpenCode session. The per-file cap
+/// (`MAX_UNDO_DEPTH = 20`) prevents unbounded growth for any individual path.
 #[derive(Debug)]
 pub struct BackupStore {
     entries: HashMap<PathBuf, Vec<BackupEntry>>,
@@ -75,20 +79,24 @@ impl BackupStore {
                 path: path.display().to_string(),
             })?;
 
-        let entry = stack.pop().ok_or_else(|| AftError::NoUndoHistory {
-            path: path.display().to_string(),
-        })?;
-
-        // Remove the key entirely if stack is now empty
-        if stack.is_empty() {
-            self.entries.remove(&key);
-        }
+        let entry = stack
+            .last()
+            .cloned()
+            .ok_or_else(|| AftError::NoUndoHistory {
+                path: path.display().to_string(),
+            })?;
 
         // Write the restored content back to disk
         std::fs::write(path, &entry.content).map_err(|e| AftError::IoError {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
+
+        stack.pop();
+        let remove_key = stack.is_empty();
+        if remove_key {
+            self.entries.remove(&key);
+        }
 
         Ok(entry)
     }

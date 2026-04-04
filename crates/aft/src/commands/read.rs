@@ -13,6 +13,7 @@ use crate::protocol::{RawRequest, Response};
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024; // 50KB output cap
+const MAX_FILE_READ_BYTES: u64 = 50 * 1024 * 1024; // 50MB input guard
 
 /// Check if file content is binary using the content_inspector crate.
 /// Detects null bytes, UTF-16 BOMs, and other binary indicators.
@@ -35,7 +36,7 @@ fn is_binary(content: &[u8]) -> bool {
 ///
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
-pub fn handle_read(req: &RawRequest, _ctx: &AppContext) -> Response {
+pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -47,7 +48,10 @@ pub fn handle_read(req: &RawRequest, _ctx: &AppContext) -> Response {
         }
     };
 
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     // Check existence
     if !path.exists() {
@@ -60,11 +64,34 @@ pub fn handle_read(req: &RawRequest, _ctx: &AppContext) -> Response {
 
     // Directory listing
     if path.is_dir() {
-        return handle_directory(req, path);
+        return handle_directory(req, path.as_path());
+    }
+
+    let metadata = match fs::metadata(path.as_path()) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            return Response::error(
+                &req.id,
+                "io_error",
+                format!("read: failed to stat file: {}", e),
+            );
+        }
+    };
+
+    if metadata.len() > MAX_FILE_READ_BYTES {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "read: file is too large to load at once ({} bytes > {} bytes). Use start_line/end_line to read sections.",
+                metadata.len(),
+                MAX_FILE_READ_BYTES
+            ),
+        );
     }
 
     // Read raw bytes for binary detection
-    let raw_bytes = match fs::read(path) {
+    let raw_bytes = match fs::read(path.as_path()) {
         Ok(b) => b,
         Err(e) => {
             return Response::error(

@@ -217,6 +217,36 @@ fn transaction_edit_match_operation() {
 }
 
 #[test]
+fn transaction_edit_match_requires_replacement() {
+    let mut aft = AftProcess::spawn();
+    let dir = std::env::temp_dir().join("aft_transaction_tests");
+    fs::create_dir_all(&dir).unwrap();
+
+    let f1 = dir.join("txn_missing_replacement.ts");
+    fs::write(&f1, "const greeting = \"hello\";\n").unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"txn-em-missing","command":"transaction","operations":[{{"file":"{}","command":"edit_match","match":"hello"}}]}}"#,
+        f1.display()
+    ));
+
+    assert_eq!(
+        resp["success"], false,
+        "transaction should fail: {:?}",
+        resp
+    );
+    assert_eq!(resp["code"], "invalid_request");
+    assert_eq!(
+        resp["message"],
+        "transaction: edit_match operation requires 'replacement' field"
+    );
+
+    let _ = fs::remove_file(&f1);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn transaction_edit_match_uses_fuzzy_matching() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();

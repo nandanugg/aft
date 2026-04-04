@@ -58,10 +58,10 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -70,7 +70,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let source = match std::fs::read_to_string(path) {
+    let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -90,7 +90,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     // Phase 2: Auto-backup once before applying (skip for dry-run)
     let dry_run = edit::is_dry_run(&req.params);
     let backup_id = if !dry_run {
-        match edit::auto_backup(ctx, path, "batch: pre-batch backup") {
+        match edit::auto_backup(ctx, &path, "batch: pre-batch backup") {
             Ok(id) => id,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -135,7 +135,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Dry-run: return combined diff without modifying disk
     if dry_run {
-        let dr = edit::dry_run_diff(&source, &content, path);
+        let dr = edit::dry_run_diff(&source, &content, &path);
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -146,15 +146,15 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 5: Write, format, and validate via shared pipeline
     let mut write_result =
-        match edit::write_format_validate(path, &content, &ctx.config(), &req.params) {
+        match edit::write_format_validate(&path, &content, &ctx.config(), &req.params) {
             Ok(r) => r,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };
 
-    if let Ok(final_content) = std::fs::read_to_string(path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(path, &final_content, &req.params);
+    if let Ok(final_content) = std::fs::read_to_string(&path) {
+        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("batch: {} edits in {}", edits.len(), file);

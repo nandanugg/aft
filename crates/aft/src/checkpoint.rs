@@ -105,6 +105,41 @@ impl CheckpointStore {
         })
     }
 
+    /// Restore a checkpoint using a caller-validated path list.
+    pub fn restore_validated(
+        &self,
+        name: &str,
+        validated_paths: &[PathBuf],
+    ) -> Result<CheckpointInfo, AftError> {
+        let checkpoint =
+            self.checkpoints
+                .get(name)
+                .ok_or_else(|| AftError::CheckpointNotFound {
+                    name: name.to_string(),
+                })?;
+
+        for path in validated_paths {
+            let content =
+                checkpoint
+                    .file_contents
+                    .get(path)
+                    .ok_or_else(|| AftError::FileNotFound {
+                        path: path.display().to_string(),
+                    })?;
+            std::fs::write(path, content).map_err(|_| AftError::FileNotFound {
+                path: path.display().to_string(),
+            })?;
+        }
+
+        log::info!("checkpoint restored: {}", name);
+
+        Ok(CheckpointInfo {
+            name: checkpoint.name.clone(),
+            file_count: checkpoint.file_contents.len(),
+            created_at: checkpoint.created_at,
+        })
+    }
+
     /// Return the file paths stored for a checkpoint.
     pub fn file_paths(&self, name: &str) -> Result<Vec<PathBuf>, AftError> {
         let checkpoint =

@@ -256,7 +256,12 @@ fn parse_operation(op: &serde_json::Value, index: usize) -> Result<ParsedOp, Str
                     index
                 )
             })?;
-            let replacement = op.get("replacement").and_then(|v| v.as_str()).unwrap_or("");
+            let replacement = op
+                .get("replacement")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    "transaction: edit_match operation requires 'replacement' field".to_string()
+                })?;
             OpKind::EditMatch {
                 match_str: match_str.to_string(),
                 replacement: replacement.to_string(),

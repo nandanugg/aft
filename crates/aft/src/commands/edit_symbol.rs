@@ -81,10 +81,10 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -94,7 +94,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Resolve symbol
-    let matches = match ctx.provider().resolve_symbol(path, symbol_name) {
+    let matches = match ctx.provider().resolve_symbol(&path, symbol_name) {
         Ok(m) => m,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -171,7 +171,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let original_range = target.range.clone();
 
     // Read file content
-    let source = match std::fs::read_to_string(path) {
+    let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -249,7 +249,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Dry-run: return diff without modifying disk
     if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, path);
+        let dr = edit::dry_run_diff(&source, &new_source, &path);
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -261,7 +261,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Auto-backup before writing
     let backup_id = match edit::auto_backup(
         ctx,
-        path,
+        &path,
         &format!("edit_symbol: {} {}", operation, symbol_name),
     ) {
         Ok(id) => id,
@@ -272,15 +272,15 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Write, format, and validate via shared pipeline
     let mut write_result =
-        match edit::write_format_validate(path, &new_source, &ctx.config(), &req.params) {
+        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
             Ok(r) => r,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
             }
         };
 
-    if let Ok(final_content) = std::fs::read_to_string(path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(path, &final_content, &req.params);
+    if let Ok(final_content) = std::fs::read_to_string(&path) {
+        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("edit_symbol: {} in {}", symbol_name, file);
@@ -344,7 +344,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Include surrounding context for replace/insert ops so the agent can
     // detect issues like duplicated attributes or misplaced decorators.
     if operation == "replace" || operation == "insert_before" || operation == "insert_after" {
-        if let Ok(new_content) = std::fs::read_to_string(path) {
+        if let Ok(new_content) = std::fs::read_to_string(&path) {
             let lines: Vec<&str> = new_content.lines().collect();
             let start = original_range.start_line as usize;
             let context_before: Vec<&str> = if start >= 3 {
@@ -373,7 +373,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Include diff info if requested (for UI metadata)
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(path).unwrap_or_default();
+        let final_content = std::fs::read_to_string(&path).unwrap_or_default();
         result["diff"] = edit::compute_diff_info(&source, &final_content);
     }
 

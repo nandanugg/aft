@@ -66,14 +66,14 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let scope = req.params.get("scope").and_then(|v| v.as_str());
     let dry_run = edit::is_dry_run(&req.params);
 
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let source_path_raw = Path::new(file);
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(destination)) {
-        return resp;
-    }
-    let dest_path_raw = Path::new(destination);
+    let source_path_raw = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    let dest_path_raw = match ctx.validate_path(&req.id, Path::new(destination)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     if !source_path_raw.exists() {
         return Response::error(
@@ -86,15 +86,15 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Canonicalize paths to match callgraph's canonicalized paths
     // (on macOS, /var/folders → /private/var/folders)
     let source_canon =
-        std::fs::canonicalize(source_path_raw).unwrap_or_else(|_| source_path_raw.to_path_buf());
+        std::fs::canonicalize(&source_path_raw).unwrap_or_else(|_| source_path_raw.clone());
     let dest_canon = if dest_path_raw.exists() {
-        std::fs::canonicalize(dest_path_raw).unwrap_or_else(|_| dest_path_raw.to_path_buf())
+        std::fs::canonicalize(&dest_path_raw).unwrap_or_else(|_| dest_path_raw.clone())
     } else if let Some(parent) = dest_path_raw.parent() {
         // Destination may not exist yet — canonicalize its parent
         let canon_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         canon_parent.join(dest_path_raw.file_name().unwrap_or_default())
     } else {
-        dest_path_raw.to_path_buf()
+        dest_path_raw.clone()
     };
     let source_path: &Path = &source_canon;
     let dest_path: &Path = &dest_canon;
@@ -121,7 +121,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Resolve symbol ---
-    let matches = match ctx.provider().resolve_symbol(source_path, symbol_name) {
+    let matches = match ctx.provider().resolve_symbol(&source_path, symbol_name) {
         Ok(m) => m,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -225,7 +225,19 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let end_byte =
         edit::line_col_to_byte(&source_content, target.range.end_line, target.range.end_col);
 
-    let symbol_text = &source_content[start_byte..end_byte];
+    let symbol_text = match source_content.get(start_byte..end_byte) {
+        Some(symbol_text) => symbol_text,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!(
+                    "move_symbol: symbol byte range [{}..{}) is not on UTF-8 boundaries",
+                    start_byte, end_byte
+                ),
+            );
+        }
+    };
 
     // Prepare the text to add to destination: ensure it has export prefix
     let dest_symbol_text = prepare_exported_symbol(symbol_text);
@@ -323,7 +335,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
         // Consumer file diffs
         for (path, original, new_content) in &consumer_rewrites {
-            let dr = edit::dry_run_diff(original, new_content, path);
+            let dr = edit::dry_run_diff(original, new_content, &path);
             diffs.push(serde_json::json!({
                 "file": path.display().to_string(),
                 "diff": dr.diff,
@@ -368,7 +380,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let dest_existed = dest_path.exists();
 
     // 1. Write source file (symbol removed)
-    match edit::write_format_validate(source_path, &new_source, &ctx.config(), &req.params) {
+    match edit::write_format_validate(&source_path, &new_source, &ctx.config(), &req.params) {
         Ok(wr) => {
             if let Ok(final_content) = std::fs::read_to_string(source_path) {
                 ctx.lsp_notify_file_changed(source_path, &final_content);
@@ -394,7 +406,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // 2. Write destination file (symbol added)
-    match edit::write_format_validate(dest_path, &new_dest, &ctx.config(), &req.params) {
+    match edit::write_format_validate(&dest_path, &new_dest, &ctx.config(), &req.params) {
         Ok(wr) => {
             if let Ok(final_content) = std::fs::read_to_string(dest_path) {
                 ctx.lsp_notify_file_changed(dest_path, &final_content);
@@ -427,9 +439,9 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // 3. Write consumer files (imports rewritten)
     let mut consumers_updated = 0;
     for (path, _original, new_content) in &consumer_rewrites {
-        match edit::write_format_validate(path, new_content, &ctx.config(), &req.params) {
+        match edit::write_format_validate(&path, new_content, &ctx.config(), &req.params) {
             Ok(wr) => {
-                if let Ok(final_content) = std::fs::read_to_string(path) {
+                if let Ok(final_content) = std::fs::read_to_string(&path) {
                     ctx.lsp_notify_file_changed(path, &final_content);
                 }
 
@@ -625,7 +637,11 @@ fn prepare_exported_symbol(symbol_text: &str) -> String {
     let trimmed = symbol_text.trim();
 
     // If it already starts with 'export', use as-is
-    if trimmed.starts_with("export ") {
+    if trimmed.starts_with("export default")
+        || trimmed.starts_with("export {")
+        || trimmed.starts_with("export *")
+        || trimmed.starts_with("export ")
+    {
         return trimmed.to_string();
     }
 
@@ -720,17 +736,13 @@ fn rewrite_consumer_imports(
     }
 
     // Parse imports
-    let (source_text, _tree, block) = match imports::parse_file_imports(consumer_file, lang) {
+    let (_source_text, _tree, block) = match imports::parse_file_imports(consumer_file, lang) {
         Ok(r) => r,
         Err(_) => return None,
     };
 
     // Use the consumer_content we already read (should match source_text)
-    let content = if source_text == consumer_content {
-        consumer_content
-    } else {
-        consumer_content
-    };
+    let content = consumer_content;
 
     // Find imports from the source file that reference the moved symbol
     let mut result = content.to_string();
@@ -1021,6 +1033,22 @@ mod tests {
         assert_eq!(
             prepare_exported_symbol(text),
             "export function doStuff() { return 42; }"
+        );
+    }
+
+    #[test]
+    fn prepare_exported_preserves_export_reexports_and_default() {
+        assert_eq!(
+            prepare_exported_symbol("export default function doStuff() { return 42; }"),
+            "export default function doStuff() { return 42; }"
+        );
+        assert_eq!(
+            prepare_exported_symbol("export { doStuff } from './other';"),
+            "export { doStuff } from './other';"
+        );
+        assert_eq!(
+            prepare_exported_symbol("export * from './other';"),
+            "export * from './other';"
         );
     }
 

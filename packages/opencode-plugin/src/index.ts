@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import type { Plugin } from "@opencode-ai/plugin";
+
 import { loadAftConfig } from "./config.js";
 import { ensureBinary } from "./downloader.js";
 import { error, log, warn } from "./logger.js";
@@ -7,6 +8,18 @@ import { consumeToolMetadata } from "./metadata-store.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
 import { BridgePool } from "./pool.js";
 import { findBinary } from "./resolver.js";
+import { astTools } from "./tools/ast.js";
+import { conflictTools } from "./tools/conflicts.js";
+import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
+import { importTools } from "./tools/imports.js";
+import { lspTools } from "./tools/lsp.js";
+import { navigationTools } from "./tools/navigation.js";
+import { readingTools } from "./tools/reading.js";
+import { refactoringTools } from "./tools/refactoring.js";
+import { safetyTools } from "./tools/safety.js";
+import { searchTools } from "./tools/search.js";
+import { structureTools } from "./tools/structure.js";
+import type { PluginContext } from "./types.js";
 
 /** Read the plugin's own version from package.json at build time. */
 const PLUGIN_VERSION: string = (() => {
@@ -18,19 +31,6 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-import { astTools } from "./tools/ast.js";
-import { conflictTools } from "./tools/conflicts.js";
-
-import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
-import { importTools } from "./tools/imports.js";
-import { lspTools } from "./tools/lsp.js";
-import { navigationTools } from "./tools/navigation.js";
-import { readingTools } from "./tools/reading.js";
-import { refactoringTools } from "./tools/refactoring.js";
-import { safetyTools } from "./tools/safety.js";
-import { structureTools } from "./tools/structure.js";
-import type { PluginContext } from "./types.js";
-
 /**
  * AFT (Agent File Toolkit) plugin for OpenCode.
  *
@@ -40,6 +40,7 @@ import type { PluginContext } from "./types.js";
  *
  * Tools organized into groups:
  * - Hoisted (default): read, write, edit, apply_patch, ast_grep_search, ast_grep_replace
+ *   and experimental grep/glob when experimental_search_index is enabled
  * - File ops: aft_delete, aft_move
  * - Reading: aft_outline
  * - Safety: aft_safety
@@ -65,6 +66,10 @@ const plugin: Plugin = async (input) => {
   if (aftConfig.checker !== undefined) configOverrides.checker = aftConfig.checker;
   if (aftConfig.restrict_to_project_root !== undefined)
     configOverrides.restrict_to_project_root = aftConfig.restrict_to_project_root;
+  if (aftConfig.experimental_search_index !== undefined)
+    configOverrides.experimental_search_index = aftConfig.experimental_search_index;
+  if (aftConfig.compress_tool_output !== undefined)
+    configOverrides.compress_tool_output = aftConfig.compress_tool_output;
 
   // Track which binary version we already attempted to upgrade from.
   // Prevents the loop: mismatch → fire-and-forget download → replaceBinary kills bridge →
@@ -147,6 +152,8 @@ const plugin: Plugin = async (input) => {
     ...navigationTools(ctx),
     // AST tools: recommended+
     ...(surface !== "minimal" && astTools(ctx)),
+    // Indexed search tools: recommended+ and opt-in
+    ...(surface !== "minimal" && aftConfig.experimental_search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),
     // LSP diagnostics: recommended+
     ...(surface !== "minimal" && lspTools(ctx)),
@@ -198,6 +205,15 @@ const plugin: Plugin = async (input) => {
       ) {
         output.output +=
           "\n\n[Hint] Use aft_conflicts to see all conflict regions across files in a single call.";
+      }
+      // Hint: when agent runs grep/rg via bash, nudge toward the built-in grep tool.
+      // Detection: check the first line of output (the echoed command) for rg or grep invocations.
+      if (input.tool === "bash" && output.output) {
+        const firstLine = output.output.slice(0, 300).split("\n")[0] ?? "";
+        if (/\b(rg|grep)\s/.test(firstLine)) {
+          output.output +=
+            "\n\n[Hint] Use the grep tool instead of bash for faster indexed search.";
+        }
       }
     },
     dispose: () => pool.shutdown(),

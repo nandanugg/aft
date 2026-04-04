@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use crate::context::AppContext;
-use crate::edit;
+use crate::edit::{self, validate_syntax};
 use crate::protocol::{RawRequest, Response};
 
 /// Handle an `edit_match` request.
@@ -146,7 +146,7 @@ fn handle_glob_edit_match(
     let mut pending: Vec<PendingEdit> = Vec::new();
 
     for path in &paths {
-        let source = match std::fs::read_to_string(path) {
+        let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -165,7 +165,7 @@ fn handle_glob_edit_match(
         let file_str = path.display().to_string();
 
         if dry_run {
-            let dr = edit::dry_run_diff(&source, &new_source, path);
+            let dr = edit::dry_run_diff(&source, &new_source, &path);
             diffs.push(serde_json::json!({
                 "file": file_str,
                 "replacements": count,
@@ -217,6 +217,14 @@ fn handle_glob_edit_match(
         } else {
             false
         };
+        let syntax_valid = if !dry_run {
+            match validate_syntax(&edit.path) {
+                Ok(valid) => valid,
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            }
+        } else {
+            None
+        };
 
         if let Ok(final_content) = std::fs::read_to_string(&edit.path) {
             ctx.lsp_notify_file_changed(&edit.path, &final_content);
@@ -226,6 +234,7 @@ fn handle_glob_edit_match(
             "file": file_str,
             "replacements": edit.count,
             "formatted": formatted,
+            "syntax_valid": syntax_valid,
         }));
     }
 
@@ -308,10 +317,10 @@ fn handle_single_file_edit_match(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if let Err(resp) = ctx.validate_path(&req.id, Path::new(file)) {
-        return resp;
-    }
-    let path = Path::new(file);
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -320,7 +329,7 @@ fn handle_single_file_edit_match(
         );
     }
 
-    let source = match std::fs::read_to_string(path) {
+    let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -408,7 +417,7 @@ fn handle_single_file_edit_match(
         } else {
             format!("edit_match: {}", match_str)
         };
-        match edit::auto_backup(ctx, path, &label) {
+        match edit::auto_backup(ctx, path.as_path(), &label) {
             Ok(id) => id,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -458,7 +467,7 @@ fn handle_single_file_edit_match(
 
     // Dry-run: return diff without modifying disk
     if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, path);
+        let dr = edit::dry_run_diff(&source, &new_source, path.as_path());
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -468,16 +477,21 @@ fn handle_single_file_edit_match(
     }
 
     // Write, format, and validate via shared pipeline
-    let mut write_result =
-        match edit::write_format_validate(path, &new_source, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let mut write_result = match edit::write_format_validate(
+        path.as_path(),
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
-    if let Ok(final_content) = std::fs::read_to_string(path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(path, &final_content, &req.params);
+    if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
+        write_result.lsp_diagnostics =
+            ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
     }
 
     log::debug!("edit_match: {} in {}", match_str, file);
@@ -510,7 +524,7 @@ fn handle_single_file_edit_match(
 
     // Include diff info if requested (for UI metadata)
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(path).unwrap_or_else(|_| new_source);
+        let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| new_source);
         result["diff"] = edit::compute_diff_info(&source, &final_content);
     }
 

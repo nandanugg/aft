@@ -66,6 +66,10 @@ export const AftConfigSchema = z.object({
    * Default: false (matches OpenCode's built-in behavior).
    */
   restrict_to_project_root: z.boolean().optional(),
+  /** Enable experimental indexed search for grep and glob hoisting. Default: false. */
+  experimental_search_index: z.boolean().optional(),
+  /** Compress grep/glob text output to reduce token usage. Default: true. */
+  compress_tool_output: z.boolean().optional(),
 });
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
@@ -132,8 +136,48 @@ function stripJsoncComments(text: string): string {
 }
 
 function stripTrailingCommas(text: string): string {
-  // Remove commas before ] or } (with optional whitespace between)
-  return text.replace(/,(\s*[}\]])/g, "$1");
+  let result = "";
+  let i = 0;
+  let inString = false;
+  let escaped = false;
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (inString) {
+      result += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      result += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === "}" || text[j] === "]") {
+        i++;
+        continue;
+      }
+    }
+
+    result += ch;
+    i++;
+  }
+
+  return result;
 }
 
 function parseJsonc<T = unknown>(content: string): T {

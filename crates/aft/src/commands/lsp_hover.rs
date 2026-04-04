@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::Deserialize;
 
 use lsp_types::request::HoverRequest;
@@ -38,11 +40,14 @@ pub fn handle_lsp_hover(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "invalid_request", "lsp_hover: 'line' must be >= 1");
     }
 
-    let file_path = std::path::Path::new(&params.file);
+    let file_path = match ctx.validate_path(&req.id, Path::new(&params.file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
 
     let server_keys = {
         let mut lsp = ctx.lsp();
-        match lsp.ensure_file_open(file_path) {
+        match lsp.ensure_file_open(&file_path) {
             Ok(keys) => keys,
             Err(err) => {
                 return Response::error(
@@ -62,7 +67,7 @@ pub fn handle_lsp_hover(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let canonical_path = match std::fs::canonicalize(file_path) {
+    let canonical_path = match std::fs::canonicalize(&file_path) {
         Ok(path) => path,
         Err(err) => {
             return Response::error(

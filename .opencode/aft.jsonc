@@ -19,5 +19,8 @@
   // Per-language checker overrides (auto-detected if omitted)
   "checker": {
     "typescript": "biome"
-  }
+  },
+
+  // Enable experimental indexed search for grep and glob hoisting
+  "experimental_search_index": true
 }

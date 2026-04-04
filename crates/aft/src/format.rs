@@ -258,13 +258,13 @@ pub fn detect_formatter(
         LangId::Go => "go",
         LangId::Markdown => "markdown",
     };
+    let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.formatter.get(lang_key) {
-        return resolve_explicit_formatter(preferred, &file_str, lang);
+        return resolve_explicit_formatter(preferred, &file_str, lang, project_root);
     }
 
     // 2. Project config file detection only — no config file means no formatting.
     //    This avoids silently reformatting code in projects without formatter setup.
-    let project_root = config.project_root.as_deref();
 
     match lang {
         LangId::TypeScript | LangId::JavaScript | LangId::Tsx => {
@@ -349,52 +349,56 @@ pub fn detect_formatter(
 }
 
 /// Resolve an explicitly configured formatter name to a command + args.
+/// Uses resolve_tool() to find the binary in node_modules/.bin or PATH,
+/// so locally-installed tools (biome, prettier) are found even when not on PATH.
 fn resolve_explicit_formatter(
     name: &str,
     file_str: &str,
     lang: LangId,
+    project_root: Option<&Path>,
 ) -> Option<(String, Vec<String>)> {
-    match name {
-        "biome" => Some((
-            "biome".to_string(),
-            vec![
-                "format".to_string(),
-                "--write".to_string(),
-                file_str.to_string(),
-            ],
-        )),
-        "prettier" => Some((
-            "prettier".to_string(),
-            vec!["--write".to_string(), file_str.to_string()],
-        )),
-        "deno" => Some((
-            "deno".to_string(),
-            vec!["fmt".to_string(), file_str.to_string()],
-        )),
-        "ruff" => Some((
-            "ruff".to_string(),
-            vec!["format".to_string(), file_str.to_string()],
-        )),
-        "black" => Some(("black".to_string(), vec![file_str.to_string()])),
-        "rustfmt" => Some(("rustfmt".to_string(), vec![file_str.to_string()])),
-        "goimports" => Some((
-            "goimports".to_string(),
-            vec!["-w".to_string(), file_str.to_string()],
-        )),
-        "gofmt" => Some((
-            "gofmt".to_string(),
-            vec!["-w".to_string(), file_str.to_string()],
-        )),
-        "none" | "off" | "false" => None,
+    let cmd = match name {
+        "none" | "off" | "false" => return None,
+        "biome" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" => {
+            // Resolve through node_modules/.bin first, then PATH
+            match resolve_tool(name, project_root) {
+                Some(resolved) => resolved,
+                None => {
+                    log::warn!(
+                        "[aft] format: configured formatter '{}' not found in node_modules/.bin or PATH",
+                        name
+                    );
+                    return None;
+                }
+            }
+        }
         _ => {
             log::debug!(
                 "[aft] format: unknown preferred_formatter '{}' for {:?}, falling back to auto",
                 name,
                 lang
             );
-            None
+            return None;
         }
-    }
+    };
+
+    let args = match name {
+        "biome" => vec![
+            "format".to_string(),
+            "--write".to_string(),
+            file_str.to_string(),
+        ],
+        "prettier" => vec!["--write".to_string(), file_str.to_string()],
+        "deno" => vec!["fmt".to_string(), file_str.to_string()],
+        "ruff" => vec!["format".to_string(), file_str.to_string()],
+        "black" => vec![file_str.to_string()],
+        "rustfmt" => vec![file_str.to_string()],
+        "goimports" => vec!["-w".to_string(), file_str.to_string()],
+        "gofmt" => vec!["-w".to_string(), file_str.to_string()],
+        _ => unreachable!(), // Already handled above
+    };
+
+    Some((cmd, args))
 }
 
 /// Check if any of the given config file names exist in the project root.
@@ -607,7 +611,7 @@ pub fn detect_type_checker(
         LangId::Markdown => "markdown",
     };
     if let Some(preferred) = config.checker.get(lang_key) {
-        return resolve_explicit_checker(preferred, &file_str, lang);
+        return resolve_explicit_checker(preferred, &file_str, lang, project_root);
     }
 
     match lang {
@@ -698,13 +702,22 @@ pub fn detect_type_checker(
 }
 
 /// Resolve an explicitly configured checker name to a command + args.
+/// Uses resolve_tool() to find the binary in node_modules/.bin or PATH,
+/// so locally-installed tools (biome, tsc, pyright) are found even when not on PATH.
 fn resolve_explicit_checker(
     name: &str,
     file_str: &str,
     _lang: LangId,
+    project_root: Option<&Path>,
 ) -> Option<(String, Vec<String>)> {
     match name {
-        "tsc" => Some((
+        "none" | "off" | "false" => return None,
+        _ => {}
+    }
+
+    // tsc is special — always runs via npx
+    if name == "tsc" {
+        return Some((
             "npx".to_string(),
             vec![
                 "tsc".to_string(),
@@ -712,41 +725,56 @@ fn resolve_explicit_checker(
                 "--pretty".to_string(),
                 "false".to_string(),
             ],
-        )),
-        "biome" => Some((
-            "biome".to_string(),
-            vec!["check".to_string(), file_str.to_string()],
-        )),
-        "pyright" => Some((
-            "pyright".to_string(),
-            vec!["--outputjson".to_string(), file_str.to_string()],
-        )),
-        "ruff" => Some((
-            "ruff".to_string(),
-            vec![
+        ));
+    }
+    // cargo and go are system tools, not in node_modules
+    if name == "cargo" {
+        return Some((
+            "cargo".to_string(),
+            vec!["check".to_string(), "--message-format=json".to_string()],
+        ));
+    }
+    if name == "go" {
+        return Some((
+            "go".to_string(),
+            vec!["vet".to_string(), file_str.to_string()],
+        ));
+    }
+
+    // For node-ecosystem tools, resolve through node_modules/.bin first
+    let known_tools = ["biome", "pyright", "ruff", "staticcheck"];
+    if known_tools.contains(&name) {
+        let cmd = match resolve_tool(name, project_root) {
+            Some(resolved) => resolved,
+            None => {
+                log::warn!(
+                    "[aft] validate: configured checker '{}' not found in node_modules/.bin or PATH",
+                    name
+                );
+                return None;
+            }
+        };
+
+        let args = match name {
+            "biome" => vec!["check".to_string(), file_str.to_string()],
+            "pyright" => vec!["--outputjson".to_string(), file_str.to_string()],
+            "ruff" => vec![
                 "check".to_string(),
                 "--output-format=json".to_string(),
                 file_str.to_string(),
             ],
-        )),
-        "cargo" => Some((
-            "cargo".to_string(),
-            vec!["check".to_string(), "--message-format=json".to_string()],
-        )),
-        "go" => Some((
-            "go".to_string(),
-            vec!["vet".to_string(), file_str.to_string()],
-        )),
-        "staticcheck" => Some(("staticcheck".to_string(), vec![file_str.to_string()])),
-        "none" | "off" | "false" => None,
-        _ => {
-            log::debug!(
-                "[aft] validate: unknown preferred_checker '{}', falling back to auto",
-                name
-            );
-            None
-        }
+            "staticcheck" => vec![file_str.to_string()],
+            _ => unreachable!(),
+        };
+
+        return Some((cmd, args));
     }
+
+    log::debug!(
+        "[aft] validate: unknown preferred_checker '{}', falling back to auto",
+        name
+    );
+    None
 }
 
 /// Parse type checker output into structured validation errors.
@@ -1194,14 +1222,33 @@ mod tests {
 
     #[test]
     fn detect_formatter_explicit_override() {
+        // Create a temp dir with a fake node_modules/.bin/biome so resolve_tool finds it
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fake = bin_dir.join("biome");
+            fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(bin_dir.join("biome.cmd"), "@echo 1.0.0").unwrap();
+        }
+
         let path = Path::new("test.ts");
         let mut config = Config::default();
+        config.project_root = Some(dir.path().to_path_buf());
         config
             .formatter
             .insert("typescript".to_string(), "biome".to_string());
         let result = detect_formatter(path, LangId::TypeScript, &config);
-        let (cmd, _) = result.unwrap();
-        assert_eq!(cmd, "biome");
+        let (cmd, args) = result.unwrap();
+        assert!(cmd.contains("biome"), "expected biome in cmd, got: {}", cmd);
+        assert!(args.contains(&"format".to_string()));
+        assert!(args.contains(&"--write".to_string()));
     }
 
     #[test]
