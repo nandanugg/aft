@@ -18,6 +18,7 @@
 <p align="center">
   <a href="#get-started">Get Started</a> ·
   <a href="#what-is-aft">What is AFT?</a> ·
+  <a href="#search-benchmarks">Benchmarks</a> ·
   <a href="#features">Features</a> ·
   <a href="#tool-reference">Tool Reference</a> ·
   <a href="#configuration">Configuration</a> ·
@@ -154,6 +155,44 @@ src/auth/session.ts:40-52
 // aft_navigate
 { "op": "callers", "filePath": "src/auth/session.ts", "symbol": "validateToken", "depth": 2 }
 ```
+
+---
+
+## Search Benchmarks
+
+With `experimental_search_index: true`, AFT builds a trigram index in the background and serves
+grep queries from memory. Here's how it compares to ripgrep on real codebases:
+
+### opencode-aft (253 files)
+
+| Query | ripgrep | AFT | Speedup |
+|-------|---------|-----|---------|
+| `validate_path` | 31.4ms | 1.48ms | **21x** |
+| `BinaryBridge` | 31.0ms | 1.3ms | **24x** |
+| `fn handle_grep` | 31.3ms | 0.2ms | **136x** |
+| `experimental_search_index` | 31.5ms | 0.4ms | **71x** |
+
+### reth (1,685 Rust files)
+
+| Query | ripgrep | AFT | Speedup |
+|-------|---------|-----|---------|
+| `BlockNumber` | 34.8ms | 15.8ms | **2x** |
+| `fn execute` | 34.4ms | 13.0ms | **3x** |
+| `EthApiError` | 33.7ms | 8.3ms | **4x** |
+| `impl Display for` | 53.5ms | 7.2ms | **7x** |
+
+### Chromium/base (3,953 C++ files)
+
+| Query | ripgrep | AFT | Speedup |
+|-------|---------|-----|---------|
+| `WebContents` | 69.5ms | 0.29ms | **236x** |
+| `StringPiece` | 51.8ms | 0.78ms | **66x** |
+| `NOTREACHED` | 51.6ms | 2.16ms | **24x** |
+| `base::Value` | 54.4ms | 1.13ms | **48x** |
+
+Rare queries see the biggest gains — the trigram index narrows candidates to a few files instantly.
+High-match queries still benefit from `memchr` SIMD scanning and early termination. Index builds
+in ~2s for most projects, persists to disk, and stays fresh via file watcher.
 
 ---
 
@@ -501,32 +540,22 @@ For out-of-project paths, shells out to ripgrep matching opencode's exact flags.
 { "pattern": "handleRequest", "include": "*.ts" }
 ```
 
-Returns matches grouped by file, sorted by modification time (newest first), capped at 100:
+Returns matches grouped by file with relative paths, sorted by modification time (newest first),
+capped at 100 matches:
 
 ```
-/Users/me/project/src/server.ts:
-  Line 42: export async function handleRequest(req: Request) {
-  Line 89:     return handleRequest(retryReq)
+src/server.ts
+42: export async function handleRequest(req: Request) {
+89:     return handleRequest(retryReq)
 
-/Users/me/project/src/test/server.test.ts:
-  Line 15: import { handleRequest } from "../server"
-
-Found 3 match(es) in 2 file(s).
-```
-
-**Compressed mode** (`compress_tool_output: true`) groups matches by file with overflow
-summarization and 200-char line truncation — reducing token usage by up to 80%:
-
-```
-── src/server.ts (2 matches) ──
-  42: export async function handleRequest(req: Request) {
-  89:     return handleRequest(retryReq)
-
-── src/test/server.test.ts (1 match) ──
-  15: import { handleRequest } from "../server"
+src/test/server.test.ts
+15: import { handleRequest } from "../server"
 
 Found 3 match(es) across 2 file(s). [index: ready]
 ```
+
+Files with more than 5 matches show the first 5 and `... and N more matches`. Lines are truncated
+at 200 characters.
 
 Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path),
 `include` (glob filter, e.g. `"*.ts"`), `exclude` (negate glob), `case_sensitive` (default true).
@@ -543,14 +572,17 @@ capped at 100 files.
 { "pattern": "**/*.test.ts" }
 ```
 
-Returns:
+Returns relative paths. For small result sets, a flat list:
+
 ```
-/Users/me/project/src/server.test.ts
-/Users/me/project/src/utils.test.ts
-/Users/me/project/src/auth/login.test.ts
+3 files matching **/*.test.ts
+
+src/server.test.ts
+src/utils.test.ts
+src/auth/login.test.ts
 ```
 
-**Compressed mode** groups files by directory when there are many results:
+For larger result sets (>20 files), groups by directory:
 
 ```
 20 files matching **/*.test.ts
@@ -779,10 +811,6 @@ Both files are JSONC (comments allowed).
   // Default: false
   "experimental_search_index": false,
 
-  // Compress grep/glob output to reduce token usage (RTK-style grouping, line truncation).
-  // Default: false
-  "compress_tool_output": false,
-
   // Restrict all file operations to the project root directory.
   // Default: false (matches opencode's permission-based model — operations prompt via ctx.ask)
   "restrict_to_project_root": false
@@ -815,7 +843,7 @@ OpenCode agent
      | JSON-over-stdio (newline-delimited)
      v
 aft binary (Rust)
-  - tree-sitter parsing (6 language grammars)
+  - tree-sitter parsing (12 language grammars)
   - Symbol resolution, call graph, diff generation
   - Format-on-edit (shells out to biome / rustfmt / etc.)
   - Backup/checkpoint management
@@ -839,6 +867,10 @@ session — warm parse trees, no re-spawn overhead per call.
 | Python | ✓ | ✓ | ✓ | ✓ |
 | Rust | ✓ | ✓ | ✓ | partial |
 | Go | ✓ | ✓ | ✓ | partial |
+| C | ✓ | ✓ | — | — |
+| C++ | ✓ | ✓ | — | — |
+| C# | ✓ | ✓ | — | — |
+| Zig | ✓ | ✓ | — | — |
 | Markdown | ✓ | ✓ | — | — |
 
 ---
@@ -891,7 +923,7 @@ opencode-aft/
 
 ## Roadmap
 
-- C/C++ language support
+- MCP server for Claude Code, Cursor, and other MCP-compatible hosts
 - LSP integration for type-aware symbol resolution (partially implemented)
 - Streaming responses for large call trees
 - Watch mode for live outline updates
