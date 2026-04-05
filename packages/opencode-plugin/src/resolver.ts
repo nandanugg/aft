@@ -3,7 +3,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ensureBinary, getCachedBinaryPath, getCacheDir } from "./downloader.js";
+import { ensureBinary, getCacheDir, getCachedBinaryPath } from "./downloader.js";
 import { log, warn } from "./logger.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
