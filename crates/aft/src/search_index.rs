@@ -822,6 +822,12 @@ pub fn extract_trigrams(content: &[u8]) -> Vec<(u32, u8, usize)> {
 }
 
 pub fn resolve_cache_dir(project_root: &Path) -> PathBuf {
+    // Respect AFT_CACHE_DIR for testing — prevents tests from polluting the user's cache
+    if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
+        return PathBuf::from(override_dir)
+            .join("index")
+            .join(project_cache_key(project_root));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

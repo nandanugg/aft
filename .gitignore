@@ -47,3 +47,5 @@ ts-bench/
 # Benchmark configs (may contain API keys)
 benchmarks/configs/
 .opencode/dumps
+codedb.snapshot
+benchmarks/search-bench-results.json

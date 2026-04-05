@@ -18,8 +18,11 @@ pub struct AftProcess {
 
 impl AftProcess {
     /// Spawn the aft binary with piped stdin/stdout/stderr.
+    /// Sets AFT_CACHE_DIR to a temp path so tests don't pollute the user's cache.
     pub fn spawn() -> Self {
-        Self::spawn_with_env(&[])
+        let temp_cache =
+            std::env::temp_dir().join(format!("aft-test-cache-{}", std::process::id()));
+        Self::spawn_with_env(&[("AFT_CACHE_DIR", temp_cache.as_os_str())])
     }
 
     /// Spawn the aft binary with additional environment variables.

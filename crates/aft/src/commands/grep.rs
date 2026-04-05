@@ -82,6 +82,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         IndexStatus::Fallback
     };
 
+    let search_start = std::time::Instant::now();
     let result = {
         let search_index = ctx.search_index().borrow();
         match search_index.as_ref() {
@@ -104,6 +105,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
                         &exclude,
                         max_results,
                     ) {
+                        let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                         return Response::success(
                             &req.id,
                             serde_json::json!({
@@ -114,6 +116,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
                                 "files_with_matches": result.files_with_matches,
                                 "index_status": result.index_status.as_str(),
                                 "truncated": result.truncated,
+                                "search_ms": (search_ms * 1000.0).round() / 1000.0,
                             }),
                         );
                     }
@@ -131,6 +134,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     };
+    let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let text = format_grep_text(&result, ctx.config().compress_tool_output);
 
     Response::success(
@@ -143,6 +147,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
             "files_with_matches": result.files_with_matches,
             "index_status": result.index_status.as_str(),
             "truncated": result.truncated,
+            "search_ms": (search_ms * 1000.0).round() / 1000.0,
         }),
     )
 }

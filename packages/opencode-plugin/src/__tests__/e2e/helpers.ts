@@ -109,6 +109,8 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
+  // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/
+  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
   await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
   const bridge = new BinaryBridge(preparedBinary.binaryPath, tempDir, {
