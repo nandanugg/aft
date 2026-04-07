@@ -131,6 +131,63 @@ describe("BinaryBridge lifecycle", () => {
     await expect(bridge.send("ping")).rejects.toThrow("shutting down");
     bridge = null; // already shut down
   });
+
+  test("multiple parallel first calls share one configure (no race)", async () => {
+    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
+      timeoutMs: TEST_TIMEOUT_MS,
+    });
+
+    // Fire 5 requests in parallel — all arrive before configure completes.
+    // Before the shared-promise fix, the 4th+ call would hit the depth limit.
+    const results = await Promise.all([
+      bridge.send("ping"),
+      bridge.send("ping"),
+      bridge.send("ping"),
+      bridge.send("ping"),
+      bridge.send("ping"),
+    ]);
+
+    // All 5 should succeed
+    for (const r of results) {
+      expect(r.success).toBe(true);
+      expect(r.command).toBe("pong");
+    }
+
+    // All should have distinct IDs
+    const ids = results.map((r) => r.id);
+    expect(new Set(ids).size).toBe(5);
+  });
+
+  test("bridge death during version check prevents configured=true", async () => {
+    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
+      timeoutMs: TEST_TIMEOUT_MS,
+      // Set a minVersion so checkVersion actually sends a "version" command
+      minVersion: "0.0.1",
+      // Disable auto-restart so the killed process stays dead
+      maxRestarts: 0,
+    });
+
+    // Intercept checkVersion to kill the process mid-flight.
+    // We monkey-patch the private checkVersion method to simulate a crash
+    // that happens during the version check window. The patched function
+    // kills the process and returns normally (simulating checkVersion's
+    // best-effort error swallowing behavior).
+    (bridge as any).checkVersion = async function (this: any) {
+      const proc = this.process;
+      if (proc) {
+        proc.kill("SIGKILL");
+        // Wait for the exit event to fire and handleCrash to run
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      // Return normally — simulates checkVersion swallowing the error
+    };
+
+    // The first send should fail because the bridge dies during checkVersion
+    await expect(bridge.send("ping")).rejects.toThrow();
+
+    // configured should be false — the bridge should NOT be marked as configured
+    expect((bridge as any).configured).toBe(false);
+  });
 });
 
 /** Check if a process with the given PID is still alive. */

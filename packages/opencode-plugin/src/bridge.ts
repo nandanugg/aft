@@ -61,7 +61,7 @@ export class BinaryBridge {
   private timeoutMs: number;
   private maxRestarts: number;
   private configured = false;
-  private _configureDepth = 0;
+  private _configurePromise: Promise<void> | null = null;
   private configOverrides: Record<string, unknown>;
   private minVersion: string | undefined;
   private onVersionMismatch: ((binaryVersion: string, minVersion: string) => void) | undefined;
@@ -108,36 +108,44 @@ export class BinaryBridge {
 
     // Auto-configure project root + plugin config on first command, then check version.
     // configured is set AFTER success to prevent skipping configuration on failure (#18).
-    // Recursion depth is guarded to prevent infinite loops on repeated version mismatches (#9).
+    // When multiple parallel calls arrive before configure completes, they all await
+    // the same promise instead of each independently trying to configure.
     if (!this.configured) {
       if (command !== "configure" && command !== "version") {
-        this._configureDepth = (this._configureDepth ?? 0) + 1;
-        if (this._configureDepth > 3) {
-          this._configureDepth = 0;
-          throw new Error(
-            `[aft-plugin] Failed to configure bridge after 3 attempts. Check logs: ${getLogFilePath()}`,
-          );
-        }
-        try {
-          await this.send("configure", {
-            project_root: this.cwd,
-            ...this.configOverrides,
-          });
-          await this.checkVersion();
-        } catch (err) {
-          // Configure failed — leave configured=false so next call retries
-          this._configureDepth = 0;
-          throw err;
+        if (!this._configurePromise) {
+          // First caller — create the configure promise.
+          // All parallel callers await this same promise.
+          this._configurePromise = (async () => {
+            try {
+              const configResult = await this.send("configure", {
+                project_root: this.cwd,
+                ...this.configOverrides,
+              });
+              if (configResult.success === false) {
+                throw new Error(
+                  `[aft-plugin] Configure failed: ${configResult.message ?? "unknown error"}`,
+                );
+              }
+              await this.checkVersion();
+              // Re-check liveness after version check — checkVersion() swallows
+              // errors as best-effort, so the bridge may have died without throwing.
+              if (!this.isAlive()) {
+                throw new Error(
+                  `[aft-plugin] Bridge died during version check. Check logs: ${getLogFilePath()}`,
+                );
+              }
+              this.configured = true;
+            } catch (err) {
+              // Configure failed — leave configured=false so next call retries
+              throw err;
+            } finally {
+              this._configurePromise = null;
+            }
+          })();
         }
 
-        // Version check may have triggered a hot-swap (replaceBinary kills the process).
-        // If the bridge died, re-spawn and re-configure before proceeding.
-        if (!this.isAlive()) {
-          return this.send(command, params);
-        }
-
-        this.configured = true;
-        this._configureDepth = 0;
+        // All callers (including the first) await the shared promise
+        await this._configurePromise;
       }
     }
 

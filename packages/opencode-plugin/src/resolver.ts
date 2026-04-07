@@ -20,9 +20,11 @@ function copyToVersionedCache(npmBinaryPath: string): string | null {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 5000,
     });
-    const version = result.stdout?.trim();
-    if (!version) return null;
+    const rawVersion = result.stdout?.trim();
+    if (!rawVersion) return null;
 
+    // `aft --version` outputs "aft 0.9.0" — extract just the version number
+    const version = rawVersion.replace(/^aft\s+/, "");
     const tag = version.startsWith("v") ? version : `v${version}`;
     const cacheDir = getCacheDir();
     const versionedDir = join(cacheDir, tag);
