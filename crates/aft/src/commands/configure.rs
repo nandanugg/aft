@@ -147,7 +147,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(&req.id, "invalid_request", error);
             }
         };
-        ctx.config_mut().storage_dir = Some(storage_dir);
+        ctx.config_mut().storage_dir = Some(storage_dir.clone());
+        ctx.backup().borrow_mut().set_storage_dir(storage_dir);
     }
 
     let experimental_search_index = ctx.config().experimental_search_index;

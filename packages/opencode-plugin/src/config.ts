@@ -1,3 +1,4 @@
+import { parse as parseJsonc } from "comment-json";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
@@ -74,120 +75,8 @@ export const AftConfigSchema = z.object({
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
 
-// ---------------------------------------------------------------------------
-// JSONC parsing — self-contained, no external dependency
-//
-// jsonc-parser's UMD bundle breaks under both ESM named imports (Node) and
-// createRequire (Bun/OpenCode hybrid runtime). Strip comments + trailing
-// commas ourselves and use JSON.parse.
-// ---------------------------------------------------------------------------
-
-function stripJsoncComments(text: string): string {
-  let result = "";
-  let i = 0;
-  let inString = false;
-  let escaped = false;
-
-  while (i < text.length) {
-    const ch = text[i];
-
-    if (inString) {
-      result += ch;
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      i++;
-      continue;
-    }
-
-    // Start of string
-    if (ch === '"') {
-      inString = true;
-      result += ch;
-      i++;
-      continue;
-    }
-
-    // Line comment
-    if (ch === "/" && text[i + 1] === "/") {
-      // Skip until end of line
-      i += 2;
-      while (i < text.length && text[i] !== "\n") i++;
-      continue;
-    }
-
-    // Block comment
-    if (ch === "/" && text[i + 1] === "*") {
-      i += 2;
-      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
-      i += 2; // skip closing */
-      continue;
-    }
-
-    result += ch;
-    i++;
-  }
-
-  return result;
-}
-
-function stripTrailingCommas(text: string): string {
-  let result = "";
-  let i = 0;
-  let inString = false;
-  let escaped = false;
-
-  while (i < text.length) {
-    const ch = text[i];
-
-    if (inString) {
-      result += ch;
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      i++;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-      result += ch;
-      i++;
-      continue;
-    }
-
-    if (ch === ",") {
-      let j = i + 1;
-      while (j < text.length && /\s/.test(text[j])) j++;
-      if (text[j] === "}" || text[j] === "]") {
-        i++;
-        continue;
-      }
-    }
-
-    result += ch;
-    i++;
-  }
-
-  return result;
-}
-
-function parseJsonc<T = unknown>(content: string): T {
-  const stripped = stripTrailingCommas(stripJsoncComments(content));
-  try {
-    return JSON.parse(stripped) as T;
-  } catch (err) {
-    throw new SyntaxError(`JSONC parse error: ${(err as Error).message}`);
-  }
-}
+// JSONC parsing via comment-json (bundled at build time).
+// Preserves comments during round-trip in tui-config.ts.
 
 // ---------------------------------------------------------------------------
 // Config file detection (.jsonc preferred over .json)

@@ -81,7 +81,7 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain(
       `[aft-plugin] Error loading config from ${fixture.projectConfigPath}:`,
     );
-    expect(result.stderr).toContain("JSONC parse error:");
+    expect(result.stderr).toContain("is not valid JSON");
   });
 
   test("keeps valid sections when invalid config values are present", () => {

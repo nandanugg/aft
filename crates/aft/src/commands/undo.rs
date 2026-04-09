@@ -35,13 +35,16 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut backup = ctx.backup().borrow_mut();
 
     match backup.restore_latest(&resolved) {
-        Ok(entry) => Response::success(
-            &req.id,
-            serde_json::json!({
+        Ok((entry, warning)) => {
+            let mut result = serde_json::json!({
                 "path": file,
                 "backup_id": entry.backup_id,
-            }),
-        ),
+            });
+            if let Some(w) = warning {
+                result["warning"] = serde_json::Value::String(w);
+            }
+            Response::success(&req.id, result)
+        }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
 }
