@@ -24,6 +24,13 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       });
 
       if (response.success === false) {
+        if (
+          response.code === "semantic_search_unavailable" &&
+          typeof response.message === "string"
+        ) {
+          return response.message;
+        }
+
         throw new Error((response.message as string) || "semantic_search failed");
       }
 

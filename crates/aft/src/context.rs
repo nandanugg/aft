@@ -2,9 +2,8 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 
-use notify::RecommendedWatcher;
-
 use fastembed::TextEmbedding;
+use notify::RecommendedWatcher;
 
 use crate::backup::BackupStore;
 use crate::callgraph::CallGraph;
@@ -316,5 +315,33 @@ impl AppContext {
         }
 
         Ok(resolved)
+    }
+
+    /// Count active LSP server instances.
+    pub fn lsp_server_count(&self) -> usize {
+        self.lsp_manager
+            .try_borrow()
+            .map(|lsp| lsp.server_count())
+            .unwrap_or(0)
+    }
+
+    /// Symbol cache statistics from the language provider.
+    pub fn symbol_cache_stats(&self) -> serde_json::Value {
+        if let Some(tsp) = self
+            .provider
+            .as_any()
+            .downcast_ref::<crate::parser::TreeSitterProvider>()
+        {
+            let (local, warm) = tsp.symbol_cache_stats();
+            serde_json::json!({
+                "local_entries": local,
+                "warm_entries": warm,
+            })
+        } else {
+            serde_json::json!({
+                "local_entries": 0,
+                "warm_entries": 0,
+            })
+        }
     }
 }

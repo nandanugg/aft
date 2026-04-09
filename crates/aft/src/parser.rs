@@ -452,6 +452,16 @@ impl FileParser {
         self.warm_cache = Some(cache);
     }
 
+    /// Number of entries in the local symbol cache.
+    pub fn symbol_cache_len(&self) -> usize {
+        self.symbol_cache.len()
+    }
+
+    /// Number of entries in the warm (pre-warmed) symbol cache.
+    pub fn warm_cache_len(&self) -> usize {
+        self.warm_cache.as_ref().map_or(0, |c| c.len())
+    }
+
     /// Parse a file, returning the tree and detected language. Uses cache if
     /// the file hasn't been modified since last parse.
     pub fn parse(&mut self, path: &Path) -> Result<(&Tree, LangId), AftError> {
@@ -2686,6 +2696,14 @@ impl TreeSitterProvider {
     pub fn merge_warm_cache(&self, cache: SymbolCache) {
         let mut parser = self.parser.borrow_mut();
         parser.set_warm_cache(cache);
+    }
+
+    /// Return (local_cache_entries, warm_cache_entries) for status reporting.
+    pub fn symbol_cache_stats(&self) -> (usize, usize) {
+        let parser = self.parser.borrow();
+        let local = parser.symbol_cache_len();
+        let warm = parser.warm_cache_len();
+        (local, warm)
     }
 
     fn resolve_symbol_inner(

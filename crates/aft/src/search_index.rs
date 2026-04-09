@@ -39,6 +39,18 @@ pub struct SearchIndex {
     unindexed_files: HashSet<u32>,
 }
 
+impl SearchIndex {
+    /// Number of indexed files.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Number of unique trigrams in the index.
+    pub fn trigram_count(&self) -> usize {
+        self.postings.len()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Posting {
     pub file_id: u32,

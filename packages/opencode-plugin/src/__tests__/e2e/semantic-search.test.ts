@@ -120,6 +120,8 @@ maybeDescribe("e2e semantic search tool", () => {
 
     if (output === "Semantic index is still building...") {
       expect(output).toBe("Semantic index is still building...");
+    } else if (output.startsWith("Semantic search unavailable:")) {
+      expect(output).toContain("ONNX Runtime");
     } else {
       expect(output).toContain("Found ");
       expect(output).toContain("[index: ready]");

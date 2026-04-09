@@ -94,9 +94,19 @@ export function platformKey(
 export function findBinarySync(): string | null {
   const ext = process.platform === "win32" ? ".exe" : "";
 
-  // 1. Check cached binary from auto-download
-  const cached = getCachedBinaryPath();
-  if (cached) return cached;
+  // 1. Check versioned cache for the plugin's own version first
+  const pluginVersion = (() => {
+    try {
+      const req = createRequire(import.meta.url);
+      return `v${(req("../package.json") as { version: string }).version}`;
+    } catch {
+      return null;
+    }
+  })();
+  if (pluginVersion) {
+    const versionCached = getCachedBinaryPath(pluginVersion);
+    if (versionCached) return versionCached;
+  }
 
   // 2. Check npm platform package — copy to versioned cache to avoid
   // corruption when npm updates the package while a bridge is running

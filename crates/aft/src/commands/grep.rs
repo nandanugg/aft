@@ -75,6 +75,19 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
     let search_scope = resolve_search_scope(&project_root, path.as_deref());
+
+    // Return clear error if the search path doesn't exist
+    if !search_scope.root.exists() {
+        return Response::error(
+            &req.id,
+            "path_not_found",
+            format!(
+                "grep: search path does not exist: {}",
+                search_scope.root.display()
+            ),
+        );
+    }
+
     let fallback_status = if search_scope.use_index {
         current_index_status(ctx)
     } else {

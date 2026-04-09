@@ -56,6 +56,18 @@ export class BridgePool {
    * Each session gets its own binary process with isolated backup/undo history.
    * The bridge's working directory is set to `directory`.
    */
+  /** Get any existing bridge that is configured and alive, preferring the given directory. */
+  getAnyActiveBridge(directory: string): BinaryBridge | null {
+    // First try to find one matching this directory
+    for (const [, entry] of this.bridges) {
+      if (entry.bridge.isAlive()) {
+        entry.lastUsed = Date.now();
+        return entry.bridge;
+      }
+    }
+    return null;
+  }
+
   getBridge(directory: string, sessionID: string): BinaryBridge {
     const key = sessionID || directory.replace(/\/+$/, "");
     const existing = this.bridges.get(key);
@@ -125,12 +137,21 @@ export class BridgePool {
    */
   async replaceBinary(newPath: string): Promise<void> {
     this.binaryPath = newPath;
-    // Do NOT kill running bridges — they may be mid-request. The old process
-    // continues running from the old binary (safe on all platforms since the
-    // binary is already loaded in memory). New bridges created by getBridge()
-    // will use the updated binaryPath. Old bridges will be recycled naturally
-    // when their session ends or when a version-check detects the mismatch.
-    log(`Binary path updated to ${newPath}. New sessions will use the updated binary.`);
+    // Clear the pool so next getBridge() creates fresh bridges with the new binary.
+    // Old bridge processes are NOT killed — they continue running from the old
+    // binary (safe on all platforms since the binary is loaded in memory) and will
+    // exit naturally when their stdin/stdout are garbage collected.
+    for (const [key, entry] of this.bridges) {
+      try {
+        entry.bridge.shutdown();
+      } catch {
+        // best-effort
+      }
+    }
+    this.bridges.clear();
+    log(
+      `Binary path updated to ${newPath}. All bridges cleared — next calls will use the new binary.`,
+    );
   }
 
   /** Number of active bridges in the pool. */

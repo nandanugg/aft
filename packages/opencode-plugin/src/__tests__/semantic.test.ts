@@ -98,4 +98,20 @@ describe("semanticTools", () => {
     ]);
     expect(output).toBe("src/auth.ts\nvalidateToken [function] lines 10-32 score 0.913");
   });
+
+  test("returns semantic runtime errors as user-friendly text", async () => {
+    const sdkCtx = createMockSdkContext("/tmp/project");
+    const { tools } = createMockSemanticHarness({}, () => ({
+      success: false,
+      code: "semantic_search_unavailable",
+      message: "Semantic search unavailable: ONNX Runtime not installed.",
+    }));
+
+    const output = await tools.aft_search.execute(
+      { query: "authentication logic", topK: 5 },
+      sdkCtx,
+    );
+
+    expect(output).toBe("Semantic search unavailable: ONNX Runtime not installed.");
+  });
 });

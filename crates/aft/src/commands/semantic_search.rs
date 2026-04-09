@@ -2,12 +2,13 @@ use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::Deserialize;
 
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::protocol::{RawRequest, Response};
-use crate::semantic_index::SemanticResult;
+use crate::semantic_index::{
+    initialize_text_embedding, is_onnx_runtime_unavailable, SemanticResult,
+};
 use crate::symbols::SymbolKind;
 
 const DEFAULT_TOP_K: usize = 10;
@@ -52,26 +53,14 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
         SemanticIndexStatus::Failed(error) => {
-            return Response::success(
-                &req.id,
-                serde_json::json!({
-                    "status": "failed",
-                    "text": format!("Semantic index build failed: {error}"),
-                }),
-            );
+            return semantic_error_response(&req.id, error);
         }
         SemanticIndexStatus::Ready => {}
     }
 
     let query_vector = match embed_query(&params.query, ctx) {
         Ok(query_vector) => query_vector,
-        Err(error) => {
-            return Response::error(
-                &req.id,
-                "semantic_search_failed",
-                format!("semantic_search: {error}"),
-            );
-        }
+        Err(error) => return semantic_error_response(&req.id, &error),
     };
 
     let project_root = ctx
@@ -122,10 +111,7 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let mut model_ref = ctx.semantic_embedding_model().borrow_mut();
 
     if model_ref.is_none() {
-        *model_ref = Some(
-            TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-                .map_err(|error| format!("failed to initialize embedding model: {error}"))?,
-        );
+        *model_ref = Some(initialize_text_embedding()?);
     }
 
     let model = model_ref
@@ -141,6 +127,22 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
         .ok_or_else(|| "embedding model returned no query vector".to_string())?;
 
     Ok(query_vector)
+}
+
+fn semantic_error_response(request_id: &str, error: &str) -> Response {
+    if is_onnx_runtime_unavailable(error) {
+        return Response::error(
+            request_id,
+            "semantic_search_unavailable",
+            format!("Semantic search unavailable: {error}"),
+        );
+    }
+
+    Response::error(
+        request_id,
+        "semantic_search_failed",
+        format!("semantic_search: {error}"),
+    )
 }
 
 fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> String {

@@ -44,6 +44,11 @@ impl LspManager {
         }
     }
 
+    /// Count active LSP server instances.
+    pub fn server_count(&self) -> usize {
+        self.clients.len()
+    }
+
     /// For testing: override the binary for a server kind.
     pub fn override_binary(&mut self, kind: ServerKind, binary_path: PathBuf) {
         self.binary_overrides.insert(kind, binary_path);

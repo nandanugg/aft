@@ -608,9 +608,17 @@ Parameters: `pattern` (required), `path` (optional — scope to subdirectory or 
 ### aft_search *(experimental)*
 
 Semantic code search — find code by describing what it does in natural language. Requires
-`experimental_semantic_search: true`. Uses a local embedding model (all-MiniLM-L6-v2, ~22MB,
-downloaded on first use) to embed all symbols in the project and match queries by cosine
-similarity. No API keys or external services needed.
+`experimental_semantic_search: true` and [ONNX Runtime](https://onnxruntime.ai/) installed on the system.
+Uses a local embedding model (all-MiniLM-L6-v2, ~22MB, downloaded on first use) to embed all
+symbols in the project and match queries by cosine similarity. No API keys or external services needed.
+
+**Install ONNX Runtime:**
+- **macOS:** `brew install onnxruntime`
+- **Linux (Debian/Ubuntu):** `apt install libonnxruntime`
+- **Linux (other):** Download from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases)
+- **Windows:** `winget install Microsoft.ONNXRuntime`
+
+Without ONNX Runtime, all other AFT tools work normally — only `aft_search` is unavailable.
 
 ```json
 { "query": "authentication middleware that validates JWT tokens" }
@@ -854,6 +862,7 @@ Both files are JSONC (comments allowed).
   "experimental_search_index": false,
 
   // Enable semantic code search (aft_search tool).
+  // Requires ONNX Runtime installed (brew install onnxruntime on macOS).
   // Builds embeddings for all symbols using a local model (all-MiniLM-L6-v2, ~22MB).
   // The model is downloaded on first use. Index persists to disk for fast cold start.
   // Default: false

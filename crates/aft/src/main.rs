@@ -119,6 +119,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
+        "status" => aft::commands::status::handle_status(&req, ctx),
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
         "callers" => aft::commands::callers::handle_callers(&req, ctx),
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),

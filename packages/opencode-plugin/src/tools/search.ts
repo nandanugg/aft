@@ -74,7 +74,12 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       const response = await bridge.send("grep", {
         pattern: args.pattern,
         case_sensitive: true,
-        include: args.include ? [normalizeGlob(String(args.include))] : undefined,
+        include: args.include
+          ? String(args.include)
+              .split(",")
+              .map((s) => normalizeGlob(s.trim()))
+              .filter(Boolean)
+          : undefined,
         path: args.path,
         max_results: 100,
       });
@@ -98,9 +103,27 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
     },
     execute: async (args, context): Promise<string> => {
       const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
+
+      // Handle absolute paths embedded in the pattern (e.g. "/abs/path/src/**/*.ts")
+      // Split into path (directory prefix) and pattern (glob suffix)
+      let globPattern = String(args.pattern);
+      let globPath = args.path ? String(args.path) : undefined;
+
+      if (!globPath && globPattern.startsWith("/")) {
+        // Find the last directory component before any glob metacharacters
+        const metaIdx = globPattern.search(/[*?{}[\]]/);
+        if (metaIdx > 0) {
+          const lastSlash = globPattern.lastIndexOf("/", metaIdx);
+          if (lastSlash > 0) {
+            globPath = globPattern.slice(0, lastSlash);
+            globPattern = `**/${globPattern.slice(lastSlash + 1)}`;
+          }
+        }
+      }
+
       const response = await bridge.send("glob", {
-        pattern: args.pattern,
-        path: args.path,
+        pattern: globPattern,
+        path: globPath,
       });
 
       if (response.success === false) {

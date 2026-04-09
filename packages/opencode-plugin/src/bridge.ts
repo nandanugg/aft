@@ -258,6 +258,17 @@ export class BinaryBridge {
           (typeof this.configOverrides.storage_dir === "string"
             ? join(this.configOverrides.storage_dir, "semantic", "models")
             : join(homedir() || "", ".cache", "fastembed")),
+        // Point ort to the auto-downloaded or system ONNX Runtime library
+        ...(typeof this.configOverrides._ort_dylib_dir === "string" && {
+          ORT_DYLIB_PATH: join(
+            this.configOverrides._ort_dylib_dir,
+            process.platform === "win32"
+              ? "onnxruntime.dll"
+              : process.platform === "darwin"
+                ? "libonnxruntime.dylib"
+                : "libonnxruntime.so",
+          ),
+        }),
       },
     });
 

@@ -1,7 +1,9 @@
 use crate::parser::FileParser;
 use crate::symbols::{Symbol, SymbolKind};
 
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,49 @@ const MAX_ENTRIES: usize = 1_000_000;
 const MAX_DIMENSION: usize = 1024;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES: usize = 9;
+const ONNX_RUNTIME_INSTALL_HINT: &str =
+    "ONNX Runtime not found. Install via: brew install onnxruntime (macOS) or apt install libonnxruntime (Linux).";
+
+pub fn initialize_text_embedding() -> Result<TextEmbedding, String> {
+    TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
+        .map_err(format_embedding_init_error)
+}
+
+pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
+    if message.trim_start().starts_with("ONNX Runtime not found.") {
+        return true;
+    }
+
+    let message = message.to_ascii_lowercase();
+    let mentions_onnx_runtime = ["onnx runtime", "onnxruntime", "libonnxruntime"]
+        .iter()
+        .any(|pattern| message.contains(pattern));
+    let mentions_dynamic_load_failure = [
+        "shared library",
+        "dynamic library",
+        "failed to load",
+        "could not load",
+        "unable to load",
+        "dlopen",
+        "loadlibrary",
+        "no such file",
+        "not found",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern));
+
+    mentions_onnx_runtime && mentions_dynamic_load_failure
+}
+
+fn format_embedding_init_error(error: impl Display) -> String {
+    let message = error.to_string();
+
+    if is_onnx_runtime_unavailable(&message) {
+        return format!("{ONNX_RUNTIME_INSTALL_HINT} Original error: {message}");
+    }
+
+    format!("failed to initialize semantic embedding model: {message}")
+}
 
 /// A chunk of code ready for embedding — derived from a Symbol with context enrichment
 #[derive(Debug, Clone)]
@@ -67,6 +112,20 @@ impl SemanticIndex {
             entries: Vec::new(),
             file_mtimes: HashMap::new(),
             dimension: DEFAULT_DIMENSION, // MiniLM-L6-v2 default
+        }
+    }
+
+    /// Number of embedded symbol entries.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Human-readable status label for the index.
+    pub fn status_label(&self) -> &'static str {
+        if self.entries.is_empty() {
+            "empty"
+        } else {
+            "ready"
         }
     }
 
@@ -796,5 +855,22 @@ mod tests {
 
         assert!(index.entries.is_empty());
         assert!(!index.file_mtimes.contains_key(&target));
+    }
+
+    #[test]
+    fn detects_missing_onnx_runtime_from_dynamic_load_error() {
+        let message = "Failed to load ONNX Runtime shared library libonnxruntime.dylib via dlopen: no such file";
+
+        assert!(is_onnx_runtime_unavailable(message));
+    }
+
+    #[test]
+    fn formats_missing_onnx_runtime_with_install_hint() {
+        let message = format_embedding_init_error(
+            "Failed to load ONNX Runtime shared library libonnxruntime.so via dlopen: no such file",
+        );
+
+        assert!(message.starts_with("ONNX Runtime not found. Install via:"));
+        assert!(message.contains("Original error:"));
     }
 }

@@ -12,6 +12,8 @@
   },
   "files": [
     "dist",
+    "src/tui",
+    "src/shared",
     "README.md"
   ],
   "scripts": {
@@ -24,6 +26,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.2.26",
+    "@opencode-ai/sdk": "^1.2.26",
     "jsonc-parser": "^3.3.1",
     "zod": "^4.1.8"
   },
@@ -37,5 +40,22 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./src/tui/index.tsx",
+      "import": "./src/tui/index.tsx"
+    }
+  },
+  "oc-plugin": [
+    "server",
+    "tui"
+  ],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.2.0"
   }
 }

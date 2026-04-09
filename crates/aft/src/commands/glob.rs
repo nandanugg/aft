@@ -52,6 +52,18 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
     let search_scope = resolve_search_scope(&project_root, path.as_deref());
 
+    // Return clear error if the search path doesn't exist
+    if !search_scope.root.exists() {
+        return Response::error(
+            &req.id,
+            "path_not_found",
+            format!(
+                "glob: search path does not exist: {}",
+                search_scope.root.display()
+            ),
+        );
+    }
+
     let mut files = {
         let search_index = ctx.search_index().borrow();
         match search_index.as_ref() {

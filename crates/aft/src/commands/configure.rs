@@ -4,7 +4,6 @@ use std::sync::mpsc;
 use std::thread;
 
 use crossbeam_channel::unbounded;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use notify::{RecursiveMode, Watcher};
 
 use crate::callgraph::CallGraph;
@@ -237,14 +236,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     let filters = build_path_filters(&[], &[]).unwrap_or_default();
                     let files = walk_project_files(&root_clone, &filters);
 
-                    let mut model =
-                        TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-                            .map_err(|error| {
-                                format!("failed to initialize semantic embedding model: {error}")
-                            })?;
+                    let mut model = crate::semantic_index::initialize_text_embedding()?;
 
                     let mut embed = |texts: Vec<String>| {
-                        model.embed(texts, None).map_err(|error| error.to_string())
+                        model
+                            .embed(texts, None::<usize>)
+                            .map_err(|error| error.to_string())
                     };
 
                     let index = SemanticIndex::build(&root_clone, &files, &mut embed, 64)?;
