@@ -52,6 +52,8 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut regex_builder = RegexBuilder::new(pattern);
     regex_builder.case_insensitive(!case_sensitive);
     regex_builder.size_limit(10 * 1024 * 1024);
+    // Treat `^` and `$` as line anchors (grep semantics), not file anchors.
+    regex_builder.multi_line(true);
     if let Err(error) = regex_builder.build() {
         return Response::error(
             &req.id,
@@ -185,6 +187,8 @@ fn fallback_grep(
     let mut regex_builder = RegexBuilder::new(pattern);
     regex_builder.case_insensitive(!case_sensitive);
     regex_builder.size_limit(10 * 1024 * 1024);
+    // Treat `^` and `$` as line anchors (grep semantics), not file anchors.
+    regex_builder.multi_line(true);
     let regex = match regex_builder.build() {
         Ok(regex) => regex,
         Err(_) => {

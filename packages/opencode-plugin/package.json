@@ -5,6 +5,9 @@
   "description": "OpenCode plugin for Agent File Tools (AFT) — tree-sitter and lsp powered code analysis",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "aft-opencode": "dist/cli.js"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,7 +20,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @opencode-ai/plugin && tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @opencode-ai/plugin && bun build src/cli/index.ts --outfile dist/cli.js --target node --format esm && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "pretest": "cd ../.. && cargo build",
     "test": "bun test",
@@ -25,8 +28,10 @@
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
+    "@clack/prompts": "^1.2.0",
     "@opencode-ai/plugin": "^1.2.26",
     "@opencode-ai/sdk": "^1.2.26",
+    "comment-json": "^4.6.2",
     "zod": "^4.1.8"
   },
   "optionalDependencies": {
@@ -38,7 +43,6 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "comment-json": "^4.6.2",
     "typescript": "^5.8.0"
   },
   "exports": {

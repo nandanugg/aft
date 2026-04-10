@@ -239,3 +239,115 @@ fn glob_text_uses_relative_paths() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+#[test]
+fn grep_fallback_supports_line_anchors() {
+    let project = setup_project(&[
+        (
+            "README.md",
+            "# Title\n\n## Section One\nbody\n\n## Section Two\nbody\n",
+        ),
+        (
+            "src/lib.rs",
+            "// not a heading\n## actually also not\nfn main() {}\n",
+        ),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-anchor-fallback",
+            "command": "grep",
+            "pattern": "^## ",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["index_status"], "Fallback");
+    // README has two `## ` headings at line start; `src/lib.rs` has one but
+    // on a non-first line, so multi_line anchors must match it too.
+    assert_eq!(response["total_matches"], 3);
+    assert_eq!(response["files_with_matches"], 2);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_indexed_supports_line_anchors() {
+    let project = setup_project(&[
+        (".fixture-id", "grep_indexed_supports_line_anchors\n"),
+        (
+            "README.md",
+            "# Title\n\n## Section One\nbody\n\n## Section Two\nbody\n",
+        ),
+        (
+            "src/lib.rs",
+            "// not a heading\n## actually also not\nfn main() {}\n",
+        ),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure_with_index(&mut aft, project.path());
+
+    let mut ready_response = None;
+    for _ in 0..20 {
+        let response = send(
+            &mut aft,
+            json!({
+                "id": "grep-anchor-indexed",
+                "command": "grep",
+                "pattern": "^## ",
+            }),
+        );
+
+        if response["index_status"] == "Ready" {
+            ready_response = Some(response);
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let response = ready_response.expect("search index should become ready");
+    assert_eq!(
+        response["success"], true,
+        "indexed grep should succeed: {response:?}"
+    );
+    assert_eq!(response["index_status"], "Ready");
+    assert_eq!(response["total_matches"], 3);
+    assert_eq!(response["files_with_matches"], 2);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_fallback_supports_end_of_line_anchor() {
+    let project = setup_project(&[("src/a.rs", "fn foo() {}\nfn bar() {}\nlet x = 1;\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    // Match lines ending with `{}` — requires `$` to act as line-end anchor.
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-eol",
+            "command": "grep",
+            "pattern": r"\{\}$",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["total_matches"], 2);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}

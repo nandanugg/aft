@@ -31,7 +31,22 @@
 
 ### OpenCode
 
-Add AFT to your OpenCode config:
+Run the setup wizard — it registers AFT in your OpenCode and TUI config and asks which experimental features to enable:
+
+```bash
+bunx @cortexkit/aft-opencode@latest setup
+```
+
+That's it. On the next session start, the binary downloads if needed and all tools become
+available. AFT replaces opencode's built-in `read`, `write`, `edit`, `apply_patch`,
+`ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` with enhanced versions — all
+powered natively by AFT — plus adds the `aft_` family of semantic tools on top.
+
+<details>
+<summary>Manual install</summary>
+
+If you prefer to edit your config by hand:
+
 ```
 opencode plugin --global @cortexkit/aft-opencode@latest
 ```
@@ -44,11 +59,26 @@ or
   "plugin": ["@cortexkit/aft-opencode@latest"]
 }
 ```
+</details>
 
-That's it. On the next session start, the binary downloads if needed and all tools become
-available. AFT replaces opencode's built-in `read`, `write`, `edit`, `apply_patch`,
-`ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` with enhanced versions — all
-powered natively by AFT — plus adds the `aft_` family of semantic tools on top.
+### CLI Commands
+
+AFT ships a standalone CLI for setup, diagnostics, and issue reporting:
+
+| Command | What it does |
+|---|---|
+| `bunx @cortexkit/aft-opencode@latest setup` | Interactive first-time setup — registers plugin entries, enables experimental features |
+| `bunx @cortexkit/aft-opencode@latest doctor` | Check configuration and auto-fix common issues |
+| `bunx @cortexkit/aft-opencode@latest doctor --force` | Force-clear the OpenCode plugin cache (fixes stale `@latest` resolution) |
+| `bunx @cortexkit/aft-opencode@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
+
+**`setup`** — Interactive wizard that registers AFT in your OpenCode and TUI config, asks whether to enable `experimental_search_index` and `experimental_semantic_search`, and writes the result to `~/.config/opencode/aft.jsonc`. Run this once after installing.
+
+**`doctor`** — Checks everything that can go wrong: OpenCode install, plugin registration, plugin cache version, binary cache, config parse errors, ONNX Runtime availability (for semantic search), storage directory sizes, and log file status. Auto-fixes missing plugin entries and outdated plugin caches.
+
+**`doctor --force`** — Same as `doctor` but always clears the OpenCode plugin cache, forcing a fresh download of the latest plugin version. Use this when you're on an old version and `@latest` doesn't seem to update (OpenCode caches npm packages aggressively).
+
+**`doctor --issue`** — Collects a full diagnostic report, sanitizes your username and home path out of the logs, and opens a pre-filled GitHub issue on [cortexkit/aft](https://github.com/cortexkit/aft/issues). If you have `gh` installed, it submits directly; otherwise it writes the report to `./aft-issue-<timestamp>.md` and opens the GitHub new-issue page in your browser so you can paste it in.
 
 ---
 

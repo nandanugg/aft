@@ -352,6 +352,8 @@ impl SearchIndex {
             };
             let mut builder = RegexBuilder::new(&regex_pattern);
             builder.case_insensitive(!case_sensitive);
+            // Treat `^` and `$` as line anchors (grep semantics), not file anchors.
+            builder.multi_line(true);
             match builder.build() {
                 Ok(r) => Some(r),
                 Err(_) => {
