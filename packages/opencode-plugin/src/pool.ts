@@ -57,7 +57,7 @@ export class BridgePool {
    * The bridge's working directory is set to `directory`.
    */
   /** Get any existing bridge that is configured and alive, preferring the given directory. */
-  getAnyActiveBridge(directory: string): BinaryBridge | null {
+  getAnyActiveBridge(_directory: string): BinaryBridge | null {
     // First try to find one matching this directory
     for (const [, entry] of this.bridges) {
       if (entry.bridge.isAlive()) {
@@ -141,7 +141,7 @@ export class BridgePool {
     // Old bridge processes are NOT killed — they continue running from the old
     // binary (safe on all platforms since the binary is loaded in memory) and will
     // exit naturally when their stdin/stdout are garbage collected.
-    for (const [key, entry] of this.bridges) {
+    for (const [, entry] of this.bridges) {
       try {
         entry.bridge.shutdown();
       } catch {

@@ -34,7 +34,7 @@ function createMockClient(): any {
 
 /** Helper to create a PluginContext with a pool and a mock client. */
 function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as any };
+  return { pool, client: createMockClient(), config: {} as any, storageDir: "/tmp/aft-test" };
 }
 
 /** Mock SDK ToolContext for test execute calls. */

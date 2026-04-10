@@ -25,7 +25,7 @@ function createMockClient(): any {
 
 /** Helper to create a ToolContext with a mock (no-op LSP) client. */
 function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as any };
+  return { pool, client: createMockClient(), config: {} as any, storageDir: "/tmp/aft-test" };
 }
 
 /** Mock SDK ToolContext for test execute calls. */
@@ -44,7 +44,12 @@ function createMockSdkContext(directory: string): ToolContext {
 
 /** Create a fake PluginContext for registration-only tests (no real pool). */
 function fakePluginContext(): PluginContext {
-  return { pool: {} as BridgePool, client: createMockClient(), config: {} as any };
+  return {
+    pool: {} as BridgePool,
+    client: createMockClient(),
+    config: {} as any,
+    storageDir: "/tmp/aft-test",
+  };
 }
 
 describe("Structure tool registrations", () => {

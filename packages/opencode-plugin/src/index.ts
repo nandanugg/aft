@@ -26,6 +26,7 @@ import { AftRpcServer } from "./shared/rpc-server.js";
 import { clearSharedBridgePool, setSharedBridgePool } from "./shared/runtime.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
+import { cleanupUrlCache } from "./shared/url-fetch.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
@@ -206,7 +207,12 @@ const plugin: Plugin = async (input) => {
     },
     configOverrides,
   );
-  const ctx: PluginContext = { pool, client: input.client, config: aftConfig };
+  const ctx: PluginContext = {
+    pool,
+    client: input.client,
+    config: aftConfig,
+    storageDir: configOverrides.storage_dir as string,
+  };
   setSharedBridgePool(pool);
 
   // Start RPC server for TUI plugin communication
@@ -265,6 +271,13 @@ const plugin: Plugin = async (input) => {
   });
 
   rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
+
+  // Periodic URL cache cleanup (fire-and-forget, removes entries older than 24 hours)
+  try {
+    cleanupUrlCache(storageDir);
+  } catch {
+    // best-effort
+  }
 
   try {
     ensureTuiPluginEntry();

@@ -10,4 +10,6 @@ export interface PluginContext {
   pool: BridgePool;
   client: PluginInput["client"];
   config: AftConfig;
+  /** Absolute path to AFT's storage dir (e.g. ~/.local/share/opencode/storage/plugin/aft) */
+  storageDir: string;
 }

@@ -30,7 +30,12 @@ function createMockClient(): any {
 }
 
 function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as PluginContext["config"] };
+  return {
+    pool,
+    client: createMockClient(),
+    config: {} as PluginContext["config"],
+    storageDir: "/tmp/aft-test",
+  };
 }
 
 function createSdkContext(directory: string): ToolContext {

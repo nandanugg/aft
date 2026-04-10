@@ -2,6 +2,7 @@ import { readdir } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { fetchUrlToTempFile } from "../shared/url-fetch.js";
 import type { PluginContext } from "../types.js";
 
 /** File extensions that aft_outline supports via tree-sitter or markdown parser */
@@ -51,39 +52,51 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
   return {
     aft_outline: {
       description:
-        "Get a structural outline of a source file, multiple files, or an entire directory — lists all top-level symbols with their kind, name, line range, and visibility. Use this to understand file/directory structure before editing.\n" +
-        "Each entry includes 'name', 'kind' (function/class/struct/heading/etc), 'range', 'signature', and 'members' (nested children like methods in classes or sub-headings in markdown).\n" +
-        "For Markdown files (.md, .mdx): returns heading hierarchy — h1/h2/h3 as nested symbols with section ranges covering all content until the next same-level heading.\n\n" +
-        "Provide 'filePath', 'files', or 'directory'. Priority: directory > files > filePath. If multiple provided, highest-priority wins.\n" +
-        "Directory mode skips commonly ignored directories and dot-prefixed directories.",
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom.\n\n" +
+        "Provide exactly ONE of: 'filePath', 'files', 'directory', or 'url'.",
       args: {
-        filePath: z
-          .string()
-          .optional()
-          .describe(
-            "Path to a single file to outline (ignored if 'files' or 'directory' is also provided)",
-          ),
+        filePath: z.string().optional().describe("Path to a single file to outline"),
         files: z
           .array(z.string())
           .optional()
-          .describe(
-            "Array of file paths to outline in one call (ignored if 'directory' is also provided)",
-          ),
-        // The 200-file cap is intentionally only in .describe() — not in the main description —
-        // because it's a parameter-level detail. The cap is silent (no warning on truncation).
+          .describe("Array of file paths to outline in one call"),
         directory: z
           .string()
           .optional()
-          .describe(
-            "Path to a directory — outlines all source files under it recursively (capped at 200 files, takes priority over 'filePath' and 'files')",
-          ),
+          .describe("Directory to outline recursively (200 file limit)"),
+        url: z
+          .string()
+          .optional()
+          .describe("HTTP/HTTPS URL of an HTML or Markdown document to fetch and outline"),
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
 
         const filesArg = Array.isArray(args.files) ? (args.files as unknown[]) : undefined;
-        if (!args.filePath && !filesArg?.length && !args.directory) {
-          throw new Error("Provide exactly one of 'filePath', 'files', or 'directory'");
+        const hasFilePath = typeof args.filePath === "string" && args.filePath.length > 0;
+        const hasFiles = (filesArg?.length ?? 0) > 0;
+        const hasDirectory = typeof args.directory === "string" && args.directory.length > 0;
+        const hasUrl = typeof args.url === "string" && args.url.length > 0;
+
+        // Mutual exclusion: exactly one of filePath, files, directory, url
+        const provided = [hasFilePath, hasFiles, hasDirectory, hasUrl].filter(Boolean).length;
+        if (provided === 0) {
+          throw new Error("Provide exactly one of 'filePath', 'files', 'directory', or 'url'");
+        }
+        if (provided > 1) {
+          throw new Error(
+            "Provide exactly ONE of 'filePath', 'files', 'directory', or 'url' — not multiple",
+          );
+        }
+
+        // URL mode: fetch to temp file, then outline the cached copy
+        if (hasUrl) {
+          const cachedPath = await fetchUrlToTempFile(args.url as string, ctx.storageDir);
+          const response = await bridge.send("outline", { file: cachedPath });
+          if (response.success === false) {
+            throw new Error((response.message as string) || "outline failed");
+          }
+          return response.text as string;
         }
 
         // Directory mode: discover source files recursively and batch outline
@@ -134,30 +147,26 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     },
 
     aft_zoom: {
-      description: `Inspect code symbols with call-graph annotations. Returns the full source of named symbols with what they call and what calls them.
-
-Use this when you need to understand a specific function, class, or type in detail.
-
-**Modes:**
-
-1. **Inspect symbol** — pass filePath + symbol
-   Returns full source + call graph annotations.
-   Example: { "filePath": "src/app.ts", "symbol": "handleRequest" }
-
-2. **Inspect multiple symbols** — pass filePath + symbols array
-   Returns multiple symbols in one call.
-   Example: { "filePath": "src/app.ts", "symbols": ["Config", "createApp"] }
-
-For Markdown files, use heading text as symbol name.
-
-Mode priority: symbols array > single symbol.`,
+      description:
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol with call-graph annotations (what it calls and what calls it). For Markdown and HTML, returns the section content under the given heading.\n\n" +
+        "Provide exactly ONE of 'filePath' or 'url'. Pass either 'symbol' for a single lookup or 'symbols' for multiple in one call.",
       args: {
-        filePath: z.string().describe("Path to file (absolute or relative to project root)"),
-        symbol: z.string().optional().describe("Name of a single symbol to inspect"),
+        filePath: z
+          .string()
+          .optional()
+          .describe("Path to file (absolute or relative to project root)"),
+        url: z
+          .string()
+          .optional()
+          .describe("HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into"),
+        symbol: z
+          .string()
+          .optional()
+          .describe("Symbol name for code, or heading text for Markdown/HTML"),
         symbols: z
           .array(z.string())
           .optional()
-          .describe("Array of symbol names to inspect in one call"),
+          .describe("Array of symbol names or heading texts for a single batched call"),
         contextLines: z
           .number()
           .optional()
@@ -165,7 +174,21 @@ Mode priority: symbols array > single symbol.`,
       },
       execute: async (args, context): Promise<string> => {
         const bridge = ctx.pool.getBridge(context.directory, context.sessionID);
-        const file = args.filePath as string;
+
+        const hasFilePath = typeof args.filePath === "string" && args.filePath.length > 0;
+        const hasUrl = typeof args.url === "string" && args.url.length > 0;
+
+        if (!hasFilePath && !hasUrl) {
+          throw new Error("Provide exactly one of 'filePath' or 'url'");
+        }
+        if (hasFilePath && hasUrl) {
+          throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
+        }
+
+        // URL mode: fetch to temp file, then zoom into the cached copy
+        const file = hasUrl
+          ? await fetchUrlToTempFile(args.url as string, ctx.storageDir)
+          : (args.filePath as string);
 
         // Multi-symbol mode: make separate zoom calls in parallel and combine results
         if (Array.isArray(args.symbols) && args.symbols.length > 0) {

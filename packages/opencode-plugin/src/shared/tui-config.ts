@@ -1,6 +1,6 @@
-import { parse, stringify } from "comment-json";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { parse, stringify } from "comment-json";
 import { log } from "../logger.js";
 import { getOpenCodeConfigPaths } from "./opencode-config-dir.js";
 

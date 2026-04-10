@@ -1,6 +1,6 @@
-import { parse as parseJsonc } from "comment-json";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parse as parseJsonc } from "comment-json";
 import { z } from "zod";
 import { error, log, warn } from "./logger.js";
 
