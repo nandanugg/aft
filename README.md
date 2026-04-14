@@ -930,7 +930,7 @@ OpenCode agent
      | JSON-over-stdio (newline-delimited)
      v
 aft binary (Rust)
-  - tree-sitter parsing (12 language grammars)
+  - tree-sitter parsing (14 language grammars)
   - Symbol resolution, call graph, diff generation
   - Format-on-edit (shells out to biome / rustfmt / etc.)
   - Backup/checkpoint management
@@ -959,6 +959,8 @@ lifetime — warm parse trees, isolated undo history, no re-spawn overhead per c
 | C++ | ✓ | ✓ | — | — |
 | C# | ✓ | ✓ | — | — |
 | Zig | ✓ | ✓ | — | — |
+| Bash | ✓ | ✓ | — | — |
+| HTML | ✓ | ✓ | — | — |
 | Markdown | ✓ | ✓ | — | — |
 
 ---

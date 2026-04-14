@@ -206,13 +206,19 @@ impl LspClient {
         self.ensure_can_send()?;
         self.state = ServerState::Initializing;
 
-        let root_uri = lsp_types::Uri::from_str(&format!("file://{}", workspace_root.display()))
-            .map_err(|_| {
-                LspError::NotFound(format!(
-                    "failed to convert workspace root '{}' to file URI",
-                    workspace_root.display()
-                ))
-            })?;
+        let normalized = normalize_windows_path(workspace_root);
+        let root_url = url::Url::from_file_path(&normalized).map_err(|_| {
+            LspError::NotFound(format!(
+                "failed to convert workspace root '{}' to file URI",
+                workspace_root.display()
+            ))
+        })?;
+        let root_uri = lsp_types::Uri::from_str(root_url.as_str()).map_err(|_| {
+            LspError::NotFound(format!(
+                "failed to convert workspace root '{}' to file URI",
+                workspace_root.display()
+            ))
+        })?;
 
         let params = serde_json::from_value::<lsp_types::InitializeParams>(json!({
             "processId": std::process::id(),
@@ -412,5 +418,17 @@ impl LspClient {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(id);
         }
+    }
+}
+
+/// Normalize a path for file URI conversion.
+/// On Windows, strips the extended-length `\\?\` prefix that `Url::from_file_path` cannot handle.
+/// On other platforms, returns the path unchanged.
+fn normalize_windows_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        PathBuf::from(&s[4..])
+    } else {
+        path.to_path_buf()
     }
 }

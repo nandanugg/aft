@@ -15,12 +15,10 @@
   },
   "files": [
     "dist",
-    "src/tui",
-    "src/shared",
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @opencode-ai/plugin && bun build src/cli/index.ts --outfile dist/cli.js --target node --format esm && tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm --external @opencode-ai/plugin && bun build src/tui/index.tsx --outfile dist/tui.js --target bun --format esm --external @opencode-ai/plugin --external @opencode-ai/plugin/tui --external @opentui/solid --external solid-js && bun build src/cli/index.ts --outfile dist/cli.js --target node --format esm && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "pretest": "cd ../.. && cargo build",
     "test": "bun test",
@@ -52,7 +50,7 @@
     },
     "./tui": {
       "types": "./src/tui/index.tsx",
-      "import": "./src/tui/index.tsx"
+      "import": "./dist/tui.js"
     }
   },
   "oc-plugin": [
