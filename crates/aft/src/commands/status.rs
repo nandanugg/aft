@@ -1,6 +1,7 @@
 //! AFT status command — returns the current state of indexes, features, and configuration.
 
 use crate::context::AppContext;
+use crate::context::SemanticIndexStatus;
 use crate::protocol::{RawRequest, Response};
 
 pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -43,12 +44,24 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
                 })
             }
             None => {
-                let status = if ctx.config().experimental_semantic_search {
-                    "loading"
-                } else {
-                    "disabled"
-                };
-                serde_json::json!({ "status": status })
+                match &*ctx.semantic_index_status().borrow() {
+                    SemanticIndexStatus::Disabled => serde_json::json!({ "status": "disabled" }),
+                    SemanticIndexStatus::Building {
+                        stage,
+                        files,
+                        entries,
+                    } => serde_json::json!({
+                        "status": "loading",
+                        "stage": stage,
+                        "files": files,
+                        "entries": entries,
+                    }),
+                    SemanticIndexStatus::Ready => serde_json::json!({ "status": "ready" }),
+                    SemanticIndexStatus::Failed(error) => serde_json::json!({
+                        "status": "failed",
+                        "error": error,
+                    }),
+                }
             }
         }
     };

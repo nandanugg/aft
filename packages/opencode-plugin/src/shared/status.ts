@@ -15,8 +15,11 @@ export interface AftStatusSnapshot {
   };
   semantic_index: {
     status: string;
+    stage?: string | null;
+    files?: number | null;
     entries: number | null;
     dimension: number | null;
+    error?: string | null;
   };
   disk: {
     storage_dir: string | null;
@@ -102,8 +105,11 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     },
     semantic_index: {
       status: readString(semanticIndex.status, "unknown"),
+      stage: readNullableString(semanticIndex.stage),
+      files: readOptionalNumber(semanticIndex.files),
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
+      error: readNullableString(semanticIndex.error),
     },
     disk: {
       storage_dir: readNullableString(disk.storage_dir),
@@ -158,6 +164,16 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     lines.push(`- storage dir: ${status.storage_dir ?? status.disk.storage_dir}`);
   }
 
+  if (status.semantic_index.stage) {
+    lines.push("", "Semantic stage", status.semantic_index.stage);
+  }
+  if (status.semantic_index.files != null) {
+    lines.push(`- semantic files: ${formatCount(status.semantic_index.files)}`);
+  }
+  if (status.semantic_index.error) {
+    lines.push("", "Semantic error", status.semantic_index.error);
+  }
+
   return lines.join("\n");
 }
 
@@ -185,6 +201,16 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
 
   if (status.semantic_index.dimension != null) {
     lines.push(`- **Dimension:** ${formatCount(status.semantic_index.dimension)}`);
+  }
+  if (status.semantic_index.stage) {
+    lines.push(`- **Stage:** ${status.semantic_index.stage}`);
+  }
+  if (status.semantic_index.files != null) {
+    lines.push(`- **Files:** ${formatCount(status.semantic_index.files)}`);
+  }
+
+  if (status.semantic_index.error) {
+    lines.push(`- **Error:** ${status.semantic_index.error}`);
   }
 
   lines.push(

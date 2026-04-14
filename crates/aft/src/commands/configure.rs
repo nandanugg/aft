@@ -213,7 +213,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if experimental_semantic_search {
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building;
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+            stage: "queued".to_string(),
+            files: None,
+            entries: None,
+        };
         let (tx, rx): (
             crossbeam_channel::Sender<SemanticIndexEvent>,
             crossbeam_channel::Receiver<SemanticIndexEvent>,
@@ -223,19 +227,30 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let root_clone = root_path.clone();
         let semantic_storage = storage_dir.clone();
         let semantic_project_key = crate::search_index::project_cache_key(&root_path);
+        let tx_progress = tx.clone();
         thread::spawn(move || {
             let build_result = catch_unwind(AssertUnwindSafe(
-                || -> Result<SemanticIndexEvent, String> {
+                || -> Result<SemanticIndex, String> {
                     if let Some(ref dir) = semantic_storage {
                         if let Some(cached) =
                             SemanticIndex::read_from_disk(dir, &semantic_project_key)
                         {
-                            return Ok(SemanticIndexEvent::Ready(cached));
+                            let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                                stage: "loaded_cached_index".to_string(),
+                                files: None,
+                                entries: Some(cached.entry_count()),
+                            });
+                            return Ok(cached);
                         }
                     }
 
                     let filters = build_path_filters(&[], &[]).unwrap_or_default();
                     let files = walk_project_files(&root_clone, &filters);
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "scanned_project_files".to_string(),
+                        files: Some(files.len()),
+                        entries: None,
+                    });
 
                     // Cap file count to prevent OOM on huge project roots (e.g., /home/user).
                     // fastembed model (~200MB) + embeddings + batch buffers can exceed memory
@@ -255,6 +270,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         ));
                     }
 
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "initializing_embedding_model".to_string(),
+                        files: Some(files.len()),
+                        entries: None,
+                    });
                     let mut model = crate::semantic_index::initialize_text_embedding()?;
 
                     let mut embed = |texts: Vec<String>| {
@@ -263,23 +283,33 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             .map_err(|error| error.to_string())
                     };
 
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "embedding_symbols".to_string(),
+                        files: Some(files.len()),
+                        entries: None,
+                    });
                     let index = SemanticIndex::build(&root_clone, &files, &mut embed, 64)?;
                     log::info!(
                         "[aft] built semantic index: {} files, {} entries",
                         files.len(),
                         index.len()
                     );
+                    let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                        stage: "persisting_index".to_string(),
+                        files: Some(files.len()),
+                        entries: Some(index.len()),
+                    });
 
                     if let Some(ref dir) = semantic_storage {
                         index.write_to_disk(dir, &semantic_project_key);
                     }
 
-                    Ok(SemanticIndexEvent::Ready(index))
+                    Ok(index)
                 },
             ));
 
             let event = match build_result {
-                Ok(Ok(event)) => event,
+                Ok(Ok(index)) => SemanticIndexEvent::Ready(index),
                 Ok(Err(error)) => {
                     log::warn!("[aft] failed to build semantic index: {}", error);
                     SemanticIndexEvent::Failed(error)

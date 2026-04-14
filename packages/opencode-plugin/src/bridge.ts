@@ -247,11 +247,32 @@ export class BinaryBridge {
   private spawnProcess(): void {
     log(`Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
 
+    const ortDir =
+      typeof this.configOverrides._ort_dylib_dir === "string"
+        ? this.configOverrides._ort_dylib_dir
+        : null;
+    const ortLibraryPath =
+      ortDir == null
+        ? null
+        : join(
+            ortDir,
+            process.platform === "win32"
+              ? "onnxruntime.dll"
+              : process.platform === "darwin"
+                ? "libonnxruntime.dylib"
+                : "libonnxruntime.so",
+          );
+    const envPath =
+      process.platform === "win32" && ortDir
+        ? `${ortDir};${process.env.PATH ?? ""}`
+        : process.env.PATH;
+
     const child = spawn(this.binaryPath, [], {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...(envPath ? { PATH: envPath } : {}),
         // Store fastembed model files alongside the semantic index, not the project cwd
         FASTEMBED_CACHE_DIR:
           process.env.FASTEMBED_CACHE_DIR ||
@@ -259,15 +280,8 @@ export class BinaryBridge {
             ? join(this.configOverrides.storage_dir, "semantic", "models")
             : join(homedir() || "", ".cache", "fastembed")),
         // Point ort to the auto-downloaded or system ONNX Runtime library
-        ...(typeof this.configOverrides._ort_dylib_dir === "string" && {
-          ORT_DYLIB_PATH: join(
-            this.configOverrides._ort_dylib_dir,
-            process.platform === "win32"
-              ? "onnxruntime.dll"
-              : process.platform === "darwin"
-                ? "libonnxruntime.dylib"
-                : "libonnxruntime.so",
-          ),
+        ...(ortLibraryPath && {
+          ORT_DYLIB_PATH: ortLibraryPath,
         }),
       },
     });

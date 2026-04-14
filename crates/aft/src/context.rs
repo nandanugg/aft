@@ -17,12 +17,21 @@ use crate::semantic_index::SemanticIndex;
 #[derive(Debug, Clone)]
 pub enum SemanticIndexStatus {
     Disabled,
-    Building,
+    Building {
+        stage: String,
+        files: Option<usize>,
+        entries: Option<usize>,
+    },
     Ready,
     Failed(String),
 }
 
 pub enum SemanticIndexEvent {
+    Progress {
+        stage: String,
+        files: Option<usize>,
+        entries: Option<usize>,
+    },
     Ready(SemanticIndex),
     Failed(String),
 }
