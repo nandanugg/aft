@@ -43,12 +43,26 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 }),
             );
         }
-        SemanticIndexStatus::Building => {
+        SemanticIndexStatus::Building {
+            stage,
+            files,
+            entries,
+        } => {
+            let mut detail = format!("Semantic index is still building (stage: {}).", stage);
+            if let Some(files) = files {
+                detail.push_str(&format!(" files: {}", files));
+            }
+            if let Some(entries) = entries {
+                detail.push_str(&format!(" entries: {}", entries));
+            }
             return Response::success(
                 &req.id,
                 serde_json::json!({
                     "status": "building",
-                    "text": "Semantic index is still building...",
+                    "text": detail,
+                    "stage": stage,
+                    "files": files,
+                    "entries": entries,
                 }),
             );
         }
@@ -77,7 +91,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 serde_json::json!({
                     "status": "not_ready",
-                    "text": "Semantic index is still building...",
+                    "text": "Semantic index is not ready yet.",
                 }),
             );
         };
