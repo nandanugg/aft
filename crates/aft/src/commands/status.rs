@@ -41,25 +41,41 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
                     "status": idx.status_label(),
                     "entries": idx.entry_count(),
                     "dimension": idx.dimension(),
+                    "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
+                    "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
                 })
             }
             None => {
                 match &*ctx.semantic_index_status().borrow() {
-                    SemanticIndexStatus::Disabled => serde_json::json!({ "status": "disabled" }),
+                    SemanticIndexStatus::Disabled => serde_json::json!({
+                        "status": "disabled",
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
                     SemanticIndexStatus::Building {
                         stage,
                         files,
-                        entries,
+                        entries_done,
+                        entries_total,
                     } => serde_json::json!({
                         "status": "loading",
                         "stage": stage,
                         "files": files,
-                        "entries": entries,
+                        "entries_done": entries_done,
+                        "entries_total": entries_total,
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
                     }),
-                    SemanticIndexStatus::Ready => serde_json::json!({ "status": "ready" }),
+                    SemanticIndexStatus::Ready => serde_json::json!({
+                        "status": "ready",
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
+                    }),
                     SemanticIndexStatus::Failed(error) => serde_json::json!({
                         "status": "failed",
                         "error": error,
+                        "backend": config.semantic_backend_label(),
+                        "model": config.semantic.model.as_str(),
                     }),
                 }
             }

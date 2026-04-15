@@ -246,9 +246,19 @@ export class BinaryBridge {
 
   private spawnProcess(): void {
     log(`Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
+    const semantic = this.configOverrides.semantic;
+    const semanticBackend = (() => {
+      if (semantic && typeof semantic === "object" && !Array.isArray(semantic)) {
+        const candidate = (semantic as { backend?: unknown }).backend;
+        return typeof candidate === "string" ? candidate : undefined;
+      }
+      return undefined;
+    })();
+    const useFastembedBackend =
+      semanticBackend === undefined || semanticBackend === "fastembed" || semanticBackend === "";
 
     const ortDir =
-      typeof this.configOverrides._ort_dylib_dir === "string"
+      typeof this.configOverrides._ort_dylib_dir === "string" && useFastembedBackend
         ? this.configOverrides._ort_dylib_dir
         : null;
     const ortLibraryPath =
@@ -267,23 +277,30 @@ export class BinaryBridge {
         ? `${ortDir};${process.env.PATH ?? ""}`
         : process.env.PATH;
 
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(envPath ? { PATH: envPath } : {}),
+    };
+
+    if (useFastembedBackend) {
+      // Store fastembed model files alongside the semantic index, not the project cwd.
+      // This is only relevant when the fastembed backend is selected.
+      env.FASTEMBED_CACHE_DIR =
+        process.env.FASTEMBED_CACHE_DIR ||
+        (typeof this.configOverrides.storage_dir === "string"
+          ? join(this.configOverrides.storage_dir, "semantic", "models")
+          : join(homedir() || "", ".cache", "fastembed"));
+
+      // Point ort to the auto-downloaded or system ONNX Runtime library.
+      if (ortLibraryPath) {
+        env.ORT_DYLIB_PATH = ortLibraryPath;
+      }
+    }
+
     const child = spawn(this.binaryPath, [], {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        ...(envPath ? { PATH: envPath } : {}),
-        // Store fastembed model files alongside the semantic index, not the project cwd
-        FASTEMBED_CACHE_DIR:
-          process.env.FASTEMBED_CACHE_DIR ||
-          (typeof this.configOverrides.storage_dir === "string"
-            ? join(this.configOverrides.storage_dir, "semantic", "models")
-            : join(homedir() || "", ".cache", "fastembed")),
-        // Point ort to the auto-downloaded or system ONNX Runtime library
-        ...(ortLibraryPath && {
-          ORT_DYLIB_PATH: ortLibraryPath,
-        }),
-      },
+      env,
     });
 
     child.stdout?.on("data", (chunk: Buffer) => {
