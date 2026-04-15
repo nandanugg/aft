@@ -348,12 +348,14 @@ fn drain_semantic_index_events(ctx: &AppContext) {
             SemanticIndexEvent::Progress {
                 stage,
                 files,
-                entries,
+                entries_done,
+                entries_total,
             } => {
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
                     stage,
                     files,
-                    entries,
+                    entries_done,
+                    entries_total,
                 };
             }
             SemanticIndexEvent::Ready(index) => {
