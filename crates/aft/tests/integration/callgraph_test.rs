@@ -1186,3 +1186,197 @@ fn callgraph_trace_data_approximation() {
 
     aft.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// trace_data pattern tests — Go fixtures for the 5 gaps
+// (reference arg, field access, struct literal, intrinsic writer, method receiver)
+// ---------------------------------------------------------------------------
+
+fn trace_data_configure_go(aft: &mut AftProcess) -> String {
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+    aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+    root
+}
+
+/// Gap 1: a tracked name passed as `&x` should produce a direct (non-approximate)
+/// parameter hop into the callee.
+#[test]
+fn callgraph_trace_data_reference_arg() {
+    let mut aft = AftProcess::spawn();
+    let root = trace_data_configure_go(&mut aft);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow_patterns.go","symbol":"refArgCase","expression":"u","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    let hops = resp["hops"].as_array().expect("hops array");
+
+    let param_hop = hops.iter().find(|h| {
+        h["flow_type"] == "parameter" && h["symbol"] == "saveRef"
+    });
+    assert!(
+        param_hop.is_some(),
+        "expected parameter hop into saveRef for &u, got hops: {:?}",
+        hops
+    );
+    let ph = param_hop.unwrap();
+    assert_eq!(ph["variable"], "user", "should map to saveRef's param 'user'");
+    assert_eq!(
+        ph["approximate"], false,
+        "reference arg is a direct flow, not approximate"
+    );
+
+    aft.shutdown();
+}
+
+/// Gap 2: a tracked name used as `x.F` in an argument should produce an
+/// approximate parameter hop.
+#[test]
+fn callgraph_trace_data_field_access_arg() {
+    let mut aft = AftProcess::spawn();
+    let root = trace_data_configure_go(&mut aft);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow_patterns.go","symbol":"fieldArgCase","expression":"u","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    let hops = resp["hops"].as_array().expect("hops array");
+
+    let param_hop = hops.iter().find(|h| {
+        h["flow_type"] == "parameter" && h["symbol"] == "consumeString"
+    });
+    assert!(
+        param_hop.is_some(),
+        "expected parameter hop into consumeString for u.Name, got hops: {:?}",
+        hops
+    );
+    let ph = param_hop.unwrap();
+    assert_eq!(ph["variable"], "name");
+    assert_eq!(
+        ph["approximate"], true,
+        "field-access flow is approximate (we know u flowed in, but only via a field)"
+    );
+
+    aft.shutdown();
+}
+
+/// Gap 3: `w := Wrapper{Name: name}` where `name` is tracked should produce an
+/// approximate assignment hop binding the struct-literal target, and subsequent
+/// uses of the new binding should be tracked.
+#[test]
+fn callgraph_trace_data_struct_literal_assign() {
+    let mut aft = AftProcess::spawn();
+    let root = trace_data_configure_go(&mut aft);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow_patterns.go","symbol":"structLitCase","expression":"name","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    let hops = resp["hops"].as_array().expect("hops array");
+
+    let assign_hop = hops.iter().find(|h| {
+        h["flow_type"] == "assignment" && h["variable"] == "w"
+    });
+    assert!(
+        assign_hop.is_some(),
+        "expected assignment hop binding 'w' from struct literal, got hops: {:?}",
+        hops
+    );
+    assert_eq!(
+        assign_hop.unwrap()["approximate"], true,
+        "struct-literal wrap is approximate"
+    );
+
+    // The new binding `w` should propagate to saveWrapper's parameter.
+    let param_hop = hops.iter().find(|h| {
+        h["flow_type"] == "parameter" && h["symbol"] == "saveWrapper"
+    });
+    assert!(
+        param_hop.is_some(),
+        "struct-lit-bound name should propagate to saveWrapper's param, got hops: {:?}",
+        hops
+    );
+    assert_eq!(param_hop.unwrap()["variable"], "wr");
+
+    aft.shutdown();
+}
+
+/// Gap 4: `json.Unmarshal(raw, &user)` where `raw` is tracked should bind
+/// `raw`'s flow into `user` via the known-writer intrinsic, and subsequent
+/// uses of `user` should be tracked.
+#[test]
+fn callgraph_trace_data_pointer_write_intrinsic() {
+    let mut aft = AftProcess::spawn();
+    let root = trace_data_configure_go(&mut aft);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow_patterns.go","symbol":"pointerWriteCase","expression":"raw","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    let hops = resp["hops"].as_array().expect("hops array");
+
+    // Should produce a "writer" hop (approximate) binding `user`.
+    let writer_hop = hops.iter().find(|h| {
+        h["variable"] == "user"
+            && (h["flow_type"] == "writer" || h["flow_type"] == "assignment")
+    });
+    assert!(
+        writer_hop.is_some(),
+        "expected a writer/assignment hop binding 'user' from json.Unmarshal, got hops: {:?}",
+        hops
+    );
+
+    // Should propagate to consumeUser's parameter as a direct flow.
+    let param_hop = hops.iter().find(|h| {
+        h["flow_type"] == "parameter" && h["symbol"] == "consumeUser"
+    });
+    assert!(
+        param_hop.is_some(),
+        "writer-bound 'user' should propagate to consumeUser, got hops: {:?}",
+        hops
+    );
+    assert_eq!(param_hop.unwrap()["variable"], "u");
+
+    aft.shutdown();
+}
+
+/// Gap 5: `u.saveMethod(...)` where `u` is tracked should produce a parameter
+/// hop binding to the method's receiver name.
+#[test]
+fn callgraph_trace_data_method_receiver() {
+    let mut aft = AftProcess::spawn();
+    let root = trace_data_configure_go(&mut aft);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow_patterns.go","symbol":"methodReceiverCase","expression":"u","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    let hops = resp["hops"].as_array().expect("hops array");
+
+    let recv_hop = hops.iter().find(|h| {
+        h["flow_type"] == "parameter" && h["symbol"] == "saveMethod"
+    });
+    assert!(
+        recv_hop.is_some(),
+        "expected parameter hop into saveMethod's receiver, got hops: {:?}",
+        hops
+    );
+    // The receiver's local name inside saveMethod is `u` (see fixture).
+    assert_eq!(recv_hop.unwrap()["variable"], "u");
+
+    aft.shutdown();
+}
