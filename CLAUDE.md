@@ -2,11 +2,20 @@
 
 Tree-sitter powered code analysis for massive context savings (60-90% token reduction).
 
+## MANDATORY: Always Use AFT First
+
+**CRITICAL**: AFT semantic commands are the DEFAULT, not optional. Grep/Read with limited context (e.g., 3 lines) misses the bigger picture. We want to SEE the full picture, not shoot in the dark.
+
+**Before ANY code exploration:**
+1. `aft outline` FIRST - understand structure before diving in
+2. `aft zoom` for symbols - never read full files when you need one function
+3. `aft callers`/`aft call_tree` for flow - grep misses cross-file relationships
+
 ## AFT CLI Commands
 
 Use `aft` commands via Bash for code navigation. These provide structured output optimized for LLM consumption.
 
-### Semantic Commands (prefer these over raw file reads)
+### Semantic Commands (USE THESE BY DEFAULT)
 
 ```bash
 # Get structure without content (~10% of full read tokens)
@@ -28,12 +37,36 @@ aft impact <file> <symbol>
 aft trace_to <file> <symbol>
 ```
 
-### Basic Commands
+### Basic Commands (fallback only)
 
 ```bash
 aft read <file> [start_line] [limit]   # Read with line numbers
 aft grep <pattern> [path]              # Trigram-indexed search
 aft glob <pattern> [path]              # File pattern matching
+```
+
+## Decision Tree
+
+```
+Need to understand code?
+    |
+    +-- Don't know the file structure?
+    |       -> aft outline <dir>
+    |
+    +-- Know the file, need specific symbol?
+    |       -> aft zoom <file> <symbol>
+    |
+    +-- Need to understand what calls what?
+    |       -> aft call_tree <file> <symbol>
+    |
+    +-- Need to find all usages?
+    |       -> aft callers <file> <symbol>
+    |
+    +-- Planning a change?
+    |       -> aft impact <file> <symbol>
+    |
+    +-- Debugging how execution reaches a point?
+            -> aft trace_to <file> <symbol>
 ```
 
 ## When to Use What
@@ -47,12 +80,22 @@ aft glob <pattern> [path]              # File pattern matching
 | Planning refactors | `aft impact` | Change propagation |
 | Debugging call paths | `aft trace_to` | Execution paths |
 
-## Best Practices
+## Rules (NOT suggestions)
 
-1. **Start with outline** - Before reading a file, use `aft outline` to understand structure
-2. **Zoom to symbols** - Instead of reading full files, use `aft zoom` for specific functions
-3. **Use call graphs** - For understanding code flow, `call_tree` and `callers` are more efficient than grep
-4. **Impact before refactor** - Run `aft impact` before making changes to understand blast radius
+1. **ALWAYS start with outline** - Before reading ANY file, use `aft outline` to understand structure
+2. **ALWAYS zoom to symbols** - Never read full files when you need specific functions
+3. **ALWAYS use call graphs** - For understanding code flow, `call_tree` and `callers` reveal what grep cannot
+4. **ALWAYS impact before refactor** - Run `aft impact` before making changes to understand blast radius
+5. **NEVER grep with limited context** - If you need more than the symbol name, use AFT semantic commands
+
+## Context Protection
+
+**Context is finite.** Even when a user explicitly requests "contents" or "read all files":
+
+1. **Directory reads: outline first** - For directories with 5+ files, ALWAYS run `aft outline` and confirm which specific files are needed before reading
+2. **All file types benefit** - AFT applies to markdown, config, docs, and data files — not just code. Documentation directories especially benefit from outline-first
+3. **Batch limit** - Never read more than 3-5 files in a single action without confirming user intent. Context exhaustion breaks the conversation.
+4. **User requests don't override physics** - "Read all files" is a request, not a command to fill context. Propose `aft outline` + selective reads instead.
 
 ## Supported Languages
 
