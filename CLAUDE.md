@@ -2,22 +2,24 @@
 
 Tree-sitter powered code analysis for massive context savings (60-90% token reduction).
 
-## MANDATORY: Always Use AFT First
+## Start With Outline, Escalate From There
 
-**CRITICAL**: AFT semantic commands are the DEFAULT, not optional. Grep/Read with limited context (e.g., 3 lines) misses the bigger picture. We want to SEE the full picture, not shoot in the dark.
+**Outline is the default entry point.** Before reading full files, run `aft outline` to get structure — ~10% the tokens of a full read. This applies to code, markdown, config, and docs.
 
-**AFT applies to ALL file types** — not just code. Markdown, config, docs, JSON, YAML all benefit. Even for "just checking what files are" — outline first.
+**Escalate to semantic commands only when the task needs them:**
+- `aft zoom <file> <symbol>` — when you need to read a specific function body.
+- `aft call_tree` / `aft callers` — when you need cross-file call relationships (grep can't infer these).
+- `aft impact` — before a refactor, to see what breaks.
+- `aft trace_to` — when debugging how execution reaches a point.
+- `aft trace_data` — when tracking where a value came from or where it flows next.
 
-**Before reading ANY files:**
-1. `aft outline` FIRST - understand structure before diving in
-2. `aft zoom` for symbols - never read full files when you need one function
-3. `aft callers`/`aft call_tree` for flow - grep misses cross-file relationships
+**Don't use semantic commands reflexively.** For verification tasks — "does this symbol still exist?", "is this doc accurate?" — outline alone is usually enough. Reaching for zoom/call_tree on every task inflates work without improving answers.
 
 ## AFT CLI Commands
 
 Use `aft` commands via Bash for code navigation. These provide structured output optimized for LLM consumption.
 
-### Semantic Commands (USE THESE BY DEFAULT)
+### Semantic Commands
 
 ```bash
 # Get structure without content (~10% of full read tokens)
@@ -35,11 +37,38 @@ aft callers <file> <symbol>
 # Impact analysis - what breaks if this changes?
 aft impact <file> <symbol>
 
-# Trace analysis - how does execution reach this?
+# Control flow - how does execution reach this function?
 aft trace_to <file> <symbol>
+
+# Data flow - how does a value flow through assignments and across calls?
+aft trace_data <file> <symbol> <expression> [depth]
 ```
 
-### Basic Commands (fallback only)
+## Tracing: control flow vs. data flow
+
+Two different questions, two commands:
+- **"How does execution reach this function?"** → `aft trace_to` (control flow).
+  Example: `aft trace_to api/handler.go ChargePayment` — shows the call chain that lands on ChargePayment.
+- **"Where did this value come from / where does it go next?"** → `aft trace_data` (data flow through assignments and parameter passing).
+  Example: `aft trace_data api/handler.go ChargePayment merchantID` — traces how `merchantID` propagates within and across function boundaries.
+
+For a bug like "this field got the wrong value," `trace_data` is usually the right starting point; for "why did this handler run," `trace_to` is.
+
+### Patterns trace_data handles
+
+`trace_data` follows values across these constructs — use it confidently on idiomatic code instead of manually reading every caller:
+
+- **Direct args**: `f(x)` → hop into `f`'s matching parameter.
+- **Reference args**: `f(&x)` → hop into `f`'s pointer parameter.
+- **Field-access args**: `f(x.Field)` → approximate hop into `f`'s matching parameter (propagation continues).
+- **Struct-literal wraps**: `w := Wrapper{Field: x}` → approximate assignment hop to `w`, then tracking continues on `w`.
+- **Pointer-write intrinsics** (`json.Unmarshal`, `yaml.Unmarshal`, `xml.Unmarshal`, `toml.Unmarshal`, `proto.Unmarshal`, `bson.Unmarshal`, `msgpack.Unmarshal`): `json.Unmarshal(raw, &out)` binds `raw`'s flow into `out`, and further uses of `out` are tracked.
+- **Method receivers**: `x.Method(...)` → hop into the receiver parameter name (Go `func (u *T) Method(...)`, Rust `&self`).
+- **Destructuring assigns**: `a, b := f()` and `{a, b} = f()` → tracking splits onto the new bindings.
+
+Hops marked `"approximate": true` are lossy (field access, struct wraps, writer intrinsics) — the flow exists but the exact subfield is not resolved.
+
+### Basic Commands
 
 ```bash
 aft read <file> [start_line] [limit]   # Read with line numbers
@@ -71,7 +100,10 @@ Need to understand files?
     |       -> aft impact <file> <symbol>
     |
     +-- Debugging how execution reaches a point?
-            -> aft trace_to <file> <symbol>
+    |       -> aft trace_to <file> <symbol>
+    |
+    +-- Tracking where a value came from or where it flows?
+            -> aft trace_data <file> <symbol> <expression>
 ```
 
 ## When to Use What
@@ -84,17 +116,26 @@ Need to understand files?
 | Understanding dependencies | `aft call_tree` | Structured graph |
 | Finding usage sites | `aft callers` | All call sites |
 | Planning refactors | `aft impact` | Change propagation |
-| Debugging call paths | `aft trace_to` | Execution paths |
+| Debugging control flow | `aft trace_to` | Execution paths |
+| Debugging data flow | `aft trace_data` | Value propagation |
 
-## Rules (NOT suggestions)
+## Rules
 
-1. **ALWAYS start with outline** - Before reading ANY file, use `aft outline` to understand structure
-2. **ALWAYS zoom to symbols** - Never read full files when you need specific functions
-3. **ALWAYS use call graphs** - For understanding code flow, `call_tree` and `callers` reveal what grep cannot
-4. **ALWAYS impact before refactor** - Run `aft impact` before making changes to understand blast radius
-5. **NEVER grep with limited context** - If you need more than the symbol name, use AFT semantic commands
-6. **ALWAYS outline before sampling** - Even for "just checking what files are" tasks, outline first
-7. **ALWAYS outline before delegating** - When briefing a subagent to explore a repo or directory, run `aft outline <path>` yourself first and include the output in the subagent prompt. Never leave outline as a mid-step instruction — subagents don't follow ordering guarantees.
+Match the command to the task type. Outline is universal; the semantic graph tools (zoom/call_tree/callers/impact/trace_to) pay off for *comprehension* tasks, not for *verification* tasks.
+
+**Verification tasks** — "does X still exist?", "is this doc still accurate?", "what files are in this dir?":
+1. **ALWAYS start with outline** - `aft outline` to confirm structure and anchor symbols.
+2. **Outline is usually enough.** Don't reach for zoom/call_tree/callers unless you need to see actual behavior, not just presence.
+3. **ALWAYS outline before delegating** - When briefing a subagent to explore a repo or directory, run `aft outline <path>` yourself first and include the output in the subagent prompt. Never leave outline as a mid-step instruction — subagents don't follow ordering guarantees.
+
+**Comprehension tasks** — "how does this flow work?", "what breaks if I change X?", "where is this called?":
+4. **Use zoom** to read a specific function body without reading the whole file.
+5. **Use call_tree / callers** to map cross-file relationships that grep cannot see.
+6. **Use impact before a refactor** to understand blast radius before editing.
+
+**When grep is fine.** `aft grep` for a bare identifier is correct when you just need to know "does this string appear, and where." Reach for semantic commands when you need to understand *behavior* behind the name, not every time a name shows up.
+
+**Context protection still applies.** See the Context Protection section — even when a task is verification-only, don't read full files; outline first and selectively read what you need.
 
 ## Context Protection
 
