@@ -94,6 +94,7 @@ Need to understand files?
 4. **ALWAYS impact before refactor** - Run `aft impact` before making changes to understand blast radius
 5. **NEVER grep with limited context** - If you need more than the symbol name, use AFT semantic commands
 6. **ALWAYS outline before sampling** - Even for "just checking what files are" tasks, outline first
+7. **ALWAYS outline before delegating** - When briefing a subagent to explore a repo or directory, run `aft outline <path>` yourself first and include the output in the subagent prompt. Never leave outline as a mid-step instruction — subagents don't follow ordering guarantees.
 
 ## Context Protection
 
