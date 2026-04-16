@@ -110,4 +110,8 @@ TypeScript, JavaScript, Python, Rust, Go, C/C++, Java, Ruby, Markdown
 
 ## Hook Integration
 
-Read, Grep, and Glob tools are automatically routed through AFT via hooks for indexed performance.
+Grep and Glob tools are automatically routed through AFT via hooks for indexed performance.
+
+**Reading files**: Use `aft read` via Bash for indexed reads with token savings.
+
+**Warning**: When you need to Edit a file, use the native Read tool (not `aft read`) because Edit requires a prior Read tool call for validation.
