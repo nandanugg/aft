@@ -85,7 +85,11 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
 
     match graph.forward_tree(&file_path, symbol, depth) {
         Ok(tree) => {
-            let tree_json = serde_json::to_value(&tree).unwrap_or_default();
+            let text = tree.render_text();
+            let mut tree_json = serde_json::to_value(&tree).unwrap_or_default();
+            if let Some(obj) = tree_json.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::Value::String(text));
+            }
             Response::success(&req.id, tree_json)
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
