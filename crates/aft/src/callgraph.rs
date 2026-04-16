@@ -335,6 +335,158 @@ pub struct TraceDataResult {
     pub depth_limited: bool,
 }
 
+impl TraceDataResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "trace_data {} in {} ({})\n",
+            self.expression, self.origin_symbol, self.origin_file
+        ));
+        if self.hops.is_empty() {
+            out.push_str("  (no hops)\n");
+        } else {
+            for (i, hop) in self.hops.iter().enumerate() {
+                let approx = if hop.approximate { " approximate" } else { "" };
+                out.push_str(&format!(
+                    "  {}. {}.{}  {}:{}  {}{}\n",
+                    i + 1,
+                    hop.symbol,
+                    hop.variable,
+                    hop.file,
+                    hop.line,
+                    hop.flow_type,
+                    approx,
+                ));
+            }
+        }
+        if self.depth_limited {
+            out.push_str("depth limit reached\n");
+        }
+        out
+    }
+}
+
+impl TraceToResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "trace_to {} ({})  paths={} entries={} truncated={}{}\n",
+            self.target_symbol,
+            self.target_file,
+            self.total_paths,
+            self.entry_points_found,
+            self.truncated_paths,
+            if self.max_depth_reached {
+                " max_depth_reached"
+            } else {
+                ""
+            },
+        ));
+        if self.paths.is_empty() {
+            out.push_str("  (no paths)\n");
+        } else {
+            for (i, path) in self.paths.iter().enumerate() {
+                out.push_str(&format!("  path {}:\n", i + 1));
+                for hop in &path.hops {
+                    let entry = if hop.is_entry_point { " [entry]" } else { "" };
+                    out.push_str(&format!(
+                        "    {} ({}:{}){}\n",
+                        hop.symbol, hop.file, hop.line, entry
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl CallersResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "callers of {} ({})  total={} files={} scanned={}\n",
+            self.symbol,
+            self.file,
+            self.total_callers,
+            self.callers.len(),
+            self.scanned_files,
+        ));
+        if self.callers.is_empty() {
+            out.push_str("  (no callers)\n");
+        } else {
+            for group in &self.callers {
+                out.push_str(&format!("  {} ({}):\n", group.file, group.callers.len()));
+                for c in &group.callers {
+                    out.push_str(&format!("    - {}:{}\n", c.symbol, c.line));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl ImpactResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        let sig = self.signature.as_deref().unwrap_or("");
+        out.push_str(&format!(
+            "impact {} ({})  affected={} files={}\n",
+            self.symbol, self.file, self.total_affected, self.affected_files,
+        ));
+        if !sig.is_empty() {
+            out.push_str(&format!("  signature: {}\n", sig));
+        }
+        if !self.parameters.is_empty() {
+            out.push_str(&format!("  parameters: {}\n", self.parameters.join(", ")));
+        }
+        if self.callers.is_empty() {
+            out.push_str("  (no callers)\n");
+        } else {
+            for c in &self.callers {
+                let entry = if c.is_entry_point { " [entry]" } else { "" };
+                out.push_str(&format!(
+                    "  - {} ({}:{}){}\n",
+                    c.caller_symbol, c.caller_file, c.line, entry
+                ));
+                if let Some(expr) = &c.call_expression {
+                    out.push_str(&format!("      {}\n", expr));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl CallTreeNode {
+    /// Compact LLM-friendly rendering (indented tree).
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        self.render_into(&mut out, 0);
+        out
+    }
+
+    fn render_into(&self, out: &mut String, depth: usize) {
+        let indent = "  ".repeat(depth);
+        let unresolved = if self.resolved { "" } else { " [unresolved]" };
+        let sig = self
+            .signature
+            .as_deref()
+            .map(|s| format!("  {}", s))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}- {} ({}:{}){}{}\n",
+            indent, self.name, self.file, self.line, unresolved, sig
+        ));
+        for child in &self.children {
+            child.render_into(out, depth + 1);
+        }
+    }
+}
+
 /// Extract parameter names from a function signature string.
 ///
 /// Strips language-specific receivers (`self`, `&self`, `&mut self` for Rust,
