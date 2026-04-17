@@ -141,6 +141,14 @@ impl AppContext {
         }
     }
 
+    /// Drain any pending helper result into the CallGraph without blocking.
+    /// Call this at the start of any command handler that uses the call graph
+    /// so a recently-completed helper run is reflected in the next reverse
+    /// index build.
+    pub fn drain_go_helper(&self) {
+        self.poll_go_helper();
+    }
+
     /// Access the cached Go helper output, draining the in-flight
     /// receiver first so a freshly-completed run becomes visible. The
     /// inner reference is held only for the duration of the borrow.
@@ -186,7 +194,13 @@ impl AppContext {
                         out.edges.len(),
                         out.skipped.len()
                     );
-                    *self.go_helper_data.borrow_mut() = Some(out);
+                    // Store a copy on AppContext (for diagnostics / future
+                    // callers), then move the data into CallGraph so the
+                    // reverse index picks it up on next build.
+                    *self.go_helper_data.borrow_mut() = Some(out.clone());
+                    if let Some(graph) = self.callgraph.borrow_mut().as_mut() {
+                        graph.set_go_helper(out);
+                    }
                 }
                 Err(err) => {
                     // Most variants are normal (no go.mod, no go on PATH,

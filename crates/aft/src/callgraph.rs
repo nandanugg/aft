@@ -14,6 +14,7 @@ use tree_sitter::{Parser, Tree};
 use crate::calls::extract_calls_full;
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
+use crate::go_helper::HelperOutput;
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
@@ -676,6 +677,10 @@ pub struct CallGraph {
     /// Reverse index: target_file → target_symbol → callers.
     /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
     reverse_index: Option<ReverseIndex>,
+    /// Resolved Go call edges from the optional `aft-go-helper`. Injected
+    /// into the reverse index at build time. Snapshot from configure time —
+    /// remains valid until the next configure call.
+    go_helper: Option<HelperOutput>,
 }
 
 impl CallGraph {
@@ -686,7 +691,15 @@ impl CallGraph {
             project_root,
             project_files: None,
             reverse_index: None,
+            go_helper: None,
         }
+    }
+
+    /// Install Go helper output. Invalidates the reverse index so the
+    /// next `callers_of` call rebuilds it with the new edges included.
+    pub fn set_go_helper(&mut self, data: HelperOutput) {
+        self.go_helper = Some(data);
+        self.reverse_index = None;
     }
 
     /// Get the project root directory.
@@ -1037,6 +1050,45 @@ impl CallGraph {
             }
         }
 
+        // Inject type-resolved edges from the Go helper. These cover
+        // interface dispatch and concrete-method disambiguation that
+        // tree-sitter alone cannot resolve.
+        // Helper paths are relative to project_root; canonicalize to
+        // match the keys used by the tree-sitter side.
+        // Note: if a Go file is edited after configure, the helper data
+        // may be stale. A new configure re-runs the helper and resets
+        // this field.
+        if let Some(helper) = &self.go_helper {
+            for edge in &helper.edges {
+                if edge.caller.symbol.is_empty() || edge.callee.symbol.is_empty() {
+                    continue;
+                }
+                let caller_abs = self.project_root.join(&edge.caller.file);
+                let callee_abs = self.project_root.join(&edge.callee.file);
+
+                let canon_caller = Arc::new(
+                    std::fs::canonicalize(&caller_abs).unwrap_or(caller_abs),
+                );
+                let canon_callee =
+                    std::fs::canonicalize(&callee_abs).unwrap_or(callee_abs);
+
+                let caller_sym: SharedStr = Arc::from(edge.caller.symbol.as_str());
+
+                reverse
+                    .entry(canon_callee)
+                    .or_default()
+                    .entry(edge.callee.symbol.clone())
+                    .or_default()
+                    .push(IndexedCallerSite {
+                        caller_file: Arc::clone(&canon_caller),
+                        caller_symbol: caller_sym,
+                        line: edge.caller.line,
+                        col: 0,
+                        resolved: true,
+                    });
+            }
+        }
+
         self.reverse_index = Some(reverse);
     }
 
@@ -1083,8 +1135,16 @@ impl CallGraph {
             &mut all_sites,
         );
 
-        // Group by file
+        // Deduplicate by (caller_file, caller_symbol, line). Prefer
+        // resolved edges over unresolved ones so that when the Go helper
+        // and tree-sitter both record the same call site, the
+        // type-accurate version wins and no duplicate appears in output.
+        all_sites.sort_unstable_by_key(|s| if s.resolved { 0u8 } else { 1u8 });
+        let mut seen: HashSet<(PathBuf, String, u32)> = HashSet::new();
+        all_sites
+            .retain(|s| seen.insert((s.caller_file.clone(), s.caller_symbol.clone(), s.line)));
 
+        // Group by file
         let mut groups_map: HashMap<PathBuf, Vec<CallerEntry>> = HashMap::new();
         let total_callers = all_sites.len();
         for site in all_sites {

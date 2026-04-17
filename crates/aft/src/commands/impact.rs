@@ -51,6 +51,7 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(5)
         .min(100) as usize;
 
+    ctx.drain_go_helper();
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
