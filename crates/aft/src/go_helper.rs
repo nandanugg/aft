@@ -172,18 +172,32 @@ pub fn is_go_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Baked-in path to the helper compiled by build.rs. `None` if build.rs
+/// didn't run `go build` (e.g. Go not on PATH at build time, or in a
+/// `cargo install` context where the build machine path doesn't apply).
+const BAKED_HELPER_PATH: Option<&str> = option_env!("AFT_GO_HELPER_BAKED_PATH");
+
 /// Locate the helper binary. Search order:
-///   1. `$AFT_GO_HELPER_PATH` (explicit override)
-///   2. `aft-go-helper` on PATH (resolved via `which`-style lookup)
+///   1. `$AFT_GO_HELPER_PATH` (explicit runtime override)
+///   2. Baked-in path from build.rs (dev builds; file must still exist)
+///   3. `aft-go-helper` on PATH
 ///
-/// Returns `None` if neither yields an executable file.
+/// Returns `None` if none of the above yields an executable file.
 pub fn find_helper_binary() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(HELPER_PATH_ENV) {
         let path = PathBuf::from(p);
         if path.is_file() {
             return Some(path);
         }
-        // Bad override — fall through to PATH search rather than fail outright.
+        // Bad override — fall through rather than fail outright.
+    }
+    // Dev builds: build.rs compiled the helper into OUT_DIR and baked the path.
+    // The file may not exist after `cargo clean` — check before returning.
+    if let Some(baked) = BAKED_HELPER_PATH {
+        let path = PathBuf::from(baked);
+        if path.is_file() {
+            return Some(path);
+        }
     }
     which_on_path(HELPER_BIN_NAME)
 }
