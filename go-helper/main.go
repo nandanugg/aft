@@ -194,8 +194,19 @@ func analyze(root string) (*Output, error) {
 	return out, nil
 }
 
-// emitEdge adds one edge to out.Edges if the caller and callee both
-// live inside the project root and carry source positions.
+// emitEdge adds one edge to out.Edges if the edge carries information
+// the consumer's generic (tree-sitter) resolver cannot derive on its own.
+//
+// Filter contract (see helper-contract.md):
+//   - static calls (bare package-level function) are dropped; tree-sitter
+//     handles these with same-file and same-directory same-package
+//     fallbacks.
+//   - concrete same-package method calls are dropped for the same reason.
+//   - concrete cross-package and interface dispatch are always kept —
+//     tree-sitter cannot infer receiver types across package boundaries
+//     or resolve dynamic dispatch without a full type checker.
+//
+// Stdlib / out-of-project callers and callees are always skipped.
 func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge) error {
 	if e == nil || e.Site == nil || e.Caller == nil || e.Callee == nil {
 		return nil
@@ -256,8 +267,17 @@ func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge) 
 	if calleeFn.Pkg != nil && calleeFn.Pkg.Pkg != nil {
 		calleePkg = calleeFn.Pkg.Pkg.Path()
 	}
+	callerPkg := ""
+	if callerFn.Pkg != nil && callerFn.Pkg.Pkg != nil {
+		callerPkg = callerFn.Pkg.Pkg.Path()
+	}
 
 	kind := edgeKind(calleeFn, e.Site)
+
+	// Filter per contract: drop edges the generic resolver already handles.
+	if !shouldEmit(kind, callerPkg, calleePkg) {
+		return nil
+	}
 
 	out.Edges = append(out.Edges, Edge{
 		Caller: Position{
@@ -274,6 +294,34 @@ func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge) 
 		Kind: kind,
 	})
 	return nil
+}
+
+// shouldEmit is the filter contract: emit an edge only when the generic
+// (tree-sitter) layer cannot resolve it on its own.
+//
+//   - "interface": always emit. Dynamic dispatch requires type flow; no
+//     syntactic layer can figure this out.
+//   - "concrete":  emit only for cross-package calls. Same-package method
+//     calls are resolved by the Rust consumer's sibling-directory fallback.
+//   - "static":    never emit. Bare package-level calls are resolved
+//     entirely by tree-sitter (same-file + same-package heuristics).
+func shouldEmit(kind, callerPkg, calleePkg string) bool {
+	switch kind {
+	case "interface":
+		return true
+	case "concrete":
+		// Missing package metadata on either side: be generous, emit.
+		if callerPkg == "" || calleePkg == "" {
+			return true
+		}
+		return callerPkg != calleePkg
+	case "static":
+		return false
+	default:
+		// Unknown kinds are new enough that we can't confidently filter;
+		// emit so the consumer has them.
+		return true
+	}
 }
 
 // collectAllFunctions returns the union of ssautil.AllFunctions and
