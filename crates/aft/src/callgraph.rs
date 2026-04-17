@@ -172,6 +172,18 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         return true;
     }
 
+    // Exported methods on service-style structs are entry points in Go and
+    // Rust: they're invoked externally by HTTP routers, gRPC servers,
+    // trait objects, etc. Without this, trace_to on a helper function
+    // would hit an exported handler method and keep searching backward,
+    // never terminating (or truncating) because no "Function" ancestor
+    // exists. Scoping to Go/Rust avoids false positives for language
+    // conventions where class methods are typically internal (Python,
+    // TypeScript, Java, etc).
+    if exported && *kind == SymbolKind::Method && matches!(lang, LangId::Go | LangId::Rust) {
+        return true;
+    }
+
     // Main/init patterns (case-insensitive exact match, any kind)
     let lower = name.to_lowercase();
     if MAIN_INIT_NAMES.contains(&lower.as_str()) {
@@ -712,6 +724,14 @@ impl CallGraph {
         short_name: &str,
         caller_file: &Path,
         import_block: &ImportBlock,
+        // True when the caller's own file defines a symbol with this short
+        // name. Used as a last-resort fallback: if no import resolves the
+        // callee but the file defines it locally, point the edge at the
+        // same file. Covers Go bare package-level calls (foo() where foo
+        // is in the same package/file), Python/JS module-local calls, and
+        // same-file methods invoked via a receiver (s.foo() where foo is
+        // defined in this file).
+        caller_file_defines_callee: bool,
         mut file_exports_symbol: F,
     ) -> EdgeResolution
     where
@@ -802,6 +822,19 @@ impl CallGraph {
             }
         }
 
+        // Same-file fallback. Import-based resolution didn't find a match,
+        // so if the caller's own file defines the symbol, point there.
+        // Without this, languages that permit calling package-local symbols
+        // without imports (Go, Python module-level, JS/TS in-file) show
+        // those edges as unresolved even though both ends live in the same
+        // file. See caller_file_defines_callee for the full rationale.
+        if caller_file_defines_callee {
+            return EdgeResolution::Resolved {
+                file: caller_file.to_path_buf(),
+                symbol: short_name.to_owned(),
+            };
+        }
+
         EdgeResolution::Unresolved {
             callee_name: short_name.to_owned(),
         }
@@ -830,11 +863,20 @@ impl CallGraph {
         caller_file: &Path,
         import_block: &ImportBlock,
     ) -> EdgeResolution {
+        // Look up whether the caller's own file defines a symbol with the
+        // short name. The immutable borrow from self.data must end before
+        // we call file_exports_symbol (which takes &mut self), so evaluate
+        // this up-front into a bool.
+        let caller_defines = self
+            .lookup_file_data(caller_file)
+            .map(|d| d.symbol_metadata.contains_key(short_name))
+            .unwrap_or(false);
         Self::resolve_cross_file_edge_with_exports(
             full_callee,
             short_name,
             caller_file,
             import_block,
+            caller_defines,
             |path, symbol_name| self.file_exports_symbol(path, symbol_name),
         )
     }
@@ -1019,11 +1061,15 @@ impl CallGraph {
                 let caller_symbol: SharedStr = Arc::from(symbol_name.as_str());
 
                 for call_site in call_sites {
+                    let caller_defines = file_data
+                        .symbol_metadata
+                        .contains_key(&call_site.callee_name);
                     let edge = Self::resolve_cross_file_edge_with_exports(
                         &call_site.full_callee,
                         &call_site.callee_name,
                         canon_caller.as_ref(),
                         &file_data.import_block,
+                        caller_defines,
                         |path, symbol_name| self.file_exports_symbol_cached(path, symbol_name),
                     );
 
