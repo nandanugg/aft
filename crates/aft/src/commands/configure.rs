@@ -9,6 +9,7 @@ use notify::{RecursiveMode, Watcher};
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use crate::go_helper;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir, walk_project_files, SearchIndex,
@@ -438,6 +439,28 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Initialize call graph with the project root
     let graph = CallGraph::new(root_path.clone());
     *ctx.callgraph().borrow_mut() = Some(graph);
+
+    // Kick off the optional Go helper. Runs in a background thread so
+    // configure returns promptly even on large Go modules; result is
+    // drained lazily by AppContext::go_helper_data on first use. Silent
+    // by design — if go isn't installed, the project isn't a Go module,
+    // or the helper binary is missing, we just leave the slot empty.
+    let helper_root = root_path.clone();
+    let helper_cache = resolve_cache_dir(&root_path, storage_dir.as_deref());
+    let (helper_tx, helper_rx) = unbounded();
+    *ctx.go_helper_rx().borrow_mut() = Some(helper_rx);
+    thread::spawn(move || {
+        let result = go_helper::resolve_for_root(
+            &helper_root,
+            std::time::Duration::from_secs(60),
+        );
+        if let Ok(ref out) = result {
+            if let Err(e) = go_helper::write_cached(&helper_cache, out) {
+                log::debug!("[aft] go-helper cache write failed: {e}");
+            }
+        }
+        let _ = helper_tx.send(result);
+    });
 
     // Drop old watcher/receiver before creating new ones (re-configure)
     *ctx.watcher().borrow_mut() = None;
