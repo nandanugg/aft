@@ -17,6 +17,7 @@ use crate::context::{
     AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
     SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
 };
+use crate::go_helper;
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
@@ -2245,6 +2246,24 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 }
             }
         }
+    }
+
+    if !home_match {
+        let helper_root = root_path.clone();
+        let helper_cache = resolve_cache_dir(&root_path, next_config.storage_dir.as_deref());
+        let (helper_tx, helper_rx) = unbounded();
+        ctx.install_go_helper_rx(helper_rx);
+        thread::spawn(move || {
+            let result = go_helper::resolve_for_root(&helper_root, Duration::from_secs(60));
+            if let Ok(output) = &result {
+                if let Err(error) = go_helper::write_cached(&helper_cache, output) {
+                    crate::slog_debug!("go-helper cache write failed: {}", error);
+                }
+            }
+            let _ = helper_tx.send(result);
+        });
+    } else {
+        ctx.clear_go_helper();
     }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());

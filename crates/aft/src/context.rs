@@ -16,6 +16,7 @@ use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
 use crate::callgraph_store::{CallGraphStore, CallGraphStoreError};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
+use crate::go_helper::{HelperError, HelperOutput};
 use crate::harness::Harness;
 use crate::inspect::{
     InspectCategory, InspectManager, InspectSnapshot, Tier2RefreshScheduler, Tier2TriggerReason,
@@ -699,6 +700,13 @@ pub struct AppContext {
     semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
     semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
+    /// Resolved Go call edges from the optional `aft-go-helper`. Empty until a
+    /// helper run succeeds; non-Go projects and missing helper/toolchain cases
+    /// leave this as `None`.
+    go_helper_data: parking_lot::Mutex<Option<HelperOutput>>,
+    /// Receiver for an in-flight helper run started during configure.
+    go_helper_rx:
+        parking_lot::Mutex<Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>>,
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
@@ -888,6 +896,8 @@ impl AppContext {
             semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
             semantic_embedding_model: parking_lot::Mutex::new(None),
+            go_helper_data: parking_lot::Mutex::new(None),
+            go_helper_rx: parking_lot::Mutex::new(None),
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_thread: parking_lot::Mutex::new(None),
@@ -911,6 +921,68 @@ impl AppContext {
             tsconfig_membership: parking_lot::Mutex::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
             ),
+        }
+    }
+
+    /// Access cached Go helper output, first draining a completed helper run
+    /// without blocking the request thread.
+    pub fn go_helper_data(&self) -> Option<HelperOutput> {
+        self.poll_go_helper();
+        self.go_helper_data.lock().clone()
+    }
+
+    /// Receiver slot for an in-flight helper run installed by configure.
+    pub fn go_helper_rx(
+        &self,
+    ) -> &parking_lot::Mutex<
+        Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>,
+    > {
+        &self.go_helper_rx
+    }
+
+    pub fn install_go_helper_rx(
+        &self,
+        rx: crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>,
+    ) {
+        *self.go_helper_data.lock() = None;
+        *self.go_helper_rx.lock() = Some(rx);
+    }
+
+    pub fn clear_go_helper(&self) {
+        *self.go_helper_rx.lock() = None;
+        *self.go_helper_data.lock() = None;
+    }
+
+    fn poll_go_helper(&self) {
+        let received = {
+            let rx_ref = self.go_helper_rx.lock();
+            match rx_ref.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(value) => Some(value),
+                    Err(crossbeam_channel::TryRecvError::Empty) => None,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(
+                        HelperError::Io("helper thread disconnected without sending".into()),
+                    )),
+                },
+                None => None,
+            }
+        };
+
+        if let Some(result) = received {
+            *self.go_helper_rx.lock() = None;
+            match result {
+                Ok(output) => {
+                    crate::slog_info!(
+                        "go-helper: {} edges, {} skipped packages",
+                        output.edges.len(),
+                        output.skipped.len()
+                    );
+                    *self.go_helper_data.lock() = Some(output);
+                }
+                Err(error) => {
+                    crate::slog_debug!("go-helper unavailable: {}", error);
+                }
+            }
         }
     }
 
