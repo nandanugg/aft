@@ -240,9 +240,28 @@ pub fn run_helper(
         .spawn()
         .map_err(|e| HelperError::Io(format!("spawn: {e}")))?;
 
-    // We can't easily honor the timeout cross-platform without an
-    // external crate, but we can give up if the process is still alive
-    // after `timeout` by killing it. Poll with try_wait.
+    // Drain stdout and stderr concurrently. The helper emits several MB of
+    // JSON on real projects; if we don't read the pipes while the child
+    // runs, the pipe buffer (typically 64KB) fills and the child blocks
+    // on write forever. Previously this deadlock looked like a timeout
+    // because the wait loop never saw the child exit.
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    // Poll-based timeout. Kill the child if it runs past the deadline.
+    // The reader threads will see EOF and exit on their own.
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -262,16 +281,12 @@ pub fn run_helper(
         }
     }
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        s.read_to_string(&mut stdout)
-            .map_err(|e| HelperError::Io(format!("read stdout: {e}")))?;
-    }
-    if let Some(mut s) = child.stderr.take() {
-        s.read_to_string(&mut stderr)
-            .map_err(|e| HelperError::Io(format!("read stderr: {e}")))?;
-    }
+    let stdout = stdout_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
 
     let status = child
         .wait()

@@ -1536,6 +1536,24 @@ impl CallGraph {
             })
             .collect();
 
+        // Deduplicate paths by their (file, symbol) chain. Multiple call
+        // sites on the same chain (e.g. one test function calling the
+        // target 20 times on different lines) produce 20 paths with
+        // identical symbol sequences but differing line numbers — useless
+        // for the "how does execution reach X" question trace_to answers.
+        // Keep the first occurrence so the reported line is meaningful.
+        {
+            let mut seen: HashSet<Vec<(String, String)>> = HashSet::new();
+            paths.retain(|p| {
+                let key: Vec<(String, String)> = p
+                    .hops
+                    .iter()
+                    .map(|h| (h.file.clone(), h.symbol.clone()))
+                    .collect();
+                seen.insert(key)
+            });
+        }
+
         // Sort paths for deterministic output (by entry point name, then path length)
         paths.sort_by(|a, b| {
             let a_entry = a.hops.first().map(|h| h.symbol.as_str()).unwrap_or("");

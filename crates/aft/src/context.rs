@@ -149,6 +149,17 @@ impl AppContext {
         self.poll_go_helper();
     }
 
+    /// Install helper output synchronously. Called from configure when a
+    /// cache hit lets us skip the async helper thread, and from
+    /// `poll_go_helper` when the async result arrives. Updates both the
+    /// AppContext's cached copy and the CallGraph's resolver.
+    pub fn install_go_helper(&self, data: HelperOutput) {
+        *self.go_helper_data.borrow_mut() = Some(data.clone());
+        if let Some(graph) = self.callgraph.borrow_mut().as_mut() {
+            graph.set_go_helper(data);
+        }
+    }
+
     /// Access the cached Go helper output, draining the in-flight
     /// receiver first so a freshly-completed run becomes visible. The
     /// inner reference is held only for the duration of the borrow.
@@ -194,13 +205,7 @@ impl AppContext {
                         out.edges.len(),
                         out.skipped.len()
                     );
-                    // Store a copy on AppContext (for diagnostics / future
-                    // callers), then move the data into CallGraph so the
-                    // reverse index picks it up on next build.
-                    *self.go_helper_data.borrow_mut() = Some(out.clone());
-                    if let Some(graph) = self.callgraph.borrow_mut().as_mut() {
-                        graph.set_go_helper(out);
-                    }
+                    self.install_go_helper(out);
                 }
                 Err(err) => {
                     // Most variants are normal (no go.mod, no go on PATH,
