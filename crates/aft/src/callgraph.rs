@@ -895,6 +895,55 @@ impl CallGraph {
             .unwrap_or(false)
     }
 
+    /// Find a Go sibling file (same directory) that defines the given
+    /// symbol. Go permits cross-file same-package calls without imports,
+    /// so this is the fallback when the normal import-based resolver
+    /// returns Unresolved and the caller's own file doesn't define the
+    /// symbol either. Builds file data on demand for sibling files.
+    ///
+    /// Returns None if caller_file isn't Go, has no parent, or no sibling
+    /// defines the symbol.
+    fn go_sibling_definer(&mut self, caller_file: &Path, symbol: &str) -> Option<PathBuf> {
+        if caller_file.extension().and_then(|e| e.to_str()) != Some("go") {
+            return None;
+        }
+        let dir = caller_file.parent()?;
+
+        // Snapshot the directory listing first so we don't hold a borrow
+        // on the filesystem iterator while mutating self via build_file.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("go") {
+                    continue;
+                }
+                let same = std::fs::canonicalize(&path)
+                    .ok()
+                    .map(|c| {
+                        std::fs::canonicalize(caller_file)
+                            .ok()
+                            .map(|cc| cc == c)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if same {
+                    continue;
+                }
+                candidates.push(path);
+            }
+        }
+
+        for path in candidates {
+            if let Ok(data) = self.build_file(&path) {
+                if data.symbol_metadata.contains_key(symbol) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
     /// Depth-limited forward call tree traversal.
     ///
     /// Starting from a (file, symbol) pair, recursively follows calls
@@ -964,6 +1013,22 @@ impl CallGraph {
                     &canon,
                     &import_block,
                 );
+
+                // Go cross-file same-package fallback: if the regular
+                // resolver returned Unresolved, try a sibling in the same
+                // directory before giving up.
+                let edge = match edge {
+                    EdgeResolution::Unresolved { callee_name } => {
+                        match self.go_sibling_definer(&canon, &callee_name) {
+                            Some(sibling) => EdgeResolution::Resolved {
+                                file: sibling,
+                                symbol: callee_name,
+                            },
+                            None => EdgeResolution::Unresolved { callee_name },
+                        }
+                    }
+                    resolved => resolved,
+                };
 
                 match edge {
                     EdgeResolution::Resolved {
@@ -1040,6 +1105,48 @@ impl CallGraph {
             let _ = self.build_file(f);
         }
 
+        // Go same-package symbol index: for every Go file, map each symbol
+        // it defines to the file that defines it, keyed by parent
+        // directory. Go allows calls between files in the same package
+        // without an explicit import, so the regular import-based
+        // resolver returns Unresolved for cross-file same-package calls
+        // (e.g. payment/sandbox.go calling prepareChargePaymentResponse
+        // defined in payment/service.go). This lookup covers those.
+        //
+        // Go enforces one package per directory, so dedup across a
+        // directory doesn't need a package-name check — any .go file in
+        // the same dir is in the same package.
+        let go_pkg_symbols: HashMap<PathBuf, HashMap<String, PathBuf>> = {
+            let mut map: HashMap<PathBuf, HashMap<String, PathBuf>> = HashMap::new();
+            for f in &all_files {
+                if f.extension().and_then(|e| e.to_str()) != Some("go") {
+                    continue;
+                }
+                let canon = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone());
+                let dir = match canon.parent() {
+                    Some(d) => d.to_path_buf(),
+                    None => continue,
+                };
+                let data = match self
+                    .data
+                    .get(f)
+                    .or_else(|| self.data.get(&canon))
+                {
+                    Some(d) => d,
+                    None => continue,
+                };
+                let bucket = map.entry(dir).or_default();
+                for sym in data.symbol_metadata.keys() {
+                    // First-writer-wins: if two files in the same package
+                    // define the same symbol name (shouldn't happen in
+                    // valid Go, but can happen mid-refactor), keep the
+                    // first. The Go compiler would reject this anyway.
+                    bucket.entry(sym.clone()).or_insert_with(|| canon.clone());
+                }
+            }
+            map
+        };
+
         // Now build the reverse map
         let mut reverse: ReverseIndex = HashMap::new();
 
@@ -1076,7 +1183,22 @@ impl CallGraph {
                     let (target_file, target_symbol, resolved) = match edge {
                         EdgeResolution::Resolved { file, symbol } => (file, symbol, true),
                         EdgeResolution::Unresolved { callee_name } => {
-                            (canon_caller.as_ref().clone(), callee_name, false)
+                            // Go same-package fallback: if the caller is a
+                            // Go file and a sibling in the same directory
+                            // defines this symbol, resolve there.
+                            let resolved_sibling = if file_data.lang == LangId::Go {
+                                canon_caller.parent().and_then(|dir| {
+                                    go_pkg_symbols
+                                        .get(dir)
+                                        .and_then(|syms| syms.get(&callee_name))
+                                })
+                            } else {
+                                None
+                            };
+                            match resolved_sibling {
+                                Some(sibling) => (sibling.clone(), callee_name, true),
+                                None => (canon_caller.as_ref().clone(), callee_name, false),
+                            }
                         }
                     };
 
