@@ -76,7 +76,6 @@ cat > "$HOOKS_DIR/aft" << 'WRAPPER_EOF'
 set -euo pipefail
 
 AFT_BINARY="__AFT_BINARY_PATH__"
-WORK_DIR="${PWD}"
 
 # Check binary exists
 if [ ! -x "$AFT_BINARY" ]; then
@@ -84,13 +83,50 @@ if [ ! -x "$AFT_BINARY" ]; then
   exit 1
 fi
 
+# Detect a project root by walking up from the given path looking for a
+# language marker (go.mod, Cargo.toml, package.json, pyproject.toml) or a
+# .git directory. Without this, callers/trace_to silently scan only the
+# shell's cwd — catastrophic when the target file lives in a different
+# module than $PWD.
+detect_project_root() {
+  local start="${1:-$PWD}"
+  local dir
+  if [ -d "$start" ]; then
+    dir="$start"
+  else
+    dir="$(dirname "$start")"
+  fi
+  # Absolutize so the walk terminates cleanly at /.
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || dir="$PWD"
+
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    if [ -f "$dir/go.mod" ] \
+        || [ -f "$dir/Cargo.toml" ] \
+        || [ -f "$dir/package.json" ] \
+        || [ -f "$dir/pyproject.toml" ] \
+        || [ -d "$dir/.git" ]; then
+      echo "$dir"
+      return
+    fi
+    dir="$(dirname "$dir")"
+  done
+  echo "$PWD"
+}
+
 # Send command to AFT binary
 call_aft() {
   local cmd="$1"
-  shift
-  local params="$1"
+  local params="$2"
+  local anchor="${3:-}"
 
-  local config_req=$(jq -cn --arg root "$WORK_DIR" '{id:"cfg",command:"configure",project_root:$root}')
+  local work_dir
+  if [ -n "$anchor" ]; then
+    work_dir="$(detect_project_root "$anchor")"
+  else
+    work_dir="$PWD"
+  fi
+
+  local config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
@@ -142,7 +178,7 @@ case "$CMD" in
     else
       PARAMS=$(jq -cn --arg f "$FILE" '{file:$f}')
     fi
-    call_aft "outline" "$PARAMS"
+    call_aft "outline" "$PARAMS" "$FILE"
     ;;
 
   zoom)
@@ -155,7 +191,7 @@ case "$CMD" in
     else
       PARAMS=$(jq -cn --arg f "$FILE" '{file:$f}')
     fi
-    call_aft "zoom" "$PARAMS"
+    call_aft "zoom" "$PARAMS" "$FILE"
     ;;
 
   call_tree)
@@ -164,7 +200,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft call_tree <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "call_tree" "$PARAMS"
+    call_aft "call_tree" "$PARAMS" "$FILE"
     ;;
 
   callers)
@@ -173,7 +209,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft callers <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "callers" "$PARAMS"
+    call_aft "callers" "$PARAMS" "$FILE"
     ;;
 
   impact)
@@ -182,7 +218,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft impact <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "impact" "$PARAMS"
+    call_aft "impact" "$PARAMS" "$FILE"
     ;;
 
   trace_to)
@@ -191,7 +227,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft trace_to <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "trace_to" "$PARAMS"
+    call_aft "trace_to" "$PARAMS" "$FILE"
     ;;
 
   trace_data)
@@ -208,7 +244,7 @@ case "$CMD" in
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" --arg e "$EXPR" --argjson d "$DEPTH" \
       '{file:$f,symbol:$s,expression:$e,depth:$d}')
-    call_aft "trace_data" "$PARAMS"
+    call_aft "trace_data" "$PARAMS" "$FILE"
     ;;
 
   read)
@@ -219,7 +255,7 @@ case "$CMD" in
 
     PARAMS=$(jq -cn --arg f "$FILE" --argjson s "$START" --argjson l "$LIMIT" \
       '{file:$f,start_line:$s,limit:$l}')
-    call_aft "read" "$PARAMS"
+    call_aft "read" "$PARAMS" "$FILE"
     ;;
 
   grep)
