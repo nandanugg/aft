@@ -272,6 +272,14 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         return true;
     }
 
+    // Exported methods on service-style structs are entry points in Go and
+    // Rust: they are commonly invoked externally by routers, RPC servers, or
+    // trait/interface dispatch. Scope this to Go/Rust to avoid over-marking
+    // class methods in languages where they are usually internal members.
+    if exported && *kind == SymbolKind::Method && matches!(lang, LangId::Go | LangId::Rust) {
+        return true;
+    }
+
     // Main/init patterns (case-insensitive exact match, any kind)
     let lower = name.to_lowercase();
     if MAIN_INIT_NAMES.contains(&lower.as_str()) {
@@ -615,6 +623,7 @@ impl CallGraph {
         short_name: &str,
         caller_file: &Path,
         import_block: &ImportBlock,
+        caller_file_defines_callee: bool,
         mut file_exports_symbol: F,
         mut file_default_export_symbol: D,
     ) -> EdgeResolution
@@ -762,6 +771,13 @@ impl CallGraph {
             }
         }
 
+        if caller_file_defines_callee {
+            return EdgeResolution::Resolved {
+                file: caller_file.to_path_buf(),
+                symbol: short_name.to_owned(),
+            };
+        }
+
         EdgeResolution::Unresolved {
             callee_name: short_name.to_owned(),
         }
@@ -790,12 +806,17 @@ impl CallGraph {
         caller_file: &Path,
         import_block: &ImportBlock,
     ) -> EdgeResolution {
+        let caller_defines = self
+            .lookup_file_data(caller_file)
+            .map(|data| data.symbol_metadata.contains_key(short_name))
+            .unwrap_or(false);
         let graph = RefCell::new(self);
         Self::resolve_cross_file_edge_with_exports(
             full_callee,
             short_name,
             caller_file,
             import_block,
+            caller_defines,
             |path, symbol_name| graph.borrow_mut().file_exports_symbol(path, symbol_name),
             |path| graph.borrow_mut().file_default_export_symbol(path),
         )
