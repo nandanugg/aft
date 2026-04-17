@@ -924,6 +924,13 @@ impl AppContext {
         }
     }
 
+    /// Drain any pending helper result without blocking.
+    /// Call this at the start of command handlers that may consume helper
+    /// output so a recently-completed run becomes visible.
+    pub fn drain_go_helper(&self) {
+        self.poll_go_helper();
+    }
+
     /// Access cached Go helper output, first draining a completed helper run
     /// without blocking the request thread.
     pub fn go_helper_data(&self) -> Option<HelperOutput> {
