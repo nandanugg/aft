@@ -358,31 +358,11 @@ call_aft() {
 }
 
 case "$TOOL_NAME" in
-  Read)
-    FILE_PATH=$(echo "$TOOL_INPUT" | jq -r '.file_path // empty')
-    [ -z "$FILE_PATH" ] && exit 0
-
-    OFFSET=$(echo "$TOOL_INPUT" | jq -r '.offset // 0')
-    LIMIT=$(echo "$TOOL_INPUT" | jq -r '.limit // 2000')
-    START_LINE=$((OFFSET + 1))
-
-    PARAMS=$(jq -cn --arg f "$FILE_PATH" --argjson s "$START_LINE" --argjson l "$LIMIT" \
-      '{file:$f,start_line:$s,limit:$l}')
-
-    RESULT=$(call_aft "read" "$PARAMS")
-    [ -z "$RESULT" ] && exit 0
-
-    SUCCESS=$(echo "$RESULT" | jq -r '.success')
-    [ "$SUCCESS" != "true" ] && exit 0
-
-    CONTENT=$(echo "$RESULT" | jq -r '.content // empty')
-    [ -z "$CONTENT" ] && exit 0
-
-    # Output to stderr for exit 2 blocking message
-    echo "[AFT Read] $FILE_PATH" >&2
-    echo "$CONTENT" >&2
-    exit 2
-    ;;
+  # Read is intentionally not hooked. If the hook intercepts Read and
+  # exits 2, the native Read tool never executes, and Claude Code's Edit
+  # tool then fails its "you must Read before Edit" validation. The
+  # agent is told in AFT.md to call `aft read <file>` directly when it
+  # wants an indexed read, and to use native Read when it plans to Edit.
 
   Grep)
     PATTERN=$(echo "$TOOL_INPUT" | jq -r '.pattern // empty')
@@ -573,7 +553,25 @@ TypeScript, JavaScript, Python, Rust, Go, C/C++, Java, Ruby, Markdown
 
 ## Hook Integration
 
-Read, Grep, and Glob tools are automatically routed through AFT via hooks for indexed performance.
+Grep and Glob are automatically routed through AFT via hooks for indexed performance. Read is **not** hooked — see below.
+
+## Reading files: prefer `aft read`, except before Edit
+
+For plain inspection (understanding code, answering questions, collecting context), call `aft read <file>` directly:
+
+```bash
+aft read path/to/file.go              # whole file, with line numbers
+aft read path/to/file.go 100 50       # 50 lines starting at line 100
+```
+
+It's indexed, cheaper in tokens than native Read, and faster on repeat reads within a session.
+
+**The exception: if you plan to Edit the file, use native Read first.** Claude Code's Edit tool validates that you've done a native Read of the file's current content before allowing an edit. `aft read` doesn't satisfy that check — Edit will reject the call. So:
+
+- Inspecting / answering / surveying → `aft read`.
+- About to Edit → native Read tool, then Edit.
+
+This is why Read is not registered as a hook: intercepting native Read would bypass the pre-Edit validation and break the Read→Edit workflow.
 INSTRUCTIONS_EOF
 
 info "Installed instructions: $CLAUDE_DIR/AFT.md"
@@ -595,46 +593,53 @@ fi
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 
 if [ -f "$SETTINGS_FILE" ]; then
-    # Check if hooks already exist
-    if jq -e '.hooks.PreToolUse[] | select(.matcher == "Read") | .hooks[] | select(.command | contains("aft-hook.sh"))' "$SETTINGS_FILE" &>/dev/null; then
-        info "AFT hooks already configured in settings.json"
-    else
-        # Add AFT hooks to existing PreToolUse array
-        TEMP_FILE=$(mktemp)
+    # Idempotent update: strip every existing aft-hook.sh entry first,
+    # then add a clean Grep + Glob pair. Re-runs don't pile up duplicates,
+    # and old Read entries (which break Edit validation) get cleaned up.
+    # Unrelated PreToolUse hooks (Bash, etc.) and all other settings keys
+    # are preserved.
+    TEMP_FILE=$(mktemp)
+    jq --arg hooks_dir "$HOOKS_DIR" '
+      .hooks.PreToolUse = (
+        # Drop any entry whose hooks include an aft-hook.sh command.
+        ((.hooks.PreToolUse // []) | map(
+          . as $entry
+          | ($entry.hooks // [])
+              | map(select((.command // "") | contains("aft-hook.sh")))
+              | length as $aft
+          | if $aft > 0 then empty else $entry end
+        )) + [
+          {
+            "matcher": "Grep",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Grep")}]
+          },
+          {
+            "matcher": "Glob",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Glob")}]
+          }
+        ]
+      )
+    ' "$SETTINGS_FILE" > "$TEMP_FILE"
 
-        jq --arg hooks_dir "$HOOKS_DIR" '
-          .hooks.PreToolUse = (
-            (.hooks.PreToolUse // []) + [
-              {
-                "matcher": "Read",
-                "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Read")}]
-              },
-              {
-                "matcher": "Grep",
-                "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Grep")}]
-              },
-              {
-                "matcher": "Glob",
-                "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Glob")}]
-              }
-            ]
-          )
-        ' "$SETTINGS_FILE" > "$TEMP_FILE"
-
+    if [ -s "$TEMP_FILE" ]; then
         mv "$TEMP_FILE" "$SETTINGS_FILE"
-        info "Added AFT hooks to settings.json"
+        info "Refreshed AFT hooks in settings.json (Grep + Glob)"
+    else
+        rm -f "$TEMP_FILE"
+        warn "jq produced empty output — leaving settings.json untouched"
     fi
 else
-    # Create new settings.json
+    # Create new settings.json. Read is intentionally NOT registered as a
+    # hook: routing Read through aft causes Claude Code's Edit tool to
+    # fail its pre-read validation (the native Read never runs). Instead,
+    # AFT.md tells the agent to call `aft read` directly as a CLI command
+    # when it just wants to inspect a file, and fall back to native Read
+    # when it plans to Edit afterward.
     cat > "$SETTINGS_FILE" << SETTINGS_EOF
 {
   "\$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
     "PreToolUse": [
-      {
-        "matcher": "Read",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-hook.sh Read"}]
-      },
       {
         "matcher": "Grep",
         "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-hook.sh Grep"}]
@@ -647,7 +652,7 @@ else
   }
 }
 SETTINGS_EOF
-    info "Created settings.json with AFT hooks"
+    info "Created settings.json with AFT hooks (Grep + Glob)"
 fi
 
 # Add aft to PATH via symlink

@@ -169,8 +169,22 @@ For Go projects, AFT automatically runs `aft-go-helper` at configure time (if av
 
 ## Hook Integration
 
-Grep and Glob tools are automatically routed through AFT via hooks for indexed performance.
+Grep and Glob are automatically routed through AFT via hooks for indexed performance. Read is **not** hooked — see below.
 
-**Reading files**: Use `aft read` via Bash for indexed reads with token savings.
+## Reading files: prefer `aft read`, except before Edit
 
-**Warning**: When you need to Edit a file, use the native Read tool (not `aft read`) because Edit requires a prior Read tool call for validation.
+For plain inspection (understanding code, answering questions, collecting context), call `aft read <file>` directly:
+
+```bash
+aft read path/to/file.go              # whole file, with line numbers
+aft read path/to/file.go 100 50       # 50 lines starting at line 100
+```
+
+It's indexed, cheaper in tokens than native Read, and faster on repeat reads within a session.
+
+**The exception: if you plan to Edit the file, use native Read first.** Claude Code's Edit tool validates that you've done a native Read of the file's current content before allowing an edit. `aft read` doesn't satisfy that check — Edit will reject the call. So:
+
+- Inspecting / answering / surveying → `aft read`.
+- About to Edit → native Read tool, then Edit.
+
+This is why Read is not registered as a hook: intercepting native Read would bypass the pre-Edit validation and break the Read→Edit workflow.
