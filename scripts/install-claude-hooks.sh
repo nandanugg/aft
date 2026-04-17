@@ -43,15 +43,16 @@ cat > "$HOOKS_DIR/aft" << 'WRAPPER_EOF'
 # Usage: aft <command> [args...]
 #
 # Commands:
-#   outline <file|dir>              - Get file/directory structure (symbols, functions, classes)
-#   zoom <file> [symbol]            - Inspect symbol with call-graph annotations
-#   call_tree <file> <symbol>       - What does this function call? (forward graph)
-#   callers <file> <symbol>         - Who calls this function? (reverse graph)
-#   impact <file> <symbol>          - What breaks if this changes?
-#   trace_to <file> <symbol>        - How does execution reach this function?
-#   read <file> [start] [limit]     - Read file with line numbers
-#   grep <pattern> [path]           - Search with trigram index
-#   glob <pattern> [path]           - Find files by pattern
+#   outline <file|dir>                       - Get file/directory structure (symbols, functions, classes)
+#   zoom <file> [symbol]                     - Inspect symbol with call-graph annotations
+#   call_tree <file> <symbol>                - What does this function call? (forward graph)
+#   callers <file> <symbol>                  - Who calls this function? (reverse graph)
+#   impact <file> <symbol>                   - What breaks if this changes?
+#   trace_to <file> <symbol>                 - How does execution reach this function?
+#   trace_data <file> <symbol> <expr> [depth] - How does this value flow through the code?
+#   read <file> [start] [limit]              - Read file with line numbers
+#   grep <pattern> [path]                    - Search with trigram index
+#   glob <pattern> [path]                    - Find files by pattern
 
 set -euo pipefail
 
@@ -73,7 +74,10 @@ call_aft() {
   local config_req=$(jq -cn --arg root "$WORK_DIR" '{id:"cfg",command:"configure",project_root:$root}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
-  local result=$( (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2>/dev/null | grep '"id":"cmd"' | head -1)
+  # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
+  # triggers SIGPIPE (exit 141) on the upstream grep once the response exceeds the
+  # pipe buffer, silently killing the script on large outlines.
+  local result=$( (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2>/dev/null | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
 
   # Check success
   local success=$(echo "$result" | jq -r '.success // false')
@@ -102,11 +106,19 @@ case "$CMD" in
 
     # Check if directory - discover source files
     if [ -d "$FILE" ]; then
+      # `awk 'NR<=100'` caps output without SIGPIPE-ing the upstream find;
+      # `head -100` would close stdin early and, under `set -o pipefail`, kill the script.
       FILES=$(find "$FILE" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \
         -o -name "*.py" -o -name "*.rs" -o -name "*.go" -o -name "*.c" -o -name "*.cpp" -o -name "*.h" \
         -o -name "*.java" -o -name "*.rb" -o -name "*.md" \) \
         ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/target/*" ! -path "*/dist/*" \
-        2>/dev/null | head -100 | jq -R . | jq -s .)
+        2>/dev/null | awk 'NR<=100' | jq -R . | jq -s .)
+
+      FILE_COUNT=$(echo "$FILES" | jq 'length')
+      if [ "$FILE_COUNT" = "0" ]; then
+        echo "No supported source files found in '$FILE' (looked for .ts/.tsx/.js/.jsx/.py/.rs/.go/.c/.cpp/.h/.java/.rb/.md, excluding node_modules/target/dist/.git)." >&2
+        exit 1
+      fi
       PARAMS=$(jq -cn --argjson files "$FILES" '{files:$files}')
     else
       PARAMS=$(jq -cn --arg f "$FILE" '{file:$f}')
@@ -163,6 +175,23 @@ case "$CMD" in
     call_aft "trace_to" "$PARAMS"
     ;;
 
+  trace_data)
+    FILE="${1:-}"
+    SYMBOL="${2:-}"
+    EXPR="${3:-}"
+    DEPTH="${4:-5}"
+    if [ -z "$FILE" ] || [ -z "$SYMBOL" ] || [ -z "$EXPR" ]; then
+      echo "Usage: aft trace_data <file> <symbol> <expression> [depth]"
+      echo "  Traces how <expression> flows through assignments and across function boundaries."
+      echo "  <symbol> is the function containing the expression; [depth] defaults to 5 (max 100)."
+      exit 1
+    fi
+
+    PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" --arg e "$EXPR" --argjson d "$DEPTH" \
+      '{file:$f,symbol:$s,expression:$e,depth:$d}')
+    call_aft "trace_data" "$PARAMS"
+    ;;
+
   read)
     FILE="${1:-}"
     START="${2:-1}"
@@ -197,23 +226,26 @@ case "$CMD" in
 AFT - Agent File Tools (Tree-sitter powered code analysis)
 
 SEMANTIC COMMANDS (massive context savings):
-  aft outline <file|dir>          Structure without content (~10% tokens)
-  aft zoom <file> <symbol>        Symbol + call graph annotations
-  aft call_tree <file> <symbol>   Forward call graph (what does it call?)
-  aft callers <file> <symbol>     Reverse call graph (who calls it?)
-  aft impact <file> <symbol>      What breaks if this changes?
-  aft trace_to <file> <symbol>    How does execution reach this?
+  aft outline <file|dir>           Structure without content (~10% tokens)
+  aft zoom <file> <symbol>         Symbol + call graph annotations
+  aft call_tree <file> <symbol>    Forward call graph (what does it call?)
+  aft callers <file> <symbol>      Reverse call graph (who calls it?)
+  aft impact <file> <symbol>       What breaks if this changes?
+  aft trace_to <file> <symbol>     How does execution reach this?
+  aft trace_data <file> <symbol> <expr> [depth]
+                                   How does a value flow through assignments/calls?
 
 BASIC COMMANDS:
-  aft read <file> [start] [limit] Read with line numbers
-  aft grep <pattern> [path]       Trigram-indexed search
-  aft glob <pattern> [path]       File pattern matching
+  aft read <file> [start] [limit]  Read with line numbers
+  aft grep <pattern> [path]        Trigram-indexed search
+  aft glob <pattern> [path]        File pattern matching
 
 EXAMPLES:
-  aft outline src/                # Get structure of all files in src/
-  aft zoom main.go main           # Inspect main() with call graph
-  aft callers api.go HandleRequest # Find all callers
-  aft call_tree service.go Process # See what Process() calls
+  aft outline src/                     # Get structure of all files in src/
+  aft zoom main.go main                # Inspect main() with call graph
+  aft callers api.go HandleRequest     # Find all callers
+  aft call_tree service.go Process     # See what Process() calls
+  aft trace_data svc.go handle userId  # Trace where userId came from and where it goes
 EOF
     ;;
 
@@ -256,7 +288,8 @@ call_aft() {
   local config_req=$(jq -cn --arg root "$WORK_DIR" '{id:"cfg",command:"configure",project_root:$root}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
-  (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2>/dev/null | grep '"id":"cmd"' | head -1
+  # awk avoids the SIGPIPE-from-head-under-pipefail trap that silently killed large responses.
+  (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2>/dev/null | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}'
 }
 
 case "$TOOL_NAME" in
@@ -351,11 +384,24 @@ cat > "$CLAUDE_DIR/AFT.md" << 'INSTRUCTIONS_EOF'
 
 Tree-sitter powered code analysis for massive context savings (60-90% token reduction).
 
+## Start With Outline, Escalate From There
+
+**Outline is the default entry point.** Before reading full files, run `aft outline` to get structure — ~10% the tokens of a full read. This applies to code, markdown, config, and docs.
+
+**Escalate to semantic commands only when the task needs them:**
+- `aft zoom <file> <symbol>` — when you need to read a specific function body.
+- `aft call_tree` / `aft callers` — when you need cross-file call relationships (grep can't infer these).
+- `aft impact` — before a refactor, to see what breaks.
+- `aft trace_to` — when debugging how execution reaches a point.
+- `aft trace_data` — when tracking where a value came from or where it flows next.
+
+**Don't use semantic commands reflexively.** For verification tasks — "does this symbol still exist?", "is this doc accurate?" — outline alone is usually enough. Reaching for zoom/call_tree on every task inflates work without improving answers.
+
 ## AFT CLI Commands
 
 Use `aft` commands via Bash for code navigation. These provide structured output optimized for LLM consumption.
 
-### Semantic Commands (prefer these over raw file reads)
+### Semantic Commands
 
 ```bash
 # Get structure without content (~10% of full read tokens)
@@ -373,8 +419,11 @@ aft callers <file> <symbol>
 # Impact analysis - what breaks if this changes?
 aft impact <file> <symbol>
 
-# Trace analysis - how does execution reach this?
+# Control flow - how does execution reach this function?
 aft trace_to <file> <symbol>
+
+# Data flow - how does a value flow through assignments and across calls?
+aft trace_data <file> <symbol> <expression> [depth]
 ```
 
 ### Basic Commands
@@ -385,6 +434,30 @@ aft grep <pattern> [path]              # Trigram-indexed search
 aft glob <pattern> [path]              # File pattern matching
 ```
 
+## Tracing: control flow vs. data flow
+
+Two different questions, two commands:
+- **"How does execution reach this function?"** → `aft trace_to` (control flow).
+  Example: `aft trace_to api/handler.go ChargePayment` — shows the call chain that lands on ChargePayment.
+- **"Where did this value come from / where does it go next?"** → `aft trace_data` (data flow through assignments and parameter passing).
+  Example: `aft trace_data api/handler.go ChargePayment merchantID` — traces how `merchantID` propagates within and across function boundaries.
+
+For a bug like "this field got the wrong value," `trace_data` is usually the right starting point; for "why did this handler run," `trace_to` is.
+
+### Patterns trace_data handles
+
+`trace_data` follows values across these constructs — use it confidently on idiomatic code instead of manually reading every caller:
+
+- **Direct args**: `f(x)` → hop into `f`'s matching parameter.
+- **Reference args**: `f(&x)` → hop into `f`'s pointer parameter.
+- **Field-access args**: `f(x.Field)` → approximate hop into `f`'s matching parameter (propagation continues).
+- **Struct-literal wraps**: `w := Wrapper{Field: x}` → approximate assignment hop to `w`, then tracking continues on `w`.
+- **Pointer-write intrinsics** (`json.Unmarshal`, `yaml.Unmarshal`, `xml.Unmarshal`, `toml.Unmarshal`, `proto.Unmarshal`, `bson.Unmarshal`, `msgpack.Unmarshal`): `json.Unmarshal(raw, &out)` binds `raw`'s flow into `out`, and further uses of `out` are tracked.
+- **Method receivers**: `x.Method(...)` → hop into the receiver parameter name (Go `func (u *T) Method(...)`, Rust `&self`).
+- **Destructuring assigns**: `a, b := f()` and `{a, b} = f()` → tracking splits onto the new bindings.
+
+Hops marked `"approximate": true` are lossy (field access, struct wraps, writer intrinsics) — the flow exists but the exact subfield is not resolved.
+
 ## When to Use What
 
 | Task | Command | Token Savings |
@@ -394,14 +467,32 @@ aft glob <pattern> [path]              # File pattern matching
 | Understanding dependencies | `aft call_tree` | Structured graph |
 | Finding usage sites | `aft callers` | All call sites |
 | Planning refactors | `aft impact` | Change propagation |
-| Debugging call paths | `aft trace_to` | Execution paths |
+| Debugging control flow | `aft trace_to` | Execution paths |
+| Debugging data flow | `aft trace_data` | Value propagation |
 
-## Best Practices
+## Rules
 
-1. **Start with outline** - Before reading a file, use `aft outline` to understand structure
-2. **Zoom to symbols** - Instead of reading full files, use `aft zoom` for specific functions
-3. **Use call graphs** - For understanding code flow, `call_tree` and `callers` are more efficient than grep
-4. **Impact before refactor** - Run `aft impact` before making changes to understand blast radius
+Match the command to the task type. Outline is universal; the semantic graph tools pay off for *comprehension* tasks, not for *verification* tasks.
+
+**Verification** ("does X still exist?", "is this doc accurate?"):
+1. Start with `aft outline`.
+2. Outline is usually enough — don't reach for zoom/call_tree unless you need behavior, not just presence.
+3. **Outline before delegating.** When briefing a subagent to explore a repo or directory, run `aft outline <path>` yourself first and include the output in the subagent prompt.
+
+**Comprehension** ("how does this flow work?", "what breaks if I change X?", "where did this value come from?"):
+4. Use `zoom` for function bodies.
+5. Use `call_tree` / `callers` for cross-file call relationships grep cannot see.
+6. Use `impact` before a refactor.
+7. Use `trace_to` for control flow questions, `trace_data` for data flow questions.
+
+**When grep is fine.** `aft grep` for a bare identifier is correct when you just need to know "does this string appear, and where." Reach for semantic commands when you need to understand *behavior* behind the name, not every time a name shows up.
+
+## Context Protection
+
+Context is finite. Even when a user explicitly requests "contents" or "read all files":
+- For directories with 5+ files, run `aft outline` first and confirm which files are actually needed.
+- Never read more than 3-5 files in a single action without confirming user intent.
+- "Read all files" is a request, not a command to fill context — propose outline + selective reads instead.
 
 ## Supported Languages
 

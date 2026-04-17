@@ -335,15 +335,196 @@ pub struct TraceDataResult {
     pub depth_limited: bool,
 }
 
+impl TraceDataResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "trace_data {} in {} ({})\n",
+            self.expression, self.origin_symbol, self.origin_file
+        ));
+        if self.hops.is_empty() {
+            out.push_str("  (no hops)\n");
+        } else {
+            for (i, hop) in self.hops.iter().enumerate() {
+                let approx = if hop.approximate { " approximate" } else { "" };
+                out.push_str(&format!(
+                    "  {}. {}.{}  {}:{}  {}{}\n",
+                    i + 1,
+                    hop.symbol,
+                    hop.variable,
+                    hop.file,
+                    hop.line,
+                    hop.flow_type,
+                    approx,
+                ));
+            }
+        }
+        if self.depth_limited {
+            out.push_str("depth limit reached\n");
+        }
+        out
+    }
+}
+
+impl TraceToResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "trace_to {} ({})  paths={} entries={} truncated={}{}\n",
+            self.target_symbol,
+            self.target_file,
+            self.total_paths,
+            self.entry_points_found,
+            self.truncated_paths,
+            if self.max_depth_reached {
+                " max_depth_reached"
+            } else {
+                ""
+            },
+        ));
+        if self.paths.is_empty() {
+            out.push_str("  (no paths)\n");
+        } else {
+            for (i, path) in self.paths.iter().enumerate() {
+                out.push_str(&format!("  path {}:\n", i + 1));
+                for hop in &path.hops {
+                    let entry = if hop.is_entry_point { " [entry]" } else { "" };
+                    out.push_str(&format!(
+                        "    {} ({}:{}){}\n",
+                        hop.symbol, hop.file, hop.line, entry
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl CallersResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "callers of {} ({})  total={} files={} scanned={}\n",
+            self.symbol,
+            self.file,
+            self.total_callers,
+            self.callers.len(),
+            self.scanned_files,
+        ));
+        if self.callers.is_empty() {
+            out.push_str("  (no callers)\n");
+        } else {
+            for group in &self.callers {
+                out.push_str(&format!("  {} ({}):\n", group.file, group.callers.len()));
+                for c in &group.callers {
+                    out.push_str(&format!("    - {}:{}\n", c.symbol, c.line));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl ImpactResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        let sig = self.signature.as_deref().unwrap_or("");
+        out.push_str(&format!(
+            "impact {} ({})  affected={} files={}\n",
+            self.symbol, self.file, self.total_affected, self.affected_files,
+        ));
+        if !sig.is_empty() {
+            out.push_str(&format!("  signature: {}\n", sig));
+        }
+        if !self.parameters.is_empty() {
+            out.push_str(&format!("  parameters: {}\n", self.parameters.join(", ")));
+        }
+        if self.callers.is_empty() {
+            out.push_str("  (no callers)\n");
+        } else {
+            for c in &self.callers {
+                let entry = if c.is_entry_point { " [entry]" } else { "" };
+                out.push_str(&format!(
+                    "  - {} ({}:{}){}\n",
+                    c.caller_symbol, c.caller_file, c.line, entry
+                ));
+                if let Some(expr) = &c.call_expression {
+                    out.push_str(&format!("      {}\n", expr));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl CallTreeNode {
+    /// Compact LLM-friendly rendering (indented tree).
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        self.render_into(&mut out, 0);
+        out
+    }
+
+    fn render_into(&self, out: &mut String, depth: usize) {
+        let indent = "  ".repeat(depth);
+        let unresolved = if self.resolved { "" } else { " [unresolved]" };
+        let sig = self
+            .signature
+            .as_deref()
+            .map(|s| format!("  {}", s))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}- {} ({}:{}){}{}\n",
+            indent, self.name, self.file, self.line, unresolved, sig
+        ));
+        for child in &self.children {
+            child.render_into(out, depth + 1);
+        }
+    }
+}
+
 /// Extract parameter names from a function signature string.
 ///
 /// Strips language-specific receivers (`self`, `&self`, `&mut self` for Rust,
 /// `self` for Python) and type annotations / default values. Returns just
 /// the parameter names.
 pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
+    // Go methods look like `func (recv Type) Name(params) ret`. The first
+    // parenthesised block is the receiver — skip it so we find the real
+    // parameter list. Other languages have no receiver block, so start from
+    // the first `(` as usual.
+    let scan_from = if lang == LangId::Go {
+        let trimmed = signature.trim_start();
+        let offset = signature.len() - trimmed.len();
+        if let Some(rest) = trimmed.strip_prefix("func ") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                // Walk the receiver parens to find its matching close.
+                if let Some(close) = first_top_level(&rest[1..], ')') {
+                    // Absolute index of the char after the receiver's ')'.
+                    let receiver_abs_end =
+                        offset + (trimmed.len() - rest.len()) + 1 + close + 1;
+                    receiver_abs_end
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     // Find the parameter list between parentheses
-    let start = match signature.find('(') {
-        Some(i) => i + 1,
+    let start = match signature[scan_from..].find('(') {
+        Some(i) => scan_from + i + 1,
         None => return Vec::new(),
     };
     let end = match signature[start..].find(')') {
@@ -1414,8 +1595,15 @@ impl CallGraph {
 
         let root = tree.root_node();
 
-        // Find the symbol's body node (the function/method definition node)
-        let body_node = match find_node_covering_range(root, body_start, body_end) {
+        // Find the symbol's function/method-declaration node. The symbol's
+        // reported range may include leading doc comments that are siblings of
+        // the function node — in that case a simple covers-range lookup falls
+        // back to the source_file root and the walker leaks into unrelated
+        // functions. Prefer a name-matched declaration whose range is inside
+        // the reported range; fall back to covering-range if nothing matches.
+        let body_node = find_function_decl_node(root, &source, body_start, body_end, symbol)
+            .or_else(|| find_node_covering_range(root, body_start, body_end));
+        let body_node = match body_node {
             Some(n) => n,
             None => return,
         };
@@ -1468,6 +1656,7 @@ impl CallGraph {
                 | "assignment_expression"
                 | "augmented_assignment_expression"
                 | "assignment"
+                | "assignment_statement"
                 | "let_declaration"
                 | "short_var_declaration"
         );
@@ -1476,19 +1665,13 @@ impl CallGraph {
             if let Some((new_name, init_text, line, is_approx)) =
                 self.extract_assignment_info(node, source, lang, tracked_names)
             {
-                // The RHS references a tracked name — add assignment hop
-                if !is_approx {
-                    hops.push(DataFlowHop {
-                        file: rel_file.to_string(),
-                        symbol: symbol.to_string(),
-                        variable: new_name.clone(),
-                        line,
-                        flow_type: "assignment".to_string(),
-                        approximate: false,
-                    });
-                    tracked_names.push(new_name);
-                } else {
-                    // Destructuring or pattern — approximate
+                // If the LHS is a destructuring pattern, we can't attribute the
+                // flow to a single name — emit an approximate hop carrying the
+                // pattern text and stop tracking through this branch.
+                let is_destructuring_pattern =
+                    new_name.starts_with('{') || new_name.starts_with('[');
+
+                if is_destructuring_pattern {
                     hops.push(DataFlowHop {
                         file: rel_file.to_string(),
                         symbol: symbol.to_string(),
@@ -1497,9 +1680,38 @@ impl CallGraph {
                         flow_type: "assignment".to_string(),
                         approximate: true,
                     });
-                    // Don't track further through this branch
                     return;
                 }
+
+                // LHS is a field/index write (e.g. `m.Field = x` or `a[i] = x`).
+                // Emit a distinct `field_write` hop. Don't extend tracked_names
+                // with the compound path — downstream tracking treats names as
+                // bare identifiers, and "m.Field" would produce noisy matches.
+                let is_field_write = new_name.contains('.')
+                    || new_name.contains('[')
+                    || new_name.starts_with('*');
+
+                if is_field_write {
+                    hops.push(DataFlowHop {
+                        file: rel_file.to_string(),
+                        symbol: symbol.to_string(),
+                        variable: new_name,
+                        line,
+                        flow_type: "field_write".to_string(),
+                        approximate: is_approx,
+                    });
+                    return;
+                }
+
+                hops.push(DataFlowHop {
+                    file: rel_file.to_string(),
+                    symbol: symbol.to_string(),
+                    variable: new_name.clone(),
+                    line,
+                    flow_type: "assignment".to_string(),
+                    approximate: is_approx,
+                });
+                tracked_names.push(new_name);
             }
         }
 
@@ -1549,7 +1761,12 @@ impl CallGraph {
     }
 
     /// Check if an assignment/declaration node assigns from a tracked name.
-    /// Returns (new_name, init_text, line, is_approximate).
+    /// Returns `(new_name, init_text, line, is_approximate)`.
+    ///
+    /// Uses [`classify_expr_text`] so all assignment forms uniformly handle:
+    /// direct identifier matches, reference/deref prefixes (`&x`/`*x`),
+    /// field/index accesses (`x.F`/`x[i]`), and composite literals containing
+    /// a tracked value (`Foo{F: x}`).
     fn extract_assignment_info(
         &self,
         node: tree_sitter::Node,
@@ -1568,22 +1785,16 @@ impl CallGraph {
                 let name_text = node_text(name_node, source);
                 let value_text = node_text(value_node, source);
 
-                // Check if name is a destructuring pattern
                 if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
-                    // Check if value references a tracked name
                     if tracked_names.iter().any(|t| value_text.contains(t)) {
                         return Some((name_text.clone(), name_text, line, true));
                     }
                     return None;
                 }
 
-                // Check if value references any tracked name
-                if tracked_names.iter().any(|t| {
-                    value_text == *t
-                        || value_text.starts_with(&format!("{}.", t))
-                        || value_text.starts_with(&format!("{}[", t))
-                }) {
-                    return Some((name_text, value_text, line, false));
+                if let Some((_matched, kind)) = classify_expr_text(&value_text, tracked_names) {
+                    let is_approx = matches!(kind, ExprMatch::Derived);
+                    return Some((name_text, value_text, line, is_approx));
                 }
                 None
             }
@@ -1594,8 +1805,9 @@ impl CallGraph {
                 let left_text = node_text(left, source);
                 let right_text = node_text(right, source);
 
-                if tracked_names.iter().any(|t| right_text == *t) {
-                    return Some((left_text, right_text, line, false));
+                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
+                    let is_approx = matches!(kind, ExprMatch::Derived);
+                    return Some((left_text, right_text, line, is_approx));
                 }
                 None
             }
@@ -1606,8 +1818,22 @@ impl CallGraph {
                 let left_text = node_text(left, source);
                 let right_text = node_text(right, source);
 
-                if tracked_names.iter().any(|t| right_text == *t) {
-                    return Some((left_text, right_text, line, false));
+                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
+                    let is_approx = matches!(kind, ExprMatch::Derived);
+                    return Some((left_text, right_text, line, is_approx));
+                }
+                None
+            }
+            "assignment_statement" => {
+                // Go: x = <expr>  (tree-sitter-go wraps both sides in expression_list).
+                let left = node.child_by_field_name("left")?;
+                let right = node.child_by_field_name("right")?;
+                let left_text = node_text(left, source);
+                let right_text = node_text(right, source);
+
+                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
+                    let is_approx = matches!(kind, ExprMatch::Derived);
+                    return Some((left_text, right_text, line, is_approx));
                 }
                 None
             }
@@ -1622,8 +1848,9 @@ impl CallGraph {
                 let left_text = node_text(left, source);
                 let right_text = node_text(right, source);
 
-                if tracked_names.iter().any(|t| right_text == *t) {
-                    return Some((left_text, right_text, line, false));
+                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
+                    let is_approx = matches!(kind, ExprMatch::Derived);
+                    return Some((left_text, right_text, line, is_approx));
                 }
                 None
             }
@@ -1631,14 +1858,27 @@ impl CallGraph {
         }
     }
 
-    /// Check if a call expression uses a tracked name as an argument, and if so,
-    /// resolve the callee and recurse into its body tracking the parameter name.
+    /// Check if a call expression uses a tracked name (as an argument or as a
+    /// method receiver), and if so resolve the callee and recurse into its body
+    /// tracking the parameter name.
+    ///
+    /// Handles:
+    /// - Generalized arg matching via [`classify_expr_text`]: `x`, `&x`, `*x`
+    ///   are `Direct`; `x.F`, `x[i]`, `Foo{F: x}` are `Derived` (approximate).
+    /// - Method receivers: `x.Method(...)` where `x` is tracked binds to the
+    ///   method's receiver param (via [`extract_receiver_name`]).
+    /// - Known-writer intrinsics ([`known_writer_spec`]): e.g.
+    ///   `json.Unmarshal(data, &out)` — when the input arg is tracked, the
+    ///   pointer output arg is added as a new tracked name via a `writer` hop.
+    ///
+    /// `tracked_names` is mutable so known-writer outputs propagate to later
+    /// siblings in the same function body.
     #[allow(clippy::too_many_arguments)]
     fn check_call_for_data_flow(
         &mut self,
         node: tree_sitter::Node,
         source: &str,
-        tracked_names: &[String],
+        tracked_names: &mut Vec<String>,
         file: &Path,
         _symbol: &str,
         rel_file: &str,
@@ -1649,70 +1889,7 @@ impl CallGraph {
         depth_limited: &mut bool,
         visited: &mut HashSet<(PathBuf, String, String)>,
     ) {
-        // Find the arguments node
-        let args_node = find_child_by_kind(node, "arguments")
-            .or_else(|| find_child_by_kind(node, "argument_list"));
-
-        let args_node = match args_node {
-            Some(n) => n,
-            None => return,
-        };
-
-        // Collect argument texts and find which position a tracked name appears at
-        let mut arg_positions: Vec<(usize, String)> = Vec::new(); // (position, tracked_name)
-        let mut arg_idx = 0;
-
-        let mut cursor = args_node.walk();
-        if cursor.goto_first_child() {
-            loop {
-                let child = cursor.node();
-                let child_kind = child.kind();
-
-                // Skip punctuation (parentheses, commas)
-                if child_kind == "(" || child_kind == ")" || child_kind == "," {
-                    if !cursor.goto_next_sibling() {
-                        break;
-                    }
-                    continue;
-                }
-
-                let arg_text = node_text(child, source);
-
-                // Check for spread element — approximate
-                if child_kind == "spread_element" || child_kind == "dictionary_splat" {
-                    if tracked_names.iter().any(|t| arg_text.contains(t)) {
-                        hops.push(DataFlowHop {
-                            file: rel_file.to_string(),
-                            symbol: _symbol.to_string(),
-                            variable: arg_text,
-                            line: child.start_position().row as u32 + 1,
-                            flow_type: "parameter".to_string(),
-                            approximate: true,
-                        });
-                    }
-                    if !cursor.goto_next_sibling() {
-                        break;
-                    }
-                    arg_idx += 1;
-                    continue;
-                }
-
-                if tracked_names.iter().any(|t| arg_text == *t) {
-                    arg_positions.push((arg_idx, arg_text));
-                }
-
-                arg_idx += 1;
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-
-        if arg_positions.is_empty() {
-            return;
-        }
-
-        // Resolve the callee
+        // Extract callee names (full = "pkg.Name" or "x.Method", short = "Method").
         let (full_callee, short_callee) = extract_callee_names(node, source);
         let full_callee = match full_callee {
             Some(f) => f,
@@ -1723,7 +1900,143 @@ impl CallGraph {
             None => return,
         };
 
-        // Try to resolve cross-file edge
+        // Detect method-call receiver: if the callee is a selector/member
+        // expression (`<base>.Method`) and `<base>` references a tracked name.
+        let receiver_match: Option<ExprMatch> = node
+            .child_by_field_name("function")
+            .and_then(|fn_node| {
+                let k = fn_node.kind();
+                if matches!(
+                    k,
+                    "selector_expression"
+                        | "member_expression"
+                        | "field_expression"
+                        | "attribute"
+                ) {
+                    let base = fn_node
+                        .child_by_field_name("operand")
+                        .or_else(|| fn_node.child_by_field_name("object"))
+                        .or_else(|| fn_node.child_by_field_name("value"));
+                    base.and_then(|b| {
+                        let text = node_text(b, source);
+                        classify_expr_text(&text, tracked_names).map(|(_, k)| k)
+                    })
+                } else {
+                    None
+                }
+            });
+
+        // Find the arguments node.
+        let args_node = find_child_by_kind(node, "arguments")
+            .or_else(|| find_child_by_kind(node, "argument_list"));
+
+        // Collect arg matches via classifier: (position, arg_text, match_kind).
+        let mut arg_matches: Vec<(usize, String, ExprMatch)> = Vec::new();
+
+        if let Some(args_node) = args_node {
+            let mut arg_idx = 0;
+            let mut cursor = args_node.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    let child = cursor.node();
+                    let child_kind = child.kind();
+
+                    if child_kind == "(" || child_kind == ")" || child_kind == "," {
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let arg_text = node_text(child, source);
+
+                    // Spread / splat — approximate, no param binding (position
+                    // mapping is ambiguous).
+                    if child_kind == "spread_element" || child_kind == "dictionary_splat" {
+                        if tracked_names.iter().any(|t| arg_text.contains(t.as_str())) {
+                            hops.push(DataFlowHop {
+                                file: rel_file.to_string(),
+                                symbol: _symbol.to_string(),
+                                variable: arg_text.clone(),
+                                line: child.start_position().row as u32 + 1,
+                                flow_type: "parameter".to_string(),
+                                approximate: true,
+                            });
+                        }
+                        arg_idx += 1;
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if let Some((_matched, kind)) = classify_expr_text(&arg_text, tracked_names) {
+                        arg_matches.push((arg_idx, arg_text.clone(), kind));
+                    }
+
+                    arg_idx += 1;
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if arg_matches.is_empty() && receiver_match.is_none() {
+            return;
+        }
+
+        // Known-writer intrinsic: e.g. json.Unmarshal(data, &out). If a tracked
+        // name appears at an input position, mark pointer output args as new
+        // tracked names and emit "writer" hops. Skip parameter-hop recursion
+        // since the intrinsic's body isn't meaningful for the tracker.
+        if let Some((input_positions, output_positions)) = known_writer_spec(&full_callee) {
+            let tracked_at_input = arg_matches
+                .iter()
+                .any(|(pos, _, _)| input_positions.contains(pos));
+            if tracked_at_input {
+                if let Some(args_node) = args_node {
+                    let mut oarg_idx = 0;
+                    let mut oc = args_node.walk();
+                    if oc.goto_first_child() {
+                        loop {
+                            let child = oc.node();
+                            let ck = child.kind();
+                            if ck == "(" || ck == ")" || ck == "," {
+                                if !oc.goto_next_sibling() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if output_positions.contains(&oarg_idx) {
+                                let txt = node_text(child, source);
+                                let stripped = strip_ref_deref_prefix(&txt).trim().to_string();
+                                if !stripped.is_empty()
+                                    && !tracked_names.iter().any(|t| t == &stripped)
+                                {
+                                    hops.push(DataFlowHop {
+                                        file: rel_file.to_string(),
+                                        symbol: _symbol.to_string(),
+                                        variable: stripped.clone(),
+                                        line: node.start_position().row as u32 + 1,
+                                        flow_type: "writer".to_string(),
+                                        approximate: true,
+                                    });
+                                    tracked_names.push(stripped);
+                                }
+                            }
+                            oarg_idx += 1;
+                            if !oc.goto_next_sibling() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // Resolve the callee (cross-file via imports, else same-file lookup).
         let import_block = {
             match self.data.get(file) {
                 Some(fd) => fd.import_block.clone(),
@@ -1733,7 +2046,8 @@ impl CallGraph {
 
         let edge = self.resolve_cross_file_edge(&full_callee, &short_callee, file, &import_block);
 
-        match edge {
+        // Unify resolution into (target_file, target_symbol, params, target_lang).
+        let resolved: Option<(PathBuf, String, Vec<String>, LangId)> = match edge {
             EdgeResolution::Resolved {
                 file: target_file,
                 symbol: target_symbol,
@@ -1742,8 +2056,6 @@ impl CallGraph {
                     *depth_limited = true;
                     return;
                 }
-
-                // Build target file to get parameter info
                 if let Err(e) = self.build_file(&target_file) {
                     log::debug!(
                         "callgraph: skipping target file {}: {}",
@@ -1751,51 +2063,20 @@ impl CallGraph {
                         e
                     );
                 }
-                let (params, _target_lang) = {
-                    match self.data.get(&target_file) {
-                        Some(fd) => {
-                            let meta = fd.symbol_metadata.get(&target_symbol);
-                            let sig = meta.and_then(|m| m.signature.clone());
-                            let params = sig
-                                .as_deref()
-                                .map(|s| extract_parameters(s, fd.lang))
-                                .unwrap_or_default();
-                            (params, fd.lang)
-                        }
-                        None => return,
+                match self.data.get(&target_file) {
+                    Some(fd) => {
+                        let meta = fd.symbol_metadata.get(&target_symbol);
+                        let sig = meta.and_then(|m| m.signature.clone());
+                        let params = sig
+                            .as_deref()
+                            .map(|s| extract_parameters(s, fd.lang))
+                            .unwrap_or_default();
+                        Some((target_file, target_symbol, params, fd.lang))
                     }
-                };
-
-                let target_rel = self.relative_path(&target_file);
-
-                for (pos, _tracked) in &arg_positions {
-                    if let Some(param_name) = params.get(*pos) {
-                        // Add parameter hop
-                        hops.push(DataFlowHop {
-                            file: target_rel.clone(),
-                            symbol: target_symbol.clone(),
-                            variable: param_name.clone(),
-                            line: get_symbol_meta(&target_file, &target_symbol).0,
-                            flow_type: "parameter".to_string(),
-                            approximate: false,
-                        });
-
-                        // Recurse into callee's body tracking the parameter name
-                        self.trace_data_inner(
-                            &target_file.clone(),
-                            &target_symbol.clone(),
-                            param_name,
-                            max_depth,
-                            current_depth + 1,
-                            hops,
-                            depth_limited,
-                            visited,
-                        );
-                    }
+                    None => None,
                 }
             }
             EdgeResolution::Unresolved { callee_name } => {
-                // Check if it's a same-file call
                 let has_local = self
                     .data
                     .get(file)
@@ -1804,61 +2085,101 @@ impl CallGraph {
                             || fd.symbol_metadata.contains_key(&callee_name)
                     })
                     .unwrap_or(false);
-
-                if has_local {
-                    // Same-file call — get param info
-                    let (params, _target_lang) = {
-                        let Some(fd) = self.data.get(file) else {
-                            return;
-                        };
+                if !has_local {
+                    // Truly unresolved — approximate arg hops, no receiver
+                    // binding (we don't know the target), no recursion.
+                    for (_pos, arg_text, _kind) in &arg_matches {
+                        hops.push(DataFlowHop {
+                            file: self.relative_path(file),
+                            symbol: callee_name.clone(),
+                            variable: arg_text.clone(),
+                            line: node.start_position().row as u32 + 1,
+                            flow_type: "parameter".to_string(),
+                            approximate: true,
+                        });
+                    }
+                    return;
+                }
+                if current_depth + 1 > max_depth {
+                    *depth_limited = true;
+                    return;
+                }
+                match self.data.get(file) {
+                    Some(fd) => {
                         let meta = fd.symbol_metadata.get(&callee_name);
                         let sig = meta.and_then(|m| m.signature.clone());
                         let params = sig
                             .as_deref()
                             .map(|s| extract_parameters(s, fd.lang))
                             .unwrap_or_default();
-                        (params, fd.lang)
-                    };
-
-                    let file_rel = self.relative_path(file);
-
-                    for (pos, _tracked) in &arg_positions {
-                        if let Some(param_name) = params.get(*pos) {
-                            hops.push(DataFlowHop {
-                                file: file_rel.clone(),
-                                symbol: callee_name.clone(),
-                                variable: param_name.clone(),
-                                line: get_symbol_meta(file, &callee_name).0,
-                                flow_type: "parameter".to_string(),
-                                approximate: false,
-                            });
-
-                            // Recurse into same-file function
-                            self.trace_data_inner(
-                                file,
-                                &callee_name.clone(),
-                                param_name,
-                                max_depth,
-                                current_depth + 1,
-                                hops,
-                                depth_limited,
-                                visited,
-                            );
-                        }
+                        Some((file.to_path_buf(), callee_name, params, fd.lang))
                     }
-                } else {
-                    // Truly unresolved — approximate hop
-                    for (_pos, tracked) in &arg_positions {
-                        hops.push(DataFlowHop {
-                            file: self.relative_path(file),
-                            symbol: callee_name.clone(),
-                            variable: tracked.clone(),
-                            line: node.start_position().row as u32 + 1,
-                            flow_type: "parameter".to_string(),
-                            approximate: true,
-                        });
-                    }
+                    None => None,
                 }
+            }
+        };
+
+        let (target_file, target_symbol, params, target_lang) = match resolved {
+            Some(t) => t,
+            None => return,
+        };
+
+        let target_rel = self.relative_path(&target_file);
+
+        // Receiver hop: bind tracked base to the method's receiver param name.
+        if let Some(recv_kind) = receiver_match {
+            let target_sig = self
+                .data
+                .get(&target_file)
+                .and_then(|fd| fd.symbol_metadata.get(&target_symbol))
+                .and_then(|m| m.signature.clone());
+            if let Some(sig) = target_sig {
+                if let Some(recv_name) = extract_receiver_name(&sig, target_lang) {
+                    let is_approx = matches!(recv_kind, ExprMatch::Derived);
+                    hops.push(DataFlowHop {
+                        file: target_rel.clone(),
+                        symbol: target_symbol.clone(),
+                        variable: recv_name.clone(),
+                        line: get_symbol_meta(&target_file, &target_symbol).0,
+                        flow_type: "parameter".to_string(),
+                        approximate: is_approx,
+                    });
+                    self.trace_data_inner(
+                        &target_file.clone(),
+                        &target_symbol.clone(),
+                        &recv_name,
+                        max_depth,
+                        current_depth + 1,
+                        hops,
+                        depth_limited,
+                        visited,
+                    );
+                }
+            }
+        }
+
+        // Explicit-arg parameter hops (approximate iff the arg match was Derived).
+        for (pos, _arg_text, kind) in &arg_matches {
+            if let Some(param_name) = params.get(*pos) {
+                let is_approx = matches!(kind, ExprMatch::Derived);
+                hops.push(DataFlowHop {
+                    file: target_rel.clone(),
+                    symbol: target_symbol.clone(),
+                    variable: param_name.clone(),
+                    line: get_symbol_meta(&target_file, &target_symbol).0,
+                    flow_type: "parameter".to_string(),
+                    approximate: is_approx,
+                });
+                self.trace_data_inner(
+                    &target_file.clone(),
+                    &target_symbol.clone(),
+                    param_name,
+                    max_depth,
+                    current_depth + 1,
+                    hops,
+                    depth_limited,
+                    visited,
+                );
             }
         }
     }
@@ -2177,6 +2498,69 @@ fn find_node_covering_range(
     best
 }
 
+/// Find a function/method declaration node by name within a byte range.
+///
+/// The symbol-range reported by [`list_symbols_from_tree`] may include
+/// preceding doc comments that are siblings (not ancestors) of the function
+/// node. A plain covers-range lookup would fail to narrow past the source
+/// file. This helper descends the tree looking for a declaration node whose
+/// `name` field matches `symbol_name` and whose byte range is contained in
+/// `[start, end]`.
+fn find_function_decl_node<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &str,
+    start: usize,
+    end: usize,
+    symbol_name: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    fn is_function_decl_kind(kind: &str) -> bool {
+        matches!(
+            kind,
+            "function_declaration"
+                | "method_declaration"
+                | "function_definition"
+                | "function_item"
+                | "method_definition"
+        )
+    }
+
+    fn node_name_matches(node: tree_sitter::Node, source: &str, name: &str) -> bool {
+        if let Some(n) = node.child_by_field_name("name") {
+            return node_text(n, source) == name;
+        }
+        false
+    }
+
+    fn dfs<'a>(
+        node: tree_sitter::Node<'a>,
+        source: &str,
+        start: usize,
+        end: usize,
+        name: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        if node.end_byte() < start || node.start_byte() > end {
+            return None;
+        }
+        if is_function_decl_kind(node.kind()) && node_name_matches(node, source, name) {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                if let Some(found) = dfs(cursor.node(), source, start, end, name) {
+                    return Some(found);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    dfs(root, source, start, end, symbol_name)
+}
+
 /// Find a direct child node by kind name.
 fn find_child_by_kind<'a>(
     node: tree_sitter::Node<'a>,
@@ -2212,6 +2596,221 @@ fn extract_callee_names(node: tree_sitter::Node, source: &str) -> (Option<String
     };
 
     (Some(full), Some(short))
+}
+
+// ---------------------------------------------------------------------------
+// Data flow classifier — how an expression references a tracked name
+// ---------------------------------------------------------------------------
+
+/// How an expression relates to a tracked name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExprMatch {
+    /// Same logical value: `x`, `&x`, `*x`, `&mut x`. Flow is non-approximate.
+    Direct,
+    /// Wraps or extracts from the tracked value: `x.F`, `x[i]`, `Foo{F: x}`.
+    /// Flow is approximate because we know the value participates but don't
+    /// track which piece.
+    Derived,
+}
+
+/// Classify whether an expression text references any tracked name.
+/// Covers:
+///   - exact identifier (Direct)
+///   - reference / pointer prefix: `&x`, `*x`, `&mut x` (Direct — same value)
+///   - field / index access: `x.F`, `x[i]`, `(&x).F` (Derived)
+///   - composite / struct / object literal with a tracked name as a value
+///     (Derived — wrapped)
+///
+/// Returns `Some((matched_tracked_name, kind))` on match, `None` otherwise.
+pub(crate) fn classify_expr_text(
+    expr_text: &str,
+    tracked: &[String],
+) -> Option<(String, ExprMatch)> {
+    if tracked.is_empty() {
+        return None;
+    }
+    let t_expr = expr_text.trim();
+    let stripped = strip_ref_deref_prefix(t_expr);
+
+    // Direct: exact identifier (optionally behind &, *, &mut).
+    for t in tracked {
+        if t_expr == t.as_str() || stripped == t.as_str() {
+            return Some((t.clone(), ExprMatch::Direct));
+        }
+    }
+    // Derived: field / index access on a tracked name.
+    for t in tracked {
+        let dot = format!("{}.", t);
+        let idx = format!("{}[", t);
+        if t_expr.starts_with(&dot)
+            || t_expr.starts_with(&idx)
+            || stripped.starts_with(&dot)
+            || stripped.starts_with(&idx)
+        {
+            return Some((t.clone(), ExprMatch::Derived));
+        }
+    }
+    // Derived: composite literal containing a tracked value.
+    if let (Some(open), Some(close)) = (t_expr.find('{'), t_expr.rfind('}')) {
+        if open < close {
+            let body = &t_expr[open + 1..close];
+            if let Some(name) = literal_body_first_tracked(body, tracked) {
+                return Some((name, ExprMatch::Derived));
+            }
+        }
+    }
+    None
+}
+
+/// Strip a single `&` or `*` prefix, plus an optional `mut ` (Rust).
+fn strip_ref_deref_prefix(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('&') {
+        let rest = rest.trim_start();
+        return rest
+            .strip_prefix("mut ")
+            .map(|r| r.trim_start())
+            .unwrap_or(rest);
+    }
+    if let Some(rest) = s.strip_prefix('*') {
+        return rest.trim_start();
+    }
+    s
+}
+
+/// Scan a brace-body (content between `{` and `}`) looking for a tracked name
+/// appearing as a value (not a key). Handles `key: value` and bare positional
+/// entries. Nesting-aware via a depth counter.
+fn literal_body_first_tracked(body: &str, tracked: &[String]) -> Option<String> {
+    for part in split_top_level(body, ',') {
+        let value_str = match first_top_level(&part, ':') {
+            Some(colon) => part[colon + 1..].to_string(),
+            None => part,
+        };
+        let v = strip_ref_deref_prefix(value_str.trim());
+        for t in tracked {
+            if v == t.as_str() {
+                return Some(t.clone());
+            }
+            let dot = format!("{}.", t);
+            let idx = format!("{}[", t);
+            if v.starts_with(&dot) || v.starts_with(&idx) {
+                return Some(t.clone());
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level(s: &str, sep: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ch if ch == sep && depth == 0 => {
+                out.push(s[start..i].to_string());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        out.push(s[start..].to_string());
+    }
+    out
+}
+
+fn first_top_level(s: &str, sep: char) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, c) in s.char_indices() {
+        if c == sep && depth == 0 {
+            return Some(i);
+        }
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Method receiver name extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the receiver parameter name from a method signature.
+///
+/// - Go: `func (u *User) Method(...)` → `Some("u")`
+/// - Rust: `fn method(&self, ...)` / `fn method(&mut self, ...)` / `fn method(self, ...)` → `Some("self")`
+/// - Other languages or non-methods: `None`
+pub(crate) fn extract_receiver_name(signature: &str, lang: LangId) -> Option<String> {
+    let sig = signature.trim();
+    match lang {
+        LangId::Go => {
+            // Expect: "func (recv Type) Name(...)"
+            let rest = sig.strip_prefix("func ")?.trim_start();
+            if !rest.starts_with('(') {
+                return None;
+            }
+            let close = first_top_level(&rest[1..], ')')?;
+            let recv_text = &rest[1..1 + close];
+            // recv_text is like "u *User" or "u User" or "User" (anonymous recv)
+            let parts: Vec<&str> = recv_text.split_whitespace().collect();
+            if parts.len() >= 2 {
+                Some(parts[0].to_string())
+            } else {
+                None
+            }
+        }
+        LangId::Rust => {
+            let paren_pos = sig.find('(')?;
+            let after = &sig[paren_pos + 1..];
+            let close = first_top_level(after, ')')?;
+            let params = &after[..close];
+            let first = params.split(',').next()?.trim();
+            let normalized = first
+                .trim_start_matches('&')
+                .trim_start()
+                .trim_start_matches("mut ")
+                .trim();
+            if normalized == "self"
+                || normalized.starts_with("self:")
+                || normalized.starts_with("self ")
+            {
+                Some("self".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Known-writer intrinsics — functions that write an input into a pointer arg
+// ---------------------------------------------------------------------------
+
+/// For a known writer function, returns `(input_positions, output_positions)`
+/// where data at `input_positions` flows into pointer args at
+/// `output_positions`.
+///
+/// Example: `json.Unmarshal(data, &out)` → input=\[0\], output=\[1\].
+pub(crate) fn known_writer_spec(full_callee: &str) -> Option<(Vec<usize>, Vec<usize>)> {
+    match full_callee {
+        // Go: Unmarshal-family — (data, &out)
+        "json.Unmarshal"
+        | "yaml.Unmarshal"
+        | "xml.Unmarshal"
+        | "toml.Unmarshal"
+        | "proto.Unmarshal"
+        | "bson.Unmarshal"
+        | "msgpack.Unmarshal" => Some((vec![0], vec![1])),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3423,6 +4022,22 @@ function testValidation() {
             LangId::Go,
         );
         assert_eq!(params, vec!["input", "count"]);
+    }
+
+    #[test]
+    fn extract_parameters_go_method_skips_receiver() {
+        // Go method: receiver block is the first `(...)`, actual params come second.
+        let params = extract_parameters(
+            "func (s *concreteSvc) concreteMethod(x int, y string) int",
+            LangId::Go,
+        );
+        assert_eq!(params, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn extract_parameters_go_method_no_params() {
+        let params = extract_parameters("func (s *svc) noParams() int", LangId::Go);
+        assert!(params.is_empty(), "no params should yield empty, got {:?}", params);
     }
 
     #[test]
