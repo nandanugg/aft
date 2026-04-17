@@ -126,7 +126,12 @@ call_aft() {
     work_dir="$PWD"
   fi
 
-  local config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root}')
+  # wait_for_helper=true makes configure block until the Go helper
+  # finishes, so same-process queries (the entire CLI flow) see resolved
+  # interface-dispatch edges. Without it, the helper thread gets killed
+  # when aft exits right after answering the command — cache never gets
+  # written, and cross-package interface calls stay unresolved.
+  local config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
