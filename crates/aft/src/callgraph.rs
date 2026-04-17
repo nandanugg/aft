@@ -811,7 +811,7 @@ impl CallGraph {
             .map(|data| data.symbol_metadata.contains_key(short_name))
             .unwrap_or(false);
         let graph = RefCell::new(self);
-        Self::resolve_cross_file_edge_with_exports(
+        let edge = Self::resolve_cross_file_edge_with_exports(
             full_callee,
             short_name,
             caller_file,
@@ -819,7 +819,20 @@ impl CallGraph {
             caller_defines,
             |path, symbol_name| graph.borrow_mut().file_exports_symbol(path, symbol_name),
             |path| graph.borrow_mut().file_default_export_symbol(path),
-        )
+        );
+
+        match edge {
+            EdgeResolution::Unresolved { callee_name } => {
+                match graph.borrow_mut().go_sibling_definer(caller_file, &callee_name) {
+                    Some(file) => EdgeResolution::Resolved {
+                        file,
+                        symbol: callee_name,
+                    },
+                    None => EdgeResolution::Unresolved { callee_name },
+                }
+            }
+            resolved => resolved,
+        }
     }
 
     /// Check if a file exports a given symbol name.
@@ -834,6 +847,38 @@ impl CallGraph {
         self.build_file(path)
             .ok()
             .and_then(|data| data.default_export_symbol.clone())
+    }
+
+    fn go_sibling_definer(&mut self, caller_file: &Path, symbol: &str) -> Option<PathBuf> {
+        if caller_file.extension().and_then(|ext| ext.to_str()) != Some("go") {
+            return None;
+        }
+        let caller_canon =
+            std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.to_path_buf());
+        let dir = caller_canon.parent()?;
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("go") {
+                continue;
+            }
+            let canon = std::fs::canonicalize(&path).unwrap_or(path);
+            if canon != caller_canon {
+                candidates.push(canon);
+            }
+        }
+
+        for path in candidates {
+            if self
+                .build_file(&path)
+                .ok()
+                .is_some_and(|data| data.symbol_metadata.contains_key(symbol))
+            {
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// Invalidate a file by removing its cached call data.
