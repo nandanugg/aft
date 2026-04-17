@@ -2,18 +2,27 @@
 
 Tree-sitter powered code analysis for massive context savings (60-90% token reduction).
 
-## Start With Outline, Escalate From There
+## Two Kinds of Questions, Two Kinds of Tools
 
-**Outline is the default entry point.** Before reading full files, run `aft outline` to get structure — ~10% the tokens of a full read. This applies to code, markdown, config, and docs.
+Every code question is either **what exists** (structure) or **what runs** (behavior). AFT has separate tools for each — pick by the question, not by caution.
 
-**Escalate to semantic commands only when the task needs them:**
-- `aft zoom <file> <symbol>` — when you need to read a specific function body.
-- `aft call_tree` / `aft callers` — when you need cross-file call relationships (grep can't infer these).
-- `aft impact` — before a refactor, to see what breaks.
-- `aft trace_to` — when debugging how execution reaches a point.
-- `aft trace_data` — when tracking where a value came from or where it flows next.
+**"What exists here?"** → `aft outline`. Use when you need to know which files live in a directory, which symbols a file defines, what types are declared. Outline is fast and cheap; reach for it freely when surveying a codebase.
 
-**Don't use semantic commands reflexively.** For verification tasks — "does this symbol still exist?", "is this doc accurate?" — outline alone is usually enough. Reaching for zoom/call_tree on every task inflates work without improving answers.
+**"How does this work / flow / connect?"** → `aft trace_to`, `aft call_tree`, `aft callers`. These are the right tool for *every* behavior or flow question, not a last resort:
+- `aft call_tree <file> <symbol>` — what this function calls (forward graph).
+- `aft callers <file> <symbol>` — who calls this function (reverse graph).
+- `aft trace_to <file> <symbol>` — how execution reaches this point (entry-point paths).
+- `aft trace_data <file> <symbol> <expr>` — how a value flows through assignments and calls.
+- `aft impact <file> <symbol>` — what breaks if this changes.
+- `aft zoom <file> <symbol>` — read a specific function body with call-graph annotations.
+
+**Default to trace tools for behavior questions.** "What's the normal flow for X?", "what handles Y?", "who sends this event?", "how does the happy path work?" — all of these are trace / call_tree / callers questions. Outline-diving through directories to piece together a flow is slower and less accurate than following the call graph directly from a known entry point (HTTP handler, Kafka consumer, CLI main, etc.).
+
+**Grep is fine for "does this string appear?"** but reach for semantic tools when the answer requires understanding the behavior behind the name.
+
+### Performance note
+
+First `aft` call in a project can take 10-30 seconds on a large codebase (Go helper run + parsing hundreds of files). Progress lines go to stderr. Subsequent calls reuse a disk cache and are near-instant unless files changed. Cold-start slowness is not a hang — watch stderr for progress.
 
 ## AFT CLI Commands
 
@@ -121,21 +130,21 @@ Need to understand files?
 
 ## Rules
 
-Match the command to the task type. Outline is universal; the semantic graph tools (zoom/call_tree/callers/impact/trace_to) pay off for *comprehension* tasks, not for *verification* tasks.
+Match the command to the question, not to caution.
 
-**Verification tasks** — "does X still exist?", "is this doc still accurate?", "what files are in this dir?":
-1. **ALWAYS start with outline** - `aft outline` to confirm structure and anchor symbols.
-2. **Outline is usually enough.** Don't reach for zoom/call_tree/callers unless you need to see actual behavior, not just presence.
-3. **ALWAYS outline before delegating** - When briefing a subagent to explore a repo or directory, run `aft outline <path>` yourself first and include the output in the subagent prompt. Never leave outline as a mid-step instruction — subagents don't follow ordering guarantees.
+**Structural / "what exists" questions** — "does X still exist?", "what files are in this dir?", "what symbols does this file declare?":
+1. `aft outline` is the right tool. Fast and cheap.
+2. For directory reads, always outline first to anchor; confirm which specific files are actually needed before expanding with zoom / selective reads.
+3. When briefing a subagent to explore a repo, run `aft outline <path>` yourself first and include the output in the subagent prompt — subagents don't follow ordering guarantees, so leaving outline as a "step 1" instruction is unreliable.
 
-**Comprehension tasks** — "how does this flow work?", "what breaks if I change X?", "where is this called?":
-4. **Use zoom** to read a specific function body without reading the whole file.
-5. **Use call_tree / callers** to map cross-file relationships that grep cannot see.
-6. **Use impact before a refactor** to understand blast radius before editing.
+**Behavioral / "what runs" questions** — "how does X work?", "what's the flow for Y?", "who calls Z?", "what happens if I change W?":
+4. Reach for `aft trace_to` / `aft call_tree` / `aft callers` / `aft trace_data` / `aft impact` **first**, not as a last resort. These tools answer the question directly; outline-diving through directories to piece together a flow is slower and less accurate.
+5. Start from a known entry point (HTTP handler, Kafka consumer, main, test entry) and follow the call graph out. Use `aft zoom` when you need to read the body of a specific function you've identified.
+6. A zero result from `callers` or `trace_to` is itself information — but cross-check with `aft grep` on the symbol name if the result looks surprisingly sparse; some dispatch patterns (reflection, DI frameworks, callback registration) can't be resolved statically.
 
-**When grep is fine.** `aft grep` for a bare identifier is correct when you just need to know "does this string appear, and where." Reach for semantic commands when you need to understand *behavior* behind the name, not every time a name shows up.
+**`aft grep` is fine for "does this string appear?"** Reach for semantic tools when the answer requires understanding the behavior behind the name.
 
-**Context protection still applies.** See the Context Protection section — even when a task is verification-only, don't read full files; outline first and selectively read what you need.
+**Context protection still applies.** See the Context Protection section — don't read full files to piece together a flow; outline + trace + zoom gives the same answer for a fraction of the tokens.
 
 ## Context Protection
 

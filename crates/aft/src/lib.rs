@@ -28,6 +28,7 @@ pub mod format;
 pub mod fuzzy_match;
 pub mod go_helper;
 pub mod imports;
+pub mod parse_cache;
 pub mod indent;
 pub mod language;
 pub mod lsp;

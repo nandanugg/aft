@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Parser, Tree};
 
 use crate::calls::extract_calls_full;
@@ -29,7 +29,7 @@ type SharedStr = Arc<str>;
 type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
 
 /// A single call site within a function body.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallSite {
     /// The short callee name (last segment, e.g. "foo" for `utils.foo()`).
     pub callee_name: String,
@@ -43,7 +43,7 @@ pub struct CallSite {
 }
 
 /// Per-symbol metadata for entry point detection (avoids re-parsing).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolMeta {
     /// The kind of symbol (function, class, method, etc).
     pub kind: SymbolKind,
@@ -56,7 +56,7 @@ pub struct SymbolMeta {
 
 /// Per-file call data: call sites grouped by containing symbol, plus
 /// exported symbol names and parsed imports.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCallData {
     /// Map from symbol name → list of call sites within that symbol's body.
     pub calls_by_symbol: HashMap<String, Vec<CallSite>>,
@@ -693,6 +693,10 @@ pub struct CallGraph {
     /// into the reverse index at build time. Snapshot from configure time —
     /// remains valid until the next configure call.
     go_helper: Option<HelperOutput>,
+    /// Directory where per-file parse results are cached to disk. `None`
+    /// disables disk caching (tests that don't want pollution, or
+    /// missing cache config). Populated via `set_parse_cache_dir`.
+    parse_cache_dir: Option<PathBuf>,
 }
 
 impl CallGraph {
@@ -704,6 +708,7 @@ impl CallGraph {
             project_files: None,
             reverse_index: None,
             go_helper: None,
+            parse_cache_dir: None,
         }
     }
 
@@ -712,6 +717,12 @@ impl CallGraph {
     pub fn set_go_helper(&mut self, data: HelperOutput) {
         self.go_helper = Some(data);
         self.reverse_index = None;
+    }
+
+    /// Enable on-disk parse-result caching. Subsequent `build_file`
+    /// calls check the cache first and skip re-parsing unchanged files.
+    pub fn set_parse_cache_dir(&mut self, dir: PathBuf) {
+        self.parse_cache_dir = Some(dir);
     }
 
     /// Get the project root directory.
@@ -841,11 +852,30 @@ impl CallGraph {
     }
 
     /// Get or build the call data for a file.
+    ///
+    /// Checks the in-memory cache first, then the on-disk parse cache
+    /// (if configured), and only re-parses on miss. Keeps repeat CLI
+    /// invocations fast: a cold first run pays full parse cost, a warm
+    /// follow-up skips straight to the cached tree per file.
     pub fn build_file(&mut self, path: &Path) -> Result<&FileCallData, AftError> {
         let canon = self.canonicalize(path)?;
 
         if !self.data.contains_key(&canon) {
-            let file_data = build_file_data(&canon)?;
+            let cache_dir = self.parse_cache_dir.clone();
+            let file_data = match cache_dir.as_deref().and_then(|d| crate::parse_cache::read(d, &canon)) {
+                Some(d) => d,
+                None => {
+                    let d = build_file_data(&canon)?;
+                    if let Some(ref dir) = cache_dir {
+                        // Best-effort write: a cache failure shouldn't
+                        // break the request.
+                        if let Err(e) = crate::parse_cache::write(dir, &canon, &d) {
+                            log::debug!("[aft] parse-cache write failed: {e}");
+                        }
+                    }
+                    d
+                }
+            };
             self.data.insert(canon.clone(), file_data);
         }
 
@@ -1097,13 +1127,30 @@ impl CallGraph {
     /// (symbol, call_sites) pair, resolves cross-file edges and inserts
     /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
     fn build_reverse_index(&mut self) {
+        let start = std::time::Instant::now();
         // Discover all project files first
         let all_files = self.project_files().to_vec();
 
-        // Build file data for all project files
-        for f in &all_files {
+        // Build file data for all project files. For large projects on a
+        // cold cache this is the dominant cost of the first CLI query
+        // (tree-sitter parsing per file). Progress lines go to stderr so
+        // the CLI wrapper can surface them — silence at 3s looks like a
+        // hang even though real work is happening.
+        log::info!("building call graph: {} files", all_files.len());
+        for (i, f) in all_files.iter().enumerate() {
             let _ = self.build_file(f);
+            // Periodic heartbeat for long runs (>~500 files). Every 250
+            // files keeps overhead low while staying visible to the user.
+            if all_files.len() > 500 && i > 0 && i % 250 == 0 {
+                log::info!("  parsed {}/{} files", i, all_files.len());
+            }
         }
+        log::info!(
+            "  parsed {}/{} files in {:.1}s",
+            all_files.len(),
+            all_files.len(),
+            start.elapsed().as_secs_f32()
+        );
 
         // Go same-package symbol index: for every Go file, map each symbol
         // it defines to the file that defines it, keyed by parent

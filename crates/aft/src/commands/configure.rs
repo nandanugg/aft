@@ -436,8 +436,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         });
     }
 
-    // Initialize call graph with the project root
-    let graph = CallGraph::new(root_path.clone());
+    // Initialize call graph with the project root, and enable on-disk
+    // parse caching so repeated CLI invocations skip re-parsing files
+    // whose mtime hasn't changed.
+    let mut graph = CallGraph::new(root_path.clone());
+    let parse_cache_root = resolve_cache_dir(&root_path, storage_dir.as_deref());
+    graph.set_parse_cache_dir(parse_cache_root);
     *ctx.callgraph().borrow_mut() = Some(graph);
 
     // Go helper strategy:

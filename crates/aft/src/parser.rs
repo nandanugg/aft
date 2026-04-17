@@ -314,7 +314,7 @@ const BASH_QUERY: &str = r#"
 "#;
 
 /// Supported language identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LangId {
     TypeScript,
     Tsx,
