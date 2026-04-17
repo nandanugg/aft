@@ -71,6 +71,7 @@ pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;
 pub mod grep_executor;
+pub mod go_helper;
 pub mod harness;
 pub mod imports;
 pub mod indent;
