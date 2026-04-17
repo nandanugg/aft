@@ -26,6 +26,7 @@ pub mod error;
 pub mod extract;
 pub mod format;
 pub mod fuzzy_match;
+pub mod go_helper;
 pub mod imports;
 pub mod indent;
 pub mod language;
