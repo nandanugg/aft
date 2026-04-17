@@ -4120,4 +4120,213 @@ function testValidation() {
         let params = extract_parameters("function handleClick(event, target)", LangId::JavaScript);
         assert_eq!(params, vec!["event", "target"]);
     }
+
+    // ---------------------------------------------------------------------------
+    // Go helper injection tests
+    // ---------------------------------------------------------------------------
+
+    use crate::go_helper::{EdgeKind, HelperCallee, HelperCaller, HelperEdge, HelperOutput};
+
+    const GO_RESOLUTION_FIXTURE: &str = r#"package callgraph
+
+func barePkgTarget(x int) int {
+	return x + 1
+}
+
+func barePkgCaller(x int) int {
+	return barePkgTarget(x)
+}
+
+type concreteSvc struct{}
+
+func (s *concreteSvc) concreteMethod(x int) int {
+	return x * 2
+}
+
+func concreteMethodCaller(x int) int {
+	s := &concreteSvc{}
+	return s.concreteMethod(x)
+}
+
+type Doer interface {
+	Do(x int) int
+}
+
+type doerA struct{}
+
+func (a *doerA) Do(x int) int { return x + 10 }
+
+type doerB struct{}
+
+func (b *doerB) Do(x int) int { return x + 100 }
+
+func interfaceCaller(d Doer, x int) int {
+	return d.Do(x)
+}
+"#;
+
+    fn make_go_helper_output(fixture_file: &str, root: &str) -> HelperOutput {
+        HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.to_string(),
+            edges: vec![
+                // static: barePkgCaller → barePkgTarget (line 8)
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 8,
+                        symbol: "barePkgCaller".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "barePkgTarget".to_string(),
+                        receiver: String::new(),
+                        pkg: String::new(),
+                    },
+                    kind: EdgeKind::Static,
+                },
+                // concrete: concreteMethodCaller → concreteMethod (line 19)
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 19,
+                        symbol: "concreteMethodCaller".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "concreteMethod".to_string(),
+                        receiver: "*pkg.concreteSvc".to_string(),
+                        pkg: "pkg".to_string(),
+                    },
+                    kind: EdgeKind::Concrete,
+                },
+                // interface dispatch: interfaceCaller → doerA.Do (line 35)
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 35,
+                        symbol: "interfaceCaller".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "Do".to_string(),
+                        receiver: "*pkg.doerA".to_string(),
+                        pkg: "pkg".to_string(),
+                    },
+                    kind: EdgeKind::Interface,
+                },
+                // interface dispatch: interfaceCaller → doerB.Do (line 35)
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 35,
+                        symbol: "interfaceCaller".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "Do".to_string(),
+                        receiver: "*pkg.doerB".to_string(),
+                        pkg: "pkg".to_string(),
+                    },
+                    kind: EdgeKind::Interface,
+                },
+            ],
+            skipped: vec![],
+        }
+    }
+
+    fn setup_go_project() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("go_resolution.go"), GO_RESOLUTION_FIXTURE).unwrap();
+        dir
+    }
+
+    #[test]
+    fn go_helper_interface_dispatch_deduplication() {
+        let dir = setup_go_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("go_resolution.go");
+        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.callers_of(&go_file, "Do", 1).unwrap();
+
+        // Two helper edges → interfaceCaller:42 (doerA) and interfaceCaller:42 (doerB).
+        // After dedup by (file, symbol, line), only 1 caller site should survive.
+        assert_eq!(
+            result.total_callers, 1,
+            "interface dispatch: two callee edges for same call site should dedup to 1 caller"
+        );
+        assert_eq!(result.callers[0].callers[0].symbol, "interfaceCaller");
+        assert_eq!(result.callers[0].callers[0].line, 35);
+    }
+
+    #[test]
+    fn go_helper_concrete_method_resolution() {
+        let dir = setup_go_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("go_resolution.go");
+        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.callers_of(&go_file, "concreteMethod", 1).unwrap();
+        assert_eq!(result.total_callers, 1);
+        assert_eq!(result.callers[0].callers[0].symbol, "concreteMethodCaller");
+        assert_eq!(result.callers[0].callers[0].line, 19);
+    }
+
+    #[test]
+    fn go_helper_static_call_resolution() {
+        let dir = setup_go_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("go_resolution.go");
+        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.callers_of(&go_file, "barePkgTarget", 1).unwrap();
+        assert_eq!(result.total_callers, 1);
+        assert_eq!(result.callers[0].callers[0].symbol, "barePkgCaller");
+        assert_eq!(result.callers[0].callers[0].line, 8);
+    }
+
+    #[test]
+    fn go_helper_set_invalidates_reverse_index() {
+        let dir = setup_go_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("go_resolution.go");
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+
+        // First query: no helper data, tree-sitter only.
+        let result_before = cg.callers_of(&go_file, "Do", 1).unwrap();
+        let count_before = result_before.total_callers;
+
+        // Now inject helper; should invalidate the reverse index.
+        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
+        cg.set_go_helper(helper_out);
+
+        // Second query: reverse index rebuilt, helper edges included then deduped.
+        let result_after = cg.callers_of(&go_file, "Do", 1).unwrap();
+
+        // Regardless of what tree-sitter found, after helper injection and
+        // deduplication the count must be exactly 1 (interfaceCaller:42).
+        assert_eq!(result_after.total_callers, 1);
+        // Tree-sitter count shouldn't have grown by more than the helper added.
+        // (It may equal before if tree-sitter already found it, or 1 if it didn't.)
+        assert!(
+            result_after.total_callers <= count_before + 2,
+            "helper should not multiply callers unexpectedly: before={count_before} after={}",
+            result_after.total_callers
+        );
+    }
 }
