@@ -493,9 +493,38 @@ impl CallTreeNode {
 /// `self` for Python) and type annotations / default values. Returns just
 /// the parameter names.
 pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
+    // Go methods look like `func (recv Type) Name(params) ret`. The first
+    // parenthesised block is the receiver — skip it so we find the real
+    // parameter list. Other languages have no receiver block, so start from
+    // the first `(` as usual.
+    let scan_from = if lang == LangId::Go {
+        let trimmed = signature.trim_start();
+        let offset = signature.len() - trimmed.len();
+        if let Some(rest) = trimmed.strip_prefix("func ") {
+            let rest = rest.trim_start();
+            if rest.starts_with('(') {
+                // Walk the receiver parens to find its matching close.
+                if let Some(close) = first_top_level(&rest[1..], ')') {
+                    // Absolute index of the char after the receiver's ')'.
+                    let receiver_abs_end =
+                        offset + (trimmed.len() - rest.len()) + 1 + close + 1;
+                    receiver_abs_end
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     // Find the parameter list between parentheses
-    let start = match signature.find('(') {
-        Some(i) => i + 1,
+    let start = match signature[scan_from..].find('(') {
+        Some(i) => scan_from + i + 1,
         None => return Vec::new(),
     };
     let end = match signature[start..].find(')') {
@@ -1627,6 +1656,7 @@ impl CallGraph {
                 | "assignment_expression"
                 | "augmented_assignment_expression"
                 | "assignment"
+                | "assignment_statement"
                 | "let_declaration"
                 | "short_var_declaration"
         );
@@ -1649,6 +1679,26 @@ impl CallGraph {
                         line,
                         flow_type: "assignment".to_string(),
                         approximate: true,
+                    });
+                    return;
+                }
+
+                // LHS is a field/index write (e.g. `m.Field = x` or `a[i] = x`).
+                // Emit a distinct `field_write` hop. Don't extend tracked_names
+                // with the compound path — downstream tracking treats names as
+                // bare identifiers, and "m.Field" would produce noisy matches.
+                let is_field_write = new_name.contains('.')
+                    || new_name.contains('[')
+                    || new_name.starts_with('*');
+
+                if is_field_write {
+                    hops.push(DataFlowHop {
+                        file: rel_file.to_string(),
+                        symbol: symbol.to_string(),
+                        variable: new_name,
+                        line,
+                        flow_type: "field_write".to_string(),
+                        approximate: is_approx,
                     });
                     return;
                 }
@@ -1763,6 +1813,19 @@ impl CallGraph {
             }
             "assignment" => {
                 // Python: x = <expr>
+                let left = node.child_by_field_name("left")?;
+                let right = node.child_by_field_name("right")?;
+                let left_text = node_text(left, source);
+                let right_text = node_text(right, source);
+
+                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
+                    let is_approx = matches!(kind, ExprMatch::Derived);
+                    return Some((left_text, right_text, line, is_approx));
+                }
+                None
+            }
+            "assignment_statement" => {
+                // Go: x = <expr>  (tree-sitter-go wraps both sides in expression_list).
                 let left = node.child_by_field_name("left")?;
                 let right = node.child_by_field_name("right")?;
                 let left_text = node_text(left, source);
@@ -3959,6 +4022,22 @@ function testValidation() {
             LangId::Go,
         );
         assert_eq!(params, vec!["input", "count"]);
+    }
+
+    #[test]
+    fn extract_parameters_go_method_skips_receiver() {
+        // Go method: receiver block is the first `(...)`, actual params come second.
+        let params = extract_parameters(
+            "func (s *concreteSvc) concreteMethod(x int, y string) int",
+            LangId::Go,
+        );
+        assert_eq!(params, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn extract_parameters_go_method_no_params() {
+        let params = extract_parameters("func (s *svc) noParams() int", LangId::Go);
+        assert!(params.is_empty(), "no params should yield empty, got {:?}", params);
     }
 
     #[test]

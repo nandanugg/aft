@@ -69,7 +69,8 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(data) => {
             // Check if the symbol exists in the file (as a call-site container or exported symbol)
             let has_symbol = data.calls_by_symbol.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string());
+                || data.exported_symbols.contains(&symbol.to_string())
+                || data.symbol_metadata.contains_key(symbol);
             if !has_symbol {
                 return Response::error(
                     &req.id,

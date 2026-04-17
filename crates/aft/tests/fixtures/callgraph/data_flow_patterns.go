@@ -52,3 +52,13 @@ func methodReceiverCase(u User) {
 }
 
 func (u *User) saveMethod(c Ctx) {}
+
+// Gap 6: field-write origin (m.Account = name) should produce a field_write hop
+// showing that the tracked value flowed into the field.
+type Message struct {
+	Account string
+}
+
+func fieldWriteCase(m *Message, name string) {
+	m.Account = name
+}

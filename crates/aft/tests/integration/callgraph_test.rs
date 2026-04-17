@@ -1380,3 +1380,31 @@ fn callgraph_trace_data_method_receiver() {
 
     aft.shutdown();
 }
+
+/// Gap 6: `m.Account = name` should produce a `field_write` hop with variable
+/// `m.Account`, since the tracked value flowed into a field.
+#[test]
+fn callgraph_trace_data_field_write() {
+    let mut aft = AftProcess::spawn();
+    let root = trace_data_configure_go(&mut aft);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow_patterns.go","symbol":"fieldWriteCase","expression":"name","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    let hops = resp["hops"].as_array().expect("hops array");
+
+    let fw_hop = hops.iter().find(|h| {
+        h["flow_type"] == "field_write" && h["symbol"] == "fieldWriteCase"
+    });
+    assert!(
+        fw_hop.is_some(),
+        "expected field_write hop for m.Account = name, got hops: {:?}",
+        hops
+    );
+    assert_eq!(fw_hop.unwrap()["variable"], "m.Account");
+
+    aft.shutdown();
+}
