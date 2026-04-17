@@ -150,6 +150,14 @@ Match the command to the task type. Outline is universal; the semantic graph too
 
 TypeScript, JavaScript, Python, Rust, Go, C/C++, Java, Ruby, Markdown
 
+## Go Interface Dispatch
+
+For Go projects, AFT automatically runs `aft-go-helper` at configure time (if available) to resolve interface method calls and concrete receiver calls that tree-sitter alone cannot type-check. The helper uses the standard Go toolchain's SSA + class-hierarchy analysis.
+
+**No action required**: if `go` is on PATH and the project has a `go.mod`, the helper runs in the background after `configure`. `callers`, `call_tree`, and related commands automatically use the results once they're ready.
+
+**Requirements**: Go 1.22+ and `aft-go-helper` on PATH (or `$AFT_GO_HELPER_PATH`). The install script builds and symlinks it automatically. Falls back silently to tree-sitter if unavailable.
+
 ## Hook Integration
 
 Grep and Glob tools are automatically routed through AFT via hooks for indexed performance.

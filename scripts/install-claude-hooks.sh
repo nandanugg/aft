@@ -32,6 +32,25 @@ fi
 
 info "AFT binary: $AFT_BINARY"
 
+# Build the optional Go helper for interface-dispatch resolution in Go projects.
+# If `go` is not installed, we skip silently — AFT still works for all languages,
+# but Go method calls won't be type-resolved (falls back to tree-sitter).
+GO_HELPER_BINARY="$AFT_ROOT/target/release/aft-go-helper"
+if command -v go &>/dev/null; then
+    info "Building aft-go-helper (Go interface-dispatch resolver)..."
+    cd "$AFT_ROOT/go-helper"
+    if go build -o "$GO_HELPER_BINARY" .; then
+        info "Go helper built: $GO_HELPER_BINARY"
+    else
+        warn "Failed to build aft-go-helper — Go interface dispatch resolution will be unavailable."
+        GO_HELPER_BINARY=""
+    fi
+    cd "$AFT_ROOT"
+else
+    warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
+    GO_HELPER_BINARY=""
+fi
+
 # Create directories
 mkdir -p "$HOOKS_DIR"
 info "Created hooks directory: $HOOKS_DIR"
@@ -582,8 +601,18 @@ if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
     ln -sf "$HOOKS_DIR/aft" /usr/local/bin/aft 2>/dev/null && \
         info "Symlinked aft to /usr/local/bin/aft" || \
         warn "Could not symlink to /usr/local/bin (run with sudo if needed)"
+
+    # Also symlink the Go helper so find_helper_binary picks it up via PATH.
+    if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+        ln -sf "$GO_HELPER_BINARY" /usr/local/bin/aft-go-helper 2>/dev/null && \
+            info "Symlinked aft-go-helper to /usr/local/bin/aft-go-helper" || \
+            warn "Could not symlink aft-go-helper to /usr/local/bin (run with sudo if needed)"
+    fi
 else
     warn "Cannot write to /usr/local/bin - add $HOOKS_DIR to PATH manually"
+    if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+        warn "Also add $GO_HELPER_BINARY to PATH as 'aft-go-helper' for Go interface dispatch resolution"
+    fi
 fi
 
 echo ""
@@ -594,10 +623,18 @@ echo "  $HOOKS_DIR/aft           - CLI wrapper"
 echo "  $HOOKS_DIR/aft-hook.sh   - Tool interceptor"
 echo "  $CLAUDE_DIR/AFT.md       - Claude instructions"
 echo "  $CLAUDE_DIR/settings.json - Hook configuration"
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+    echo "  $GO_HELPER_BINARY - Go interface-dispatch resolver"
+fi
 echo ""
 echo "Usage:"
 echo "  aft outline src/         # Get file structure"
 echo "  aft zoom file.ts func    # Inspect function"
 echo "  aft callers file.ts func # Find all callers"
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+    echo ""
+    echo "Go interface dispatch is enabled. AFT will automatically resolve"
+    echo "interface method calls to their concrete implementations in Go projects."
+fi
 echo ""
 echo "Restart Claude Code to activate hooks."
