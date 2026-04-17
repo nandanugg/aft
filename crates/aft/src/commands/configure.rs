@@ -2251,17 +2251,58 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if !home_match {
         let helper_root = root_path.clone();
         let helper_cache = resolve_cache_dir(&root_path, next_config.storage_dir.as_deref());
-        let (helper_tx, helper_rx) = unbounded();
-        ctx.install_go_helper_rx(helper_rx);
-        thread::spawn(move || {
-            let result = go_helper::resolve_for_root(&helper_root, Duration::from_secs(60));
-            if let Ok(output) = &result {
-                if let Err(error) = go_helper::write_cached(&helper_cache, output) {
-                    crate::slog_debug!("go-helper cache write failed: {}", error);
+
+        let had_cache = if let Some(cached) = go_helper::read_cached(&helper_cache, &root_path) {
+            slog_info!(
+                "go-helper: loaded {} cached edges from {}",
+                cached.edges.len(),
+                helper_cache.display()
+            );
+            ctx.install_go_helper(cached);
+            true
+        } else {
+            ctx.clear_go_helper();
+            false
+        };
+
+        let wait_for_helper = req
+            .params
+            .get("wait_for_helper")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        if wait_for_helper && !had_cache {
+            match go_helper::resolve_for_root(&helper_root, Duration::from_secs(60)) {
+                Ok(output) => {
+                    slog_info!(
+                        "go-helper: {} edges (sync), {} skipped packages",
+                        output.edges.len(),
+                        output.skipped.len()
+                    );
+                    if let Err(error) = go_helper::write_cached(&helper_cache, &output) {
+                        slog_debug!("go-helper cache write failed: {}", error);
+                    }
+                    ctx.install_go_helper(output);
+                }
+                Err(error) => {
+                    slog_debug!("go-helper sync run unavailable: {}", error);
                 }
             }
-            let _ = helper_tx.send(result);
-        });
+        } else {
+            let helper_cache_bg = helper_cache.clone();
+            let helper_root_bg = helper_root.clone();
+            let (helper_tx, helper_rx) = unbounded();
+            ctx.install_go_helper_rx(helper_rx);
+            thread::spawn(move || {
+                let result = go_helper::resolve_for_root(&helper_root_bg, Duration::from_secs(60));
+                if let Ok(output) = &result {
+                    if let Err(error) = go_helper::write_cached(&helper_cache_bg, output) {
+                        crate::slog_debug!("go-helper cache write failed: {}", error);
+                    }
+                }
+                let _ = helper_tx.send(result);
+            });
+        }
     } else {
         ctx.clear_go_helper();
     }

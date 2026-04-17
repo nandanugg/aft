@@ -938,6 +938,10 @@ impl AppContext {
         self.go_helper_data.lock().clone()
     }
 
+    pub fn install_go_helper(&self, data: HelperOutput) {
+        *self.go_helper_data.lock() = Some(data);
+    }
+
     /// Receiver slot for an in-flight helper run installed by configure.
     pub fn go_helper_rx(
         &self,
@@ -951,7 +955,6 @@ impl AppContext {
         &self,
         rx: crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>,
     ) {
-        *self.go_helper_data.lock() = None;
         *self.go_helper_rx.lock() = Some(rx);
     }
 
@@ -984,7 +987,7 @@ impl AppContext {
                         output.edges.len(),
                         output.skipped.len()
                     );
-                    *self.go_helper_data.lock() = Some(output);
+                    self.install_go_helper(output);
                 }
                 Err(error) => {
                     crate::slog_debug!("go-helper unavailable: {}", error);
