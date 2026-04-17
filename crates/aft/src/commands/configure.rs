@@ -20,6 +20,7 @@ use crate::context::{
     SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
     SubcLifecycleAdmission,
 };
+use crate::go_helper;
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
@@ -2381,6 +2382,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
+
+    if !home_match {
+        let helper_root = root_path.clone();
+        let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
+        let helper_cache =
+            resolve_cache_dir_with_key(&project_key, next_config.storage_dir.as_deref());
+        let (helper_tx, helper_rx) = unbounded();
+        ctx.install_go_helper_rx(helper_rx);
+        thread::spawn(move || {
+            let result = go_helper::resolve_for_root(&helper_root, Duration::from_secs(60));
+            if let Ok(output) = &result {
+                if let Err(error) = go_helper::write_cached(&helper_cache, output) {
+                    crate::slog_debug!("go-helper cache write failed: {}", error);
+                }
+            }
+            let _ = helper_tx.send(result);
+        });
+    } else {
+        ctx.clear_go_helper();
+    }
+
     ctx.begin_configure_ack_phase("maintenance_enqueue");
     ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
