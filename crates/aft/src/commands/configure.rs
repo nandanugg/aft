@@ -267,6 +267,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         ctx.config_mut().semantic = semantic;
     }
+    // `no_cache: true` disables the persistent call-graph cache for this session.
+    if let Some(v) = req.params.get("no_cache").and_then(|v| v.as_bool()) {
+        ctx.config_mut().cache_enabled = !v;
+    }
 
     // [similarity] config section
     if let Some(v) = req.params.get("similarity") {
@@ -510,7 +514,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // Initialize call graph with the project root, and enable on-disk
     // parse caching so repeated CLI invocations skip re-parsing files
     // whose mtime hasn't changed.
-    let mut graph = CallGraph::new(root_path.clone());
+    // `no_cache` inverts `cache_enabled`: persistent cache is ON by default
+    // unless overridden via `--no-cache`, `AFT_DISABLE_CACHE=1`, or
+    // `configure { "no_cache": true }`.
+    let no_cache = !ctx.config().cache_enabled;
+    let mut graph = CallGraph::new(root_path.clone(), no_cache);
     // Propagate feature-flag settings from Config into the graph.
     graph.enable_dispatch_edges = ctx.config().enable_dispatch_edges;
     graph.enable_implementation_edges = ctx.config().enable_implementation_edges;

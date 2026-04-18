@@ -18,6 +18,7 @@ use crate::go_helper::{EdgeKind, HelperOutput};
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
+use crate::persistent_cache::{CacheManager, FileCacheOutcome, FileStat};
 use crate::symbols::SymbolKind;
 
 // ---------------------------------------------------------------------------
@@ -990,6 +991,11 @@ fn extract_param_name(param: &str, lang: LangId) -> String {
 ///
 /// Files are parsed and analyzed on first access, then cached. The graph
 /// can resolve cross-file call edges using the import engine.
+///
+/// Persistent caching is handled via [`CacheManager`]: call data is keyed on
+/// `(mtime, size)` per file and survives across process restarts. On warm
+/// runs (no file changes) the entire reverse index may be loaded from the
+/// merged-graph cache, making queries near-instant.
 pub struct CallGraph {
     /// Cached per-file call data.
     data: HashMap<PathBuf, FileCallData>,
@@ -1027,11 +1033,18 @@ pub struct CallGraph {
     /// Default `true`. Set via `Config::enable_writes_edges` or
     /// `AFT_DISABLE_WRITES_EDGES=1`. When `false`, writes edges are dropped.
     pub enable_writes_edges: bool,
+    /// On-disk persistent cache manager (Tier 2). Tracks parse, helper,
+    /// and merged-graph caches per project. Disabled when `no_cache` is
+    /// passed to `CallGraph::new`.
+    cache: CacheManager,
 }
 
 impl CallGraph {
     /// Create a new call graph for a project.
-    pub fn new(project_root: PathBuf) -> Self {
+    ///
+    /// `no_cache` forces a cache-less run (equivalent to `AFT_DISABLE_CACHE=1`).
+    pub fn new(project_root: PathBuf, no_cache: bool) -> Self {
+        let cache = CacheManager::new(project_root.clone(), no_cache);
         Self {
             data: HashMap::new(),
             project_root,
@@ -1050,6 +1063,7 @@ impl CallGraph {
             enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
+            cache,
         }
     }
 
@@ -1196,30 +1210,31 @@ impl CallGraph {
 
     /// Get or build the call data for a file.
     ///
-    /// Checks the in-memory cache first, then the on-disk parse cache
-    /// (if configured), and only re-parses on miss. Keeps repeat CLI
-    /// invocations fast: a cold first run pays full parse cost, a warm
-    /// follow-up skips straight to the cached tree per file.
+    /// Uses the Tier 2 persistent cache (keyed on mtime+size): on a warm run,
+    /// returns the cached parse without touching tree-sitter. On miss, parses
+    /// fresh and writes back to the cache. The Tier 2 `CacheManager` supersedes
+    /// the earlier per-file `parse_cache` module; `parse_cache_dir` is retained
+    /// on the struct for compatibility with older call sites but is not the
+    /// active cache path.
     pub fn build_file(&mut self, path: &Path) -> Result<&FileCallData, AftError> {
         let canon = self.canonicalize(path)?;
 
         if !self.data.contains_key(&canon) {
-            let cache_dir = self.parse_cache_dir.clone();
-            let file_data = match cache_dir.as_deref().and_then(|d| crate::parse_cache::read(d, &canon)) {
-                Some(d) => d,
-                None => {
-                    let d = build_file_data(&canon)?;
-                    if let Some(ref dir) = cache_dir {
-                        // Best-effort write: a cache failure shouldn't
-                        // break the request.
-                        if let Err(e) = crate::parse_cache::write(dir, &canon, &d) {
-                            log::debug!("[aft] parse-cache write failed: {e}");
-                        }
-                    }
-                    d
+            // Try the persistent parse cache first (Tier 2).
+            match self.cache.get_file(&canon) {
+                FileCacheOutcome::Hit(cached_data) => {
+                    log::debug!("[cache] parse-cache hit: {}", canon.display());
+                    self.data.insert(canon.clone(), cached_data);
                 }
-            };
-            self.data.insert(canon.clone(), file_data);
+                FileCacheOutcome::Miss => {
+                    let file_data = build_file_data(&canon)?;
+                    // Write back to persistent cache.
+                    if let Some(stat) = FileStat::from_path(&canon) {
+                        self.cache.put_file(&canon, stat, &file_data);
+                    }
+                    self.data.insert(canon.clone(), file_data);
+                }
+            }
         }
 
         Ok(&self.data[&canon])
@@ -1469,16 +1484,19 @@ impl CallGraph {
     /// For each file, builds the call data (if not cached), then for each
     /// (symbol, call_sites) pair, resolves cross-file edges and inserts
     /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
+    ///
+    /// After building, flushes the parse-index cache to disk and saves the
+    /// merged-graph cache so that subsequent warm runs skip this work entirely.
     fn build_reverse_index(&mut self) {
         let start = std::time::Instant::now();
         // Discover all project files first
         let all_files = self.project_files().to_vec();
 
-        // Build file data for all project files. For large projects on a
-        // cold cache this is the dominant cost of the first CLI query
-        // (tree-sitter parsing per file). Progress lines go to stderr so
-        // the CLI wrapper can surface them — silence at 3s looks like a
-        // hang even though real work is happening.
+        // Build file data for all project files (cache-aware).
+        // For large projects on a cold cache this is the dominant cost of the
+        // first CLI query. Progress lines go to stderr so the CLI wrapper can
+        // surface them — silence at 3s looks like a hang even though real
+        // work is happening.
         log::info!("building call graph: {} files", all_files.len());
         for (i, f) in all_files.iter().enumerate() {
             let _ = self.build_file(f);
@@ -1536,6 +1554,10 @@ impl CallGraph {
             }
             map
         };
+
+        // Flush parse index before building the merged graph (the merged-graph
+        // header embeds a digest of the parse index CBOR).
+        self.cache.flush_parse_index();
 
         // Now build the reverse map
         let mut reverse: ReverseIndex = HashMap::new();
@@ -1753,9 +1775,95 @@ impl CallGraph {
             }
         }
 
+        // Tier 2: save the merged graph to disk for future warm runs.
+        // Convert the internal IndexedCallerSite to the public CallerSite for storage.
+        let serialisable: HashMap<PathBuf, HashMap<String, Vec<CallerSite>>> = reverse
+            .iter()
+            .map(|(target, sym_map)| {
+                let inner = sym_map
+                    .iter()
+                    .map(|(sym, sites)| {
+                        let caller_sites: Vec<CallerSite> = sites
+                            .iter()
+                            .map(|s| CallerSite {
+                                caller_file: s.caller_file.as_ref().clone(),
+                                caller_symbol: s.caller_symbol.to_string(),
+                                line: s.line,
+                                col: s.col,
+                                resolved: s.resolved,
+                                kind: s.kind,
+                                nearby_string: s.nearby_string.clone(),
+                            })
+                            .collect();
+                        (sym.clone(), caller_sites)
+                    })
+                    .collect();
+                (target.clone(), inner)
+            })
+            .collect();
+        self.cache.save_merged_graph(&serialisable);
+
         self.reverse_index = Some(reverse);
         self.dispatch_index = Some(dispatch);
         self.implementation_index = Some(impl_index);
+    }
+
+    /// Try to restore the reverse index from the on-disk merged graph.
+    ///
+    /// Returns `true` if a valid cached graph was loaded (warm path).
+    fn try_load_merged_graph(&mut self) -> bool {
+        let Some(graph) = self.cache.load_merged_graph() else {
+            return false;
+        };
+
+        log::info!("[cache] loaded merged-graph from disk (warm run)");
+
+        // Also populate `self.data` from the parse-index so that other queries
+        // (symbol resolution, imports) work without re-parsing.
+        // We load only what the reverse index references.
+        if let Some(cache_dir) = self.cache.cache_dir() {
+            if let Some(parse_index) = crate::persistent_cache::read_parse_index(cache_dir) {
+                for (rel, (stat, ser_data)) in parse_index.entries {
+                    let abs_path = self.project_root.join(&rel);
+                    // Only load if the file on disk matches the cached stat
+                    if let Some(current) = FileStat::from_path(&abs_path) {
+                        if current == stat {
+                            let data = crate::callgraph::FileCallData::from(ser_data);
+                            self.data.insert(abs_path, data);
+                        }
+                    }
+                }
+            }
+        }
+
+        let reverse_flat = self.cache.restore_reverse_index(graph);
+
+        // Convert the flat CallerSite map into the internal IndexedCallerSite ReverseIndex
+        let mut reverse: ReverseIndex = HashMap::new();
+        for (target_path, sym_map) in reverse_flat {
+            let inner = sym_map
+                .into_iter()
+                .map(|(sym, callers)| {
+                    let indexed: Vec<IndexedCallerSite> = callers
+                        .into_iter()
+                        .map(|c| IndexedCallerSite {
+                            caller_file: Arc::new(c.caller_file),
+                            caller_symbol: Arc::from(c.caller_symbol.as_str()),
+                            line: c.line,
+                            col: c.col,
+                            resolved: c.resolved,
+                            kind: c.kind,
+                            nearby_string: c.nearby_string,
+                        })
+                        .collect();
+                    (sym, indexed)
+                })
+                .collect();
+            reverse.insert(target_path, inner);
+        }
+
+        self.reverse_index = Some(reverse);
+        true
     }
 
     fn reverse_sites(&self, file: &Path, symbol: &str) -> Option<&[IndexedCallerSite]> {
@@ -1959,9 +2067,12 @@ impl CallGraph {
         // Ensure file is built (may already be cached)
         self.build_file(&canon)?;
 
-        // Build the reverse index if not cached
+        // Build the reverse index if not cached.
+        // First try the warm path: load from the merged-graph disk cache.
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            if !self.try_load_merged_graph() {
+                self.build_reverse_index();
+            }
         }
 
         let scanned_files = self.project_files.as_ref().map(|f| f.len()).unwrap_or(0);
@@ -3241,11 +3352,17 @@ impl CallGraph {
     /// Called by the file watcher when a file changes on disk. The reverse
     /// index is rebuilt lazily on the next `callers_of` call.
     pub fn invalidate_file(&mut self, path: &Path) {
-        // Remove from data cache (try both as-is and canonicalized)
+        // Remove from in-memory data cache (try both as-is and canonicalized)
         self.data.remove(path);
         if let Ok(canon) = self.canonicalize(path) {
             self.data.remove(&canon);
+            // Remove from persistent parse cache (also invalidates merged-graph.cbor).
+            self.cache.remove_file(&canon);
         }
+        // Also invalidate the merged graph unconditionally — even if the file
+        // was not in the parse cache (e.g. newly added file), the merged graph
+        // is stale because the set of callers may have changed.
+        self.cache.invalidate_merged_graph();
         // Clear the reverse index — it's stale
         self.reverse_index = None;
         self.dispatch_index = None;
@@ -4076,7 +4193,7 @@ export function funcB() {
     #[test]
     fn callgraph_single_file_call_extraction() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let file_data = graph.build_file(&dir.path().join("main.ts")).unwrap();
         let main_calls = &file_data.calls_by_symbol["main"];
@@ -4102,7 +4219,7 @@ export function funcB() {
     #[test]
     fn callgraph_file_data_has_exports() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let file_data = graph.build_file(&dir.path().join("utils.ts")).unwrap();
         assert!(
@@ -4122,7 +4239,7 @@ export function funcB() {
     #[test]
     fn callgraph_resolve_direct_import() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4147,7 +4264,7 @@ export function funcB() {
     #[test]
     fn callgraph_resolve_namespace_import() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4172,7 +4289,7 @@ export function funcB() {
     #[test]
     fn callgraph_resolve_aliased_import() {
         let dir = setup_alias_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4197,7 +4314,7 @@ export function funcB() {
     #[test]
     fn callgraph_unresolved_edge_marked() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4219,7 +4336,7 @@ export function funcB() {
     #[test]
     fn callgraph_cycle_detection_stops() {
         let dir = setup_cycle_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // This should NOT infinite loop
         let tree = graph
@@ -4257,7 +4374,7 @@ export function funcB() {
     #[test]
     fn callgraph_depth_limit_truncates() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // main → helper → double, main → compute
         // With depth 1, we should see direct callees but not their children
@@ -4281,7 +4398,7 @@ export function funcB() {
     #[test]
     fn callgraph_depth_zero_no_children() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let tree = graph
             .forward_tree(&dir.path().join("main.ts"), "main", 0)
@@ -4299,7 +4416,7 @@ export function funcB() {
     #[test]
     fn callgraph_forward_tree_cross_file() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // main → helper (in utils.ts) → double (in helpers.ts)
         let tree = graph
@@ -4447,7 +4564,7 @@ export function funcB() {
     #[test]
     fn callgraph_callers_of_direct() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // helpers.ts:double is called by utils.ts:helper
         let result = graph
@@ -4478,7 +4595,7 @@ export function funcB() {
     #[test]
     fn callgraph_callers_of_no_callers() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // main.ts:main is the entry point — nothing calls it
         let result = graph
@@ -4493,7 +4610,7 @@ export function funcB() {
     #[test]
     fn callgraph_callers_recursive_depth() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // helpers.ts:double is called by utils.ts:helper
         // utils.ts:helper is called by main.ts:main
@@ -4520,7 +4637,7 @@ export function funcB() {
     #[test]
     fn callgraph_invalidate_file_clears_reverse_index() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // Build callers to populate the reverse index
         let _ = graph
@@ -4697,7 +4814,7 @@ export function funcB() {
     #[test]
     fn callgraph_symbol_metadata_populated() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let file_data = graph.build_file(&dir.path().join("utils.ts")).unwrap();
         assert!(
@@ -4803,7 +4920,7 @@ function testValidation() {
     #[test]
     fn trace_to_multi_path() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let result = graph
             .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 10)
@@ -4846,7 +4963,7 @@ function testValidation() {
     #[test]
     fn trace_to_single_path() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // validate is called from processData, testValidation
         // processData is called from main, handleRequest
@@ -4866,7 +4983,7 @@ function testValidation() {
     #[test]
     fn trace_to_cycle_detection() {
         let dir = setup_cycle_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // funcA ↔ funcB cycle — should terminate
         let result = graph
@@ -4880,7 +4997,7 @@ function testValidation() {
     #[test]
     fn trace_to_depth_limit() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // With max_depth=1, should not be able to reach entry points that are 3+ hops away
         let result = graph
@@ -4908,7 +5025,7 @@ function testValidation() {
     #[test]
     fn trace_to_entry_point_target() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         // main is itself an entry point — should return a single trivial path
         let result = graph
@@ -5196,7 +5313,7 @@ func interfaceCaller(d Doer, x int) int {
         let go_file = root.join("go_resolution.go");
         let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5219,7 +5336,7 @@ func interfaceCaller(d Doer, x int) int {
         let go_file = root.join("go_resolution.go");
         let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5236,7 +5353,7 @@ func interfaceCaller(d Doer, x int) int {
         let go_file = root.join("go_resolution.go");
         let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5252,7 +5369,7 @@ func interfaceCaller(d Doer, x int) int {
         let root = dir.path().to_path_buf();
         let go_file = root.join("go_resolution.go");
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
 
         // First query: no helper data, tree-sitter only.
@@ -5393,7 +5510,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5411,7 +5528,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5427,7 +5544,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5445,7 +5562,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5461,7 +5578,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5497,7 +5614,7 @@ func processRequest() {
             skipped: vec![],
         };
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5513,7 +5630,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.enable_dispatch_edges = false; // disable flag
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
@@ -5534,7 +5651,7 @@ func processRequest() {
         let go_file = root.join("handler.go");
         let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5643,7 +5760,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let iface_file = root.join("iface.go");
         let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5668,7 +5785,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let iface_file = root.join("iface.go");
         let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5687,7 +5804,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let iface_file = root.join("iface.go");
         let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
@@ -5702,7 +5819,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let iface_file = root.join("iface.go");
         let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.enable_implementation_edges = false;
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
@@ -5722,7 +5839,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let iface_file = root.join("iface.go");
         let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
 
-        let mut cg = CallGraph::new(root.clone());
+        let mut cg = CallGraph::new(root.clone(), true);
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 

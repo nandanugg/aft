@@ -124,6 +124,10 @@ pub struct Config {
     pub similarity_auto_build_index: bool,
     /// Similarity weights: (w_lex, w_syn, w_cit), must sum to 1.0.
     pub similarity_weights: (f32, f32, f32),
+    /// When `true` (default), the persistent call-graph cache is active.
+    /// Disabled by `--no-cache` CLI flag, `AFT_DISABLE_CACHE=1` env var, or
+    /// `configure { "no_cache": true }` request param.
+    pub cache_enabled: bool,
 }
 
 impl Default for Config {
@@ -161,6 +165,9 @@ impl Default for Config {
             similarity_enabled: true,
             similarity_auto_build_index: true,
             similarity_weights: (0.70, 0.15, 0.15),
+            cache_enabled: std::env::var("AFT_DISABLE_CACHE")
+                .map(|v| v != "1")
+                .unwrap_or(true),
         }
     }
 }

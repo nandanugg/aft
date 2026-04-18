@@ -34,6 +34,7 @@ pub mod language;
 pub mod lsp;
 pub mod lsp_hints;
 pub mod parser;
+pub mod persistent_cache;
 pub mod protocol;
 pub mod search_index;
 pub mod semantic_index;
