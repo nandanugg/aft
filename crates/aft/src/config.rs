@@ -101,6 +101,10 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// When `true` (default), the persistent call-graph cache is active.
+    /// Disabled by `--no-cache` CLI flag, `AFT_DISABLE_CACHE=1` env var, or
+    /// `configure { "no_cache": true }` request param.
+    pub cache_enabled: bool,
 }
 
 impl Default for Config {
@@ -124,6 +128,7 @@ impl Default for Config {
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             storage_dir: None,
+            cache_enabled: true,
         }
     }
 }

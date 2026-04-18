@@ -227,6 +227,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         ctx.config_mut().semantic = semantic;
     }
+    // `no_cache: true` disables the persistent call-graph cache for this session.
+    if let Some(v) = req.params.get("no_cache").and_then(|v| v.as_bool()) {
+        ctx.config_mut().cache_enabled = !v;
+    }
 
     let experimental_search_index = ctx.config().experimental_search_index;
     let experimental_semantic_search = ctx.config().experimental_semantic_search;
@@ -436,7 +440,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Initialize call graph with the project root
-    let graph = CallGraph::new(root_path.clone());
+    // `no_cache` inverts `cache_enabled`: cache is ON by default.
+    let no_cache = !ctx.config().cache_enabled;
+    let graph = CallGraph::new(root_path.clone(), no_cache);
     *ctx.callgraph().borrow_mut() = Some(graph);
 
     // Drop old watcher/receiver before creating new ones (re-configure)

@@ -14,6 +14,18 @@ fn main() {
         return;
     }
 
+    // --no-cache: disable the persistent call-graph cache for this invocation.
+    // Sets AFT_DISABLE_CACHE=1 so that CacheManager sees it on all code paths
+    // regardless of when configure() is called.
+    let no_cache = std::env::args().any(|a| a == "--no-cache");
+    if no_cache {
+        // SAFETY: single-threaded at this point (before any thread::spawn calls).
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("AFT_DISABLE_CACHE", "1");
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             use std::io::Write;
@@ -30,7 +42,11 @@ fn main() {
 
     log::info!("started, pid {}", std::process::id());
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let mut config = Config::default();
+    if no_cache {
+        config.cache_enabled = false;
+    }
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
 
     let stdin = io::stdin();
     let reader = stdin.lock();
