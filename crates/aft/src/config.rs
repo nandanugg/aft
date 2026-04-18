@@ -101,6 +101,12 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// Similarity index: enabled (default: true).
+    pub similarity_enabled: bool,
+    /// Similarity index: auto-build on configure (default: true).
+    pub similarity_auto_build_index: bool,
+    /// Similarity weights: (w_lex, w_syn, w_cit), must sum to 1.0.
+    pub similarity_weights: (f32, f32, f32),
 }
 
 impl Default for Config {
@@ -124,6 +130,9 @@ impl Default for Config {
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             storage_dir: None,
+            similarity_enabled: true,
+            similarity_auto_build_index: true,
+            similarity_weights: (0.70, 0.15, 0.15),
         }
     }
 }

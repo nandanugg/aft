@@ -35,6 +35,7 @@ pub mod parser;
 pub mod protocol;
 pub mod search_index;
 pub mod semantic_index;
+pub mod similarity;
 pub mod symbols;
 
 #[cfg(test)]
