@@ -34,7 +34,7 @@
 Run the setup wizard — it registers AFT in your OpenCode and TUI config and asks which experimental features to enable:
 
 ```bash
-bunx @cortexkit/aft-opencode@latest setup
+bunx --bun @cortexkit/aft-opencode@latest setup
 ```
 
 That's it. On the next session start, the binary downloads if needed and all tools become
@@ -67,10 +67,10 @@ AFT ships a standalone CLI for setup, diagnostics, and issue reporting:
 
 | Command | What it does |
 |---|---|
-| `bunx @cortexkit/aft-opencode@latest setup` | Interactive first-time setup — registers plugin entries, enables experimental features |
-| `bunx @cortexkit/aft-opencode@latest doctor` | Check configuration and auto-fix common issues |
-| `bunx @cortexkit/aft-opencode@latest doctor --force` | Force-clear the OpenCode plugin cache (fixes stale `@latest` resolution) |
-| `bunx @cortexkit/aft-opencode@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
+| `bunx --bun @cortexkit/aft-opencode@latest setup` | Interactive first-time setup — registers plugin entries, enables experimental features |
+| `bunx --bun @cortexkit/aft-opencode@latest doctor` | Check configuration and auto-fix common issues |
+| `bunx --bun @cortexkit/aft-opencode@latest doctor --force` | Force-clear the OpenCode plugin cache (fixes stale `@latest` resolution) |
+| `bunx --bun @cortexkit/aft-opencode@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
 
 **`setup`** — Interactive wizard that registers AFT in your OpenCode and TUI config, asks whether to enable `experimental_search_index` and `experimental_semantic_search`, and writes the result to `~/.config/opencode/aft.jsonc`. Run this once after installing.
 

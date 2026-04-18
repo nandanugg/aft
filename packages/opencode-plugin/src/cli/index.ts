@@ -22,9 +22,9 @@ if (command === "setup") {
   console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
   console.log("");
   console.log("  Usage:");
-  console.log("    bunx @cortexkit/aft-opencode@latest setup");
-  console.log("    bunx @cortexkit/aft-opencode@latest doctor");
-  console.log("    bunx @cortexkit/aft-opencode@latest doctor --issue");
+  console.log("    bunx --bun @cortexkit/aft-opencode@latest setup");
+  console.log("    bunx --bun @cortexkit/aft-opencode@latest doctor");
+  console.log("    bunx --bun @cortexkit/aft-opencode@latest doctor --issue");
   console.log("");
   process.exit(command ? 1 : 0);
 }
