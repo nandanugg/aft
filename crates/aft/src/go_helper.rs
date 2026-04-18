@@ -61,6 +61,12 @@ pub struct HelperEdge {
     pub callee: HelperCallee,
     /// Classification of the edge. See `EdgeKind`.
     pub kind: EdgeKind,
+    /// For `dispatches` edges: a string literal co-located at the same
+    /// call site (e.g. a task name passed alongside the handler).
+    /// Present only when exactly one string literal arg ≤128 chars
+    /// appears in the call. Absent for all other edge kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nearby_string: Option<String>,
 }
 
 /// Caller-side position for an edge.
@@ -106,6 +112,42 @@ pub enum EdgeKind {
     /// Interface dispatch resolved by class-hierarchy analysis. One
     /// `HelperEdge` is emitted per concrete implementation.
     Interface,
+    /// A function value is passed as an argument to a call site.
+    /// E.g. `scheduler.Register("task", myHandler)` — `myHandler` is
+    /// dispatched to `Register` for later invocation. See `nearby_string`
+    /// on the edge for the accompanying string label, if any.
+    Dispatches,
+    /// The callee is launched as a goroutine: `go callee(args)`.
+    Goroutine,
+    /// The callee is deferred: `defer callee(args)`.
+    Defer,
+}
+
+impl EdgeKind {
+    /// Return the wire-format name of this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Concrete => "concrete",
+            Self::Interface => "interface",
+            Self::Dispatches => "dispatches",
+            Self::Goroutine => "goroutine",
+            Self::Defer => "defer",
+        }
+    }
+
+    /// Parse from the wire-format string. Returns `None` for unknown kinds.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "static" => Some(Self::Static),
+            "concrete" => Some(Self::Concrete),
+            "interface" => Some(Self::Interface),
+            "dispatches" => Some(Self::Dispatches),
+            "goroutine" => Some(Self::Goroutine),
+            "defer" => Some(Self::Defer),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +497,7 @@ mod tests {
                     pkg: String::new(),
                 },
                 kind: EdgeKind::Static,
+                nearby_string: None,
             }],
             skipped: vec![],
         };
@@ -543,5 +586,141 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<HelperOutput>(json).unwrap_err();
         assert!(err.to_string().contains("telepathy") || err.to_string().contains("variant"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 1.1/1.2/1.3: new kinds and nearby_string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_kinds_parse_correctly() {
+        let json = r#"{
+            "version": 1,
+            "root": "/x",
+            "edges": [
+                {
+                    "caller": {"file": "a.go", "line": 10, "symbol": "Register"},
+                    "callee": {"file": "b.go", "symbol": "HandleTask"},
+                    "kind": "dispatches",
+                    "nearby_string": "my-task"
+                },
+                {
+                    "caller": {"file": "a.go", "line": 20, "symbol": "LaunchWorker"},
+                    "callee": {"file": "b.go", "symbol": "WorkerLoop"},
+                    "kind": "goroutine"
+                },
+                {
+                    "caller": {"file": "a.go", "line": 30, "symbol": "CleanUp"},
+                    "callee": {"file": "b.go", "symbol": "Close"},
+                    "kind": "defer"
+                }
+            ]
+        }"#;
+        let out: HelperOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.edges.len(), 3);
+
+        let dispatches = &out.edges[0];
+        assert_eq!(dispatches.kind, EdgeKind::Dispatches);
+        assert_eq!(dispatches.nearby_string, Some("my-task".to_string()));
+
+        let goroutine = &out.edges[1];
+        assert_eq!(goroutine.kind, EdgeKind::Goroutine);
+        assert_eq!(goroutine.nearby_string, None);
+
+        let defer_edge = &out.edges[2];
+        assert_eq!(defer_edge.kind, EdgeKind::Defer);
+        assert_eq!(defer_edge.nearby_string, None);
+    }
+
+    #[test]
+    fn nearby_string_absent_means_none() {
+        // An edge without nearby_string should deserialize to None
+        let json = r#"{
+            "version": 1,
+            "root": "/x",
+            "edges": [
+                {
+                    "caller": {"file": "a.go", "line": 1, "symbol": "f"},
+                    "callee": {"file": "b.go", "symbol": "g"},
+                    "kind": "dispatches"
+                }
+            ]
+        }"#;
+        let out: HelperOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.edges[0].nearby_string, None);
+    }
+
+    #[test]
+    fn nearby_string_skipped_in_serialization_when_none() {
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "a.go".into(),
+                line: 1,
+                symbol: "f".into(),
+            },
+            callee: HelperCallee {
+                file: "b.go".into(),
+                symbol: "g".into(),
+                receiver: String::new(),
+                pkg: String::new(),
+            },
+            kind: EdgeKind::Dispatches,
+            nearby_string: None,
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
+    }
+
+    #[test]
+    fn nearby_string_included_in_serialization_when_some() {
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "a.go".into(),
+                line: 1,
+                symbol: "f".into(),
+            },
+            callee: HelperCallee {
+                file: "b.go".into(),
+                symbol: "g".into(),
+                receiver: String::new(),
+                pkg: String::new(),
+            },
+            kind: EdgeKind::Dispatches,
+            nearby_string: Some("send-email".to_string()),
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(s.contains("nearby_string"), "nearby_string=Some should be present: {s}");
+        assert!(s.contains("send-email"));
+    }
+
+    #[test]
+    fn old_v1_output_round_trips_with_new_fields() {
+        // An old-format v1 output (no nearby_string, no new kinds) should
+        // still parse without errors — backward compat via #[serde(default)].
+        let out: HelperOutput = serde_json::from_str(SAMPLE_OUTPUT).unwrap();
+        let serialized = serde_json::to_string(&out).unwrap();
+        let again: HelperOutput = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(out, again);
+        // All edges should have nearby_string=None (old format)
+        for e in &out.edges {
+            assert_eq!(e.nearby_string, None, "old-format edges should have no nearby_string");
+        }
+    }
+
+    #[test]
+    fn edge_kind_as_str_round_trips() {
+        let kinds = [
+            EdgeKind::Static,
+            EdgeKind::Concrete,
+            EdgeKind::Interface,
+            EdgeKind::Dispatches,
+            EdgeKind::Goroutine,
+            EdgeKind::Defer,
+        ];
+        for kind in kinds {
+            let s = kind.as_str();
+            let back = EdgeKind::from_str(s).expect("from_str should parse as_str output");
+            assert_eq!(kind, back, "round-trip failed for {s}");
+        }
     }
 }
