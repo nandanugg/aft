@@ -14,7 +14,7 @@ use tree_sitter::{Parser, Tree};
 use crate::calls::extract_calls_full;
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
-use crate::go_helper::HelperOutput;
+use crate::go_helper::{EdgeKind, HelperOutput};
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
@@ -27,6 +27,39 @@ use crate::symbols::SymbolKind;
 type SharedPath = Arc<PathBuf>;
 type SharedStr = Arc<str>;
 type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
+/// Secondary index: nearby_string (dispatch key) → list of dispatch callee targets.
+/// Populated only for `EdgeKind::Dispatches` edges that carry a `nearby_string`.
+type DispatchIndex = HashMap<String, Vec<DispatchEntry>>;
+
+/// One entry in the dispatch secondary index: a callee registered under a
+/// particular dispatch key, plus the registration call site.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchEntry {
+    /// The handler / callee being registered.
+    pub handler: DispatchCallee,
+    /// The call site that registers it (e.g. `asynq.HandleFunc(key, handler)`).
+    pub registered_by: DispatchRegistrar,
+}
+
+/// Callee side of a dispatch edge.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchCallee {
+    /// File path relative to project root.
+    pub file: String,
+    /// Symbol name of the handler function.
+    pub symbol: String,
+}
+
+/// Registrar call site of a dispatch edge.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchRegistrar {
+    /// File path relative to project root.
+    pub file: String,
+    /// Symbol that makes the registration call.
+    pub symbol: String,
+    /// 1-based line number.
+    pub line: u32,
+}
 
 /// A single call site within a function body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +125,12 @@ pub struct CallerSite {
     pub col: u32,
     /// Whether the edge was resolved via import chain.
     pub resolved: bool,
+    /// Edge kind from Go helper, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<EdgeKind>,
+    /// Dispatch key for `dispatches` edges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearby_string: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +140,10 @@ struct IndexedCallerSite {
     line: u32,
     col: u32,
     resolved: bool,
+    /// Edge kind from the Go helper, if applicable. `None` for tree-sitter edges.
+    kind: Option<EdgeKind>,
+    /// Dispatch key, present only on `EdgeKind::Dispatches` sites with a nearby_string.
+    nearby_string: Option<String>,
 }
 
 /// A group of callers from a single file.
@@ -312,6 +355,40 @@ pub struct ImpactResult {
 }
 
 // ---------------------------------------------------------------------------
+// Dispatch edge query result types  (Tier 1.1/1.2/1.3)
+// ---------------------------------------------------------------------------
+
+/// Result of `aft dispatched_by <file> <symbol>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchedByResult {
+    /// The queried symbol.
+    pub symbol: String,
+    /// The queried file (relative to project root).
+    pub file: String,
+    /// Call sites that pass this symbol as a function value.
+    pub dispatched_by: Vec<DispatchedBySite>,
+}
+
+/// A single call site that dispatches (registers) a handler.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchedBySite {
+    /// The registration call site.
+    pub caller: DispatchRegistrar,
+    /// The dispatch key (nearby_string), if the call site has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearby_string: Option<String>,
+}
+
+/// Result of `aft dispatches <key>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchesResult {
+    /// The key that was looked up.
+    pub key: String,
+    /// Handlers registered under this key.
+    pub handlers: Vec<DispatchEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Data flow tracking types
 // ---------------------------------------------------------------------------
 
@@ -468,6 +545,62 @@ impl ImpactResult {
                 if let Some(expr) = &c.call_expression {
                     out.push_str(&format!("      {}\n", expr));
                 }
+            }
+        }
+        out
+    }
+}
+
+impl DispatchedByResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "dispatched_by {} ({})  total={}\n",
+            self.symbol,
+            self.file,
+            self.dispatched_by.len(),
+        ));
+        if self.dispatched_by.is_empty() {
+            out.push_str("  (no dispatch registrations found)\n");
+        } else {
+            for site in &self.dispatched_by {
+                let key = site
+                    .nearby_string
+                    .as_deref()
+                    .map(|s| format!(" key={}", s))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - {} ({}:{}){}\n",
+                    site.caller.symbol, site.caller.file, site.caller.line, key
+                ));
+            }
+        }
+        out
+    }
+}
+
+impl DispatchesResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "dispatches key={} total={}\n",
+            self.key,
+            self.handlers.len(),
+        ));
+        if self.handlers.is_empty() {
+            out.push_str("  (no handlers found for this key)\n");
+        } else {
+            for h in &self.handlers {
+                out.push_str(&format!(
+                    "  - {} ({})  registered by {} ({}:{})\n",
+                    h.handler.symbol,
+                    h.handler.file,
+                    h.registered_by.symbol,
+                    h.registered_by.file,
+                    h.registered_by.line,
+                ));
             }
         }
         out
@@ -689,6 +822,9 @@ pub struct CallGraph {
     /// Reverse index: target_file → target_symbol → callers.
     /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
     reverse_index: Option<ReverseIndex>,
+    /// Secondary dispatch index: nearby_string key → list of dispatch entries.
+    /// Built alongside `reverse_index`. Powers `aft dispatches <key>`.
+    dispatch_index: Option<DispatchIndex>,
     /// Resolved Go call edges from the optional `aft-go-helper`. Injected
     /// into the reverse index at build time. Snapshot from configure time —
     /// remains valid until the next configure call.
@@ -697,6 +833,11 @@ pub struct CallGraph {
     /// disables disk caching (tests that don't want pollution, or
     /// missing cache config). Populated via `set_parse_cache_dir`.
     parse_cache_dir: Option<PathBuf>,
+    /// Whether to include dispatches/goroutine/defer edges from the Go helper.
+    /// Default `true`. Set via `Config::enable_dispatch_edges` or
+    /// `AFT_DISABLE_DISPATCH_EDGES=1`. When `false`, those edge kinds are
+    /// dropped on index build.
+    pub enable_dispatch_edges: bool,
 }
 
 impl CallGraph {
@@ -707,8 +848,12 @@ impl CallGraph {
             project_root,
             project_files: None,
             reverse_index: None,
+            dispatch_index: None,
             go_helper: None,
             parse_cache_dir: None,
+            enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
         }
     }
 
@@ -717,6 +862,7 @@ impl CallGraph {
     pub fn set_go_helper(&mut self, data: HelperOutput) {
         self.go_helper = Some(data);
         self.reverse_index = None;
+        self.dispatch_index = None;
     }
 
     /// Enable on-disk parse-result caching. Subsequent `build_file`
@@ -1260,6 +1406,8 @@ impl CallGraph {
                             line: call_site.line,
                             col: 0,
                             resolved,
+                            kind: None,
+                            nearby_string: None,
                         });
                 }
             }
@@ -1273,11 +1421,23 @@ impl CallGraph {
         // Note: if a Go file is edited after configure, the helper data
         // may be stale. A new configure re-runs the helper and resets
         // this field.
+        let mut dispatch: DispatchIndex = HashMap::new();
+        let enable_dispatch = self.enable_dispatch_edges;
         if let Some(helper) = &self.go_helper {
             for edge in &helper.edges {
                 if edge.caller.symbol.is_empty() || edge.callee.symbol.is_empty() {
                     continue;
                 }
+
+                // Feature flag: drop dispatches/goroutine/defer kinds when disabled.
+                let is_dispatch_kind = matches!(
+                    edge.kind,
+                    EdgeKind::Dispatches | EdgeKind::Goroutine | EdgeKind::Defer
+                );
+                if is_dispatch_kind && !enable_dispatch {
+                    continue;
+                }
+
                 let caller_abs = self.project_root.join(&edge.caller.file);
                 let callee_abs = self.project_root.join(&edge.callee.file);
 
@@ -1285,7 +1445,7 @@ impl CallGraph {
                     std::fs::canonicalize(&caller_abs).unwrap_or(caller_abs),
                 );
                 let canon_callee =
-                    std::fs::canonicalize(&callee_abs).unwrap_or(callee_abs);
+                    std::fs::canonicalize(&callee_abs).unwrap_or(callee_abs.clone());
 
                 let caller_sym: SharedStr = Arc::from(edge.caller.symbol.as_str());
 
@@ -1300,11 +1460,45 @@ impl CallGraph {
                         line: edge.caller.line,
                         col: 0,
                         resolved: true,
+                        kind: Some(edge.kind),
+                        nearby_string: edge.nearby_string.clone(),
                     });
+
+                // Secondary dispatch key index: only for dispatches edges with a nearby_string.
+                if edge.kind == EdgeKind::Dispatches {
+                    if let Some(ref key) = edge.nearby_string {
+                        let callee_rel = self
+                            .project_root
+                            .join(&edge.callee.file)
+                            .strip_prefix(&self.project_root)
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| edge.callee.file.clone());
+                        let caller_rel = self
+                            .project_root
+                            .join(&edge.caller.file)
+                            .strip_prefix(&self.project_root)
+                            .ok()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| edge.caller.file.clone());
+                        dispatch.entry(key.clone()).or_default().push(DispatchEntry {
+                            handler: DispatchCallee {
+                                file: callee_rel,
+                                symbol: edge.callee.symbol.clone(),
+                            },
+                            registered_by: DispatchRegistrar {
+                                file: caller_rel,
+                                symbol: edge.caller.symbol.clone(),
+                                line: edge.caller.line,
+                            },
+                        });
+                    }
+                }
             }
         }
 
         self.reverse_index = Some(reverse);
+        self.dispatch_index = Some(dispatch);
     }
 
     fn reverse_sites(&self, file: &Path, symbol: &str) -> Option<&[IndexedCallerSite]> {
@@ -1313,6 +1507,75 @@ impl CallGraph {
             .get(file)?
             .get(symbol)
             .map(Vec::as_slice)
+    }
+
+    /// Ensure the dispatch index is built. Mirrors `build_reverse_index` laziness.
+    fn ensure_dispatch_index(&mut self) {
+        if self.reverse_index.is_none() {
+            self.build_reverse_index();
+        }
+    }
+
+    /// Exact-match lookup in the dispatch secondary index.
+    /// Returns all dispatch entries whose `nearby_string` equals `key`.
+    pub fn find_by_dispatch_key(&mut self, key: &str) -> Vec<DispatchEntry> {
+        self.ensure_dispatch_index();
+        self.dispatch_index
+            .as_ref()
+            .and_then(|di| di.get(key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Prefix-match lookup in the dispatch secondary index.
+    /// Returns all dispatch entries whose `nearby_string` starts with `prefix`.
+    pub fn find_by_dispatch_key_prefix(&mut self, prefix: &str) -> Vec<(String, Vec<DispatchEntry>)> {
+        self.ensure_dispatch_index();
+        let Some(di) = self.dispatch_index.as_ref() else {
+            return vec![];
+        };
+        di.iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Find all dispatch call sites that pass `symbol` (from `file`) as a function value.
+    /// Equivalent to `callers_of` filtered to `kind == Dispatches`.
+    pub fn dispatched_by(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+    ) -> Result<DispatchedByResult, AftError> {
+        let canon = self.canonicalize(file)?;
+        self.build_file(&canon)?;
+
+        if self.reverse_index.is_none() {
+            self.build_reverse_index();
+        }
+
+        let target_rel = self.relative_path(&canon);
+
+        let sites = self
+            .reverse_sites(&canon, symbol)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|s| s.kind == Some(EdgeKind::Dispatches))
+            .map(|s| DispatchedBySite {
+                caller: DispatchRegistrar {
+                    file: self.relative_path(s.caller_file.as_ref()),
+                    symbol: s.caller_symbol.to_string(),
+                    line: s.line,
+                },
+                nearby_string: s.nearby_string.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        Ok(DispatchedByResult {
+            symbol: symbol.to_string(),
+            file: target_rel,
+            dispatched_by: sites,
+        })
     }
 
     /// Get callers of a symbol in a file, grouped by calling file.
@@ -2515,6 +2778,8 @@ impl CallGraph {
                     line: site.line,
                     col: site.col,
                     resolved: site.resolved,
+                    kind: site.kind,
+                    nearby_string: site.nearby_string.clone(),
                 });
                 // Recurse: find callers of the caller
                 if current_depth + 1 < max_depth {
@@ -2543,6 +2808,7 @@ impl CallGraph {
         }
         // Clear the reverse index — it's stale
         self.reverse_index = None;
+        self.dispatch_index = None;
         // Clear project_files cache for create/remove events
         self.project_files = None;
     }
@@ -4417,6 +4683,7 @@ func interfaceCaller(d Doer, x int) int {
                         pkg: String::new(),
                     },
                     kind: EdgeKind::Static,
+                    nearby_string: None,
                 },
                 // concrete: concreteMethodCaller → concreteMethod (line 19)
                 HelperEdge {
@@ -4432,6 +4699,7 @@ func interfaceCaller(d Doer, x int) int {
                         pkg: "pkg".to_string(),
                     },
                     kind: EdgeKind::Concrete,
+                    nearby_string: None,
                 },
                 // interface dispatch: interfaceCaller → doerA.Do (line 35)
                 HelperEdge {
@@ -4447,6 +4715,7 @@ func interfaceCaller(d Doer, x int) int {
                         pkg: "pkg".to_string(),
                     },
                     kind: EdgeKind::Interface,
+                    nearby_string: None,
                 },
                 // interface dispatch: interfaceCaller → doerB.Do (line 35)
                 HelperEdge {
@@ -4462,6 +4731,7 @@ func interfaceCaller(d Doer, x int) int {
                         pkg: "pkg".to_string(),
                     },
                     kind: EdgeKind::Interface,
+                    nearby_string: None,
                 },
             ],
             skipped: vec![],
@@ -4561,5 +4831,269 @@ func interfaceCaller(d Doer, x int) int {
             "helper should not multiply callers unexpectedly: before={count_before} after={}",
             result_after.total_callers
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tier 1.1/1.2/1.3: dispatch_index and new commands
+    // ---------------------------------------------------------------------------
+
+    fn make_dispatch_helper_output(fixture_file: &str, root: &str) -> HelperOutput {
+        HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.to_string(),
+            edges: vec![
+                // dispatches edge with nearby_string (asynq-style registration)
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 10,
+                        symbol: "startAsyncQueueServer".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "HandleMerchantTask".to_string(),
+                        receiver: String::new(),
+                        pkg: "example.com/fixture".to_string(),
+                    },
+                    kind: EdgeKind::Dispatches,
+                    nearby_string: Some("TypeMerchantTask".to_string()),
+                },
+                // dispatches edge with no nearby_string
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 15,
+                        symbol: "startAsyncQueueServer".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "HandleGenericTask".to_string(),
+                        receiver: String::new(),
+                        pkg: "example.com/fixture".to_string(),
+                    },
+                    kind: EdgeKind::Dispatches,
+                    nearby_string: None,
+                },
+                // goroutine edge
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 20,
+                        symbol: "startWorker".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "workerLoop".to_string(),
+                        receiver: String::new(),
+                        pkg: "example.com/fixture".to_string(),
+                    },
+                    kind: EdgeKind::Goroutine,
+                    nearby_string: None,
+                },
+                // defer edge
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: fixture_file.to_string(),
+                        line: 25,
+                        symbol: "processRequest".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: fixture_file.to_string(),
+                        symbol: "cleanup".to_string(),
+                        receiver: String::new(),
+                        pkg: "example.com/fixture".to_string(),
+                    },
+                    kind: EdgeKind::Defer,
+                    nearby_string: None,
+                },
+            ],
+            skipped: vec![],
+        }
+    }
+
+    const DISPATCH_FIXTURE: &str = r#"package fixture
+
+func HandleMerchantTask() error { return nil }
+func HandleGenericTask() error  { return nil }
+func workerLoop()                {}
+func cleanup()                   {}
+
+func startAsyncQueueServer() {
+    // would call mux.HandleFunc("TypeMerchantTask", HandleMerchantTask)
+}
+
+func startWorker() {
+    // would call go workerLoop()
+}
+
+func processRequest() {
+    // would call defer cleanup()
+}
+"#;
+
+    fn setup_dispatch_project() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("handler.go"), DISPATCH_FIXTURE).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dispatched_by_finds_dispatch_sites() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        assert_eq!(result.symbol, "HandleMerchantTask");
+        assert_eq!(result.dispatched_by.len(), 1);
+        assert_eq!(result.dispatched_by[0].caller.symbol, "startAsyncQueueServer");
+        assert_eq!(result.dispatched_by[0].nearby_string, Some("TypeMerchantTask".to_string()));
+    }
+
+    #[test]
+    fn dispatched_by_no_results_for_non_dispatch() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        // workerLoop is registered via goroutine (not dispatches), so dispatched_by should be empty.
+        let result = cg.dispatched_by(&go_file, "workerLoop").unwrap();
+        assert_eq!(result.dispatched_by.len(), 0, "goroutine edges should not appear in dispatched_by");
+    }
+
+    #[test]
+    fn find_by_dispatch_key_exact_match() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let entries = cg.find_by_dispatch_key("TypeMerchantTask");
+        assert_eq!(entries.len(), 1, "should find exactly one handler for TypeMerchantTask");
+        assert_eq!(entries[0].handler.symbol, "HandleMerchantTask");
+        assert_eq!(entries[0].registered_by.symbol, "startAsyncQueueServer");
+        assert_eq!(entries[0].registered_by.line, 10);
+    }
+
+    #[test]
+    fn find_by_dispatch_key_prefix_match() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let results = cg.find_by_dispatch_key_prefix("Type");
+        assert_eq!(results.len(), 1, "should find TypeMerchantTask with prefix 'Type'");
+        assert_eq!(results[0].0, "TypeMerchantTask");
+    }
+
+    #[test]
+    fn find_by_dispatch_key_not_found() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let entries = cg.find_by_dispatch_key("TypeNonExistent");
+        assert!(entries.is_empty(), "should find nothing for unknown key");
+    }
+
+    #[test]
+    fn find_by_dispatch_key_special_chars() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        // Test that special chars in key don't panic.
+        let helper_out = HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.to_string_lossy().into_owned(),
+            edges: vec![HelperEdge {
+                caller: HelperCaller {
+                    file: "handler.go".to_string(),
+                    line: 1,
+                    symbol: "register".to_string(),
+                },
+                callee: HelperCallee {
+                    file: "handler.go".to_string(),
+                    symbol: "handler".to_string(),
+                    receiver: String::new(),
+                    pkg: String::new(),
+                },
+                kind: EdgeKind::Dispatches,
+                nearby_string: Some("/api/v1?foo=bar&baz=.*+[".to_string()),
+            }],
+            skipped: vec![],
+        };
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        // Should not panic on special chars.
+        let entries = cg.find_by_dispatch_key("/api/v1?foo=bar&baz=.*+[");
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_edges_disabled_by_flag() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.enable_dispatch_edges = false; // disable flag
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        // No dispatch edges in reverse index.
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        assert_eq!(result.dispatched_by.len(), 0, "dispatch edges should be absent when flag is false");
+
+        // Dispatch index should also be empty.
+        let entries = cg.find_by_dispatch_key("TypeMerchantTask");
+        assert!(entries.is_empty(), "dispatch index should be empty when flag is false");
+    }
+
+    #[test]
+    fn goroutine_and_defer_appear_in_callers() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        // workerLoop is started via goroutine — should appear in callers_of
+        let callers = cg.callers_of(&go_file, "workerLoop", 1).unwrap();
+        assert!(callers.total_callers >= 1, "workerLoop should have at least one caller (goroutine)");
+
+        // cleanup is deferred — should appear in callers_of
+        let callers = cg.callers_of(&go_file, "cleanup", 1).unwrap();
+        assert!(callers.total_callers >= 1, "cleanup should have at least one caller (defer)");
     }
 }

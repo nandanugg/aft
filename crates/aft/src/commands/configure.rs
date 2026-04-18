@@ -208,6 +208,21 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         ctx.config_mut().search_index_max_file_size = v;
     }
+    // [callgraph] enable_dispatch_edges — drop dispatches/goroutine/defer edges
+    // when false. Env var `AFT_DISABLE_DISPATCH_EDGES=1` is the kill switch
+    // (set at Config::default() time); this param lets the caller override
+    // it per-session. When the env var is set to "1", this param cannot
+    // re-enable it (env var wins).
+    if let Some(v) = req
+        .params
+        .get("enable_dispatch_edges")
+        .and_then(|v| v.as_bool())
+    {
+        // Only honour if env-var kill switch is not active.
+        if std::env::var("AFT_DISABLE_DISPATCH_EDGES").as_deref() != Ok("1") {
+            ctx.config_mut().enable_dispatch_edges = v;
+        }
+    }
     if let Some(v) = req.params.get("storage_dir").and_then(|v| v.as_str()) {
         let storage_dir = match validate_storage_dir(v) {
             Ok(path) => path,
@@ -440,6 +455,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // parse caching so repeated CLI invocations skip re-parsing files
     // whose mtime hasn't changed.
     let mut graph = CallGraph::new(root_path.clone());
+    // Propagate the enable_dispatch_edges setting from Config into the graph.
+    graph.enable_dispatch_edges = ctx.config().enable_dispatch_edges;
     let parse_cache_root = resolve_cache_dir(&root_path, storage_dir.as_deref());
     graph.set_parse_cache_dir(parse_cache_root);
     *ctx.callgraph().borrow_mut() = Some(graph);

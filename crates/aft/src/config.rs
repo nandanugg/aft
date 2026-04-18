@@ -101,6 +101,12 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// [callgraph] enable_dispatch_edges — include dispatches/goroutine/defer edges from
+    /// the Go helper in the reverse index and make them available to `callers`,
+    /// `call_tree`, `trace_to`, and the new `dispatched_by` / `dispatches` commands.
+    /// Default `true`. Set to `false` to revert to v1-semantic behavior.
+    /// Overridden to `false` by `AFT_DISABLE_DISPATCH_EDGES=1`.
+    pub enable_dispatch_edges: bool,
 }
 
 impl Default for Config {
@@ -124,6 +130,10 @@ impl Default for Config {
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             storage_dir: None,
+            // Env var kill switch takes priority over config file value.
+            enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
         }
     }
 }
