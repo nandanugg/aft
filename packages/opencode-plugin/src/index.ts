@@ -96,6 +96,22 @@ const PLUGIN_VERSION: string = (() => {
 })();
 
 /**
+ * Release-notes identifier for the startup announcement dialog.
+ *
+ * This is intentionally decoupled from PLUGIN_VERSION so bugfix releases don't
+ * re-trigger a stale dialog. Bump this string and populate ANNOUNCEMENT_FEATURES
+ * ONLY when a release ships user-facing news worth surfacing once at startup.
+ * Leave ANNOUNCEMENT_VERSION empty (or ANNOUNCEMENT_FEATURES empty) to skip the
+ * dialog entirely for bugfix-only releases.
+ *
+ * Persistence (storage/last_announced_version) stores this value, so once a user
+ * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
+ * will not re-show it.
+ */
+const ANNOUNCEMENT_VERSION = "";
+const ANNOUNCEMENT_FEATURES: string[] = [];
+
+/**
  * AFT (Agent File Toolkit) plugin for OpenCode.
  *
  * Config is loaded from two levels (project overrides user):
@@ -226,36 +242,33 @@ const plugin: Plugin = async (input) => {
       pool.getAnyActiveBridge(input.directory) ?? pool.getBridge(input.directory, sessionID);
     return await bridge.send("status", {});
   });
-  // Feature announcement data — TUI plugin calls this on startup to show dialog
+  // Feature announcement — TUI plugin calls this on startup to show a dialog.
+  // Uses ANNOUNCEMENT_VERSION (not PLUGIN_VERSION) so patch releases don't re-fire.
   const storageDir = configOverrides.storage_dir as string;
-  const featureList = [
-    "Semantic code search (`aft_search`) — enable with `experimental_semantic_search: true` in aft.jsonc",
-    "/aft-status command — live index health, disk usage, and runtime details",
-    "HTML outline and zoom — heading hierarchy for .html/.htm files",
-    "And many bugfixes",
-  ];
 
   rpcServer.handle("get-announcement", async () => {
-    // Check if already announced this version
+    if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
+      return { show: false };
+    }
     if (storageDir) {
       const versionFile = join(storageDir, "last_announced_version");
       try {
         if (existsSync(versionFile)) {
           const lastVersion = readFileSync(versionFile, "utf-8").trim();
-          if (lastVersion === PLUGIN_VERSION) return { show: false };
+          if (lastVersion === ANNOUNCEMENT_VERSION) return { show: false };
         }
       } catch {
         // proceed
       }
     }
-    return { show: true, version: PLUGIN_VERSION, features: featureList };
+    return { show: true, version: ANNOUNCEMENT_VERSION, features: ANNOUNCEMENT_FEATURES };
   });
 
   rpcServer.handle("mark-announced", async () => {
-    if (storageDir) {
+    if (storageDir && ANNOUNCEMENT_VERSION) {
       try {
         mkdirSync(storageDir, { recursive: true });
-        writeFileSync(join(storageDir, "last_announced_version"), PLUGIN_VERSION);
+        writeFileSync(join(storageDir, "last_announced_version"), ANNOUNCEMENT_VERSION);
       } catch {
         // best-effort
       }
@@ -300,11 +313,18 @@ const plugin: Plugin = async (input) => {
 
   // Feature announcements in TUI are handled by the TUI plugin via RPC (get-announcement + dialog).
   // In Desktop, sendFeatureAnnouncement sends an ignored message to the active session.
-  // Both share the same last_announced_version file — TUI checks first via RPC,
-  // Desktop fires with a delay to avoid racing the TUI path.
-  setTimeout(() => {
-    sendFeatureAnnouncement(notifyOpts, PLUGIN_VERSION, featureList, storageDir).catch(() => {});
-  }, 8000);
+  // Both share the same last_announced_version file and the same ANNOUNCEMENT_VERSION
+  // constant, so bugfix releases don't re-fire a stale dialog. No-op when empty.
+  if (ANNOUNCEMENT_VERSION && ANNOUNCEMENT_FEATURES.length > 0) {
+    setTimeout(() => {
+      sendFeatureAnnouncement(
+        notifyOpts,
+        ANNOUNCEMENT_VERSION,
+        ANNOUNCEMENT_FEATURES,
+        storageDir,
+      ).catch(() => {});
+    }, 8000);
+  }
 
   // Warn about ONNX Runtime if semantic search is enabled but ORT is unavailable
   if (
