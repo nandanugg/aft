@@ -261,11 +261,16 @@ func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites b
 // emitImplementsEdges enumerates all in-project interface types and emits
 // "implements" edges for every in-project concrete type that satisfies them.
 //
-// Filter rules (per helper-contract.md):
+// Filter rules:
 //   - Skip empty interfaces (any/interface{}) — every type implements them.
-//   - Skip when both interface and concrete are in the same file — tree-sitter
-//     handles same-file method resolution.
 //   - Skip when either side is outside the project root (stdlib, vendored).
+//
+// Note: same-file implementations are NOT filtered. Tree-sitter cannot resolve
+// Go interface satisfaction (it's structural, no declaration site says "X satisfies Y"),
+// so only the helper's CHA pass has this information — even for implementations
+// co-located with their interface in the same file, which is idiomatic Go
+// (e.g. `type FooStorer interface { ... }` + `type fooStore struct { ... }`
+// in the same `foo_store.go`).
 //
 // Deduplication uses implKey keyed on (ifaceFile, ifaceLine, ifaceSymbol,
 // concPkg, concRecv, concSymbol).
@@ -413,10 +418,11 @@ func emitImplementsEdges(out *Output, prog *ssa.Program, root string) {
 						}
 					}
 
-					// Filter: same-file means tree-sitter already sees it.
-					if cm.file == ifaceFile {
-						continue
-					}
+					// Filter note: tree-sitter cannot compute interface
+					// satisfaction (it's structural in Go), so we do NOT
+					// filter same-file pairs — the helper is the only way
+					// to derive these edges even when the concrete type
+					// and interface live in the same file.
 
 					key := implKey{
 						ifaceFile:   ifaceFile,
@@ -661,9 +667,23 @@ func emitDispatchesFromCall(
 		if !ok || fn == nil {
 			continue
 		}
-		// Skip closures (no source-level identifier).
+		// Closure handling: an anonymous closure (fn.Parent() != nil) has no
+		// source-level identifier to point at directly. But the idiomatic Go
+		// registration pattern
+		//
+		//     mux.HandleFunc("Type", func(ctx, task) error { return HandleX(ctx, task) })
+		//
+		// wraps a single named handler in a thin lambda. If the closure body
+		// contains exactly one call to a named in-project function, treat
+		// that function as the dispatched target (amendment to
+		// DESIGN-dispatch-edges.md §1.1). Zero or ≥2 in-project calls is
+		// genuinely ambiguous — drop.
 		if fn.Parent() != nil {
-			continue
+			resolved := resolveClosureTarget(fn, fns, callerFn.Prog, root)
+			if resolved == nil {
+				continue
+			}
+			fn = resolved
 		}
 		// Skip synthetic functions.
 		if fn.Synthetic != "" {
@@ -773,6 +793,71 @@ func extractFuncValue(val ssa.Value) (*ssa.Function, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// resolveClosureTarget returns the single named in-project function that a
+// closure body dispatches to, if unambiguous. This supports the idiomatic
+// registration pattern:
+//
+//	mux.HandleFunc("Type", func(ctx, task) error { return HandleXTask(ctx, task) })
+//
+// where the second argument is an anonymous lambda whose only purpose is to
+// forward to a real handler. Counting rules:
+//   - Only calls to named in-project functions (static call target, declared
+//     under project `root`) are counted. `fns` alone is insufficient because
+//     it also includes functions from monorepo-module-cache packages that
+//     happen to be loaded; we must additionally verify the callee's source
+//     file lives under `root`.
+//   - Exactly one distinct such callee → return it.
+//   - Zero or ≥2 distinct → return nil (drop the dispatch edge; ambiguous).
+//   - Calls in nested closures inside the lambda are NOT recursed; only the
+//     top-level body is inspected. That keeps the heuristic conservative.
+func resolveClosureTarget(closure *ssa.Function, fns map[*ssa.Function]bool, prog *ssa.Program, root string) *ssa.Function {
+	if closure == nil || closure.Parent() == nil {
+		return nil
+	}
+	var found *ssa.Function
+	for _, b := range closure.Blocks {
+		for _, instr := range b.Instrs {
+			call, ok := instr.(ssa.CallInstruction)
+			if !ok {
+				continue
+			}
+			common := call.Common()
+			if common == nil {
+				continue
+			}
+			// Static callee only. Method/interface dispatch doesn't resolve
+			// to a single named function.
+			fn, ok := common.Value.(*ssa.Function)
+			if !ok || fn == nil {
+				continue
+			}
+			if fn.Parent() != nil || fn.Synthetic != "" {
+				continue
+			}
+			// Must live under the project root (not module cache / vendored).
+			if fn.Pos() == token.NoPos {
+				continue
+			}
+			pos := prog.Fset.Position(fn.Pos())
+			if pos.Filename == "" {
+				continue
+			}
+			if _, ok := relPath(root, pos.Filename); !ok {
+				continue
+			}
+			if !fns[fn] {
+				continue
+			}
+			if found != nil && found != fn {
+				// Ambiguous — two different in-project calls.
+				return nil
+			}
+			found = fn
+		}
+	}
+	return found
 }
 
 // extractNearbyString returns the single string literal ≤128 chars from

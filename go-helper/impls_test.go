@@ -70,8 +70,14 @@ func TestImplementsCrossPackage(t *testing.T) {
 	}
 }
 
-// TestImplementsSameFileExcluded verifies that same-file implementations are NOT emitted.
-func TestImplementsSameFileExcluded(t *testing.T) {
+// TestImplementsSameFileIncluded verifies that same-file implementations ARE emitted.
+// Previously these were filtered under the (flawed) assumption that tree-sitter
+// could resolve interface satisfaction from same-file pairs. Tree-sitter can't:
+// Go's implements-relation is structural and only the type checker / CHA knows
+// when a concrete type satisfies an interface. Idiomatic Go colocates interface
+// and primary implementation in one `*_store.go` file, so dropping same-file
+// was silently hiding the most important edges in most real projects.
+func TestImplementsSameFileIncluded(t *testing.T) {
 	root := filepath.Join("testdata", "impls")
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -85,13 +91,17 @@ func TestImplementsSameFileExcluded(t *testing.T) {
 
 	impls := filterImplements(out.Edges)
 
-	// localImpl is in the same file as Storer interface — must not appear.
-	// Receiver format uses full package path as types.Type.String() renders it.
+	// localImpl is in the same file as Storer interface — MUST appear.
+	found := false
 	for _, e := range impls {
 		recv := e.Callee.Receiver
 		if recv == "*example.com/impls.localImpl" || recv == "example.com/impls.localImpl" {
-			t.Errorf("same-file implementation should not be emitted: %+v", e)
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Errorf("same-file implementation (localImpl) must be emitted; got %d impls edges, none matching", len(impls))
 	}
 }
 

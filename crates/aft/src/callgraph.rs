@@ -1876,14 +1876,22 @@ impl CallGraph {
 
     /// Ensure the dispatch index is built. Mirrors `build_reverse_index` laziness.
     fn ensure_dispatch_index(&mut self) {
-        if self.reverse_index.is_none() {
+        // Warm-load (`try_load_merged_graph`) only populates `reverse_index`,
+        // leaving `dispatch_index` None. So gate on `dispatch_index` itself,
+        // not `reverse_index`, to force a full build when needed.
+        if self.dispatch_index.is_none() {
+            // Discard any warm-loaded reverse_index so build_reverse_index
+            // runs end-to-end and populates all three indexes from helper data.
+            self.reverse_index = None;
             self.build_reverse_index();
         }
     }
 
     /// Ensure the implementation index is built.
     fn ensure_implementation_index(&mut self) {
-        if self.reverse_index.is_none() {
+        // Same rationale as `ensure_dispatch_index` above.
+        if self.implementation_index.is_none() {
+            self.reverse_index = None;
             self.build_reverse_index();
         }
     }
@@ -1985,9 +1993,13 @@ impl CallGraph {
         let canon = self.canonicalize(file)?;
         self.build_file(&canon)?;
 
-        if self.reverse_index.is_none() {
-            self.build_reverse_index();
-        }
+        // dispatched_by needs dispatch-kind edges to be present in the reverse
+        // index. warm-load via try_load_merged_graph populates reverse_index
+        // but the current cache serialization drops per-site `kind`, so we
+        // must rebuild to recover dispatch-kind metadata. Route through
+        // ensure_dispatch_index, which forces a rebuild when dispatch_index
+        // is missing.
+        self.ensure_dispatch_index();
 
         let target_rel = self.relative_path(&canon);
 
