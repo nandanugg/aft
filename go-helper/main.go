@@ -39,6 +39,16 @@ import (
 	"golang.org/x/tools/go/types/typeutil"
 )
 
+// implKey is used for deduplication of implements edges.
+type implKey struct {
+	ifaceFile   string
+	ifaceLine   int
+	ifaceSymbol string
+	concPkg     string
+	concRecv    string
+	concSymbol  string
+}
+
 // Position describes a file location in the caller.
 type Position struct {
 	File   string `json:"file"`             // path relative to root
@@ -49,6 +59,7 @@ type Position struct {
 // Target describes a resolved callee.
 type Target struct {
 	File     string `json:"file"`               // path relative to root
+	Line     int    `json:"line,omitempty"`     // 1-based line number (0 = unknown)
 	Symbol   string `json:"symbol"`             // function or method name (no receiver)
 	Receiver string `json:"receiver,omitempty"` // e.g. "*pkg.concreteSvc"
 	Pkg      string `json:"pkg,omitempty"`      // full package path
@@ -95,8 +106,9 @@ type edgeKey struct {
 
 func main() {
 	var (
-		rootFlag        = flag.String("root", ".", "project root (absolute path preferred)")
-		noDispatchesFlag = flag.Bool("no-dispatches", false, "disable emission of dispatches/goroutine/defer edge kinds")
+		rootFlag          = flag.String("root", ".", "project root (absolute path preferred)")
+		noDispatchesFlag  = flag.Bool("no-dispatches", false, "disable emission of dispatches/goroutine/defer edge kinds")
+		noImplementsFlag  = flag.Bool("no-implements", false, "disable emission of implements edges")
 	)
 	flag.Parse()
 
@@ -106,7 +118,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	out, err := analyze(root, !*noDispatchesFlag)
+	out, err := analyze(root, !*noDispatchesFlag, !*noImplementsFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aft-go-helper: %v\n", err)
 		os.Exit(1)
@@ -121,7 +133,7 @@ func main() {
 }
 
 // analyze loads all packages under root and returns resolved call edges.
-func analyze(root string, emitDispatches bool) (*Output, error) {
+func analyze(root string, emitDispatches bool, emitImplements bool) (*Output, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -230,7 +242,207 @@ func analyze(root string, emitDispatches bool) (*Output, error) {
 		}
 	}
 
+	// Tier 1.4: emit implements edges — one per (interface method, concrete method)
+	// pair for all in-project interfaces and their in-project implementations.
+	if emitImplements {
+		emitImplementsEdges(out, prog, root)
+	}
+
 	return out, nil
+}
+
+// emitImplementsEdges enumerates all in-project interface types and emits
+// "implements" edges for every in-project concrete type that satisfies them.
+//
+// Filter rules (per helper-contract.md):
+//   - Skip empty interfaces (any/interface{}) — every type implements them.
+//   - Skip when both interface and concrete are in the same file — tree-sitter
+//     handles same-file method resolution.
+//   - Skip when either side is outside the project root (stdlib, vendored).
+//
+// Deduplication uses implKey keyed on (ifaceFile, ifaceLine, ifaceSymbol,
+// concPkg, concRecv, concSymbol).
+func emitImplementsEdges(out *Output, prog *ssa.Program, root string) {
+	implSeen := make(map[implKey]bool)
+
+	// Collect all in-project named types so we can check implementations.
+	// We need both named types (for value receivers) and pointer-to-named
+	// (for pointer receivers) — Go's implements check is receiver-type specific.
+	type concreteMethod struct {
+		fn      *ssa.Function
+		recv    string // textual receiver type, e.g. "*pkg.T"
+		pkg     string // full package path
+		file    string // relative to root
+		symName string // method name (bare)
+		line    int    // 1-based line number of the method declaration
+	}
+
+	// methodsByName maps method name → list of concrete methods that could implement an interface method with that name.
+	// Keyed by the method's Id() (package-qualified name) to avoid cross-package collisions.
+	type methodID struct {
+		id   string // types.Func.Id()
+		name string // bare method name
+	}
+	methodsByID := make(map[string][]concreteMethod) // key = types.Func.Id()
+
+	for _, pkg := range prog.AllPackages() {
+		if pkg == nil || pkg.Pkg == nil {
+			continue
+		}
+		for _, mem := range pkg.Members {
+			t, ok := mem.(*ssa.Type)
+			if !ok {
+				continue
+			}
+			named, ok := t.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			// Skip generic types (instantiations handled by SSA canonicalization).
+			if named.TypeParams() != nil {
+				continue
+			}
+			// Enumerate both T and *T — Go methods can have value or pointer receivers.
+			for _, recvType := range []types.Type{named, types.NewPointer(named)} {
+				mset := prog.MethodSets.MethodSet(recvType)
+				for i := 0; i < mset.Len(); i++ {
+					sel := mset.At(i)
+					fn := prog.MethodValue(sel)
+					if fn == nil || fn.Synthetic != "" {
+						continue
+					}
+					if fn.Pos() == token.NoPos {
+						continue
+					}
+					pos := prog.Fset.Position(fn.Pos())
+					if pos.Filename == "" {
+						continue
+					}
+					relFile, ok := relPath(root, pos.Filename)
+					if !ok {
+						// Outside project root.
+						continue
+					}
+					obj := sel.Obj()
+					tf, ok := obj.(*types.Func)
+					if !ok {
+						continue
+					}
+					recv := recvType.String()
+					pkgPath := ""
+					if pkg.Pkg != nil {
+						pkgPath = pkg.Pkg.Path()
+					}
+					methodsByID[tf.Id()] = append(methodsByID[tf.Id()], concreteMethod{
+						fn:      fn,
+						recv:    recv,
+						pkg:     pkgPath,
+						file:    relFile,
+						symName: fn.Name(),
+						line:    pos.Line,
+					})
+				}
+			}
+		}
+	}
+
+	// Now enumerate all in-project interface types and find implementations.
+	for _, pkg := range prog.AllPackages() {
+		if pkg == nil || pkg.Pkg == nil {
+			continue
+		}
+		for _, mem := range pkg.Members {
+			t, ok := mem.(*ssa.Type)
+			if !ok {
+				continue
+			}
+			named, ok := t.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			iface, ok := named.Underlying().(*types.Interface)
+			if !ok {
+				continue
+			}
+			// Skip empty interfaces — every type implements them.
+			if iface.NumMethods() == 0 {
+				continue
+			}
+			// Interface must be in-project.
+			ifacePos := prog.Fset.Position(named.Obj().Pos())
+			if ifacePos.Filename == "" {
+				continue
+			}
+			ifaceFile, ok := relPath(root, ifacePos.Filename)
+			if !ok {
+				continue
+			}
+			ifaceName := named.Obj().Name()
+
+			// For each method of the interface, find all concrete implementations.
+			for mi := 0; mi < iface.NumMethods(); mi++ {
+				ifaceMethod := iface.Method(mi)
+				ifaceMethodPos := prog.Fset.Position(ifaceMethod.Pos())
+				ifaceMethodLine := ifaceMethodPos.Line
+				if ifaceMethodLine == 0 {
+					// Use the interface type's position as fallback.
+					ifaceMethodLine = ifacePos.Line
+				}
+
+				// Look up all concrete methods with this method's Id.
+				concretes := methodsByID[ifaceMethod.Id()]
+				for _, cm := range concretes {
+					// Verify the concrete type's receiver actually implements the interface.
+					// We do this by checking types.Implements on the receiver type.
+					if cm.fn.Signature == nil || cm.fn.Signature.Recv() == nil {
+						continue
+					}
+					recvT := cm.fn.Signature.Recv().Type()
+					if !types.Implements(recvT, iface) {
+						// Also check pointer receiver.
+						ptrT := types.NewPointer(recvT)
+						if !types.Implements(ptrT, iface) {
+							continue
+						}
+					}
+
+					// Filter: same-file means tree-sitter already sees it.
+					if cm.file == ifaceFile {
+						continue
+					}
+
+					key := implKey{
+						ifaceFile:   ifaceFile,
+						ifaceLine:   ifaceMethodLine,
+						ifaceSymbol: ifaceName,
+						concPkg:     cm.pkg,
+						concRecv:    cm.recv,
+						concSymbol:  cm.symName,
+					}
+					if implSeen[key] {
+						continue
+					}
+					implSeen[key] = true
+
+					out.Edges = append(out.Edges, Edge{
+						Caller: Position{
+							File:   ifaceFile,
+							Line:   ifaceMethodLine,
+							Symbol: ifaceName,
+						},
+						Callee: Target{
+							File:     cm.file,
+							Line:     cm.line,
+							Symbol:   cm.symName,
+							Receiver: cm.recv,
+							Pkg:      cm.pkg,
+						},
+						Kind: "implements",
+					})
+				}
+			}
+		}
+	}
 }
 
 // emitDispatchGoroutineDefer walks all instructions in f and emits:

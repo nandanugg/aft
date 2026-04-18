@@ -39,7 +39,7 @@ func TestDispatchEdgesAsynq(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true /* emitDispatches */)
+	out, err := analyze(absRoot, true /* emitDispatches */, true /* emitImplements */)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestDispatchEdgesHTTP(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true)
+	out, err := analyze(absRoot, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestDispatchEdgesGoroutineDefer(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true)
+	out, err := analyze(absRoot, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestNoDispatchesFlag(t *testing.T) {
 	}
 
 	// With emitDispatches=false, no dispatch/goroutine/defer edges should appear.
-	out, err := analyze(absRoot, false)
+	out, err := analyze(absRoot, false, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestBadAnonymousClosure(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true)
+	out, err := analyze(absRoot, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestDispatchGoldenJSON(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true)
+	out, err := analyze(absRoot, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
