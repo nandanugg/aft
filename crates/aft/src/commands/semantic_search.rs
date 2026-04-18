@@ -252,6 +252,7 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
         SymbolKind::Enum => "enum",
         SymbolKind::TypeAlias => "type_alias",
         SymbolKind::Variable => "variable",
+        SymbolKind::Constant => "constant",
         SymbolKind::Heading => "heading",
     }
 }

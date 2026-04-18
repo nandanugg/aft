@@ -13,6 +13,8 @@ pub enum SymbolKind {
     TypeAlias,
     /// Top-level const/let variable declaration
     Variable,
+    /// Top-level const declaration (Go `const X = ...`)
+    Constant,
     /// Markdown heading (h1, h2, h3, etc.)
     Heading,
 }

@@ -235,6 +235,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.config_mut().enable_implementation_edges = v;
         }
     }
+    // [callgraph] enable_writes_edges — include cross-package variable-write edges.
+    // Env var `AFT_DISABLE_WRITES_EDGES=1` is the kill switch.
+    if let Some(v) = req
+        .params
+        .get("enable_writes_edges")
+        .and_then(|v| v.as_bool())
+    {
+        if std::env::var("AFT_DISABLE_WRITES_EDGES").as_deref() != Ok("1") {
+            ctx.config_mut().enable_writes_edges = v;
+        }
+    }
     if let Some(v) = req.params.get("storage_dir").and_then(|v| v.as_str()) {
         let storage_dir = match validate_storage_dir(v) {
             Ok(path) => path,
@@ -467,10 +478,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // parse caching so repeated CLI invocations skip re-parsing files
     // whose mtime hasn't changed.
     let mut graph = CallGraph::new(root_path.clone());
-    // Propagate the enable_dispatch_edges setting from Config into the graph.
+    // Propagate feature-flag settings from Config into the graph.
     graph.enable_dispatch_edges = ctx.config().enable_dispatch_edges;
-    // Propagate the enable_implementation_edges setting from Config into the graph.
     graph.enable_implementation_edges = ctx.config().enable_implementation_edges;
+    graph.enable_writes_edges = ctx.config().enable_writes_edges;
     let parse_cache_root = resolve_cache_dir(&root_path, storage_dir.as_deref());
     graph.set_parse_cache_dir(parse_cache_root);
     *ctx.callgraph().borrow_mut() = Some(graph);

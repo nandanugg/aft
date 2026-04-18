@@ -125,6 +125,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "dispatched_by" => aft::commands::dispatched_by::handle_dispatched_by(&req, ctx),
         "dispatches" => aft::commands::dispatches::handle_dispatches(&req, ctx),
         "implementations" => aft::commands::implementations::handle_implementations(&req, ctx),
+        "writers" => aft::commands::writers::handle_writers(&req, ctx),
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),

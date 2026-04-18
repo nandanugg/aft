@@ -140,6 +140,22 @@ const GO_QUERY: &str = r#"
   (type_spec
     name: (type_identifier) @type.name
     type: (_) @type.body)) @type.def
+
+;; package-level var declarations — single form: var X = ...
+(var_declaration
+  (var_spec
+    name: (identifier) @var.name)) @var.def
+
+;; package-level var declarations — grouped form: var ( X ...; Y ... )
+(var_declaration
+  (var_spec_list
+    (var_spec
+      name: (identifier) @var.name))) @var.def
+
+;; package-level const declarations (single and grouped)
+(const_declaration
+  (const_spec
+    name: (identifier) @const.name)) @const.def
 "#;
 
 const C_QUERY: &str = r#"
@@ -1513,6 +1529,10 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut type_name_node = None;
         let mut type_body_node = None;
         let mut type_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut const_name_node = None;
+        let mut const_def_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1526,6 +1546,10 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "type.name" => type_name_node = Some(cap.node),
                 "type.body" => type_body_node = Some(cap.node),
                 "type.def" => type_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "const.name" => const_name_node = Some(cap.node),
+                "const.def" => const_def_node = Some(cap.node),
                 _ => {}
             }
         }
@@ -1587,6 +1611,54 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 scope_chain: vec![],
                 parent: None,
             });
+        }
+
+        // Package-level var declarations. The query matches each var_spec
+        // individually, so one match = one name even inside grouped `var (...)`.
+        // Filter out function-local vars: only emit if the var_declaration
+        // is a direct child of the source_file (package-level).
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            // def_node is the var_declaration; check parent is source_file.
+            let is_package_level = def_node
+                .parent()
+                .map(|p| p.kind() == "source_file")
+                .unwrap_or(false);
+            if is_package_level {
+                let name = node_text(source, &name_node).to_string();
+                // Use the var_spec node's range (the name_node's parent) for
+                // a tight range; fall back to def_node if not available.
+                let range_node = name_node.parent().unwrap_or(def_node);
+                symbols.push(Symbol {
+                    exported: is_go_exported(&name),
+                    name,
+                    kind: SymbolKind::Variable,
+                    range: node_range_with_decorators(&range_node, source, lang),
+                    signature: None,
+                    scope_chain: vec![],
+                    parent: None,
+                });
+            }
+        }
+
+        // Package-level const declarations.
+        if let (Some(name_node), Some(def_node)) = (const_name_node, const_def_node) {
+            let is_package_level = def_node
+                .parent()
+                .map(|p| p.kind() == "source_file")
+                .unwrap_or(false);
+            if is_package_level {
+                let name = node_text(source, &name_node).to_string();
+                let range_node = name_node.parent().unwrap_or(def_node);
+                symbols.push(Symbol {
+                    exported: is_go_exported(&name),
+                    name,
+                    kind: SymbolKind::Constant,
+                    range: node_range_with_decorators(&range_node, source, lang),
+                    signature: None,
+                    scope_chain: vec![],
+                    parent: None,
+                });
+            }
         }
     }
 

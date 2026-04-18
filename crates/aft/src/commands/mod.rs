@@ -45,4 +45,5 @@ pub mod transaction;
 pub mod undo;
 pub mod wrap_try_catch;
 pub mod write;
+pub mod writers;
 pub mod zoom;

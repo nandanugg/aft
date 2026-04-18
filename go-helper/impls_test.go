@@ -39,7 +39,7 @@ func TestImplementsCrossPackage(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, false /* emitDispatches */, true /* emitImplements */)
+	out, err := analyze(absRoot, false /* emitDispatches */, true /* emitImplements */, true /* emitWrites */)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestImplementsSameFileExcluded(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, false, true)
+	out, err := analyze(absRoot, false, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestImplementsEmbeddedInterface(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, false, true)
+	out, err := analyze(absRoot, false, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestNoImplementsFlag(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, false /* emitDispatches */, false /* emitImplements */)
+	out, err := analyze(absRoot, false /* emitDispatches */, false /* emitImplements */, true /* emitWrites */)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestImplementsReceiverType(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, false, true)
+	out, err := analyze(absRoot, false, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}

@@ -132,6 +132,9 @@ pub enum EdgeKind {
     /// This is an existence edge, not a call edge — it answers
     /// "which concrete types implement interface X?"
     Implements,
+    /// Cross-package write to a package-level variable (`*ssa.Store` → `*ssa.Global`).
+    /// `callee.symbol` is the variable name; same-package writes are filtered at source.
+    Writes,
 }
 
 impl EdgeKind {
@@ -145,6 +148,7 @@ impl EdgeKind {
             Self::Goroutine => "goroutine",
             Self::Defer => "defer",
             Self::Implements => "implements",
+            Self::Writes => "writes",
         }
     }
 
@@ -158,6 +162,7 @@ impl EdgeKind {
             "goroutine" => Some(Self::Goroutine),
             "defer" => Some(Self::Defer),
             "implements" => Some(Self::Implements),
+            "writes" => Some(Self::Writes),
             _ => None,
         }
     }
@@ -219,6 +224,7 @@ impl std::error::Error for HelperError {}
 pub fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
+
 
 /// Probe whether `go` is on PATH. Cheap (`go env GOROOT` is fast and
 /// doesn't touch any modules).
@@ -738,11 +744,72 @@ mod tests {
             EdgeKind::Dispatches,
             EdgeKind::Goroutine,
             EdgeKind::Defer,
+            EdgeKind::Writes,
         ];
         for kind in kinds {
             let s = kind.as_str();
             let back = EdgeKind::from_str(s).expect("from_str should parse as_str output");
             assert_eq!(kind, back, "round-trip failed for {s}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier 1.5: writes kind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn writes_kind_parses_correctly() {
+        let json = r#"{
+            "version": 1,
+            "root": "/x",
+            "edges": [
+                {
+                    "caller": {"file": "server/asynq.go", "line": 47, "symbol": "startServer"},
+                    "callee": {"file": "server/registry.go", "symbol": "handlerRegistry", "pkg": "server"},
+                    "kind": "writes"
+                },
+                {
+                    "caller": {"file": "server/registry.go", "line": 12, "symbol": "init"},
+                    "callee": {"file": "server/registry.go", "symbol": "defaultRegistry", "pkg": "server"},
+                    "kind": "writes"
+                }
+            ]
+        }"#;
+        let out: HelperOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.edges.len(), 2);
+
+        let write_edge = &out.edges[0];
+        assert_eq!(write_edge.kind, EdgeKind::Writes);
+        assert_eq!(write_edge.caller.symbol, "startServer");
+        assert_eq!(write_edge.callee.symbol, "handlerRegistry");
+        assert_eq!(write_edge.nearby_string, None);
+
+        let init_edge = &out.edges[1];
+        assert_eq!(init_edge.kind, EdgeKind::Writes);
+        assert_eq!(init_edge.caller.symbol, "init");
+        assert_eq!(init_edge.callee.symbol, "defaultRegistry");
+    }
+
+    #[test]
+    fn writes_kind_serializes_correctly() {
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "a.go".into(),
+                line: 10,
+                symbol: "SetRegistry".into(),
+            },
+            callee: HelperCallee {
+                file: "b.go".into(),
+                line: 0,
+                symbol: "globalRegistry".into(),
+                receiver: String::new(),
+                pkg: "example.com/b".into(),
+            },
+            kind: EdgeKind::Writes,
+            nearby_string: None,
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(s.contains("\"writes\""), "kind should be 'writes': {s}");
+        assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
     }
 }

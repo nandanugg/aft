@@ -109,6 +109,7 @@ func main() {
 		rootFlag          = flag.String("root", ".", "project root (absolute path preferred)")
 		noDispatchesFlag  = flag.Bool("no-dispatches", false, "disable emission of dispatches/goroutine/defer edge kinds")
 		noImplementsFlag  = flag.Bool("no-implements", false, "disable emission of implements edges")
+		noWritesFlag     = flag.Bool("no-writes", false, "disable emission of writes edges for package-level variables")
 	)
 	flag.Parse()
 
@@ -118,7 +119,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	out, err := analyze(root, !*noDispatchesFlag, !*noImplementsFlag)
+	out, err := analyze(root, !*noDispatchesFlag, !*noImplementsFlag, !*noWritesFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aft-go-helper: %v\n", err)
 		os.Exit(1)
@@ -133,7 +134,7 @@ func main() {
 }
 
 // analyze loads all packages under root and returns resolved call edges.
-func analyze(root string, emitDispatches bool, emitImplements bool) (*Output, error) {
+func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites bool) (*Output, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -246,6 +247,12 @@ func analyze(root string, emitDispatches bool, emitImplements bool) (*Output, er
 	// pair for all in-project interfaces and their in-project implementations.
 	if emitImplements {
 		emitImplementsEdges(out, prog, root)
+	}
+
+	// Tier 1.5: emit writes edges for cross-package stores to *ssa.Global.
+	// Same-package writes are filtered at source (tree-sitter already sees them).
+	if emitWrites {
+		emitWritesEdges(out, prog, fns, root, seen)
 	}
 
 	return out, nil
@@ -1121,6 +1128,139 @@ func edgeKind(callee *ssa.Function, site ssa.CallInstruction) string {
 		return "concrete"
 	}
 	return "static"
+}
+
+// emitWritesEdges walks all SSA Store instructions and emits "writes" edges
+// for cross-package stores to *ssa.Global.
+//
+// Filter contract (helper-contract.md):
+//   - Same-package writes are dropped: tree-sitter sees them.
+//   - Out-of-project globals are dropped.
+//   - Only direct *ssa.Store → *ssa.Global is considered (no pointer indirection).
+//
+// Initialization writes from synthetic init functions are emitted with
+// caller.symbol = "init" — SSA synthesizes a package-init function that
+// runs var initializers.
+func emitWritesEdges(
+	out *Output,
+	prog *ssa.Program,
+	fns map[*ssa.Function]bool,
+	root string,
+	seen map[edgeKey]bool,
+) {
+	for f := range fns {
+		if f.Pkg == nil {
+			continue
+		}
+
+		for _, block := range f.Blocks {
+			for _, instr := range block.Instrs {
+				store, ok := instr.(*ssa.Store)
+				if !ok {
+					continue
+				}
+				glob, ok := store.Addr.(*ssa.Global)
+				if !ok {
+					continue
+				}
+
+				// Must be an in-project global.
+				globPos := prog.Fset.Position(glob.Pos())
+				if globPos.Filename == "" {
+					continue
+				}
+				globRel, ok := relPath(root, globPos.Filename)
+				if !ok {
+					continue
+				}
+
+				// Filter: drop same-package writes — tree-sitter handles them.
+				globPkg := ""
+				if glob.Pkg != nil && glob.Pkg.Pkg != nil {
+					globPkg = glob.Pkg.Pkg.Path()
+				}
+				callerPkg := ""
+				if f.Pkg != nil && f.Pkg.Pkg != nil {
+					callerPkg = f.Pkg.Pkg.Path()
+				}
+				if globPkg != "" && callerPkg != "" && globPkg == callerPkg {
+					continue
+				}
+
+				// Caller position: prefer the store instruction's position,
+				// fall back to the enclosing function's position.
+				var callerFile string
+				var callerLine int
+				storePos := prog.Fset.Position(store.Pos())
+				if storePos.Filename != "" {
+					rel, ok2 := relPath(root, storePos.Filename)
+					if !ok2 {
+						continue
+					}
+					callerFile = rel
+					callerLine = storePos.Line
+				} else {
+					fnPos := prog.Fset.Position(f.Pos())
+					if fnPos.Filename == "" {
+						continue
+					}
+					rel, ok2 := relPath(root, fnPos.Filename)
+					if !ok2 {
+						continue
+					}
+					callerFile = rel
+					callerLine = fnPos.Line
+				}
+
+				// Caller symbol: use the SSA function's name directly.
+				// For synthetic package-init functions the name is "init".
+				callerSym := f.Name()
+				if callerSym == "" {
+					continue
+				}
+				// Collapse closures to their outer named function.
+				callerSym = containingName(f)
+				if callerSym == "" {
+					continue
+				}
+
+				globName := glob.Name()
+				if globName == "" {
+					continue
+				}
+
+				key := edgeKey{
+					callerFile:   callerFile,
+					callerLine:   callerLine,
+					callerSymbol: callerSym,
+					calleeFile:   globRel,
+					calleeSymbol: globName,
+					kind:         "writes",
+					nearbyString: "",
+				}
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+
+				pkg := globPkg
+
+				out.Edges = append(out.Edges, Edge{
+					Caller: Position{
+						File:   callerFile,
+						Line:   callerLine,
+						Symbol: callerSym,
+					},
+					Callee: Target{
+						File:   globRel,
+						Symbol: globName,
+						Pkg:    pkg,
+					},
+					Kind: "writes",
+				})
+			}
+		}
+	}
 }
 
 // relPath returns filename relative to root, or (_, false) if filename

@@ -160,6 +160,7 @@ impl ImplementationsResult {
     }
 }
 
+
 /// One entry in the dispatch secondary index: a callee registered under a
 /// particular dispatch key, plus the registration call site.
 #[derive(Debug, Clone, Serialize)]
@@ -736,6 +737,54 @@ impl DispatchesResult {
     }
 }
 
+/// Result of `aft writers <file> <var_symbol>`.
+/// Lists all cross-package write sites for a package-level variable.
+#[derive(Debug, Clone, Serialize)]
+pub struct WritersResult {
+    /// The queried variable name.
+    pub variable: String,
+    /// The queried file (relative to project root).
+    pub file: String,
+    /// Write sites — each entry is a function that writes to the variable.
+    pub writers: Vec<WriterSite>,
+}
+
+/// A single write site for a package-level variable.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriterSite {
+    /// File containing the writer function.
+    pub file: String,
+    /// Name of the function that performs the write.
+    pub symbol: String,
+    /// 1-based line number of the store instruction.
+    pub line: u32,
+}
+
+impl WritersResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "writers {} ({})  total={}\n",
+            self.variable,
+            self.file,
+            self.writers.len(),
+        ));
+        if self.writers.is_empty() {
+            out.push_str("  (no cross-package writers found)\n");
+        } else {
+            for w in &self.writers {
+                out.push_str(&format!(
+                    "  - {} ({}:{})\n",
+                    w.symbol, w.file, w.line
+                ));
+            }
+        }
+        out
+    }
+}
+
+
 impl CallTreeNode {
     /// Compact LLM-friendly rendering (indented tree).
     pub fn render_text(&self) -> String {
@@ -974,6 +1023,10 @@ pub struct CallGraph {
     /// Default `true`. Set via `Config::enable_implementation_edges` or
     /// `AFT_DISABLE_IMPLEMENTATION_EDGES=1`. When `false`, the index is not built.
     pub enable_implementation_edges: bool,
+    /// Whether to include writes edges from the Go helper.
+    /// Default `true`. Set via `Config::enable_writes_edges` or
+    /// `AFT_DISABLE_WRITES_EDGES=1`. When `false`, writes edges are dropped.
+    pub enable_writes_edges: bool,
 }
 
 impl CallGraph {
@@ -992,6 +1045,9 @@ impl CallGraph {
                 .map(|v| v != "1")
                 .unwrap_or(true),
             enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
         }
@@ -1566,6 +1622,7 @@ impl CallGraph {
         let mut impl_index = ImplementationIndex::new();
         let enable_dispatch = self.enable_dispatch_edges;
         let enable_implements = self.enable_implementation_edges;
+        let enable_writes = self.enable_writes_edges;
         if let Some(helper) = &self.go_helper {
             for edge in &helper.edges {
                 if edge.caller.symbol.is_empty() || edge.callee.symbol.is_empty() {
@@ -1621,6 +1678,7 @@ impl CallGraph {
                     continue;
                 }
 
+
                 // Feature flag: drop dispatches/goroutine/defer kinds when disabled.
                 let is_dispatch_kind = matches!(
                     edge.kind,
@@ -1629,6 +1687,12 @@ impl CallGraph {
                 if is_dispatch_kind && !enable_dispatch {
                     continue;
                 }
+
+                // Feature flag: drop writes edges when disabled.
+                if edge.kind == EdgeKind::Writes && !enable_writes {
+                    continue;
+                }
+
 
                 let caller_abs = self.project_root.join(&edge.caller.file);
                 let callee_abs = self.project_root.join(&edge.callee.file);
@@ -1778,6 +1842,7 @@ impl CallGraph {
         })
     }
 
+
     /// Exact-match lookup in the dispatch secondary index.
     /// Returns all dispatch entries whose `nearby_string` equals `key`.
     pub fn find_by_dispatch_key(&mut self, key: &str) -> Vec<DispatchEntry> {
@@ -1839,6 +1904,44 @@ impl CallGraph {
             dispatched_by: sites,
         })
     }
+
+    /// Find all cross-package write sites for a package-level variable.
+    /// This is the backend for `aft writers <file> <var>`.
+    /// Returns only edges with `kind == Writes` — same-package writes are
+    /// filtered at the helper side (filter-at-source contract).
+    pub fn writers_of(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+    ) -> Result<WritersResult, AftError> {
+        let canon = self.canonicalize(file)?;
+        self.build_file(&canon)?;
+
+        if self.reverse_index.is_none() {
+            self.build_reverse_index();
+        }
+
+        let target_rel = self.relative_path(&canon);
+
+        let sites = self
+            .reverse_sites(&canon, symbol)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|s| s.kind == Some(EdgeKind::Writes))
+            .map(|s| WriterSite {
+                file: self.relative_path(s.caller_file.as_ref()),
+                symbol: s.caller_symbol.to_string(),
+                line: s.line,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(WritersResult {
+            variable: symbol.to_string(),
+            file: target_rel,
+            writers: sites,
+        })
+    }
+
 
     /// Get callers of a symbol in a file, grouped by calling file.
     ///

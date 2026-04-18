@@ -2,12 +2,13 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::callgraph::WriterSite;
 use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::lsp_hints;
 use crate::parser::{FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
-use crate::symbols::Range;
+use crate::symbols::{Range, SymbolKind};
 
 /// A reference to a called/calling function.
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +35,10 @@ pub struct ZoomResponse {
     pub context_before: Vec<String>,
     pub context_after: Vec<String>,
     pub annotations: Annotations,
+    /// Cross-package write sites. Present only when the symbol is a
+    /// Variable or Constant and the Go helper has resolved writes edges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writers: Option<Vec<WriterSite>>,
 }
 
 /// Handle a `zoom` request.
@@ -377,6 +382,26 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", target.kind).to_lowercase());
 
+    // For Variable and Constant symbols, query the call graph for cross-package writers.
+    let writers = if matches!(target.kind, SymbolKind::Variable | SymbolKind::Constant) {
+        ctx.drain_go_helper();
+        let mut cg_ref = ctx.callgraph().borrow_mut();
+        if let Some(graph) = cg_ref.as_mut() {
+            let writers = graph
+                .writers_of(resolved_file_path, &target.name)
+                .unwrap_or_else(|_| crate::callgraph::WritersResult {
+                    variable: target.name.clone(),
+                    file: String::new(),
+                    writers: vec![],
+                });
+            Some(writers.writers)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let resp = ZoomResponse {
         name: target.name.clone(),
         kind: kind_str,
@@ -388,6 +413,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             calls_out,
             called_by,
         },
+        writers,
     };
 
     match serde_json::to_value(&resp) {

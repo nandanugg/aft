@@ -113,6 +113,11 @@ pub struct Config {
     /// Default `true`. Set to `false` to skip index construction.
     /// Overridden to `false` by `AFT_DISABLE_IMPLEMENTATION_EDGES=1`.
     pub enable_implementation_edges: bool,
+    /// [callgraph] enable_writes_edges — include cross-package variable-write edges from
+    /// the Go helper. These power `aft writers <file> <var>` lookups.
+    /// Default `true`. Set to `false` to disable.
+    /// Overridden to `false` by `AFT_DISABLE_WRITES_EDGES=1`.
+    pub enable_writes_edges: bool,
 }
 
 impl Default for Config {
@@ -142,6 +147,9 @@ impl Default for Config {
                 .unwrap_or(true),
             // Env var kill switch takes priority over config file value.
             enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
         }
