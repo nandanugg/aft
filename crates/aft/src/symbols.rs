@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The kind of a discovered symbol.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
     Function,
@@ -13,6 +13,8 @@ pub enum SymbolKind {
     TypeAlias,
     /// Top-level const/let variable declaration
     Variable,
+    /// Top-level const declaration (Go `const X = ...`)
+    Constant,
     /// Markdown heading (h1, h2, h3, etc.)
     Heading,
 }

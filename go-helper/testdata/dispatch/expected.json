@@ -1,0 +1,97 @@
+[
+  {
+    "caller": {
+      "file": "goroutine.go",
+      "line": 15,
+      "symbol": "WithDefer"
+    },
+    "callee": {
+      "file": "goroutine.go",
+      "symbol": "cleanup",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "defer"
+  },
+  {
+    "caller": {
+      "file": "http.go",
+      "line": 12,
+      "symbol": "RegisterHTTPHandlers"
+    },
+    "callee": {
+      "file": "http.go",
+      "symbol": "handleAPI",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "/api"
+  },
+  {
+    "caller": {
+      "file": "http.go",
+      "line": 11,
+      "symbol": "RegisterHTTPHandlers"
+    },
+    "callee": {
+      "file": "http.go",
+      "symbol": "handleHome",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "/"
+  },
+  {
+    "caller": {
+      "file": "asynq.go",
+      "line": 13,
+      "symbol": "RegisterHandlers"
+    },
+    "callee": {
+      "file": "asynq.go",
+      "symbol": "HandleTaskA",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "TypeTaskA"
+  },
+  {
+    "caller": {
+      "file": "asynq.go",
+      "line": 14,
+      "symbol": "RegisterHandlers"
+    },
+    "callee": {
+      "file": "asynq.go",
+      "symbol": "HandleTaskB",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "TypeTaskB"
+  },
+  {
+    "caller": {
+      "file": "goroutine.go",
+      "line": 11,
+      "symbol": "StartWorkers"
+    },
+    "callee": {
+      "file": "goroutine.go",
+      "symbol": "process",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "goroutine"
+  },
+  {
+    "caller": {
+      "file": "goroutine.go",
+      "line": 10,
+      "symbol": "StartWorkers"
+    },
+    "callee": {
+      "file": "goroutine.go",
+      "symbol": "workerLoop",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "goroutine"
+  }
+]

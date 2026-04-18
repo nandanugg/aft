@@ -9,6 +9,7 @@ use notify::{RecursiveMode, Watcher};
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use crate::go_helper;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir, walk_project_files, SearchIndex,
@@ -206,6 +207,32 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_u64())
     {
         ctx.config_mut().search_index_max_file_size = v;
+    }
+    // [callgraph] enable_dispatch_edges — drop dispatches/goroutine/defer edges
+    // when false. Env var `AFT_DISABLE_DISPATCH_EDGES=1` is the kill switch
+    // (set at Config::default() time); this param lets the caller override
+    // it per-session. When the env var is set to "1", this param cannot
+    // re-enable it (env var wins).
+    if let Some(v) = req
+        .params
+        .get("enable_dispatch_edges")
+        .and_then(|v| v.as_bool())
+    {
+        // Only honour if env-var kill switch is not active.
+        if std::env::var("AFT_DISABLE_DISPATCH_EDGES").as_deref() != Ok("1") {
+            ctx.config_mut().enable_dispatch_edges = v;
+        }
+    }
+    // [callgraph] enable_writes_edges — include cross-package variable-write edges.
+    // Env var `AFT_DISABLE_WRITES_EDGES=1` is the kill switch.
+    if let Some(v) = req
+        .params
+        .get("enable_writes_edges")
+        .and_then(|v| v.as_bool())
+    {
+        if std::env::var("AFT_DISABLE_WRITES_EDGES").as_deref() != Ok("1") {
+            ctx.config_mut().enable_writes_edges = v;
+        }
     }
     if let Some(v) = req.params.get("storage_dir").and_then(|v| v.as_str()) {
         let storage_dir = match validate_storage_dir(v) {
@@ -435,9 +462,89 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         });
     }
 
-    // Initialize call graph with the project root
-    let graph = CallGraph::new(root_path.clone());
+    // Initialize call graph with the project root, and enable on-disk
+    // parse caching so repeated CLI invocations skip re-parsing files
+    // whose mtime hasn't changed.
+    let mut graph = CallGraph::new(root_path.clone());
+    // Propagate feature-flag settings from Config into the graph.
+    graph.enable_dispatch_edges = ctx.config().enable_dispatch_edges;
+    graph.enable_writes_edges = ctx.config().enable_writes_edges;
+    let parse_cache_root = resolve_cache_dir(&root_path, storage_dir.as_deref());
+    graph.set_parse_cache_dir(parse_cache_root);
     *ctx.callgraph().borrow_mut() = Some(graph);
+
+    // Go helper strategy:
+    //   1. Try reading cache synchronously — if present, install immediately
+    //      so the first query has resolved interface-dispatch edges.
+    //   2. If caller set wait_for_helper=true (CLI mode), and we don't have a
+    //      fresh cache, run the helper synchronously and block configure until
+    //      it finishes. This is needed because CLI processes exit right after
+    //      replying to the command, killing any background thread mid-run.
+    //   3. Otherwise (daemon mode), spawn the helper in a background thread
+    //      and let AppContext drain it lazily on first query.
+    let helper_root = root_path.clone();
+    let helper_cache = resolve_cache_dir(&root_path, storage_dir.as_deref());
+
+    let had_cache = if let Some(cached) = go_helper::read_cached(&helper_cache, &root_path) {
+        log::info!(
+            "[aft] go-helper: loaded {} cached edges from {}",
+            cached.edges.len(),
+            helper_cache.display()
+        );
+        ctx.install_go_helper(cached);
+        true
+    } else {
+        false
+    };
+
+    let wait_for_helper = req
+        .params
+        .get("wait_for_helper")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if wait_for_helper && !had_cache {
+        // CLI path: block for helper so same-process queries see resolved
+        // interface-dispatch edges. Bounded by the 60s timeout already in
+        // run_helper (plus whatever packages.Load takes on cold cache).
+        match go_helper::resolve_for_root(&helper_root, std::time::Duration::from_secs(60)) {
+            Ok(data) => {
+                log::info!(
+                    "[aft] go-helper: {} edges (sync), {} skipped pkgs",
+                    data.edges.len(),
+                    data.skipped.len()
+                );
+                if let Err(e) = go_helper::write_cached(&helper_cache, &data) {
+                    log::debug!("[aft] go-helper cache write failed: {e}");
+                }
+                ctx.install_go_helper(data);
+            }
+            Err(e) => {
+                // Silent fallback by design — non-Go project, missing go,
+                // missing helper binary, build errors, etc. Tree-sitter
+                // still handles same-file and same-package resolution.
+                log::debug!("[aft] go-helper sync run unavailable: {e}");
+            }
+        }
+    } else {
+        // Daemon path (or cache hit — still refresh for next time).
+        let helper_cache_bg = helper_cache.clone();
+        let helper_root_bg = helper_root.clone();
+        let (helper_tx, helper_rx) = unbounded();
+        *ctx.go_helper_rx().borrow_mut() = Some(helper_rx);
+        thread::spawn(move || {
+            let result = go_helper::resolve_for_root(
+                &helper_root_bg,
+                std::time::Duration::from_secs(60),
+            );
+            if let Ok(ref out) = result {
+                if let Err(e) = go_helper::write_cached(&helper_cache_bg, out) {
+                    log::debug!("[aft] go-helper cache write failed: {e}");
+                }
+            }
+            let _ = helper_tx.send(result);
+        });
+    }
 
     // Drop old watcher/receiver before creating new ones (re-configure)
     *ctx.watcher().borrow_mut() = None;

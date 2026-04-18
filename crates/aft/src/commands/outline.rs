@@ -209,6 +209,7 @@ fn kind_abbrev(kind: &str) -> &str {
         "property" => "prop",
         "struct" => "st",
         "heading" => "h",
+        "constant" => "con",
         _ => &kind[..kind.len().min(4)],
     }
 }

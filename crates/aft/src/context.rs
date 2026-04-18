@@ -8,6 +8,7 @@ use crate::backup::BackupStore;
 use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
+use crate::go_helper::{HelperError, HelperOutput};
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::search_index::SearchIndex;
@@ -107,6 +108,15 @@ pub struct AppContext {
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
+    /// Resolved Go call edges from the optional `aft-go-helper`. `None`
+    /// until the helper has run successfully (or never runs, e.g. when
+    /// the project has no `go.mod`). Consumers should drain
+    /// `go_helper_rx` first to surface a freshly-completed run.
+    go_helper_data: RefCell<Option<HelperOutput>>,
+    /// Receiver for an in-flight helper run. Sent value is the parsed
+    /// output, or the error that prevented producing one — both are
+    /// useful for diagnostics.
+    go_helper_rx: RefCell<Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>>,
 }
 
 impl AppContext {
@@ -126,6 +136,84 @@ impl AppContext {
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(LspManager::new()),
+            go_helper_data: RefCell::new(None),
+            go_helper_rx: RefCell::new(None),
+        }
+    }
+
+    /// Drain any pending helper result into the CallGraph without blocking.
+    /// Call this at the start of any command handler that uses the call graph
+    /// so a recently-completed helper run is reflected in the next reverse
+    /// index build.
+    pub fn drain_go_helper(&self) {
+        self.poll_go_helper();
+    }
+
+    /// Install helper output synchronously. Called from configure when a
+    /// cache hit lets us skip the async helper thread, and from
+    /// `poll_go_helper` when the async result arrives. Updates both the
+    /// AppContext's cached copy and the CallGraph's resolver.
+    pub fn install_go_helper(&self, data: HelperOutput) {
+        *self.go_helper_data.borrow_mut() = Some(data.clone());
+        if let Some(graph) = self.callgraph.borrow_mut().as_mut() {
+            graph.set_go_helper(data);
+        }
+    }
+
+    /// Access the cached Go helper output, draining the in-flight
+    /// receiver first so a freshly-completed run becomes visible. The
+    /// inner reference is held only for the duration of the borrow.
+    pub fn go_helper_data(&self) -> Ref<'_, Option<HelperOutput>> {
+        self.poll_go_helper();
+        self.go_helper_data.borrow()
+    }
+
+    /// Receiver slot for an in-flight helper run. Configure-time code
+    /// installs a receiver here; readers shouldn't touch this directly,
+    /// they should call `go_helper_data` which drains it.
+    pub fn go_helper_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>> {
+        &self.go_helper_rx
+    }
+
+    /// Drain a pending helper result without blocking. If the receiver
+    /// has produced a value, store it and drop the channel.
+    fn poll_go_helper(&self) {
+        let received = {
+            let rx_ref = self.go_helper_rx.borrow();
+            match rx_ref.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(v) => Some(v),
+                    Err(crossbeam_channel::TryRecvError::Empty) => None,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(
+                        HelperError::Io("helper thread disconnected without sending".into()),
+                    )),
+                },
+                None => None,
+            }
+        };
+        if let Some(result) = received {
+            // Drop the receiver — we'll get one new one on each
+            // configure call, and a closed channel shouldn't keep
+            // re-entering this branch.
+            *self.go_helper_rx.borrow_mut() = None;
+            match result {
+                Ok(out) => {
+                    log::info!(
+                        "[aft] go-helper: {} edges, {} skipped pkgs",
+                        out.edges.len(),
+                        out.skipped.len()
+                    );
+                    self.install_go_helper(out);
+                }
+                Err(err) => {
+                    // Most variants are normal (no go.mod, no go on PATH,
+                    // helper not installed). Log at debug so we don't
+                    // spam stderr on every Rust/Python project.
+                    log::debug!("[aft] go-helper unavailable: {err}");
+                }
+            }
         }
     }
 

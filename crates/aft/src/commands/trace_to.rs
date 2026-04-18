@@ -51,6 +51,7 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(10)
         .min(100) as usize;
 
+    ctx.drain_go_helper();
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -89,7 +90,11 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
 
     match graph.trace_to(&file_path, symbol, depth) {
         Ok(result) => {
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
+            let text = result.render_text();
+            let mut result_json = serde_json::to_value(&result).unwrap_or_default();
+            if let Some(obj) = result_json.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::Value::String(text));
+            }
             Response::success(&req.id, result_json)
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),

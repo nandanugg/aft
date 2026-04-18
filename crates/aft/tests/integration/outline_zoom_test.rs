@@ -414,3 +414,95 @@ fn zoom_follows_reexport_chains_to_the_resolved_symbol_source() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+#[test]
+fn go_outline_includes_package_level_var_and_const() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "vars.go",
+        r#"// Package sample is a fixture for var/const extraction.
+package sample
+
+var SingleVar = "hello"
+
+const ExportedConst = 42
+
+var unexportedVar int
+
+var (
+    GroupedA string
+    GroupedB int
+)
+
+const (
+    ConstX = 1
+    ConstY = 2
+)
+
+func PackageFunc() {}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({"id": "go-vars", "command": "outline", "file": file}),
+    );
+
+    assert_eq!(resp["success"], true, "outline should succeed: {:?}", resp);
+    let text = resp["text"].as_str().expect("outline text");
+
+    // Single var and const
+    assert!(
+        text.contains("SingleVar"),
+        "package-level var should appear: {text}"
+    );
+    assert!(
+        text.contains("ExportedConst"),
+        "package-level const should appear: {text}"
+    );
+
+    // Unexported var should still appear
+    assert!(
+        text.contains("unexportedVar"),
+        "unexported var should appear: {text}"
+    );
+
+    // Grouped var declarations — each name individually
+    assert!(
+        text.contains("GroupedA"),
+        "grouped var GroupedA should appear: {text}"
+    );
+    assert!(
+        text.contains("GroupedB"),
+        "grouped var GroupedB should appear: {text}"
+    );
+
+    // Grouped const declarations — each name individually
+    assert!(
+        text.contains("ConstX"),
+        "grouped const ConstX should appear: {text}"
+    );
+    assert!(
+        text.contains("ConstY"),
+        "grouped const ConstY should appear: {text}"
+    );
+
+    // Function still appears with its kind abbreviation
+    assert!(
+        text.contains("PackageFunc"),
+        "function should still appear: {text}"
+    );
+
+    // Var kind should use "var" abbreviation; const kind should use "con"
+    assert!(
+        text.contains("var") || text.contains("con"),
+        "outline should include var/con kind abbreviations: {text}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
