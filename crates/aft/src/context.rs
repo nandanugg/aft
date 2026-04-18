@@ -13,6 +13,7 @@ use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::search_index::SearchIndex;
 use crate::semantic_index::SemanticIndex;
+use crate::similarity::SimilarityIndex;
 
 #[derive(Debug, Clone)]
 pub enum SemanticIndexStatus {
@@ -105,6 +106,7 @@ pub struct AppContext {
     semantic_index_rx: RefCell<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RefCell<SemanticIndexStatus>,
     semantic_embedding_model: RefCell<Option<crate::semantic_index::EmbeddingModel>>,
+    similarity_index: RefCell<Option<SimilarityIndex>>,
     watcher: RefCell<Option<RecommendedWatcher>>,
     watcher_rx: RefCell<Option<mpsc::Receiver<notify::Result<notify::Event>>>>,
     lsp_manager: RefCell<LspManager>,
@@ -133,6 +135,7 @@ impl AppContext {
             semantic_index_rx: RefCell::new(None),
             semantic_index_status: RefCell::new(SemanticIndexStatus::Disabled),
             semantic_embedding_model: RefCell::new(None),
+            similarity_index: RefCell::new(None),
             watcher: RefCell::new(None),
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(LspManager::new()),
@@ -279,6 +282,11 @@ impl AppContext {
     /// Access the cached semantic embedding model.
     pub fn semantic_embedding_model(&self) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
+    }
+
+    /// Access the similarity index (lexical TF-IDF + co-citation).
+    pub fn similarity_index(&self) -> &RefCell<Option<SimilarityIndex>> {
+        &self.similarity_index
     }
 
     /// Access the file watcher handle (kept alive to continue watching).

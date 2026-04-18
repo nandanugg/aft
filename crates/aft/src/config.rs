@@ -118,6 +118,12 @@ pub struct Config {
     /// Default `true`. Set to `false` to disable.
     /// Overridden to `false` by `AFT_DISABLE_WRITES_EDGES=1`.
     pub enable_writes_edges: bool,
+    /// Similarity index: enabled (default: true).
+    pub similarity_enabled: bool,
+    /// Similarity index: auto-build on configure (default: true).
+    pub similarity_auto_build_index: bool,
+    /// Similarity weights: (w_lex, w_syn, w_cit), must sum to 1.0.
+    pub similarity_weights: (f32, f32, f32),
 }
 
 impl Default for Config {
@@ -152,6 +158,9 @@ impl Default for Config {
             enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
+            similarity_enabled: true,
+            similarity_auto_build_index: true,
+            similarity_weights: (0.70, 0.15, 0.15),
         }
     }
 }

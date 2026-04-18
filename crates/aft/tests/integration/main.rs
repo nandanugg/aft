@@ -28,5 +28,6 @@ mod outline_zoom_test;
 mod protocol_test;
 mod safety_test;
 mod security_test;
+mod similar_test;
 mod structure_test;
 mod transaction_test;
