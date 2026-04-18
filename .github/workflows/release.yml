@@ -243,9 +243,17 @@ jobs:
         run: bun install
         working-directory: packages/opencode-plugin
 
-      - name: Build plugin
+      - name: Build OpenCode plugin
         run: bun run build
         working-directory: packages/opencode-plugin
+
+      - name: Install Pi plugin dependencies
+        run: bun install
+        working-directory: packages/pi-plugin
+
+      - name: Build Pi plugin
+        run: bun run build
+        working-directory: packages/pi-plugin
 
       # Uses npm Trusted Publishing (OIDC) — configured per-package on npmjs.com
       - name: Publish platform packages
@@ -257,6 +265,10 @@ jobs:
       - name: Publish @cortexkit/aft-opencode
         run: npm publish --access public --provenance
         working-directory: packages/opencode-plugin
+
+      - name: Publish @cortexkit/aft-pi
+        run: npm publish --access public --provenance
+        working-directory: packages/pi-plugin
 
   github-release:
     name: Create GitHub Release

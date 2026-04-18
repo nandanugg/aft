@@ -61,6 +61,20 @@ or
 ```
 </details>
 
+### Pi
+
+AFT also ships as an extension for the [Pi coding agent](https://github.com/badlogic/pi-mono):
+
+```bash
+pi install npm:@cortexkit/aft-pi
+```
+
+That's it. Pi loads the extension on the next session start. AFT replaces Pi's built-in
+`read`, `write`, `edit`, and `grep` with enhanced versions — all powered natively by AFT —
+plus adds the `aft_` family of semantic tools on top.
+
+See the [pi-plugin README](packages/pi-plugin/README.md) for detailed configuration.
+
 ### CLI Commands
 
 AFT ships a standalone CLI for setup, diagnostics, and issue reporting:

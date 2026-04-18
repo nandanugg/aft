@@ -147,7 +147,11 @@ for (const dir of PLATFORM_DIRS) {
 const corePath = join(root, "packages", "opencode-plugin", "package.json");
 results.push(updateJsonFile(corePath, version, { optionalDependencies: true }, dryRun));
 
-// 7: Cargo.toml
+// 7: @cortexkit/aft-pi
+const piPath = join(root, "packages", "pi-plugin", "package.json");
+results.push(updateJsonFile(piPath, version, { optionalDependencies: true }, dryRun));
+
+// 8: Cargo.toml
 const cargoPath = join(root, "crates", "aft", "Cargo.toml");
 results.push(updateCargoToml(cargoPath, version, dryRun));
 
