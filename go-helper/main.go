@@ -11,6 +11,10 @@
 //     resolves to `(*Foo).Method`, not just any method named `Method`.
 //   - Cross-package calls: resolved via go/packages, not heuristic import
 //     maps.
+//   - Dispatch edges: `Register("task", handler)` where handler is a
+//     function value — the callee receives the function for later call.
+//   - Goroutine launches: `go fn(args)` — in-project goroutine callees.
+//   - Defer calls: `defer fn(args)` — in-project defer callees.
 //
 // The helper is invoked opportunistically by AFT at configure time. It
 // writes JSON to stdout. Any error writes to stderr and exits non-zero;
@@ -22,6 +26,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"os"
@@ -56,7 +61,14 @@ type Edge struct {
 	// Kind is "static" for package-level functions, "concrete" for
 	// methods bound to a concrete type, "interface" for VTA-resolved
 	// dynamic dispatch sites (one edge per concrete target).
+	// "dispatches" for function-value arguments passed to a call.
+	// "goroutine" for `go fn(args)` launches.
+	// "defer" for `defer fn(args)` calls.
 	Kind string `json:"kind"`
+	// NearbyString is set on "dispatches" edges when the same call site
+	// has exactly one string literal argument of ≤128 chars. Used as a
+	// human-readable label (e.g. the task name in a job scheduler).
+	NearbyString string `json:"nearby_string,omitempty"`
 }
 
 // Output is the top-level JSON document.
@@ -70,9 +82,21 @@ type Output struct {
 	Skipped []string `json:"skipped,omitempty"`
 }
 
+// edgeKey is used for deduplication of edges.
+type edgeKey struct {
+	callerFile   string
+	callerLine   int
+	callerSymbol string
+	calleeFile   string
+	calleeSymbol string
+	kind         string
+	nearbyString string
+}
+
 func main() {
 	var (
-		rootFlag = flag.String("root", ".", "project root (absolute path preferred)")
+		rootFlag        = flag.String("root", ".", "project root (absolute path preferred)")
+		noDispatchesFlag = flag.Bool("no-dispatches", false, "disable emission of dispatches/goroutine/defer edge kinds")
 	)
 	flag.Parse()
 
@@ -82,7 +106,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	out, err := analyze(root)
+	out, err := analyze(root, !*noDispatchesFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aft-go-helper: %v\n", err)
 		os.Exit(1)
@@ -97,7 +121,7 @@ func main() {
 }
 
 // analyze loads all packages under root and returns resolved call edges.
-func analyze(root string) (*Output, error) {
+func analyze(root string, emitDispatches bool) (*Output, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -175,6 +199,9 @@ func analyze(root string) (*Output, error) {
 		Skipped: skipped,
 	}
 
+	// Deduplication set for all emitted edges.
+	seen := make(map[edgeKey]bool)
+
 	_ = ssaPkgs // retained for debugging; not used directly
 
 	// Iterate every node's outgoing edges. GraphVisitEdges walks only
@@ -185,13 +212,391 @@ func analyze(root string) (*Output, error) {
 			continue
 		}
 		for _, e := range node.Out {
-			if err := emitEdge(out, prog.Fset, root, e); err != nil {
+			if err := emitEdge(out, prog.Fset, root, e, seen); err != nil {
 				return nil, err
 			}
 		}
 	}
 
+	// Tier 1.1/1.2/1.3: emit dispatch/goroutine/defer edges by walking
+	// all SSA instructions directly — these are not captured in the
+	// callgraph edges above.
+	if emitDispatches {
+		for f := range fns {
+			if f.Synthetic != "" {
+				continue
+			}
+			emitDispatchGoroutineDefer(out, prog.Fset, root, f, fns, seen)
+		}
+	}
+
 	return out, nil
+}
+
+// emitDispatchGoroutineDefer walks all instructions in f and emits:
+//
+//   - "dispatches" edges: a call site passes a named in-project function
+//     as an argument. Exactly one string literal arg ≤128 chars → nearby_string.
+//   - "goroutine" edges: `go callee(args)` where callee is a named in-project func.
+//   - "defer" edges: `defer callee(args)` where callee is a named in-project func.
+func emitDispatchGoroutineDefer(
+	out *Output,
+	fset *token.FileSet,
+	root string,
+	f *ssa.Function,
+	fns map[*ssa.Function]bool,
+	seen map[edgeKey]bool,
+) {
+	callerSym := containingName(f)
+	if callerSym == "" {
+		return
+	}
+
+	for _, b := range f.Blocks {
+		for _, instr := range b.Instrs {
+			switch v := instr.(type) {
+			case *ssa.Go:
+				// `go fn(args)` — goroutine launch.
+				emitGoOrDeferEdge(out, fset, root, f, callerSym, v.Common(), "goroutine", fns, seen, nil)
+
+			case *ssa.Defer:
+				// `defer fn(args)` — deferred call.
+				emitGoOrDeferEdge(out, fset, root, f, callerSym, v.Common(), "defer", fns, seen, nil)
+
+			case ssa.CallInstruction:
+				// Regular call — scan args for function values being passed.
+				emitDispatchesFromCall(out, fset, root, f, callerSym, v, fns, seen)
+			}
+		}
+	}
+}
+
+// emitGoOrDeferEdge handles one `*ssa.Go` or `*ssa.Defer` instruction.
+// Only in-project, named callees are emitted. Closures are skipped (no
+// source-level name). If nearbyOverride is non-nil its value is used as
+// nearby_string (reserved for future use by callers that already computed it).
+func emitGoOrDeferEdge(
+	out *Output,
+	fset *token.FileSet,
+	root string,
+	callerFn *ssa.Function,
+	callerSym string,
+	common *ssa.CallCommon,
+	kind string,
+	fns map[*ssa.Function]bool,
+	seen map[edgeKey]bool,
+	nearbyOverride *string,
+) {
+	if common == nil {
+		return
+	}
+
+	var targets []*ssa.Function
+	if g := common.StaticCallee(); g != nil {
+		targets = []*ssa.Function{g}
+	} else if !common.IsInvoke() {
+		// Dynamic non-interface call: function value. Collect all
+		// matching-signature functions from our known set.
+		//
+		// Note: for goroutine/defer with a plain function value we
+		// still emit edges to in-project callees — the same logic
+		// that handles dispatches applies here.
+		if _, isBuiltin := common.Value.(*ssa.Builtin); !isBuiltin {
+			// We don't have direct access to funcsBySig here; use
+			// a simpler heuristic: if the Value is an *ssa.Function
+			// itself (i.e. `go myFunc`), use it directly.
+			if fn, ok := common.Value.(*ssa.Function); ok {
+				targets = []*ssa.Function{fn}
+			}
+		}
+	}
+
+	for _, callee := range targets {
+		if callee == nil || callee.Parent() != nil {
+			// Skip closures.
+			continue
+		}
+		if callee.Synthetic != "" {
+			continue
+		}
+		// Must be in our function set (i.e. in-project).
+		if !fns[callee] {
+			continue
+		}
+
+		calleeSym := calleeName(callee)
+		if calleeSym == "" {
+			continue
+		}
+
+		calleeFile := funcFile(fset, root, callee)
+		if calleeFile == "" {
+			continue
+		}
+
+		// Caller position.
+		var callerFile string
+		var callerLine int
+		if pos := common.Pos(); pos != token.NoPos {
+			p := fset.Position(pos)
+			rel, ok := relPath(root, p.Filename)
+			if !ok {
+				continue
+			}
+			callerFile = rel
+			callerLine = p.Line
+		} else {
+			// No position info; try caller function's position.
+			cp := fset.Position(callerFn.Pos())
+			if cp.Filename == "" {
+				continue
+			}
+			rel, ok := relPath(root, cp.Filename)
+			if !ok {
+				continue
+			}
+			callerFile = rel
+			callerLine = cp.Line
+		}
+
+		nearby := ""
+		if nearbyOverride != nil {
+			nearby = *nearbyOverride
+		}
+
+		key := edgeKey{
+			callerFile:   callerFile,
+			callerLine:   callerLine,
+			callerSymbol: callerSym,
+			calleeFile:   calleeFile,
+			calleeSymbol: calleeSym,
+			kind:         kind,
+			nearbyString: nearby,
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		recv := funcReceiverText(callee)
+		pkg := ""
+		if callee.Pkg != nil && callee.Pkg.Pkg != nil {
+			pkg = callee.Pkg.Pkg.Path()
+		}
+
+		out.Edges = append(out.Edges, Edge{
+			Caller: Position{
+				File:   callerFile,
+				Line:   callerLine,
+				Symbol: callerSym,
+			},
+			Callee: Target{
+				File:     calleeFile,
+				Symbol:   calleeSym,
+				Receiver: recv,
+				Pkg:      pkg,
+			},
+			Kind:         kind,
+			NearbyString: nearby,
+		})
+	}
+}
+
+// emitDispatchesFromCall scans the arguments of a call instruction for
+// function values that refer to named in-project functions and emits
+// "dispatches" edges for each. Applies filter rules:
+//   - Self-reference (caller == callee) is skipped.
+//   - Anonymous closures (no source-level name) are skipped.
+//   - Out-of-project callees are skipped.
+//
+// nearby_string: if the call has exactly one string literal arg ≤128
+// chars among all its arguments, it is attached to every dispatches edge
+// emitted from that call site.
+func emitDispatchesFromCall(
+	out *Output,
+	fset *token.FileSet,
+	root string,
+	callerFn *ssa.Function,
+	callerSym string,
+	site ssa.CallInstruction,
+	fns map[*ssa.Function]bool,
+	seen map[edgeKey]bool,
+) {
+	common := site.Common()
+	if common == nil {
+		return
+	}
+
+	// All arguments (excludes the callee value itself).
+	args := common.Args
+
+	// Scan for function-value arguments.
+	type dispatchArg struct {
+		fn  *ssa.Function
+		idx int
+	}
+	var dispatched []dispatchArg
+
+	for i, arg := range args {
+		fn, ok := extractFuncValue(arg)
+		if !ok || fn == nil {
+			continue
+		}
+		// Skip closures (no source-level identifier).
+		if fn.Parent() != nil {
+			continue
+		}
+		// Skip synthetic functions.
+		if fn.Synthetic != "" {
+			continue
+		}
+		// Must be in our in-project function set.
+		if !fns[fn] {
+			continue
+		}
+		dispatched = append(dispatched, dispatchArg{fn: fn, idx: i})
+	}
+
+	if len(dispatched) == 0 {
+		return
+	}
+
+	// Compute nearby_string: exactly one string literal ≤128 chars.
+	nearby := extractNearbyString(args)
+
+	// Caller position.
+	sitePos := site.Pos()
+	if sitePos == token.NoPos {
+		return
+	}
+	p := fset.Position(sitePos)
+	if p.Filename == "" {
+		return
+	}
+	callerFile, ok := relPath(root, p.Filename)
+	if !ok {
+		return
+	}
+	callerLine := p.Line
+
+	for _, d := range dispatched {
+		callee := d.fn
+
+		// Self-reference filter: skip if caller and callee resolve to
+		// the same top-level symbol in the same file.
+		if containingName(callee) == callerSym {
+			calleeF := funcFile(fset, root, callee)
+			if calleeF == callerFile {
+				continue
+			}
+		}
+
+		calleeSym := calleeName(callee)
+		if calleeSym == "" {
+			continue
+		}
+		calleeFile := funcFile(fset, root, callee)
+		if calleeFile == "" {
+			continue
+		}
+
+		key := edgeKey{
+			callerFile:   callerFile,
+			callerLine:   callerLine,
+			callerSymbol: callerSym,
+			calleeFile:   calleeFile,
+			calleeSymbol: calleeSym,
+			kind:         "dispatches",
+			nearbyString: nearby,
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		recv := funcReceiverText(callee)
+		pkg := ""
+		if callee.Pkg != nil && callee.Pkg.Pkg != nil {
+			pkg = callee.Pkg.Pkg.Path()
+		}
+
+		out.Edges = append(out.Edges, Edge{
+			Caller: Position{
+				File:   callerFile,
+				Line:   callerLine,
+				Symbol: callerSym,
+			},
+			Callee: Target{
+				File:     calleeFile,
+				Symbol:   calleeSym,
+				Receiver: recv,
+				Pkg:      pkg,
+			},
+			Kind:         "dispatches",
+			NearbyString: nearby,
+		})
+	}
+}
+
+// extractFuncValue returns the *ssa.Function referred to by val, if val
+// is an SSA value that directly references a named function. Returns
+// (nil, false) for non-function values.
+func extractFuncValue(val ssa.Value) (*ssa.Function, bool) {
+	switch v := val.(type) {
+	case *ssa.Function:
+		return v, true
+	case *ssa.MakeClosure:
+		// Closure wrapping a named function — use the underlying func.
+		if fn, ok := v.Fn.(*ssa.Function); ok {
+			return fn, true
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
+}
+
+// extractNearbyString returns the single string literal ≤128 chars from
+// args, or "" if there are 0 or ≥2 such literals.
+func extractNearbyString(args []ssa.Value) string {
+	var found string
+	count := 0
+	for _, arg := range args {
+		c, ok := arg.(*ssa.Const)
+		if !ok {
+			continue
+		}
+		if c.Value == nil || c.Value.Kind() != constant.String {
+			continue
+		}
+		s := constant.StringVal(c.Value)
+		if len(s) > 128 {
+			continue
+		}
+		count++
+		found = s
+	}
+	if count == 1 {
+		return found
+	}
+	return ""
+}
+
+// funcFile returns the project-relative file path where fn is defined,
+// or "" if fn is outside the project root or has no position info.
+func funcFile(fset *token.FileSet, root string, fn *ssa.Function) string {
+	if fn == nil || fn.Pos() == token.NoPos {
+		return ""
+	}
+	cp := fset.Position(fn.Pos())
+	if cp.Filename == "" {
+		return ""
+	}
+	rel, ok := relPath(root, cp.Filename)
+	if !ok {
+		return ""
+	}
+	return rel
 }
 
 // emitEdge adds one edge to out.Edges if the edge carries information
@@ -207,7 +612,7 @@ func analyze(root string) (*Output, error) {
 //     or resolve dynamic dispatch without a full type checker.
 //
 // Stdlib / out-of-project callers and callees are always skipped.
-func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge) error {
+func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge, seen map[edgeKey]bool) error {
 	if e == nil || e.Site == nil || e.Caller == nil || e.Callee == nil {
 		return nil
 	}
@@ -278,6 +683,20 @@ func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge) 
 	if !shouldEmit(kind, callerPkg, calleePkg) {
 		return nil
 	}
+
+	key := edgeKey{
+		callerFile:   callerRel,
+		callerLine:   p.Line,
+		callerSymbol: callerSym,
+		calleeFile:   calleeFile,
+		calleeSymbol: calleeSym,
+		kind:         kind,
+		nearbyString: "",
+	}
+	if seen[key] {
+		return nil
+	}
+	seen[key] = true
 
 	out.Edges = append(out.Edges, Edge{
 		Caller: Position{
