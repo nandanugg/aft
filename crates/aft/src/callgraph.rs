@@ -31,6 +31,135 @@ type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
 /// Populated only for `EdgeKind::Dispatches` edges that carry a `nearby_string`.
 type DispatchIndex = HashMap<String, Vec<DispatchEntry>>;
 
+// ---------------------------------------------------------------------------
+// Implementation index (Tier 1.4)
+// ---------------------------------------------------------------------------
+
+/// One concrete method implementation of an interface method.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcreteImpl {
+    /// Method name (same as the interface method name by definition).
+    pub name: String,
+    /// File containing the concrete method (relative to project root).
+    pub file: String,
+    /// 1-based line number of the concrete method.
+    pub line: u32,
+    /// Receiver type string (e.g. `"*example.com/pkg.T"`).
+    pub receiver: String,
+    /// Full package import path.
+    pub pkg: String,
+}
+
+/// A reference back to an interface that a concrete type satisfies.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceRef {
+    /// Interface type name.
+    pub symbol: String,
+    /// File containing the interface declaration (relative to project root).
+    pub file: String,
+}
+
+/// Index of interface → concrete implementations, and the reverse.
+///
+/// Built lazily from `implements` edges emitted by the Go helper.
+/// Memory budget: < 100KB typical (few hundred edges × ~200 bytes).
+#[derive(Debug, Default)]
+pub struct ImplementationIndex {
+    /// Forward: (interface_file, interface_symbol) → list of concrete implementations.
+    /// Each entry covers one (concrete_receiver, method) pair; multiple entries
+    /// with different receivers belong to different concrete types.
+    pub by_interface: HashMap<(PathBuf, String), Vec<ConcreteImpl>>,
+    /// Reverse: receiver string → list of interfaces it satisfies.
+    pub by_concrete: HashMap<String, Vec<InterfaceRef>>,
+}
+
+impl ImplementationIndex {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&mut self, iface_file: PathBuf, iface_symbol: String, concrete: ConcreteImpl) {
+        let iface_ref = InterfaceRef {
+            symbol: iface_symbol.clone(),
+            file: iface_file.to_string_lossy().into_owned(),
+        };
+        // Reverse index keyed on receiver type.
+        self.by_concrete
+            .entry(concrete.receiver.clone())
+            .or_default()
+            .push(iface_ref);
+        self.by_interface
+            .entry((iface_file, iface_symbol))
+            .or_default()
+            .push(concrete);
+    }
+}
+
+/// One concrete type and all its implementing methods, as returned by
+/// `aft implementations`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcreteTypeImpl {
+    /// Receiver type string (e.g. `"*pkg.T"`).
+    pub receiver: String,
+    /// Full package import path.
+    pub pkg: String,
+    /// Methods from this type that satisfy the interface.
+    pub methods: Vec<ConcreteMethodRef>,
+}
+
+/// A single concrete method reference within a ConcreteTypeImpl.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcreteMethodRef {
+    /// Method name.
+    pub name: String,
+    /// File containing the method (relative to project root).
+    pub file: String,
+    /// 1-based line number.
+    pub line: u32,
+}
+
+/// Result of `aft implementations <file> <interface_symbol>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImplementationsResult {
+    /// The queried interface.
+    pub interface: InterfaceInfo,
+    /// Concrete types that implement this interface (excluding mocks by default).
+    pub implementations: Vec<ConcreteTypeImpl>,
+}
+
+/// Interface metadata included in `ImplementationsResult`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceInfo {
+    /// File containing the interface (relative to project root).
+    pub file: String,
+    /// Interface type name.
+    pub symbol: String,
+}
+
+impl ImplementationsResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "implementations of {} ({})  total={}\n",
+            self.interface.symbol,
+            self.interface.file,
+            self.implementations.len(),
+        ));
+        if self.implementations.is_empty() {
+            out.push_str("  (no implementations found)\n");
+        } else {
+            for impl_type in &self.implementations {
+                out.push_str(&format!("  {} ({}):\n", impl_type.receiver, impl_type.pkg));
+                for m in &impl_type.methods {
+                    out.push_str(&format!("    - {} ({}:{})\n", m.name, m.file, m.line));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// One entry in the dispatch secondary index: a callee registered under a
 /// particular dispatch key, plus the registration call site.
 #[derive(Debug, Clone, Serialize)]
@@ -825,6 +954,9 @@ pub struct CallGraph {
     /// Secondary dispatch index: nearby_string key → list of dispatch entries.
     /// Built alongside `reverse_index`. Powers `aft dispatches <key>`.
     dispatch_index: Option<DispatchIndex>,
+    /// Implementation index: interface → concrete implementations.
+    /// Built lazily from `implements` edges in the Go helper output (Tier 1.4).
+    implementation_index: Option<ImplementationIndex>,
     /// Resolved Go call edges from the optional `aft-go-helper`. Injected
     /// into the reverse index at build time. Snapshot from configure time —
     /// remains valid until the next configure call.
@@ -838,6 +970,10 @@ pub struct CallGraph {
     /// `AFT_DISABLE_DISPATCH_EDGES=1`. When `false`, those edge kinds are
     /// dropped on index build.
     pub enable_dispatch_edges: bool,
+    /// Whether to build the ImplementationIndex from `implements` edges.
+    /// Default `true`. Set via `Config::enable_implementation_edges` or
+    /// `AFT_DISABLE_IMPLEMENTATION_EDGES=1`. When `false`, the index is not built.
+    pub enable_implementation_edges: bool,
 }
 
 impl CallGraph {
@@ -849,9 +985,13 @@ impl CallGraph {
             project_files: None,
             reverse_index: None,
             dispatch_index: None,
+            implementation_index: None,
             go_helper: None,
             parse_cache_dir: None,
             enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
         }
@@ -863,6 +1003,7 @@ impl CallGraph {
         self.go_helper = Some(data);
         self.reverse_index = None;
         self.dispatch_index = None;
+        self.implementation_index = None;
     }
 
     /// Enable on-disk parse-result caching. Subsequent `build_file`
@@ -1422,10 +1563,61 @@ impl CallGraph {
         // may be stale. A new configure re-runs the helper and resets
         // this field.
         let mut dispatch: DispatchIndex = HashMap::new();
+        let mut impl_index = ImplementationIndex::new();
         let enable_dispatch = self.enable_dispatch_edges;
+        let enable_implements = self.enable_implementation_edges;
         if let Some(helper) = &self.go_helper {
             for edge in &helper.edges {
                 if edge.caller.symbol.is_empty() || edge.callee.symbol.is_empty() {
+                    continue;
+                }
+
+                // implements edges are handled separately — they populate the
+                // ImplementationIndex, not the reverse call index.
+                if edge.kind == EdgeKind::Implements {
+                    if !enable_implements {
+                        continue;
+                    }
+                    // caller.file = interface file, caller.symbol = interface type name.
+                    // callee = concrete implementation.
+                    let iface_abs = self.project_root.join(&edge.caller.file);
+                    let iface_canon = std::fs::canonicalize(&iface_abs).unwrap_or(iface_abs);
+                    let iface_rel = iface_canon
+                        .strip_prefix(&self.project_root)
+                        .unwrap_or(&iface_canon)
+                        .to_string_lossy()
+                        .into_owned();
+
+                    let concrete_abs = self.project_root.join(&edge.callee.file);
+                    let concrete_rel = std::fs::canonicalize(&concrete_abs)
+                        .unwrap_or(concrete_abs)
+                        .strip_prefix(&self.project_root)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| edge.callee.file.clone());
+
+                    impl_index.insert(
+                        iface_canon,
+                        edge.caller.symbol.clone(),
+                        ConcreteImpl {
+                            name: edge.callee.symbol.clone(),
+                            file: concrete_rel,
+                            line: edge.callee.line,
+                            receiver: edge.callee.receiver.clone(),
+                            pkg: edge.callee.pkg.clone(),
+                        },
+                    );
+                    // Store the interface file relative path for InterfaceRef rendering.
+                    // The insert() already stores the full path as the key; update
+                    // the InterfaceRef file to use the relative path.
+                    // This is handled inside ImplementationIndex::insert — the
+                    // InterfaceRef.file is set from iface_file.to_string_lossy()
+                    // which is the canonicalized abs path. We want relative here.
+                    // Fix: update the last-pushed InterfaceRef.
+                    if let Some(refs) = impl_index.by_concrete.get_mut(&edge.callee.receiver) {
+                        if let Some(last) = refs.last_mut() {
+                            last.file = iface_rel;
+                        }
+                    }
                     continue;
                 }
 
@@ -1499,6 +1691,7 @@ impl CallGraph {
 
         self.reverse_index = Some(reverse);
         self.dispatch_index = Some(dispatch);
+        self.implementation_index = Some(impl_index);
     }
 
     fn reverse_sites(&self, file: &Path, symbol: &str) -> Option<&[IndexedCallerSite]> {
@@ -1514,6 +1707,75 @@ impl CallGraph {
         if self.reverse_index.is_none() {
             self.build_reverse_index();
         }
+    }
+
+    /// Ensure the implementation index is built.
+    fn ensure_implementation_index(&mut self) {
+        if self.reverse_index.is_none() {
+            self.build_reverse_index();
+        }
+    }
+
+    /// Look up all concrete types that implement the interface declared in `file`
+    /// with type name `interface_symbol`.
+    ///
+    /// By default, excludes implementations whose receiver contains `Mock`
+    /// or whose file path is under a `mocks/` directory. Pass
+    /// `include_mocks = true` to override.
+    pub fn implementations_of(
+        &mut self,
+        file: &Path,
+        interface_symbol: &str,
+        include_mocks: bool,
+    ) -> Result<ImplementationsResult, AftError> {
+        let canon = self.canonicalize(file)?;
+        self.ensure_implementation_index();
+
+        let iface_rel = self.relative_path(&canon);
+
+        let key = (canon, interface_symbol.to_string());
+        let raw = self
+            .implementation_index
+            .as_ref()
+            .and_then(|idx| idx.by_interface.get(&key))
+            .cloned()
+            .unwrap_or_default();
+
+        // Group by (receiver, pkg) and sort within each group for determinism.
+        use std::collections::BTreeMap;
+        let mut by_recv: BTreeMap<(String, String), Vec<ConcreteMethodRef>> = BTreeMap::new();
+        for ci in &raw {
+            // Mock filter.
+            if !include_mocks {
+                if ci.receiver.contains("Mock") || ci.file.contains("/mocks/") {
+                    continue;
+                }
+            }
+            by_recv
+                .entry((ci.receiver.clone(), ci.pkg.clone()))
+                .or_default()
+                .push(ConcreteMethodRef {
+                    name: ci.name.clone(),
+                    file: ci.file.clone(),
+                    line: ci.line,
+                });
+        }
+
+        let implementations: Vec<ConcreteTypeImpl> = by_recv
+            .into_iter()
+            .map(|((receiver, pkg), mut methods)| {
+                methods.sort_by(|a, b| a.name.cmp(&b.name));
+                ConcreteTypeImpl { receiver, pkg, methods }
+            })
+            .collect();
+
+        Ok(ImplementationsResult {
+            interface: InterfaceInfo {
+                file: iface_rel,
+                symbol: interface_symbol.to_string(),
+            },
+            implementations,
+        })
     }
 
     /// Exact-match lookup in the dispatch secondary index.
@@ -1659,6 +1921,81 @@ impl CallGraph {
             total_callers,
             scanned_files,
         })
+    }
+
+    /// Like `callers_of` but also includes concrete types from the
+    /// ImplementationIndex when the queried symbol is an interface method.
+    ///
+    /// Used by `aft callers --via-interface`. The concrete implementors are
+    /// appended as additional `CallerGroup` entries so the result is a
+    /// superset of the regular `callers_of` result.
+    pub fn callers_of_via_interface(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        depth: usize,
+        include_mocks: bool,
+    ) -> Result<CallersResult, AftError> {
+        // Get regular callers first.
+        let mut result = self.callers_of(file, symbol, depth)?;
+
+        // Try to find implementations of the interface named by `symbol`.
+        // The symbol in `callers_of` context is the interface *method* name,
+        // but the ImplementationIndex is keyed by the interface *type* name.
+        // We search the implementation index for any interface type whose
+        // concrete implementations include a method named `symbol`.
+        //
+        // Alternatively: the user could be querying any symbol, not necessarily
+        // an interface method. We check the implementation index and append if
+        // anything is found.
+        let canon = self.canonicalize(file)?;
+        self.ensure_implementation_index();
+
+        let impl_data = self
+            .implementation_index
+            .as_ref()
+            .map(|idx| {
+                // Find all entries where the interface file matches and look for
+                // methods named `symbol`. Since we key by interface type name,
+                // we need to scan entries where the interface file = canon.
+                let mut rows: Vec<(String, ConcreteImpl)> = Vec::new();
+                for ((iface_file, iface_sym), impls) in &idx.by_interface {
+                    if *iface_file != canon {
+                        continue;
+                    }
+                    for ci in impls {
+                        if ci.name == symbol {
+                            if !include_mocks
+                                && (ci.receiver.contains("Mock") || ci.file.contains("/mocks/"))
+                            {
+                                continue;
+                            }
+                            rows.push((iface_sym.clone(), ci.clone()));
+                        }
+                    }
+                }
+                rows
+            })
+            .unwrap_or_default();
+
+        // Group additional implementations by their concrete file and append
+        // as extra CallerGroups so they appear alongside regular callers.
+        use std::collections::BTreeMap;
+        let mut extra: BTreeMap<String, Vec<CallerEntry>> = BTreeMap::new();
+        for (_iface_sym, ci) in impl_data {
+            extra.entry(ci.file.clone()).or_default().push(CallerEntry {
+                symbol: format!("{} (implements)", ci.receiver),
+                line: ci.line,
+            });
+        }
+
+        let extra_total: usize = extra.values().map(|v| v.len()).sum();
+        for (file, entries) in extra {
+            result.callers.push(CallerGroup { file, callers: entries });
+        }
+        result.total_callers += extra_total;
+
+        Ok(result)
     }
 
     /// Trace backward from a symbol to all entry points.
@@ -2809,6 +3146,7 @@ impl CallGraph {
         // Clear the reverse index — it's stale
         self.reverse_index = None;
         self.dispatch_index = None;
+        self.implementation_index = None;
         // Clear project_files cache for create/remove events
         self.project_files = None;
     }
@@ -4678,6 +5016,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "barePkgTarget".to_string(),
                         receiver: String::new(),
                         pkg: String::new(),
@@ -4694,6 +5033,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "concreteMethod".to_string(),
                         receiver: "*pkg.concreteSvc".to_string(),
                         pkg: "pkg".to_string(),
@@ -4710,6 +5050,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "Do".to_string(),
                         receiver: "*pkg.doerA".to_string(),
                         pkg: "pkg".to_string(),
@@ -4726,6 +5067,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "Do".to_string(),
                         receiver: "*pkg.doerB".to_string(),
                         pkg: "pkg".to_string(),
@@ -4851,6 +5193,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "HandleMerchantTask".to_string(),
                         receiver: String::new(),
                         pkg: "example.com/fixture".to_string(),
@@ -4867,6 +5210,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "HandleGenericTask".to_string(),
                         receiver: String::new(),
                         pkg: "example.com/fixture".to_string(),
@@ -4883,6 +5227,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "workerLoop".to_string(),
                         receiver: String::new(),
                         pkg: "example.com/fixture".to_string(),
@@ -4899,6 +5244,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     callee: HelperCallee {
                         file: fixture_file.to_string(),
+                        line: 0,
                         symbol: "cleanup".to_string(),
                         receiver: String::new(),
                         pkg: "example.com/fixture".to_string(),
@@ -5037,6 +5383,7 @@ func processRequest() {
                 },
                 callee: HelperCallee {
                     file: "handler.go".to_string(),
+                    line: 0,
                     symbol: "handler".to_string(),
                     receiver: String::new(),
                     pkg: String::new(),
@@ -5095,5 +5442,245 @@ func processRequest() {
         // cleanup is deferred — should appear in callers_of
         let callers = cg.callers_of(&go_file, "cleanup", 1).unwrap();
         assert!(callers.total_callers >= 1, "cleanup should have at least one caller (defer)");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tier 1.4: ImplementationIndex and implementations_of
+    // ---------------------------------------------------------------------------
+
+    /// Build a HelperOutput with `implements` edges for testing.
+    fn make_impl_helper_output(iface_file: &str, concrete_file: &str, root: &str) -> HelperOutput {
+        HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.to_string(),
+            edges: vec![
+                // Create method implementation.
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: iface_file.to_string(),
+                        line: 5,
+                        symbol: "Storer".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: concrete_file.to_string(),
+                        line: 0,
+                        symbol: "Create".to_string(),
+                        receiver: "*store.storeImpl".to_string(),
+                        pkg: "example.com/store".to_string(),
+                    },
+                    kind: EdgeKind::Implements,
+                    nearby_string: None,
+                },
+                // Delete method implementation.
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: iface_file.to_string(),
+                        line: 6,
+                        symbol: "Storer".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: concrete_file.to_string(),
+                        line: 0,
+                        symbol: "Delete".to_string(),
+                        receiver: "*store.storeImpl".to_string(),
+                        pkg: "example.com/store".to_string(),
+                    },
+                    kind: EdgeKind::Implements,
+                    nearby_string: None,
+                },
+                // Mock implementation (excluded by default).
+                HelperEdge {
+                    caller: HelperCaller {
+                        file: iface_file.to_string(),
+                        line: 5,
+                        symbol: "Storer".to_string(),
+                    },
+                    callee: HelperCallee {
+                        file: "mocks/storer.go".to_string(),
+                        line: 0,
+                        symbol: "Create".to_string(),
+                        receiver: "*mocks.MockStorer".to_string(),
+                        pkg: "example.com/mocks".to_string(),
+                    },
+                    kind: EdgeKind::Implements,
+                    nearby_string: None,
+                },
+            ],
+            skipped: vec![],
+        }
+    }
+
+    const IFACE_FIXTURE: &str = r#"package domain
+
+// Storer is the persistence interface.
+type Storer interface {
+    Create(name string) error
+    Delete(id int) error
+}
+"#;
+
+    const STORE_FIXTURE: &str = r#"package store
+
+type storeImpl struct{}
+func (s *storeImpl) Create(name string) error { return nil }
+func (s *storeImpl) Delete(id int) error      { return nil }
+"#;
+
+    fn setup_impl_project() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("iface.go"), IFACE_FIXTURE).unwrap();
+        fs::write(dir.path().join("store.go"), STORE_FIXTURE).unwrap();
+        dir
+    }
+
+    #[test]
+    fn implementations_of_finds_concrete_types() {
+        let dir = setup_impl_project();
+        let root = dir.path().to_path_buf();
+        let iface_file = root.join("iface.go");
+        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&iface_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.implementations_of(&iface_file, "Storer", false).unwrap();
+        assert_eq!(result.interface.symbol, "Storer");
+        // storeImpl should be there (mocks excluded by default).
+        assert_eq!(result.implementations.len(), 1, "should find exactly one non-mock implementation");
+        let impl_type = &result.implementations[0];
+        assert_eq!(impl_type.receiver, "*store.storeImpl");
+        assert_eq!(impl_type.pkg, "example.com/store");
+        // Both methods should appear.
+        assert_eq!(impl_type.methods.len(), 2, "should find Create and Delete methods");
+        let method_names: Vec<&str> = impl_type.methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(method_names.contains(&"Create"), "Create should be listed");
+        assert!(method_names.contains(&"Delete"), "Delete should be listed");
+    }
+
+    #[test]
+    fn implementations_of_include_mocks() {
+        let dir = setup_impl_project();
+        let root = dir.path().to_path_buf();
+        let iface_file = root.join("iface.go");
+        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&iface_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.implementations_of(&iface_file, "Storer", true).unwrap();
+        // With include_mocks=true, MockStorer should also appear.
+        assert_eq!(result.implementations.len(), 2, "should find 2 implementations with mocks");
+        let receivers: Vec<&str> = result.implementations.iter().map(|i| i.receiver.as_str()).collect();
+        assert!(receivers.contains(&"*store.storeImpl"), "storeImpl should be present");
+        assert!(receivers.contains(&"*mocks.MockStorer"), "MockStorer should be present with include_mocks=true");
+    }
+
+    #[test]
+    fn implementations_of_not_found() {
+        let dir = setup_impl_project();
+        let root = dir.path().to_path_buf();
+        let iface_file = root.join("iface.go");
+        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&iface_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.implementations_of(&iface_file, "NonExistentInterface", false).unwrap();
+        assert!(result.implementations.is_empty(), "should return empty for unknown interface");
+    }
+
+    #[test]
+    fn implements_edges_disabled_by_flag() {
+        let dir = setup_impl_project();
+        let root = dir.path().to_path_buf();
+        let iface_file = root.join("iface.go");
+        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.enable_implementation_edges = false;
+        cg.build_file(&iface_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.implementations_of(&iface_file, "Storer", true).unwrap();
+        assert!(
+            result.implementations.is_empty(),
+            "implementation index should be empty when flag is false"
+        );
+    }
+
+    #[test]
+    fn implements_edges_dont_pollute_callers() {
+        // Implements edges must NOT appear in the reverse call index.
+        let dir = setup_impl_project();
+        let root = dir.path().to_path_buf();
+        let iface_file = root.join("iface.go");
+        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone());
+        cg.build_file(&iface_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        // Querying callers_of "Create" in iface.go should find no implements edges
+        // (those would be wrong — Create is never "called" by the interface declaration).
+        let callers = cg.callers_of(&iface_file, "Storer", 1).unwrap();
+        for group in &callers.callers {
+            for entry in &group.callers {
+                assert!(
+                    !entry.symbol.contains("storeImpl"),
+                    "implements edges must not appear as callers: {:?}",
+                    entry
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edge_kind_implements_roundtrips() {
+        // Verify EdgeKind::Implements serializes/deserializes correctly.
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "iface.go".to_string(),
+                line: 5,
+                symbol: "Storer".to_string(),
+            },
+            callee: HelperCallee {
+                file: "store.go".to_string(),
+                line: 0,
+                symbol: "Create".to_string(),
+                receiver: "*store.storeImpl".to_string(),
+                pkg: "example.com/store".to_string(),
+            },
+            kind: EdgeKind::Implements,
+            nearby_string: None,
+        };
+
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(json.contains("\"implements\""), "should serialize as 'implements'");
+
+        let parsed: HelperEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, EdgeKind::Implements);
+    }
+
+    #[test]
+    fn old_output_without_implements_parses_unchanged() {
+        // Verify backwards compatibility: JSON without implements edges parses fine.
+        let json = r#"{
+            "version": 1,
+            "root": "/tmp/test",
+            "edges": [
+                {
+                    "caller": {"file": "a.go", "line": 10, "symbol": "foo"},
+                    "callee": {"file": "b.go", "symbol": "bar", "receiver": "*pkg.T", "pkg": "pkg"},
+                    "kind": "interface"
+                }
+            ]
+        }"#;
+
+        let out: crate::go_helper::HelperOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.edges.len(), 1);
+        assert_eq!(out.edges[0].kind, EdgeKind::Interface);
     }
 }

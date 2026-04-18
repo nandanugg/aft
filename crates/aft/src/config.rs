@@ -107,6 +107,12 @@ pub struct Config {
     /// Default `true`. Set to `false` to revert to v1-semantic behavior.
     /// Overridden to `false` by `AFT_DISABLE_DISPATCH_EDGES=1`.
     pub enable_dispatch_edges: bool,
+    /// [callgraph] enable_implementation_edges — build the ImplementationIndex from
+    /// `implements` edges emitted by the Go helper (Tier 1.4). Powers the
+    /// `aft implementations` command and `aft callers --via-interface`.
+    /// Default `true`. Set to `false` to skip index construction.
+    /// Overridden to `false` by `AFT_DISABLE_IMPLEMENTATION_EDGES=1`.
+    pub enable_implementation_edges: bool,
 }
 
 impl Default for Config {
@@ -132,6 +138,10 @@ impl Default for Config {
             storage_dir: None,
             // Env var kill switch takes priority over config file value.
             enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            // Env var kill switch takes priority over config file value.
+            enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
         }

@@ -10,6 +10,7 @@ pub mod call_tree;
 pub mod callers;
 pub mod dispatched_by;
 pub mod dispatches;
+pub mod implementations;
 pub mod checkpoint;
 pub mod configure;
 pub mod conflicts;

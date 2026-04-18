@@ -88,6 +88,11 @@ pub struct HelperCaller {
 pub struct HelperCallee {
     /// File path relative to the helper's `root`.
     pub file: String,
+    /// 1-based line number of the callee declaration.
+    /// Present for `implements` edges (Tier 1.4); 0 / absent for call edges
+    /// where the callee position is resolved by tree-sitter instead.
+    #[serde(default, skip_serializing_if = "crate::go_helper::is_zero_u32")]
+    pub line: u32,
     /// Function or method name (without receiver).
     pub symbol: String,
     /// Receiver type as Go renders it, e.g. `"*example.com/pkg.T"`.
@@ -121,6 +126,12 @@ pub enum EdgeKind {
     Goroutine,
     /// The callee is deferred: `defer callee(args)`.
     Defer,
+    /// Concrete method M_C satisfies interface method M_I (Tier 1.4).
+    /// caller = interface declaration site (file + line + interface type name).
+    /// callee = concrete method (file + method name + receiver type + pkg).
+    /// This is an existence edge, not a call edge — it answers
+    /// "which concrete types implement interface X?"
+    Implements,
 }
 
 impl EdgeKind {
@@ -133,6 +144,7 @@ impl EdgeKind {
             Self::Dispatches => "dispatches",
             Self::Goroutine => "goroutine",
             Self::Defer => "defer",
+            Self::Implements => "implements",
         }
     }
 
@@ -145,6 +157,7 @@ impl EdgeKind {
             "dispatches" => Some(Self::Dispatches),
             "goroutine" => Some(Self::Goroutine),
             "defer" => Some(Self::Defer),
+            "implements" => Some(Self::Implements),
             _ => None,
         }
     }
@@ -200,6 +213,12 @@ impl std::fmt::Display for HelperError {
 }
 
 impl std::error::Error for HelperError {}
+
+/// Serde skip helper — omit zero line numbers from serialized output.
+#[doc(hidden)]
+pub fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
 
 /// Probe whether `go` is on PATH. Cheap (`go env GOROOT` is fast and
 /// doesn't touch any modules).
@@ -492,6 +511,7 @@ mod tests {
                 },
                 callee: HelperCallee {
                     file: "b.go".into(),
+                    line: 0,
                     symbol: "g".into(),
                     receiver: String::new(),
                     pkg: String::new(),
@@ -660,6 +680,7 @@ mod tests {
             },
             callee: HelperCallee {
                 file: "b.go".into(),
+                line: 0,
                 symbol: "g".into(),
                 receiver: String::new(),
                 pkg: String::new(),
@@ -681,6 +702,7 @@ mod tests {
             },
             callee: HelperCallee {
                 file: "b.go".into(),
+                line: 0,
                 symbol: "g".into(),
                 receiver: String::new(),
                 pkg: String::new(),
