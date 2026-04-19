@@ -9,6 +9,9 @@ AFT_ROOT="$(dirname "$SCRIPT_DIR")"
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 
+SESSION_REMINDER_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-reminder.sh"
+DISCOVERY_GATE_TEMPLATE="$AFT_ROOT/templates/claude/aft-code-discovery-gate.sh"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -286,6 +289,67 @@ case "$CMD" in
     call_aft "glob" "$PARAMS"
     ;;
 
+  dispatched_by)
+    FILE="${1:-}"
+    SYMBOL="${2:-}"
+    [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft dispatched_by <file> <symbol>"; exit 1; }
+    PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
+    call_aft "dispatched_by" "$PARAMS" "$FILE"
+    ;;
+
+  dispatches)
+    KEY="${1:-}"
+    [ -z "$KEY" ] && { echo "Usage: aft dispatches <key> [--prefix]"; exit 1; }
+    PREFIX_FLAG=false
+    for arg in "$@"; do
+      [ "$arg" = "--prefix" ] && PREFIX_FLAG=true
+    done
+    PARAMS=$(jq -cn --arg k "$KEY" --argjson p "$PREFIX_FLAG" '{key:$k,prefix:$p}')
+    call_aft "dispatches" "$PARAMS"
+    ;;
+
+  implementations)
+    FILE="${1:-}"
+    SYMBOL="${2:-}"
+    [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft implementations <file> <interface_symbol> [--include-mocks]"; exit 1; }
+    INCLUDE_MOCKS=false
+    for arg in "$@"; do
+      [ "$arg" = "--include-mocks" ] && INCLUDE_MOCKS=true
+    done
+    PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" --argjson m "$INCLUDE_MOCKS" '{file:$f,symbol:$s,include_mocks:$m}')
+    call_aft "implementations" "$PARAMS" "$FILE"
+    ;;
+
+  writers)
+    FILE="${1:-}"
+    SYMBOL="${2:-}"
+    [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft writers <file> <variable_symbol>"; exit 1; }
+    PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
+    call_aft "writers" "$PARAMS" "$FILE"
+    ;;
+
+  similar)
+    FILE="${1:-}"
+    SYMBOL="${2:-}"
+    [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft similar <file> <symbol> [--top=N] [--dict] [--explain] [--min-score=F]"; exit 1; }
+    TOP=10
+    MIN_SCORE=0.15
+    USE_DICT=false
+    EXPLAIN=false
+    for arg in "$@"; do
+      case "$arg" in
+        --top=*)       TOP="${arg#--top=}" ;;
+        --min-score=*) MIN_SCORE="${arg#--min-score=}" ;;
+        --dict)        USE_DICT=true ;;
+        --explain)     EXPLAIN=true ;;
+      esac
+    done
+    PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" --argjson t "$TOP" --argjson m "$MIN_SCORE" \
+                    --argjson d "$USE_DICT" --argjson e "$EXPLAIN" \
+                    '{file:$f,symbol:$s,top:$t,min_score:$m,dict:$d,explain:$e}')
+    call_aft "similar" "$PARAMS" "$FILE"
+    ;;
+
   help|--help|-h)
     cat << 'EOF'
 AFT - Agent File Tools (Tree-sitter powered code analysis)
@@ -300,17 +364,32 @@ SEMANTIC COMMANDS (massive context savings):
   aft trace_data <file> <symbol> <expr> [depth]
                                    How does a value flow through assignments/calls?
 
+DISPATCH / STRUCTURE QUERIES (Tier 1.1–1.5):
+  aft dispatched_by <file> <symbol>  Who registers this function as a handler?
+  aft dispatches <key> [--prefix]    What handler is registered under this key?
+  aft implementations <file> <interface> [--include-mocks]
+                                   Which concrete types implement this interface?
+  aft writers <file> <var>         Who writes to this package-level variable?
+
+SIMILARITY (Tier 3):
+  aft similar <file> <symbol> [--top=N] [--dict] [--explain]
+                                   Find symbols semantically similar to this one
+
 BASIC COMMANDS:
   aft read <file> [start] [limit]  Read with line numbers
   aft grep <pattern> [path]        Trigram-indexed search
   aft glob <pattern> [path]        File pattern matching
 
 EXAMPLES:
-  aft outline src/                     # Get structure of all files in src/
-  aft zoom main.go main                # Inspect main() with call graph
-  aft callers api.go HandleRequest     # Find all callers
-  aft call_tree service.go Process     # See what Process() calls
-  aft trace_data svc.go handle userId  # Trace where userId came from and where it goes
+  aft outline src/                                        # Structure of all files in src/
+  aft zoom main.go main                                   # Inspect main() with call graph
+  aft callers api.go HandleRequest                        # Find all callers
+  aft trace_data svc.go handle userId                     # Trace a value's flow
+  aft dispatched_by asynq_handler.go HandleTaskV3         # Registration sites for this handler
+  aft dispatches TypeMerchantSettlementV3                 # Handler for this dispatch key
+  aft implementations store/iface.go SettlementStorer     # Types that satisfy this interface
+  aft writers server/registry.go handlerRegistry          # Who assigns to this package var
+  aft similar settlement/svc.go SettleMerchant --explain  # Semantically similar symbols
 EOF
     ;;
 
@@ -422,6 +501,25 @@ HOOK_EOF
 sed -i '' "s|__AFT_BINARY_PATH__|$AFT_BINARY|g" "$HOOKS_DIR/aft-hook.sh"
 chmod +x "$HOOKS_DIR/aft-hook.sh"
 info "Installed hook script: $HOOKS_DIR/aft-hook.sh"
+
+# SessionStart reminder + PreToolUse discovery gate — nudge the agent
+# toward AFT semantic tools before it reaches for raw Grep/Glob/Read.
+# Modeled on codebase-memory-mcp's equivalent pair.
+if [ -f "$SESSION_REMINDER_TEMPLATE" ]; then
+    cp "$SESSION_REMINDER_TEMPLATE" "$HOOKS_DIR/aft-session-reminder.sh"
+    chmod +x "$HOOKS_DIR/aft-session-reminder.sh"
+    info "Installed hook script: $HOOKS_DIR/aft-session-reminder.sh"
+else
+    warn "Missing template: $SESSION_REMINDER_TEMPLATE — skipping session reminder"
+fi
+
+if [ -f "$DISCOVERY_GATE_TEMPLATE" ]; then
+    cp "$DISCOVERY_GATE_TEMPLATE" "$HOOKS_DIR/aft-code-discovery-gate.sh"
+    chmod +x "$HOOKS_DIR/aft-code-discovery-gate.sh"
+    info "Installed hook script: $HOOKS_DIR/aft-code-discovery-gate.sh"
+else
+    warn "Missing template: $DISCOVERY_GATE_TEMPLATE — skipping discovery gate"
+fi
 
 # Write AFT.md instructions
 cat > "$CLAUDE_DIR/AFT.md" << 'INSTRUCTIONS_EOF'
@@ -593,22 +691,30 @@ fi
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 
 if [ -f "$SETTINGS_FILE" ]; then
-    # Idempotent update: strip every existing aft-hook.sh entry first,
-    # then add a clean Grep + Glob pair. Re-runs don't pile up duplicates,
-    # and old Read entries (which break Edit validation) get cleaned up.
-    # Unrelated PreToolUse hooks (Bash, etc.) and all other settings keys
-    # are preserved.
+    # Idempotent update: strip every existing AFT hook entry first, then
+    # re-add a clean set. Re-runs don't pile up duplicates, and old Read
+    # entries (which break Edit validation) get cleaned up. Unrelated hooks
+    # (Bash, etc.) and all other settings keys are preserved.
     TEMP_FILE=$(mktemp)
     jq --arg hooks_dir "$HOOKS_DIR" '
+      .hooks = (.hooks // {}) |
       .hooks.PreToolUse = (
-        # Drop any entry whose hooks include an aft-hook.sh command.
+        # Drop any entry whose hooks reference an AFT-owned script.
         ((.hooks.PreToolUse // []) | map(
           . as $entry
           | ($entry.hooks // [])
-              | map(select((.command // "") | contains("aft-hook.sh")))
+              | map(select(
+                  (.command // "") as $c
+                  | ($c | contains("aft-hook.sh")) or
+                    ($c | contains("aft-code-discovery-gate.sh"))
+                ))
               | length as $aft
           | if $aft > 0 then empty else $entry end
         )) + [
+          {
+            "matcher": "Grep|Glob|Read|Search",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-code-discovery-gate.sh")}]
+          },
           {
             "matcher": "Grep",
             "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Grep")}]
@@ -618,28 +724,59 @@ if [ -f "$SETTINGS_FILE" ]; then
             "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-hook.sh Glob")}]
           }
         ]
+      ) |
+      .hooks.SessionStart = (
+        # Drop any existing AFT session reminder entry, then re-add one
+        # that fires on every session-start variant Claude Code emits.
+        ((.hooks.SessionStart // []) | map(
+          . as $entry
+          | ($entry.hooks // [])
+              | map(select((.command // "") | contains("aft-session-reminder.sh")))
+              | length as $aft
+          | if $aft > 0 then empty else $entry end
+        )) + [
+          {
+            "matcher": "startup",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+          },
+          {
+            "matcher": "resume",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+          },
+          {
+            "matcher": "clear",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+          },
+          {
+            "matcher": "compact",
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+          }
+        ]
       )
     ' "$SETTINGS_FILE" > "$TEMP_FILE"
 
     if [ -s "$TEMP_FILE" ]; then
         mv "$TEMP_FILE" "$SETTINGS_FILE"
-        info "Refreshed AFT hooks in settings.json (Grep + Glob)"
+        info "Refreshed AFT hooks in settings.json (Grep + Glob interception, discovery gate, session reminder)"
     else
         rm -f "$TEMP_FILE"
         warn "jq produced empty output — leaving settings.json untouched"
     fi
 else
-    # Create new settings.json. Read is intentionally NOT registered as a
-    # hook: routing Read through aft causes Claude Code's Edit tool to
-    # fail its pre-read validation (the native Read never runs). Instead,
-    # AFT.md tells the agent to call `aft read` directly as a CLI command
-    # when it just wants to inspect a file, and fall back to native Read
-    # when it plans to Edit afterward.
+    # Create new settings.json. Read is intentionally NOT routed through
+    # aft-hook.sh (which would transform the result and break Claude Code's
+    # Edit pre-read validation). The discovery gate is a one-shot nudge
+    # per session; after the first blocked call, subsequent Read/Grep/Glob
+    # passes through natively (or, for Grep/Glob, through aft-hook.sh).
     cat > "$SETTINGS_FILE" << SETTINGS_EOF
 {
   "\$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
     "PreToolUse": [
+      {
+        "matcher": "Grep|Glob|Read|Search",
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-code-discovery-gate.sh"}]
+      },
       {
         "matcher": "Grep",
         "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-hook.sh Grep"}]
@@ -648,11 +785,29 @@ else
         "matcher": "Glob",
         "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-hook.sh Glob"}]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+      }
     ]
   }
 }
 SETTINGS_EOF
-    info "Created settings.json with AFT hooks (Grep + Glob)"
+    info "Created settings.json with AFT hooks (Grep + Glob interception, discovery gate, session reminder)"
 fi
 
 # Add aft to PATH via symlink
@@ -678,10 +833,12 @@ echo ""
 echo -e "${GREEN}AFT Claude Code integration installed successfully!${NC}"
 echo ""
 echo "Installed files:"
-echo "  $HOOKS_DIR/aft           - CLI wrapper"
-echo "  $HOOKS_DIR/aft-hook.sh   - Tool interceptor"
-echo "  $CLAUDE_DIR/AFT.md       - Claude instructions"
-echo "  $CLAUDE_DIR/settings.json - Hook configuration"
+echo "  $HOOKS_DIR/aft                         - CLI wrapper"
+echo "  $HOOKS_DIR/aft-hook.sh                 - Grep/Glob interceptor (routes through AFT)"
+echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart reminder (AFT discovery protocol)"
+echo "  $HOOKS_DIR/aft-code-discovery-gate.sh  - PreToolUse gate (nudges toward AFT tools once per session)"
+echo "  $CLAUDE_DIR/AFT.md                     - Claude instructions"
+echo "  $CLAUDE_DIR/settings.json              - Hook configuration"
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
     echo "  $GO_HELPER_BINARY - Go interface-dispatch resolver"
 fi
