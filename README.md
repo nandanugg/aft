@@ -162,12 +162,12 @@ same space, is **yes — and by a measurable margin**.
 
 ### The study (brief)
 
-A settlement-flow documentation task was given to Claude Code running inside three isolated
+A business-flow documentation task was given to Claude Code running inside three isolated
 Docker containers, each configured with exactly one code-navigation tool: this fork, the
 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) server, and
 [Serena](https://github.com/oraios/serena). Each tool produced five independent documentation
 passes (15 runs total). Factual claims were extracted from each doc and verified against the
-real codebase (the example project's target-service: 473 Go files, ~10k symbols).
+real codebase — a production Go service with 473 files and ~10k symbols.
 
 **Results (lower is better):**
 
