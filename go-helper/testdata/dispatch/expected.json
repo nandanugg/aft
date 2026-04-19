@@ -10,7 +10,10 @@
       "symbol": "cleanup",
       "pkg": "example.com/dispatch"
     },
-    "kind": "defer"
+    "kind": "defer",
+    "context": {
+      "in_defer": true
+    }
   },
   {
     "caller": {
@@ -79,7 +82,10 @@
       "symbol": "process",
       "pkg": "example.com/dispatch"
     },
-    "kind": "goroutine"
+    "kind": "goroutine",
+    "context": {
+      "in_goroutine": true
+    }
   },
   {
     "caller": {
@@ -92,6 +98,9 @@
       "symbol": "workerLoop",
       "pkg": "example.com/dispatch"
     },
-    "kind": "goroutine"
+    "kind": "goroutine",
+    "context": {
+      "in_goroutine": true
+    }
   }
 ]

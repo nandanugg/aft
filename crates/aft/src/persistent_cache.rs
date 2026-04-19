@@ -1181,6 +1181,7 @@ impl CacheManager {
                             resolved: e.resolved,
                             kind: None,
                             nearby_string: None,
+                            context: None,
                         })
                         .collect();
                     (sym, callers)

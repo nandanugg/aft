@@ -262,6 +262,9 @@ pub struct CallerSite {
     /// Dispatch key for `dispatches` edges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearby_string: Option<String>,
+    /// Control-flow context from the Go helper, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::go_helper::CallContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +278,8 @@ struct IndexedCallerSite {
     kind: Option<EdgeKind>,
     /// Dispatch key, present only on `EdgeKind::Dispatches` sites with a nearby_string.
     nearby_string: Option<String>,
+    /// Control-flow context from the Go helper.
+    context: Option<crate::go_helper::CallContext>,
 }
 
 /// A group of callers from a single file.
@@ -508,6 +513,10 @@ pub struct DispatchedBySite {
     /// The dispatch key (nearby_string), if the call site has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearby_string: Option<String>,
+    /// Control-flow context at the registration call site (in_loop, in_defer, etc.).
+    /// Absent when the helper didn't emit context (e.g. pre-v3-context output, disabled feature flag).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::go_helper::CallContext>,
 }
 
 /// Result of `aft dispatches <key>`.
@@ -1627,6 +1636,7 @@ impl CallGraph {
                             resolved,
                             kind: None,
                             nearby_string: None,
+                    context: None,
                         });
                 }
             }
@@ -1740,6 +1750,7 @@ impl CallGraph {
                         resolved: true,
                         kind: Some(edge.kind),
                         nearby_string: edge.nearby_string.clone(),
+                        context: edge.context.clone(),
                     });
 
                 // Secondary dispatch key index: only for dispatches edges with a nearby_string.
@@ -1793,6 +1804,7 @@ impl CallGraph {
                                 resolved: s.resolved,
                                 kind: s.kind,
                                 nearby_string: s.nearby_string.clone(),
+                                context: s.context.clone(),
                             })
                             .collect();
                         (sym.clone(), caller_sites)
@@ -1854,6 +1866,7 @@ impl CallGraph {
                             resolved: c.resolved,
                             kind: c.kind,
                             nearby_string: c.nearby_string,
+                            context: c.context,
                         })
                         .collect();
                     (sym, indexed)
@@ -2015,6 +2028,7 @@ impl CallGraph {
                     line: s.line,
                 },
                 nearby_string: s.nearby_string.clone(),
+                context: None,
             })
             .collect::<Vec<_>>();
 
@@ -3343,6 +3357,7 @@ impl CallGraph {
                     resolved: site.resolved,
                     kind: site.kind,
                     nearby_string: site.nearby_string.clone(),
+                    context: site.context.clone(),
                 });
                 // Recurse: find callers of the caller
                 if current_depth + 1 < max_depth {
@@ -5255,6 +5270,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Static,
                     nearby_string: None,
+                    context: None,
                 },
                 // concrete: concreteMethodCaller → concreteMethod (line 19)
                 HelperEdge {
@@ -5272,6 +5288,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Concrete,
                     nearby_string: None,
+                    context: None,
                 },
                 // interface dispatch: interfaceCaller → doerA.Do (line 35)
                 HelperEdge {
@@ -5289,6 +5306,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Interface,
                     nearby_string: None,
+                    context: None,
                 },
                 // interface dispatch: interfaceCaller → doerB.Do (line 35)
                 HelperEdge {
@@ -5306,9 +5324,11 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Interface,
                     nearby_string: None,
+                    context: None,
                 },
             ],
             skipped: vec![],
+       returns: vec![],
         }
     }
 
@@ -5432,6 +5452,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Dispatches,
                     nearby_string: Some("TypeMerchantTask".to_string()),
+                    context: None,
                 },
                 // dispatches edge with no nearby_string
                 HelperEdge {
@@ -5449,6 +5470,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Dispatches,
                     nearby_string: None,
+                    context: None,
                 },
                 // goroutine edge
                 HelperEdge {
@@ -5466,6 +5488,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Goroutine,
                     nearby_string: None,
+                    context: None,
                 },
                 // defer edge
                 HelperEdge {
@@ -5483,9 +5506,11 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Defer,
                     nearby_string: None,
+                    context: None,
                 },
             ],
             skipped: vec![],
+       returns: vec![],
         }
     }
 
@@ -5622,8 +5647,10 @@ func processRequest() {
                 },
                 kind: EdgeKind::Dispatches,
                 nearby_string: Some("/api/v1?foo=bar&baz=.*+[".to_string()),
+                context: None,
             }],
             skipped: vec![],
+       returns: vec![],
         };
 
         let mut cg = CallGraph::new(root.clone(), true);
@@ -5702,6 +5729,7 @@ func processRequest() {
                     },
                     kind: EdgeKind::Implements,
                     nearby_string: None,
+                    context: None,
                 },
                 // Delete method implementation.
                 HelperEdge {
@@ -5719,6 +5747,7 @@ func processRequest() {
                     },
                     kind: EdgeKind::Implements,
                     nearby_string: None,
+                    context: None,
                 },
                 // Mock implementation (excluded by default).
                 HelperEdge {
@@ -5736,9 +5765,11 @@ func processRequest() {
                     },
                     kind: EdgeKind::Implements,
                     nearby_string: None,
+                    context: None,
                 },
             ],
             skipped: vec![],
+       returns: vec![],
         }
     }
 
@@ -5887,6 +5918,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
             },
             kind: EdgeKind::Implements,
             nearby_string: None,
+            context: None,
         };
 
         let json = serde_json::to_string(&edge).unwrap();

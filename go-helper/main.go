@@ -65,6 +65,33 @@ type Target struct {
 	Pkg      string `json:"pkg,omitempty"`      // full package path
 }
 
+// CallContext holds control-flow context about a call site: whether it's
+// inside a defer, goroutine, loop body, or error-handling branch. Emitted
+// on every edge except "implements" (which has no call-site context).
+type CallContext struct {
+	InDefer      bool `json:"in_defer,omitempty"`
+	InGoroutine  bool `json:"in_goroutine,omitempty"`
+	InLoop       bool `json:"in_loop,omitempty"`
+	InErrorBranch bool `json:"in_error_branch,omitempty"`
+	BranchDepth  int  `json:"branch_depth,omitempty"`
+}
+
+// ReturnSite describes one return statement in a function and the path
+// condition that must hold for execution to reach it.
+type ReturnSite struct {
+	Line               int    `json:"line"`
+	Value              string `json:"value"`
+	PathCondition      string `json:"path_condition"`
+	PathConditionSimple bool   `json:"path_condition_simple"`
+}
+
+// ReturnInfo holds the per-return-site analysis for one function.
+type ReturnInfo struct {
+	File    string       `json:"file"`
+	Symbol  string       `json:"symbol"`
+	Returns []ReturnSite `json:"returns"`
+}
+
 // Edge is one resolved call edge.
 type Edge struct {
 	Caller Position `json:"caller"`
@@ -80,6 +107,10 @@ type Edge struct {
 	// has exactly one string literal argument of ≤128 chars. Used as a
 	// human-readable label (e.g. the task name in a job scheduler).
 	NearbyString string `json:"nearby_string,omitempty"`
+	// Context holds control-flow context annotations for the call site.
+	// Absent for "implements" edges. Omitted when all booleans are false
+	// and branch_depth is 0.
+	Context *CallContext `json:"context,omitempty"`
 }
 
 // Output is the top-level JSON document.
@@ -91,6 +122,9 @@ type Output struct {
 	// these as "no VTA data for this package" and falls back to
 	// tree-sitter.
 	Skipped []string `json:"skipped,omitempty"`
+	// Returns holds per-function return-site analysis, one entry per
+	// in-project function that has at least one interesting return.
+	Returns []ReturnInfo `json:"returns,omitempty"`
 }
 
 // edgeKey is used for deduplication of edges.
@@ -106,10 +140,12 @@ type edgeKey struct {
 
 func main() {
 	var (
-		rootFlag          = flag.String("root", ".", "project root (absolute path preferred)")
-		noDispatchesFlag  = flag.Bool("no-dispatches", false, "disable emission of dispatches/goroutine/defer edge kinds")
-		noImplementsFlag  = flag.Bool("no-implements", false, "disable emission of implements edges")
-		noWritesFlag     = flag.Bool("no-writes", false, "disable emission of writes edges for package-level variables")
+		rootFlag             = flag.String("root", ".", "project root (absolute path preferred)")
+		noDispatchesFlag     = flag.Bool("no-dispatches", false, "disable emission of dispatches/goroutine/defer edge kinds")
+		noImplementsFlag     = flag.Bool("no-implements", false, "disable emission of implements edges")
+		noWritesFlag         = flag.Bool("no-writes", false, "disable emission of writes edges for package-level variables")
+		noCallContextFlag    = flag.Bool("no-call-context", false, "disable caller-context annotations on edges")
+		noReturnAnalysisFlag = flag.Bool("no-return-analysis", false, "disable per-return path-condition analysis")
 	)
 	flag.Parse()
 
@@ -119,7 +155,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	out, err := analyze(root, !*noDispatchesFlag, !*noImplementsFlag, !*noWritesFlag)
+	out, err := analyze(root, !*noDispatchesFlag, !*noImplementsFlag, !*noWritesFlag, !*noCallContextFlag, !*noReturnAnalysisFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aft-go-helper: %v\n", err)
 		os.Exit(1)
@@ -134,7 +170,7 @@ func main() {
 }
 
 // analyze loads all packages under root and returns resolved call edges.
-func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites bool) (*Output, error) {
+func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites bool, emitCallContext bool, emitReturnAnalysis bool) (*Output, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -253,6 +289,16 @@ func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites b
 	// Same-package writes are filtered at source (tree-sitter already sees them).
 	if emitWrites {
 		emitWritesEdges(out, prog, fns, root, seen)
+	}
+
+	// Feature 1: annotate edges with caller-context booleans.
+	if emitCallContext {
+		annotateCallContext(out, prog, fns)
+	}
+
+	// Feature 2: per-return path-condition analysis.
+	if emitReturnAnalysis {
+		out.Returns = analyzeReturnPaths(prog, fns, root)
 	}
 
 	return out, nil
@@ -1364,4 +1410,643 @@ func relPath(root, filename string) (string, bool) {
 		return "", false
 	}
 	return rel, true
+}
+
+// =============================================================================
+// Feature 1 — Caller-context annotations
+// =============================================================================
+
+// blockCtxData holds pre-computed control-flow classification for a basic block.
+type blockCtxData struct {
+	inLoop        bool
+	inErrorBranch bool
+	branchDepth   int
+}
+
+// annotateCallContext walks all edges in out and, for each, computes the
+// CallContext for the call site using SSA dominator analysis. Edges with
+// kind=="implements" are skipped (no call-site context).
+//
+// The implementation uses a per-function context map keyed by basic-block
+// index, computed once per function and cached in a local map for the
+// duration of this function.
+func annotateCallContext(out *Output, prog *ssa.Program, fns map[*ssa.Function]bool) {
+	// Build a lookup: (callerFile, callerLine) → *ssa.Function
+	// so we can find the SSA function for each edge.
+	type fileLineKey struct {
+		file string
+		line int
+	}
+	funcByFileLine := make(map[fileLineKey]*ssa.Function)
+	for f := range fns {
+		if f.Synthetic != "" || f.Pos() == token.NoPos {
+			continue
+		}
+		pos := prog.Fset.Position(f.Pos())
+		if pos.Filename == "" {
+			continue
+		}
+		funcByFileLine[fileLineKey{pos.Filename, pos.Line}] = f
+	}
+
+	// Cache: function → per-block context data (built lazily).
+	fnBlockCtxCache := make(map[*ssa.Function]map[int]blockCtxData)
+
+	getBlockCtx := func(fn *ssa.Function) map[int]blockCtxData {
+		if cached, ok := fnBlockCtxCache[fn]; ok {
+			return cached
+		}
+		result := computeBlockContexts(fn)
+		fnBlockCtxCache[fn] = result
+		return result
+	}
+
+	// For each edge, compute context.
+	for i := range out.Edges {
+		edge := &out.Edges[i]
+		if edge.Kind == "implements" {
+			continue
+		}
+
+		// Annotate in_defer and in_goroutine from the edge kind directly.
+		ctx := &CallContext{}
+		if edge.Kind == "defer" {
+			ctx.InDefer = true
+		}
+		if edge.Kind == "goroutine" {
+			ctx.InGoroutine = true
+		}
+
+		// Find the SSA function containing the call site.
+		// We need to find the function by walking the SSA fns and matching
+		// the caller file+line to a function's block instructions.
+		fn := findFunctionContainingCall(prog, fns, edge.Caller.File, edge.Caller.Line)
+		if fn != nil {
+			blockCtxs := getBlockCtx(fn)
+			// Find the basic block that contains this line.
+			blk := findBlockContainingLine(fn, prog.Fset, edge.Caller.Line)
+			if blk != nil {
+				if bc, ok := blockCtxs[blk.Index]; ok {
+					ctx.InLoop = bc.inLoop
+					if !ctx.InErrorBranch {
+						ctx.InErrorBranch = bc.inErrorBranch
+					}
+					ctx.BranchDepth = bc.branchDepth
+				}
+			}
+		}
+
+		// Only emit context if it carries information (any bool true or depth > 0).
+		if ctx.InDefer || ctx.InGoroutine || ctx.InLoop || ctx.InErrorBranch || ctx.BranchDepth > 0 {
+			edge.Context = ctx
+		}
+	}
+}
+
+// findFunctionContainingCall returns the *ssa.Function that contains the
+// given (file, line) call site, searching by checking if the call site
+// line falls within any block's instruction lines.
+func findFunctionContainingCall(prog *ssa.Program, fns map[*ssa.Function]bool, callerFile string, callerLine int) *ssa.Function {
+	for f := range fns {
+		if f.Synthetic != "" {
+			continue
+		}
+		// Quick filter: check if this function even has the right file.
+		if f.Pos() == token.NoPos {
+			continue
+		}
+		fnPos := prog.Fset.Position(f.Pos())
+		if fnPos.Filename == "" {
+			continue
+		}
+		// Check if the absolute path suffix matches callerFile.
+		// callerFile is relative to root; fnPos.Filename is absolute.
+		// We check via suffix match (callerFile is a relative path).
+		if !hasSuffix(fnPos.Filename, callerFile) {
+			continue
+		}
+		// Check if any instruction in this function is at callerLine.
+		for _, blk := range f.Blocks {
+			for _, instr := range blk.Instrs {
+				pos := prog.Fset.Position(instr.Pos())
+				if pos.Line == callerLine && pos.Filename != "" && hasSuffix(pos.Filename, callerFile) {
+					return f
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// hasSuffix checks if abs ends with the relative path rel (path-separator aware).
+func hasSuffix(abs, rel string) bool {
+	if rel == "" {
+		return false
+	}
+	if abs == rel {
+		return true
+	}
+	sep := string(filepath.Separator)
+	return len(abs) > len(rel) && abs[len(abs)-len(rel)-1] == sep[0] && abs[len(abs)-len(rel):] == rel
+}
+
+// findBlockContainingLine returns the basic block that contains an
+// instruction at the given line number, or nil if none found.
+func findBlockContainingLine(fn *ssa.Function, fset *token.FileSet, line int) *ssa.BasicBlock {
+	for _, blk := range fn.Blocks {
+		for _, instr := range blk.Instrs {
+			pos := fset.Position(instr.Pos())
+			if pos.Line == line {
+				return blk
+			}
+		}
+	}
+	return nil
+}
+
+// computeBlockContexts performs dominator-tree analysis for fn and returns
+// a map from block index → blockCtxData containing loop/error/depth info.
+func computeBlockContexts(fn *ssa.Function) map[int]blockCtxData {
+	result := make(map[int]blockCtxData)
+	if len(fn.Blocks) == 0 {
+		return result
+	}
+
+	// Step 1: find loop headers via back-edges in the CFG.
+	// A back-edge is a→b where b dominates a (b is a loop header).
+	loopHeaders := make(map[*ssa.BasicBlock]bool)
+	for _, blk := range fn.Blocks {
+		for _, succ := range blk.Succs {
+			// succ dominates blk iff succ is an ancestor in the dominator tree.
+			if dominates(succ, blk) {
+				loopHeaders[succ] = true
+			}
+		}
+	}
+
+	// Step 2: a block is "in a loop" if it is dominated by a loop header.
+	loopBlocks := make(map[*ssa.BasicBlock]bool)
+	for h := range loopHeaders {
+		for _, blk := range fn.Blocks {
+			if dominates(h, blk) {
+				loopBlocks[blk] = true
+			}
+		}
+	}
+
+	// Step 3: for each block, walk the dominator chain toward entry and
+	// classify each dominating If terminator.
+	for _, blk := range fn.Blocks {
+		depth := 0
+		inError := false
+
+		// Walk dominator chain (excluding blk itself, upward toward entry).
+		cur := blk.Idom()
+		for cur != nil {
+			ifInstr := blockIfTerminator(cur)
+			if ifInstr != nil {
+				depth++
+				if !inError {
+					// Determine which side of this If the current block is on.
+					onTrue := dominates(cur.Succs[0], blk)
+					if onTrue && isErrorCondition(ifInstr.Cond) {
+						inError = true
+					}
+				}
+			}
+			cur = cur.Idom()
+		}
+
+		result[blk.Index] = blockCtxData{
+			inLoop:        loopBlocks[blk],
+			inErrorBranch: inError,
+			branchDepth:   depth,
+		}
+	}
+
+	return result
+}
+
+// dominates returns true iff block a dominates block b in the dominator tree.
+// Uses BasicBlock.Idom() to walk up the tree from b.
+func dominates(a, b *ssa.BasicBlock) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	// Walk dominator chain of b upward.
+	cur := b.Idom()
+	for cur != nil {
+		if cur == a {
+			return true
+		}
+		cur = cur.Idom()
+	}
+	return false
+}
+
+// blockIfTerminator returns the *ssa.If terminator of blk, or nil if the
+// block doesn't end with an If.
+func blockIfTerminator(blk *ssa.BasicBlock) *ssa.If {
+	if len(blk.Instrs) == 0 {
+		return nil
+	}
+	last := blk.Instrs[len(blk.Instrs)-1]
+	ifInstr, ok := last.(*ssa.If)
+	if !ok {
+		return nil
+	}
+	return ifInstr
+}
+
+// isErrorCondition returns true if val looks like an error check:
+//   - BinOp with NEQ/EQL where one operand implements the error interface, or
+//   - BinOp where one operand is named "err" (name-based fallback).
+func isErrorCondition(val ssa.Value) bool {
+	binop, ok := val.(*ssa.BinOp)
+	if !ok {
+		return false
+	}
+	if binop.Op != token.NEQ && binop.Op != token.EQL {
+		return false
+	}
+	errIface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	for _, operand := range []ssa.Value{binop.X, binop.Y} {
+		if operand == nil {
+			continue
+		}
+		t := operand.Type()
+		if types.Implements(t, errIface) {
+			return true
+		}
+		if pt, ok2 := t.(*types.Pointer); ok2 {
+			if types.Implements(pt.Elem(), errIface) {
+				return true
+			}
+		}
+		// Name-based fallback: if the SSA name contains "err".
+		if name := operand.Name(); name == "err" || name == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+// =============================================================================
+// Feature 2 — Per-return path-condition analysis
+// =============================================================================
+
+// analyzeReturnPaths walks every in-project function and collects path
+// conditions for each *ssa.Return instruction. Returns one ReturnInfo per
+// function that has at least one interesting return.
+func analyzeReturnPaths(prog *ssa.Program, fns map[*ssa.Function]bool, root string) []ReturnInfo {
+	var results []ReturnInfo
+
+	for f := range fns {
+		if f.Synthetic != "" {
+			continue
+		}
+		if len(f.Blocks) == 0 {
+			continue
+		}
+		// Must be in-project.
+		if f.Pos() == token.NoPos {
+			continue
+		}
+		fnPos := prog.Fset.Position(f.Pos())
+		if fnPos.Filename == "" {
+			continue
+		}
+		fnFile, ok := relPath(root, fnPos.Filename)
+		if !ok {
+			continue
+		}
+
+		var sites []ReturnSite
+		for _, blk := range f.Blocks {
+			for _, instr := range blk.Instrs {
+				ret, ok := instr.(*ssa.Return)
+				if !ok {
+					continue
+				}
+
+				retPos := prog.Fset.Position(ret.Pos())
+				line := 0
+				if retPos.IsValid() {
+					line = retPos.Line
+				}
+
+				// Collect (cond, side) pairs by walking dominator chain.
+				type condSide struct {
+					cond ssa.Value
+					neg  bool // true = on False branch (negate cond)
+				}
+				var chain []condSide
+				cur := blk.Idom()
+				depth := 0
+				for cur != nil && depth < 4 {
+					ifInstr := blockIfTerminator(cur)
+					if ifInstr != nil {
+						onTrue := len(cur.Succs) > 0 && dominates(cur.Succs[0], blk)
+						chain = append(chain, condSide{cond: ifInstr.Cond, neg: !onTrue})
+						depth++
+					}
+					cur = cur.Idom()
+				}
+				// Remaining conditions beyond depth 4.
+				extraDepth := 0
+				{
+					tmp := blk.Idom()
+					for tmp != nil {
+						if blockIfTerminator(tmp) != nil {
+							if extraDepth >= depth {
+								// count beyond what we captured
+								extraDepth++
+							} else {
+								extraDepth++
+							}
+						}
+						tmp = tmp.Idom()
+					}
+					extraDepth = extraDepth - depth // how many we didn't capture
+					if extraDepth < 0 {
+						extraDepth = 0
+					}
+				}
+
+				// Render the path condition.
+				var terms []string
+				simple := true
+				for _, cs := range chain {
+					rendered, isSimple := renderSSAValue(cs.cond, prog.Fset, 0)
+					if !isSimple {
+						simple = false
+					}
+					if cs.neg {
+						// negate: flip NEQ→EQL or wrap with !
+						negated := negateCondition(rendered, cs.cond)
+						terms = append(terms, negated)
+					} else {
+						terms = append(terms, rendered)
+					}
+				}
+				// Reverse so outermost condition is first (dominator chain walks
+				// from innermost outward).
+				for li, ri := 0, len(terms)-1; li < ri; li, ri = li+1, ri-1 {
+					terms[li], terms[ri] = terms[ri], terms[li]
+				}
+
+				// Simplify: remove duplicates and trivially-true terms.
+				terms = simplifyTerms(terms)
+				if len(terms) == 0 && extraDepth > 0 {
+					simple = false
+				}
+
+				pathCond := joinTerms(terms, extraDepth)
+				if pathCond == "" {
+					pathCond = "true"
+				}
+
+				// Handle Phi values in the return.
+				var retValues []string
+				if len(ret.Results) == 0 {
+					retValues = []string{""}
+				} else {
+					for _, rv := range ret.Results {
+						phi, isPhi := rv.(*ssa.Phi)
+						if isPhi {
+							// Split: emit one entry per Phi incoming edge.
+							for edgeIdx, incoming := range phi.Edges {
+								if edgeIdx < len(blk.Preds) {
+									// Use the predecessor block's condition context for split.
+									rendered, isS := renderSSAValue(incoming, prog.Fset, 0)
+									if !isS {
+										simple = false
+									}
+									retValues = append(retValues, rendered)
+								}
+							}
+						} else {
+							rendered, isS := renderSSAValue(rv, prog.Fset, 0)
+							if !isS {
+								simple = false
+							}
+							retValues = append(retValues, rendered)
+						}
+					}
+				}
+
+				if len(retValues) == 0 {
+					retValues = []string{""}
+				}
+
+				// For Phi splits: emit one ReturnSite per value.
+				for _, rv := range retValues {
+					sites = append(sites, ReturnSite{
+						Line:                line,
+						Value:               rv,
+						PathCondition:       pathCond,
+						PathConditionSimple: simple,
+					})
+				}
+			}
+		}
+
+		if len(sites) > 0 {
+			fnName := containingName(f)
+			if fnName == "" {
+				fnName = f.Name()
+			}
+			results = append(results, ReturnInfo{
+				File:    fnFile,
+				Symbol:  fnName,
+				Returns: sites,
+			})
+		}
+	}
+
+	return results
+}
+
+// renderSSAValue renders an SSA value as a Go-source-like string.
+// Returns (rendered, isSimple). isSimple is false when structural rendering
+// was used or recursion depth was hit.
+func renderSSAValue(val ssa.Value, fset *token.FileSet, depth int) (string, bool) {
+	if val == nil {
+		return "?", false
+	}
+	if depth > 5 {
+		return "...", false
+	}
+
+	switch v := val.(type) {
+	case *ssa.Const:
+		if v.Value == nil {
+			return "nil", true
+		}
+		switch v.Value.Kind() {
+		case constant.Bool:
+			return v.Value.String(), true
+		case constant.String:
+			return fmt.Sprintf("%q", constant.StringVal(v.Value)), true
+		default:
+			return v.Value.String(), true
+		}
+	case *ssa.BinOp:
+		x, xSimple := renderSSAValue(v.X, fset, depth+1)
+		y, ySimple := renderSSAValue(v.Y, fset, depth+1)
+		return fmt.Sprintf("%s %s %s", x, v.Op.String(), y), xSimple && ySimple
+	case *ssa.UnOp:
+		x, xSimple := renderSSAValue(v.X, fset, depth+1)
+		return fmt.Sprintf("%s%s", v.Op.String(), x), xSimple
+	case *ssa.Phi:
+		return "<merged value>", false
+	case *ssa.Call:
+		return renderSSACallValue(v, fset, depth), false
+	default:
+		// Try position-based source recovery.
+		if val.Pos() != token.NoPos {
+			p := fset.Position(val.Pos())
+			if p.IsValid() {
+				// Use the SSA Name() as a proxy for the source identifier.
+				name := val.Name()
+				if name != "" && !isSSASyntheticName(name) {
+					return name, true
+				}
+			}
+		}
+		// Structural fallback: use the SSA name.
+		name := val.Name()
+		if name == "" {
+			return "?", false
+		}
+		return name, !isSSASyntheticName(name)
+	}
+}
+
+// renderSSACallValue renders a Call value as a function-call string.
+func renderSSACallValue(v *ssa.Call, fset *token.FileSet, depth int) string {
+	if depth > 5 {
+		return "..."
+	}
+	common := v.Common()
+	if common == nil {
+		return "?"
+	}
+	var fnName string
+	if sf := common.StaticCallee(); sf != nil {
+		fnName = sf.Name()
+	} else {
+		fnName, _ = renderSSAValue(common.Value, fset, depth+1)
+	}
+	var argStrs []string
+	for _, arg := range common.Args {
+		s, _ := renderSSAValue(arg, fset, depth+1)
+		argStrs = append(argStrs, s)
+	}
+	if len(argStrs) > 3 {
+		argStrs = argStrs[:3]
+		argStrs = append(argStrs, "...")
+	}
+	return fmt.Sprintf("%s(%s)", fnName, joinStrings(argStrs, ", "))
+}
+
+// isSSASyntheticName returns true for SSA-generated temporaries like "t0", "t1" etc.
+func isSSASyntheticName(name string) bool {
+	if len(name) < 2 {
+		return false
+	}
+	return name[0] == 't' && isDigit(name[1:])
+}
+
+func isDigit(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// negateCondition returns the logical negation of the rendered condition string.
+// If the original SSA value is a BinOp with NEQ, flips to EQL and vice versa.
+func negateCondition(rendered string, val ssa.Value) string {
+	if binop, ok := val.(*ssa.BinOp); ok {
+		switch binop.Op {
+		case token.NEQ:
+			// Flip to ==
+			x := rendered
+			// Replace " != " with " == "
+			if idx := findOpInRendered(x, "!="); idx >= 0 {
+				return x[:idx] + "==" + x[idx+2:]
+			}
+		case token.EQL:
+			if idx := findOpInRendered(rendered, "=="); idx >= 0 {
+				return rendered[:idx] + "!=" + rendered[idx+2:]
+			}
+		}
+	}
+	return "!(" + rendered + ")"
+}
+
+// findOpInRendered finds the first occurrence of op surrounded by spaces.
+func findOpInRendered(s, op string) int {
+	search := " " + op + " "
+	idx := 0
+	for idx <= len(s)-len(search) {
+		if s[idx:idx+len(search)] == search {
+			return idx + 1 // position of op itself
+		}
+		idx++
+	}
+	return -1
+}
+
+// simplifyTerms removes duplicates and "true"/"false" identity terms.
+func simplifyTerms(terms []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, t := range terms {
+		if t == "true" {
+			continue // x && true = x
+		}
+		if t == "false" {
+			return []string{"false"} // x && false = false (unreachable)
+		}
+		if seen[t] {
+			continue // x && x = x
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+// joinTerms joins condition terms with " && ", appending "...and N more" if extra > 0.
+func joinTerms(terms []string, extra int) string {
+	if len(terms) == 0 && extra == 0 {
+		return ""
+	}
+	result := joinStrings(terms, " && ")
+	if extra > 0 {
+		if result != "" {
+			result += fmt.Sprintf(" && ...and %d more", extra)
+		} else {
+			result = fmt.Sprintf("...and %d more", extra)
+		}
+	}
+	return result
+}
+
+func joinStrings(ss []string, sep string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	result := ss[0]
+	for _, s := range ss[1:] {
+		result += sep + s
+	}
+	return result
 }

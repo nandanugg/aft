@@ -17,7 +17,7 @@ func TestWritesEdgesCrossPackage(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true /* emitImplements */, true /* emitWrites */)
+	out, err := analyze(absRoot, true, true /* emitImplements */, true /* emitWrites */, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestWritesEdgesSamePackageDropped(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestNoWritesFlag(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true /* emitImplements */, false /* emitWrites */)
+	out, err := analyze(absRoot, true, true /* emitImplements */, false /* emitWrites */, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}

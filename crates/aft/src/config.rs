@@ -118,6 +118,14 @@ pub struct Config {
     /// Default `true`. Set to `false` to disable.
     /// Overridden to `false` by `AFT_DISABLE_WRITES_EDGES=1`.
     pub enable_writes_edges: bool,
+    /// [callgraph] emit_call_context — annotate each helper edge with caller-context booleans
+    /// (in_defer, in_goroutine, in_loop, in_error_branch, branch_depth). Default `true`.
+    /// Overridden to `false` by `AFT_DISABLE_CALL_CONTEXT=1`.
+    pub emit_call_context: bool,
+    /// [callgraph] emit_return_analysis — include per-return path-condition analysis in the
+    /// helper output, surfaced by `aft zoom`. Default `true`.
+    /// Overridden to `false` by `AFT_DISABLE_RETURN_ANALYSIS=1`.
+    pub emit_return_analysis: bool,
     /// Similarity index: enabled (default: true).
     pub similarity_enabled: bool,
     /// Similarity index: auto-build on configure (default: true).
@@ -160,6 +168,12 @@ impl Default for Config {
                 .map(|v| v != "1")
                 .unwrap_or(true),
             enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            emit_call_context: std::env::var("AFT_DISABLE_CALL_CONTEXT")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            emit_return_analysis: std::env::var("AFT_DISABLE_RETURN_ANALYSIS")
                 .map(|v| v != "1")
                 .unwrap_or(true),
             similarity_enabled: true,

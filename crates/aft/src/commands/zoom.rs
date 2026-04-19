@@ -39,6 +39,10 @@ pub struct ZoomResponse {
     /// Variable or Constant and the Go helper has resolved writes edges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writers: Option<Vec<WriterSite>>,
+    /// Per-return path-condition analysis. Present when the Go helper ran
+    /// with return analysis enabled and this symbol has interesting returns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returns: Option<Vec<crate::go_helper::ReturnSite>>,
 }
 
 /// Handle a `zoom` request.
@@ -382,9 +386,11 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", target.kind).to_lowercase());
 
+    // Drain the go helper early so both writers and returns are up-to-date.
+    ctx.drain_go_helper();
+
     // For Variable and Constant symbols, query the call graph for cross-package writers.
     let writers = if matches!(target.kind, SymbolKind::Variable | SymbolKind::Constant) {
-        ctx.drain_go_helper();
         let mut cg_ref = ctx.callgraph().borrow_mut();
         if let Some(graph) = cg_ref.as_mut() {
             let writers = graph
@@ -402,6 +408,48 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         None
     };
 
+    // Look up return-site analysis from the Go helper for this symbol.
+    let returns: Option<Vec<crate::go_helper::ReturnSite>> = {
+        let helper_data = ctx.go_helper_data();
+        if let Some(ref helper) = *helper_data {
+            // Match by symbol name and file. The helper uses relative paths
+            // (relative to project root); resolved_file_path is absolute.
+            // Compute the relative path for comparison.
+            let rel_file: Option<String> = ctx
+                .config()
+                .project_root
+                .as_ref()
+                .and_then(|root| {
+                    resolved_file_path
+                        .strip_prefix(root)
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .or_else(|| {
+                    // Fallback: use the original file param (may already be relative).
+                    Some(file.to_string())
+                });
+
+            if let Some(ref rel) = rel_file {
+                helper
+                    .returns
+                    .iter()
+                    .find(|ri| ri.symbol == target.name && {
+                        // Allow suffix match: helper path vs resolved path.
+                        let ri_norm = ri.file.replace('\\', "/");
+                        let rel_norm = rel.replace('\\', "/");
+                        ri_norm == rel_norm || rel_norm.ends_with(&ri_norm) || ri_norm.ends_with(&rel_norm)
+                    })
+                    .map(|ri| ri.returns.clone())
+                    .filter(|v| !v.is_empty())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     let resp = ZoomResponse {
         name: target.name.clone(),
         kind: kind_str,
@@ -414,6 +462,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             called_by,
         },
         writers,
+        returns,
     };
 
     match serde_json::to_value(&resp) {
