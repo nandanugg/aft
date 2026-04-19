@@ -179,6 +179,144 @@ func TestBadAnonymousClosure(t *testing.T) {
 	}
 }
 
+// TestTypedConstNearbyString tests Feature 2: resolveStringConst resolves
+// typed-string constants and string(...) casts to the underlying string value.
+func TestTypedConstNearbyString(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	// RegisterTypedHandlers uses string(TypeMerchantSettlement) and
+	// string(TypeRefundCallback). Both should resolve to their string values.
+	wantKeys := map[dispatchEdgeKey]bool{
+		{callerSymbol: "RegisterTypedHandlers", calleeSymbol: "HandleMerchantSettlementTask", kind: "dispatches", nearbyString: "merchant_settlement:merchant_id"}: false,
+		{callerSymbol: "RegisterTypedHandlers", calleeSymbol: "HandleRefundCallbackTask", kind: "dispatches", nearbyString: "refund_callback:payment_id"}:         false,
+	}
+	for _, e := range out.Edges {
+		if !dispatchKinds[e.Kind] {
+			continue
+		}
+		k := edgeToKey(e)
+		if _, want := wantKeys[k]; want {
+			wantKeys[k] = true
+		}
+	}
+	for k, found := range wantKeys {
+		if !found {
+			t.Errorf("expected typed-const dispatch edge not found: caller=%s callee=%s key=%q",
+				k.callerSymbol, k.calleeSymbol, k.nearbyString)
+		}
+	}
+}
+
+// TestDispatchedViaPresent tests Feature 1: dispatched_via is populated on
+// dispatches edges and reflects the callee FQN.
+func TestDispatchedViaPresent(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	// All dispatches edges should have dispatched_via populated.
+	for _, e := range out.Edges {
+		if e.Kind != "dispatches" {
+			continue
+		}
+		if e.DispatchedVia == "" {
+			t.Errorf("dispatches edge missing dispatched_via: caller=%s callee=%s key=%q",
+				e.Caller.Symbol, e.Callee.Symbol, e.NearbyString)
+		}
+	}
+}
+
+// TestDispatchedViaNoStringConst tests that dispatched_via is populated even
+// when there is no nearby_string (no string arg at the call site).
+func TestDispatchedViaNoStringConst(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	found := false
+	for _, e := range out.Edges {
+		if e.Kind == "dispatches" && e.Callee.Symbol == "HandleNoKey" {
+			found = true
+			if e.NearbyString != "" {
+				t.Errorf("HandleNoKey edge should have no nearby_string, got %q", e.NearbyString)
+			}
+			if e.DispatchedVia == "" {
+				t.Errorf("HandleNoKey edge missing dispatched_via")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected dispatch edge for HandleNoKey not found")
+	}
+}
+
+// TestDispatchedViaInterfaceSite tests that dispatched_via uses the
+// parenthesized interface format for interface method call sites.
+func TestDispatchedViaInterfaceSite(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	found := false
+	for _, e := range out.Edges {
+		if e.Kind == "dispatches" && e.Callee.Symbol == "HandleViaInterface" {
+			found = true
+			if e.DispatchedVia == "" {
+				t.Errorf("HandleViaInterface edge missing dispatched_via")
+			}
+			// Should contain the interface method name.
+			if !containsStr(e.DispatchedVia, "Register") {
+				t.Errorf("dispatched_via %q should contain 'Register'", e.DispatchedVia)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected dispatch edge for HandleViaInterface not found")
+	}
+}
+
+func containsStr(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
+		func() bool {
+			for i := 0; i <= len(s)-len(sub); i++ {
+				if s[i:i+len(sub)] == sub {
+					return true
+				}
+			}
+			return false
+		}())
+}
+
 // TestDispatchGoldenJSON tests that the sorted dispatch edges match a golden file
 // if it exists. To regenerate: delete testdata/dispatch/expected.json and run the test.
 func TestDispatchGoldenJSON(t *testing.T) {

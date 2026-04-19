@@ -24,7 +24,8 @@
       "pkg": "example.com/dispatch"
     },
     "kind": "dispatches",
-    "nearby_string": "/api"
+    "nearby_string": "/api",
+    "dispatched_via": "(*net/http.ServeMux).HandleFunc"
   },
   {
     "caller": {
@@ -38,7 +39,8 @@
       "pkg": "example.com/dispatch"
     },
     "kind": "dispatches",
-    "nearby_string": "/"
+    "nearby_string": "/",
+    "dispatched_via": "(*net/http.ServeMux).HandleFunc"
   },
   {
     "caller": {
@@ -52,7 +54,8 @@
       "pkg": "example.com/dispatch"
     },
     "kind": "dispatches",
-    "nearby_string": "TypeTaskA"
+    "nearby_string": "TypeTaskA",
+    "dispatched_via": "(*example.com/dispatch.ServeMux).HandleFunc"
   },
   {
     "caller": {
@@ -66,7 +69,67 @@
       "pkg": "example.com/dispatch"
     },
     "kind": "dispatches",
-    "nearby_string": "TypeTaskB"
+    "nearby_string": "TypeTaskB",
+    "dispatched_via": "(*example.com/dispatch.ServeMux).HandleFunc"
+  },
+  {
+    "caller": {
+      "file": "no_string_const.go",
+      "line": 17,
+      "symbol": "RegisterNoKey"
+    },
+    "callee": {
+      "file": "no_string_const.go",
+      "symbol": "HandleNoKey",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "dispatched_via": "(*example.com/dispatch.NoStringMux).AddHandler"
+  },
+  {
+    "caller": {
+      "file": "asynq_typed_const.go",
+      "line": 28,
+      "symbol": "RegisterTypedHandlers"
+    },
+    "callee": {
+      "file": "asynq_typed_const.go",
+      "symbol": "HandleMerchantSettlementTask",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "merchant_settlement:merchant_id",
+    "dispatched_via": "(*example.com/dispatch.TypedMux).HandleFunc"
+  },
+  {
+    "caller": {
+      "file": "asynq_typed_const.go",
+      "line": 29,
+      "symbol": "RegisterTypedHandlers"
+    },
+    "callee": {
+      "file": "asynq_typed_const.go",
+      "symbol": "HandleRefundCallbackTask",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "refund_callback:payment_id",
+    "dispatched_via": "(*example.com/dispatch.TypedMux).HandleFunc"
+  },
+  {
+    "caller": {
+      "file": "interface_dispatch_site.go",
+      "line": 20,
+      "symbol": "UseDispatcher"
+    },
+    "callee": {
+      "file": "interface_dispatch_site.go",
+      "symbol": "HandleViaInterface",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "interface-dispatch-key",
+    "dispatched_via": "(example.com/dispatch.Dispatcher).Register"
   },
   {
     "caller": {

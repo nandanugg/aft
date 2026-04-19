@@ -67,6 +67,14 @@ pub struct HelperEdge {
     /// appears in the call. Absent for all other edge kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nearby_string: Option<String>,
+    /// For `dispatches` edges: the FQN of the function whose call received
+    /// the function-value argument. Format follows Go's ssa.Function.String():
+    ///   - Free function: `"pkg/path.FuncName"`
+    ///   - Pointer receiver: `"pkg/path.(*TypeName).Method"`
+    ///   - Interface invoke: `"(pkg/path.InterfaceName).Method"`
+    /// Absent when the callee cannot be resolved, or for non-dispatches kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_via: Option<String>,
 }
 
 /// Caller-side position for an edge.
@@ -524,6 +532,7 @@ mod tests {
                 },
                 kind: EdgeKind::Static,
                 nearby_string: None,
+                dispatched_via: None,
             }],
             skipped: vec![],
         };
@@ -693,9 +702,11 @@ mod tests {
             },
             kind: EdgeKind::Dispatches,
             nearby_string: None,
+            dispatched_via: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
+        assert!(!s.contains("dispatched_via"), "dispatched_via=None should be omitted: {s}");
     }
 
     #[test]
@@ -715,6 +726,7 @@ mod tests {
             },
             kind: EdgeKind::Dispatches,
             nearby_string: Some("send-email".to_string()),
+            dispatched_via: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(s.contains("nearby_string"), "nearby_string=Some should be present: {s}");
@@ -807,9 +819,131 @@ mod tests {
             },
             kind: EdgeKind::Writes,
             nearby_string: None,
+            dispatched_via: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(s.contains("\"writes\""), "kind should be 'writes': {s}");
         assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: dispatched_via round-trips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatched_via_absent_means_none() {
+        // Old-format output without dispatched_via should deserialize to None.
+        let json = r#"{
+            "version": 1,
+            "root": "/x",
+            "edges": [
+                {
+                    "caller": {"file": "a.go", "line": 1, "symbol": "f"},
+                    "callee": {"file": "b.go", "symbol": "g"},
+                    "kind": "dispatches",
+                    "nearby_string": "my-task"
+                }
+            ]
+        }"#;
+        let out: HelperOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(out.edges[0].nearby_string, Some("my-task".to_string()));
+        assert_eq!(out.edges[0].dispatched_via, None);
+    }
+
+    #[test]
+    fn dispatched_via_present_deserializes_correctly() {
+        let json = r#"{
+            "version": 1,
+            "root": "/x",
+            "edges": [
+                {
+                    "caller": {"file": "a.go", "line": 1, "symbol": "f"},
+                    "callee": {"file": "b.go", "symbol": "HandleTask"},
+                    "kind": "dispatches",
+                    "nearby_string": "my-task",
+                    "dispatched_via": "github.com/hibiken/asynq.(*ServeMux).HandleFunc"
+                }
+            ]
+        }"#;
+        let out: HelperOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            out.edges[0].dispatched_via,
+            Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string())
+        );
+    }
+
+    #[test]
+    fn dispatched_via_skipped_in_serialization_when_none() {
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "a.go".into(),
+                line: 1,
+                symbol: "f".into(),
+            },
+            callee: HelperCallee {
+                file: "b.go".into(),
+                line: 0,
+                symbol: "HandleTask".into(),
+                receiver: String::new(),
+                pkg: String::new(),
+            },
+            kind: EdgeKind::Dispatches,
+            nearby_string: Some("task-key".to_string()),
+            dispatched_via: None,
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(!s.contains("dispatched_via"), "dispatched_via=None should be omitted: {s}");
+    }
+
+    #[test]
+    fn dispatched_via_included_in_serialization_when_some() {
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "a.go".into(),
+                line: 1,
+                symbol: "f".into(),
+            },
+            callee: HelperCallee {
+                file: "b.go".into(),
+                line: 0,
+                symbol: "HandleTask".into(),
+                receiver: String::new(),
+                pkg: String::new(),
+            },
+            kind: EdgeKind::Dispatches,
+            nearby_string: Some("task-key".to_string()),
+            dispatched_via: Some("example.com/pkg.(*Mux).Register".to_string()),
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(s.contains("dispatched_via"), "dispatched_via=Some should be present: {s}");
+        assert!(s.contains("example.com/pkg.(*Mux).Register"));
+    }
+
+    #[test]
+    fn dispatched_via_round_trips() {
+        let edge = HelperEdge {
+            caller: HelperCaller {
+                file: "server/register.go".into(),
+                line: 42,
+                symbol: "startServer".into(),
+            },
+            callee: HelperCallee {
+                file: "server/handler.go".into(),
+                line: 0,
+                symbol: "HandleMerchantTask".into(),
+                receiver: String::new(),
+                pkg: "example.com/server".into(),
+            },
+            kind: EdgeKind::Dispatches,
+            nearby_string: Some("merchant_settlement:merchant_id".to_string()),
+            dispatched_via: Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        let back: HelperEdge = serde_json::from_str(&s).unwrap();
+        assert_eq!(edge, back);
+        assert_eq!(
+            back.dispatched_via,
+            Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string())
+        );
     }
 }
