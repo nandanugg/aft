@@ -170,6 +170,11 @@ pub struct DispatchEntry {
     pub handler: DispatchCallee,
     /// The call site that registers it (e.g. `asynq.HandleFunc(key, handler)`).
     pub registered_by: DispatchRegistrar,
+    /// FQN of the function that received the function-value argument
+    /// (e.g. `"github.com/hibiken/asynq.(*ServeMux).HandleFunc"`).
+    /// Present only when the helper resolved the callee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_via: Option<String>,
 }
 
 /// Callee side of a dispatch edge.
@@ -262,6 +267,10 @@ pub struct CallerSite {
     /// Dispatch key for `dispatches` edges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearby_string: Option<String>,
+    /// FQN of the function that received the function-value argument.
+    /// Present only on `dispatches` edges where the callee was resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_via: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +284,8 @@ struct IndexedCallerSite {
     kind: Option<EdgeKind>,
     /// Dispatch key, present only on `EdgeKind::Dispatches` sites with a nearby_string.
     nearby_string: Option<String>,
+    /// FQN of the receiving function for `dispatches` edges.
+    dispatched_via: Option<String>,
 }
 
 /// A group of callers from a single file.
@@ -508,6 +519,11 @@ pub struct DispatchedBySite {
     /// The dispatch key (nearby_string), if the call site has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearby_string: Option<String>,
+    /// FQN of the function that received the function-value argument
+    /// (e.g. `"github.com/hibiken/asynq.(*ServeMux).HandleFunc"`).
+    /// Present only when the helper resolved the callee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_via: Option<String>,
 }
 
 /// Result of `aft dispatches <key>`.
@@ -701,9 +717,14 @@ impl DispatchedByResult {
                     .as_deref()
                     .map(|s| format!(" key={}", s))
                     .unwrap_or_default();
+                let via = site
+                    .dispatched_via
+                    .as_deref()
+                    .map(|s| format!(" via {}", s))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "  - {} ({}:{}){}\n",
-                    site.caller.symbol, site.caller.file, site.caller.line, key
+                    "  - {} ({}:{}){}{}\n",
+                    site.caller.symbol, site.caller.file, site.caller.line, key, via
                 ));
             }
         }
@@ -724,13 +745,19 @@ impl DispatchesResult {
             out.push_str("  (no handlers found for this key)\n");
         } else {
             for h in &self.handlers {
+                let via = h
+                    .dispatched_via
+                    .as_deref()
+                    .map(|s| format!(" via {}", s))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "  - {} ({})  registered by {} ({}:{})\n",
+                    "  - {} ({})  registered by {} ({}:{}){}\n",
                     h.handler.symbol,
                     h.handler.file,
                     h.registered_by.symbol,
                     h.registered_by.file,
                     h.registered_by.line,
+                    via,
                 ));
             }
         }
@@ -1627,6 +1654,7 @@ impl CallGraph {
                             resolved,
                             kind: None,
                             nearby_string: None,
+                            dispatched_via: None,
                         });
                 }
             }
@@ -1740,6 +1768,7 @@ impl CallGraph {
                         resolved: true,
                         kind: Some(edge.kind),
                         nearby_string: edge.nearby_string.clone(),
+                        dispatched_via: edge.dispatched_via.clone(),
                     });
 
                 // Secondary dispatch key index: only for dispatches edges with a nearby_string.
@@ -1769,6 +1798,7 @@ impl CallGraph {
                                 symbol: edge.caller.symbol.clone(),
                                 line: edge.caller.line,
                             },
+                            dispatched_via: edge.dispatched_via.clone(),
                         });
                     }
                 }
@@ -1793,6 +1823,7 @@ impl CallGraph {
                                 resolved: s.resolved,
                                 kind: s.kind,
                                 nearby_string: s.nearby_string.clone(),
+                                dispatched_via: s.dispatched_via.clone(),
                             })
                             .collect();
                         (sym.clone(), caller_sites)
@@ -1854,6 +1885,7 @@ impl CallGraph {
                             resolved: c.resolved,
                             kind: c.kind,
                             nearby_string: c.nearby_string,
+                            dispatched_via: c.dispatched_via,
                         })
                         .collect();
                     (sym, indexed)
@@ -2015,6 +2047,7 @@ impl CallGraph {
                     line: s.line,
                 },
                 nearby_string: s.nearby_string.clone(),
+                dispatched_via: s.dispatched_via.clone(),
             })
             .collect::<Vec<_>>();
 
@@ -3343,6 +3376,7 @@ impl CallGraph {
                     resolved: site.resolved,
                     kind: site.kind,
                     nearby_string: site.nearby_string.clone(),
+                    dispatched_via: site.dispatched_via.clone(),
                 });
                 // Recurse: find callers of the caller
                 if current_depth + 1 < max_depth {
@@ -5255,6 +5289,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Static,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // concrete: concreteMethodCaller → concreteMethod (line 19)
                 HelperEdge {
@@ -5272,6 +5307,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Concrete,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // interface dispatch: interfaceCaller → doerA.Do (line 35)
                 HelperEdge {
@@ -5289,6 +5325,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Interface,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // interface dispatch: interfaceCaller → doerB.Do (line 35)
                 HelperEdge {
@@ -5306,6 +5343,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Interface,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
             ],
             skipped: vec![],
@@ -5432,6 +5470,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Dispatches,
                     nearby_string: Some("TypeMerchantTask".to_string()),
+                    dispatched_via: Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
                 },
                 // dispatches edge with no nearby_string
                 HelperEdge {
@@ -5449,6 +5488,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Dispatches,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // goroutine edge
                 HelperEdge {
@@ -5466,6 +5506,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Goroutine,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // defer edge
                 HelperEdge {
@@ -5483,6 +5524,7 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Defer,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
             ],
             skipped: vec![],
@@ -5547,6 +5589,91 @@ func processRequest() {
         // workerLoop is registered via goroutine (not dispatches), so dispatched_by should be empty.
         let result = cg.dispatched_by(&go_file, "workerLoop").unwrap();
         assert_eq!(result.dispatched_by.len(), 0, "goroutine edges should not appear in dispatched_by");
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature: dispatched_via propagation through dispatched_by / dispatches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatched_by_includes_dispatched_via() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone(), true);
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        assert_eq!(result.dispatched_by.len(), 1);
+        assert_eq!(
+            result.dispatched_by[0].dispatched_via,
+            Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
+            "dispatched_by site should include dispatched_via"
+        );
+    }
+
+    #[test]
+    fn dispatched_by_text_renderer_includes_via() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone(), true);
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        let text = result.render_text();
+        assert!(
+            text.contains("via github.com/hibiken/asynq.(*ServeMux).HandleFunc"),
+            "text renderer should include 'via <fqn>': {text}"
+        );
+    }
+
+    #[test]
+    fn find_by_dispatch_key_includes_dispatched_via() {
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone(), true);
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        let entries = cg.find_by_dispatch_key("TypeMerchantTask");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].dispatched_via,
+            Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
+            "dispatch entry should include dispatched_via"
+        );
+    }
+
+    #[test]
+    fn dispatched_via_none_when_not_in_helper() {
+        // An edge with no dispatched_via in the helper should have None in the result.
+        let dir = setup_dispatch_project();
+        let root = dir.path().to_path_buf();
+        let go_file = root.join("handler.go");
+        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
+
+        let mut cg = CallGraph::new(root.clone(), true);
+        cg.build_file(&go_file).unwrap();
+        cg.set_go_helper(helper_out);
+
+        // HandleGenericTask has dispatched_via = None in make_dispatch_helper_output.
+        let result = cg.dispatched_by(&go_file, "HandleGenericTask").unwrap();
+        assert_eq!(result.dispatched_by.len(), 1);
+        assert_eq!(
+            result.dispatched_by[0].dispatched_via,
+            None,
+            "dispatch site with no dispatched_via should return None"
+        );
     }
 
     #[test]
@@ -5622,6 +5749,7 @@ func processRequest() {
                 },
                 kind: EdgeKind::Dispatches,
                 nearby_string: Some("/api/v1?foo=bar&baz=.*+[".to_string()),
+                dispatched_via: None,
             }],
             skipped: vec![],
         };
@@ -5702,6 +5830,7 @@ func processRequest() {
                     },
                     kind: EdgeKind::Implements,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // Delete method implementation.
                 HelperEdge {
@@ -5719,6 +5848,7 @@ func processRequest() {
                     },
                     kind: EdgeKind::Implements,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
                 // Mock implementation (excluded by default).
                 HelperEdge {
@@ -5736,6 +5866,7 @@ func processRequest() {
                     },
                     kind: EdgeKind::Implements,
                     nearby_string: None,
+                    dispatched_via: None,
                 },
             ],
             skipped: vec![],
@@ -5887,6 +6018,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
             },
             kind: EdgeKind::Implements,
             nearby_string: None,
+            dispatched_via: None,
         };
 
         let json = serde_json::to_string(&edge).unwrap();

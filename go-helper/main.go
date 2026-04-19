@@ -80,6 +80,13 @@ type Edge struct {
 	// has exactly one string literal argument of ≤128 chars. Used as a
 	// human-readable label (e.g. the task name in a job scheduler).
 	NearbyString string `json:"nearby_string,omitempty"`
+	// DispatchedVia is the FQN of the function whose call received the
+	// function-value argument. Set only on "dispatches" edges where the
+	// callee can be resolved. Format follows Go's ssa.Function.String():
+	//   - Free function: "pkg/path.FuncName"
+	//   - Pointer receiver: "pkg/path.(*TypeName).Method"
+	//   - Interface invoke: "(pkg/path.InterfaceName).Method"
+	DispatchedVia string `json:"dispatched_via,omitempty"`
 }
 
 // Output is the top-level JSON document.
@@ -700,8 +707,13 @@ func emitDispatchesFromCall(
 		return
 	}
 
-	// Compute nearby_string: exactly one string literal ≤128 chars.
+	// Compute nearby_string: exactly one string constant ≤128 chars
+	// (bare literals, typed-string constants, string(...) casts).
 	nearby := extractNearbyString(args)
+
+	// Compute dispatched_via: FQN of the function receiving the handler.
+	// Same for all dispatches from this call site.
+	dispatchedVia, _ := calleeFQN(common)
 
 	// Caller position.
 	sitePos := site.Pos()
@@ -771,8 +783,9 @@ func emitDispatchesFromCall(
 				Receiver: recv,
 				Pkg:      pkg,
 			},
-			Kind:         "dispatches",
-			NearbyString: nearby,
+			Kind:          "dispatches",
+			NearbyString:  nearby,
+			DispatchedVia: dispatchedVia,
 		})
 	}
 }
@@ -860,20 +873,49 @@ func resolveClosureTarget(closure *ssa.Function, fns map[*ssa.Function]bool, pro
 	return found
 }
 
-// extractNearbyString returns the single string literal ≤128 chars from
-// args, or "" if there are 0 or ≥2 such literals.
+// resolveStringConst resolves val to a string constant, unwrapping type
+// conversions and named-type aliases. Returns ("", false) if the value is
+// not a string constant or if depth exceeds 3.
+//
+// Resolution rules (first match wins):
+//  1. *ssa.Const with Kind == constant.String → return StringVal.
+//  2. *ssa.Convert or *ssa.ChangeType → recurse into X.
+//  3. Named-type string alias (*ssa.Const whose underlying type is string).
+func resolveStringConst(val ssa.Value, depth int) (string, bool) {
+	if depth > 3 {
+		return "", false
+	}
+	switch v := val.(type) {
+	case *ssa.Const:
+		if v.Value == nil || v.Value.Kind() != constant.String {
+			return "", false
+		}
+		// Accept both plain string and named-type string aliases.
+		u := v.Type().Underlying()
+		basic, ok := u.(*types.Basic)
+		if !ok || basic.Kind() != types.String {
+			return "", false
+		}
+		return constant.StringVal(v.Value), true
+	case *ssa.Convert:
+		return resolveStringConst(v.X, depth+1)
+	case *ssa.ChangeType:
+		return resolveStringConst(v.X, depth+1)
+	}
+	return "", false
+}
+
+// extractNearbyString returns the single string constant ≤128 chars from
+// args, or "" if there are 0 or ≥2 such constants. Accepts typed-string
+// constants and string(...) type-casts in addition to bare string literals.
 func extractNearbyString(args []ssa.Value) string {
 	var found string
 	count := 0
 	for _, arg := range args {
-		c, ok := arg.(*ssa.Const)
+		s, ok := resolveStringConst(arg, 0)
 		if !ok {
 			continue
 		}
-		if c.Value == nil || c.Value.Kind() != constant.String {
-			continue
-		}
-		s := constant.StringVal(c.Value)
 		if len(s) > 128 {
 			continue
 		}
@@ -884,6 +926,32 @@ func extractNearbyString(args []ssa.Value) string {
 		return found
 	}
 	return ""
+}
+
+// calleeFQN returns the fully-qualified name of the function being called at
+// common, following Go's ssa.Function.String() rendering convention. Returns
+// ("", false) when the callee cannot be resolved (e.g. dynamic function value
+// from a map or reflection).
+func calleeFQN(common *ssa.CallCommon) (string, bool) {
+	if common == nil {
+		return "", false
+	}
+	// Direct function call: value is *ssa.Function.
+	if fn, ok := common.Value.(*ssa.Function); ok {
+		return fn.String(), true
+	}
+	// Interface method call (invoke mode): IsInvoke() && Method != nil.
+	if common.IsInvoke() && common.Method != nil {
+		recv := common.Value.Type().String()
+		return fmt.Sprintf("(%s).%s", recv, common.Method.Name()), true
+	}
+	// Method call via bound method closure (MakeClosure).
+	if mc, ok := common.Value.(*ssa.MakeClosure); ok {
+		if fn, ok := mc.Fn.(*ssa.Function); ok {
+			return fn.String(), true
+		}
+	}
+	return "", false
 }
 
 // funcFile returns the project-relative file path where fn is defined,
