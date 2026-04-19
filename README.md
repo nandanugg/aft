@@ -29,126 +29,81 @@
 
 ## Get Started
 
-### Claude Code
+Pick your agent. Each install guide is collapsed below — expand only the one you use.
 
-Run the install script to set up AFT hooks for Claude Code:
+<details>
+<summary><strong>Claude Code</strong> — hook-based tool interception</summary>
+
+Run the install script:
 
 ```bash
 ./scripts/install-claude-hooks.sh
 ```
 
 This installs:
-- **Tool interception** — Read, Grep, Glob tools route through AFT for indexed performance
-- **CLI wrapper** — `aft` command for semantic commands (outline, zoom, call_tree, callers, etc.)
-- **Instructions** — Claude learns when to use AFT commands for context savings
+- **Tool interception hooks** — `Grep` and `Glob` route through AFT for indexed performance; a first-call discovery gate nudges Claude toward semantic tools before raw `Read`/`Search`.
+- **CLI wrapper** — the `aft` command is placed on `PATH` for shell use (`aft outline src/`, `aft zoom file sym`, etc.).
+- **Session reminder** — a `SessionStart` hook injects AFT's code-discovery protocol at the top of every session.
+- **Instructions** — `~/.claude/AFT.md` is added to the global `CLAUDE.md` include chain.
 
-After installation, restart Claude Code. Then use semantic commands via Bash:
+After install, restart Claude Code. See the [Tool Reference](#tool-reference) for every command.
 
-```bash
-aft outline src/              # File structure (~10% of full read tokens)
-aft zoom main.go main         # Inspect function with call graph
-aft callers api.ts handler    # Find all callers
-aft call_tree service.ts run  # What does run() call?
-```
-
-<details>
-<summary>Uninstall</summary>
+**Uninstall:**
 
 ```bash
 ./scripts/uninstall-claude-hooks.sh
 ```
+
 </details>
 
----
+<details>
+<summary><strong>Codex</strong> — prompt-injection guidance hooks</summary>
 
-### Codex
-
-Run the install script to set up AFT guidance hooks for Codex:
+Run the install script:
 
 ```bash
 ./scripts/install-codex-hooks.sh
 ```
 
 This installs:
-- **Prompt hooks** — Session-start and prompt-submit hooks inject AFT guidance into Codex
-- **CLI wrapper** — `aft` command for semantic commands (outline, zoom, call_tree, callers, etc.)
-- **Instructions** — `~/.codex/AFT.md` is added to your global Codex `AGENTS.md`
-- **Codex config** — `~/.codex/config.toml` is updated to enable `codex_hooks` and suppress the unstable-feature warning
+- **SessionStart hook** — injects AFT's code-discovery protocol at session start.
+- **UserPromptSubmit hook** — nudges the agent toward the right semantic command based on the prompt shape.
+- **CLI wrapper** — `aft` command for shell use.
+- **Instructions** — `~/.codex/AFT.md` is added to the global `AGENTS.md` include chain.
+- **Codex config** — `~/.codex/config.toml` gains `codex_hooks = true` and suppresses the unstable-feature warning.
 
-Codex hooks currently do **not** replace Codex's native non-Bash file tools, so this integration
-teaches Codex when to call `aft` explicitly via shell instead of transparently intercepting
-Read/Grep/Glob.
+Codex hooks currently do **not** replace its non-Bash file tools, so this integration teaches
+Codex when to call `aft` explicitly via shell rather than transparently intercepting `Read`/`Grep`.
 
-After installation, restart Codex. Then use semantic commands via shell:
+After install, restart Codex. See the [Tool Reference](#tool-reference) for every command.
 
-```bash
-aft outline src/              # File structure (~10% of full read tokens)
-aft zoom main.go main         # Inspect function with call graph
-aft callers api.ts handler    # Find all callers
-aft call_tree service.ts run  # What does run() call?
-```
-
-<details>
-<summary>Uninstall</summary>
+**Uninstall:**
 
 ```bash
 ./scripts/uninstall-codex-hooks.sh
 ```
+
 </details>
 
----
+<details>
+<summary><strong>OpenCode</strong> — not published for this fork</summary>
 
+The OpenCode integration lives as an npm package. **This fork has not published an OpenCode
+package**, so the plugin-based OpenCode install path is not available here.
 
-### OpenCode
-
-Run the setup wizard — it registers AFT in your OpenCode and TUI config and asks which experimental features to enable:
+If you want AFT inside OpenCode *without* the fork's accuracy features (dispatch edges,
+implementation edges, control-flow context, similarity stack, etc.), install the upstream
+[cortexkit/aft](https://github.com/cortexkit/aft) OpenCode package:
 
 ```bash
 bunx @cortexkit/aft-opencode@latest setup
 ```
 
-That's it. On the next session start, the binary downloads if needed and all tools become
-available. AFT replaces opencode's built-in `read`, `write`, `edit`, `apply_patch`,
-`ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` with enhanced versions — all
-powered natively by AFT — plus adds the `aft_` family of semantic tools on top.
+That gets you upstream AFT's OpenCode integration, with none of this fork's additions. If you
+want this fork's features in OpenCode, either use Claude Code / Codex instead, or let us know
+via an issue so publishing priority can go up.
 
-<details>
-<summary>Manual install</summary>
-
-If you prefer to edit your config by hand:
-
-```
-opencode plugin --global @cortexkit/aft-opencode@latest
-```
-
-or
-
-```json
-// ~/.config/opencode/config.json
-{
-  "plugin": ["@cortexkit/aft-opencode@latest"]
-}
-```
 </details>
-
-### CLI Commands
-
-AFT ships a standalone CLI for setup, diagnostics, and issue reporting:
-
-| Command | What it does |
-|---|---|
-| `bunx @cortexkit/aft-opencode@latest setup` | Interactive first-time setup — registers plugin entries, enables experimental features |
-| `bunx @cortexkit/aft-opencode@latest doctor` | Check configuration and auto-fix common issues |
-| `bunx @cortexkit/aft-opencode@latest doctor --force` | Force-clear the OpenCode plugin cache (fixes stale `@latest` resolution) |
-| `bunx @cortexkit/aft-opencode@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
-
-**`setup`** — Interactive wizard that registers AFT in your OpenCode and TUI config, asks whether to enable `experimental_search_index` and `experimental_semantic_search`, and writes the result to `~/.config/opencode/aft.jsonc`. Run this once after installing.
-
-**`doctor`** — Checks everything that can go wrong: OpenCode install, plugin registration, plugin cache version, binary cache, config parse errors, ONNX Runtime availability (for semantic search), storage directory sizes, and log file status. Auto-fixes missing plugin entries and outdated plugin caches.
-
-**`doctor --force`** — Same as `doctor` but always clears the OpenCode plugin cache, forcing a fresh download of the latest plugin version. Use this when you're on an old version and `@latest` doesn't seem to update (OpenCode caches npm packages aggressively).
-
-**`doctor --issue`** — Collects a full diagnostic report, sanitizes your username and home path out of the logs, and opens a pre-filled GitHub issue on [cortexkit/aft](https://github.com/cortexkit/aft/issues). If you have `gh` installed, it submits directly; otherwise it writes the report to `./aft-issue-<timestamp>.md` and opens the GitHub new-issue page in your browser so you can paste it in.
 
 ---
 
@@ -182,118 +137,192 @@ real codebase — a production Go service with 473 files and ~10k symbols.
 summary AND the real code sided with the agent. Higher is better — the tool is helping the
 agent trust current code over stale priors.
 
-### What this fork adds beyond upstream
+### What this fork adds
 
-**New semantic commands:**
-- `aft dispatched_by <file> <symbol>` — reverse lookup: which call sites pass this function as a handler?
-- `aft dispatches <key> [--prefix]` — forward lookup: what handler is registered under this dispatch key?
-- `aft implementations <file> <interface>` — which concrete types satisfy this interface? (mock-filtered by default)
-- `aft writers <file> <var>` — who writes to this package-level variable across package boundaries?
-- `aft similar <file> <symbol> [--top=N] [--dict] [--explain]` — semantically similar symbols, no embeddings required.
+Each new command follows the standard `[desc] / [input] / [output]` shape. Full parameters and
+every output field live in [Tool Reference](#tool-reference); the blurbs here show typical
+shape. Fork-only additions are linked individually:
 
-**New edge types and structural data (surfaced via the Go helper's SSA + CHA passes):**
-- **Dispatch edges** (`kind: "dispatches"`) — function-value arguments, with `dispatched_via`
-  FQN of the receiving call and constant-resolved `nearby_string` keys. Catches
-  `asynq.HandleFunc(string(TypeX), handler)`-style patterns that upstream misses entirely.
-- **Goroutine and defer edges** — `go fn()` and `defer fn()` as distinct edge kinds.
-- **Interface implementation edges** (`kind: "implements"`) — explicit interface→concrete
-  relationships independent of call sites. Works across same-file pairs (upstream filtered these
-  out, incorrectly assuming tree-sitter resolved them — it can't, Go's implements-relation is
-  structural).
-- **Package-level variable and constant nodes** — first-class outline symbols with cross-package
-  write-site tracking.
-- **Call-context annotations** — every edge tagged with `in_defer`, `in_goroutine`, `in_loop`,
-  `in_error_branch`, and `branch_depth`. Derived from SSA dominator analysis, not grep heuristics.
-- **Per-return path-condition analysis** — `aft zoom` output includes the conditions under which
-  each `return` statement fires, so agents can write accurate descriptions of retry / error semantics
-  without guessing.
+- [`aft dispatched_by`](#aft-dispatched_by) — reverse lookup: who registered this as a handler?
+- [`aft dispatches`](#aft-dispatches) — forward lookup by dispatch key to its handler.
+- [`aft implementations`](#aft-implementations) — which concrete types satisfy an interface?
+- [`aft writers`](#aft-writers) — cross-package writers to a package-level variable.
+- [`aft similar`](#aft-similar) — semantically-similar symbols, dict-based, no embeddings.
 
-**Performance & persistence:**
-- **Persistent merged-graph cache** — CBOR-encoded per-file (mtime, size) cache plus a merged
-  project-level graph. Warm runs on a 1000-file Go project land in ~50 ms vs ~1.8 s cold.
-- **Similarity index** — identifier tokens + Snowball stemming + project-wide TF-IDF + optional
-  project synonym dict (`.aft/synonyms.toml`) + call-graph co-citation. Disk-cached; query
-  latency under 10 ms on 10k symbols.
+#### `aft dispatched_by` (preview)
 
-**Steering-layer changes (Claude Code integration):**
-- **SessionStart reminder hook** — injects an AFT code-discovery protocol at the top of every
-  session. Explicitly biases the agent toward AFT's semantic tools before raw Grep/Glob/Read,
-  and toward trusting the current code over stale prior knowledge.
+**desc.** Reverse lookup on dispatch edges. Given a handler function, returns every call site
+that passed it as a function-value argument, along with the FQN of the receiving call (so the
+caller can tell `asynq.HandleFunc` from `redis.Set` from `logger.With`) and the dispatch key
+string when one is present.
+
+**input.**
+
+```bash
+aft dispatched_by server/asynq_handler.go HandleMerchantSettlementTask
+```
+
+**output.**
+
+```
+dispatched_by HandleMerchantSettlementTask (server/asynq_handler.go)  total=1
+  - startAsyncQueueServer (server/asynq_server.go:69)
+      key=merchant_settlement:merchant_id
+      via (*github.com/hibiken/asynq.ServeMux).HandleFunc
+```
+
+Full parameters & JSON schema: [Tool Reference ▸ `aft dispatched_by`](#aft-dispatched_by).
+
+#### `aft implementations` (preview)
+
+**desc.** Which concrete types satisfy this interface. Covers same-package / same-file pairs
+(upstream dropped these on a flawed tree-sitter assumption). Mock directories filtered by
+default; pass `--include-mocks` to see them.
+
+**input.**
+
+```bash
+aft implementations store/settlement_store.go SettlementStorer
+```
+
+**output.**
+
+```
+implementations of SettlementStorer (store/settlement_store.go)  total=1
+  *store.settlementStore  (store):
+    - Create (store/settlement_store.go:125)
+    - FindOrCreate (store/settlement_store.go:501)
+    - ListByMerchantID (store/settlement_store.go:251)
+    ... 40 more methods
+```
+
+Full params: [Tool Reference ▸ `aft implementations`](#aft-implementations).
+
+#### `aft similar` (preview)
+
+**desc.** Semantically similar symbols computed from identifier tokens (camelCase split +
+Snowball stem + project TF-IDF + optional synonym dict + call-graph co-citation). No embedding
+model; explainable rankings.
+
+**input.**
+
+```bash
+aft similar merchant_settlement/service.go SettleMerchantSettlement --top=3 --explain
+```
+
+**output.** (abbreviated)
+
+```json
+{
+  "query": {"file": "merchant_settlement/service.go", "symbol": "SettleMerchantSettlement"},
+  "matches": [
+    {"file": "early_settlement/service.go",    "symbol": "processEarlySettlementV3", "score": 0.72},
+    {"file": "merchant_settlement/service.go", "symbol": "OnHoldMerchantSettlement", "score": 0.68},
+    {"file": "realtime_settlement/service.go", "symbol": "settleRealtime",           "score": 0.64}
+  ]
+}
+```
+
+With `--explain` each match includes a `breakdown` object listing the matching stem tokens with
+their TF-IDF contributions and the shared callees driving co-citation. Full params & field-level
+output: [Tool Reference ▸ `aft similar`](#aft-similar).
+
+`dispatches` and `writers` follow the same two-field (`desc / input / output`) shape — see their
+entries in the Tool Reference.
+
+### New structural data the agent gets for free
+
+Every existing command (`aft callers`, `aft call_tree`, `aft trace_to`, `aft zoom`) returns
+richer output on this fork without any new command surface:
+
+- **Dispatch / goroutine / defer edge kinds** — call-graph results now distinguish direct calls
+  from `go fn()`, `defer fn()`, and function-value registrations.
+- **Constant-resolved `nearby_string`** — when a dispatch key is `string(pkg.TypedConst)`, the
+  resolved literal shows up in results instead of being silently dropped.
+- **Dispatched-via FQN** — every registration edge carries the receiving call's qualified name.
+- **Call-context flags** — every caller edge is annotated with `in_defer`, `in_goroutine`,
+  `in_loop`, `in_error_branch`, and a `branch_depth`. Derived from SSA dominator analysis.
+- **Per-return path conditions** — `aft zoom <file> <func>` now includes a `returns` block
+  showing each return statement's path condition (the conjunction of dominating ifs) and the
+  returned expression. Critical for documenting retry/error semantics without guessing.
+- **Package-level var / const nodes** — show up in `aft outline` as first-class symbols;
+  `aft callers` resolves cross-package writes to them.
+- **Persistent merged-graph cache** — second invocation on the same tree is ~30× faster. CBOR
+  mtime index; no daemon; no behavior change at the agent level, just warm-start latency.
+- **Closure-to-handler resolution** — anonymous registration lambdas
+  (`mux.HandleFunc("X", func(...) { return Handler(...) })`) resolve through to the inner
+  named handler when there's exactly one in-project call in the body. This alone closes the
+  async-dispatch accuracy gap measured in the study.
+
+### Steering-layer changes (Claude Code)
+
+- **SessionStart reminder** — injects an AFT code-discovery protocol into every session.
+  Biases the agent toward structural tools before raw `Grep`/`Glob`/`Read`, and toward trusting
+  the current code over stale prior knowledge.
 - **PreToolUse discovery gate** — blocks the *first* raw `Grep|Glob|Read|Search` of a session
   with a nudge toward `aft outline` / `aft trace_to` / `aft callers`. One-shot per session;
-  subsequent calls pass through.
-
-### Single-shot closure resolution
-
-A particularly important refinement: when a Go codebase uses anonymous-lambda handler registration —
-`mux.HandleFunc("TypeX", func(ctx, task) error { return HandleXTask(ctx, task) })` — upstream AFT
-filters those closures and emits nothing. This fork detects the "single in-project call in the
-closure body" pattern and resolves through to the real handler, which recovered most of the
-measured accuracy gap on async dispatch documentation.
+  subsequent calls pass through unmolested.
 
 ### Design docs and reproduction
 
 Each feature has a design doc under `docs/DESIGN-*.md` with the SSA mechanics, filter rules,
-performance budget, and rollout strategy. The comparison study's raw outputs and verification
-data are kept in a sibling directory (`../aft-compare/results/` in the reference setup) — the
-Dockerfiles and run scripts are preserved if you want to reproduce against a different codebase.
+performance budget, and rollout strategy:
 
-Upstream cortexkit/aft remains the source of everything structural about AFT's architecture
-(tree-sitter parser, edit primitives, OpenCode/Codex integration, etc.). This fork contributes
-the extensions above and the accuracy-centered measurement work. Features may or may not be
-accepted upstream; this fork exists regardless.
+- [DESIGN-dispatch-edges.md](docs/DESIGN-dispatch-edges.md) — dispatch, goroutine, defer edges.
+- [DESIGN-call-site-provenance.md](docs/DESIGN-call-site-provenance.md) — `dispatched_via` FQN + typed-constant resolution.
+- [DESIGN-interface-edges.md](docs/DESIGN-interface-edges.md) — `aft implementations` + implements edges.
+- [DESIGN-variable-nodes.md](docs/DESIGN-variable-nodes.md) — var/const outline + cross-package writes.
+- [DESIGN-control-flow-context.md](docs/DESIGN-control-flow-context.md) — call-context flags + per-return path conditions.
+- [DESIGN-similarity.md](docs/DESIGN-similarity.md) — tokenize / stem / TF-IDF / synonym dict / co-citation.
+- [DESIGN-persistent-graph.md](docs/DESIGN-persistent-graph.md) — CBOR cache + incremental updates.
+
+Upstream cortexkit/aft remains the source of everything structural about AFT's core
+architecture (tree-sitter parser, edit primitives, Codex integration, etc.). This fork
+contributes the extensions above and the accuracy-centered measurement work. Features may or
+may not be accepted upstream; this fork stands regardless.
 
 ---
 
 ## What is AFT?
 
-AI coding agents are fast, but their interaction with code is often blunt. The typical pattern:
-read an entire file to find one function, construct a diff from memory, apply it by line number,
-and hope nothing shifted. Tokens burned on context noise. Edits that break when the file changes.
-Navigation that requires reading three files to answer "what calls this?"
+AFT addresses code by what it *is* — a function, a class, a call site, a symbol — rather than
+by line number. It's a two-component system: a Rust binary that does parsing, analysis, edits,
+and formatting on top of tree-sitter concrete syntax trees; and a set of agent integrations
+(Claude Code hooks, Codex prompt hooks, OpenCode plugin) that expose those operations as tool
+calls. Every operation is symbol-aware by default, which makes agent edits stable against
+unrelated line shifts and cuts token usage sharply — a file outline is ~10 % of a full read,
+and `zoom` on a single function skips everything else.
 
-AFT is a toolkit built on top of tree-sitter's concrete syntax trees. Every operation addresses
-code by what it *is* — a function, a class, a call site, a symbol — not by where it happens to
-sit in a file right now. Agents can outline a file's structure in one call, zoom into a single
-function, edit it by name, then follow its callers across the workspace. All without reading a
-single line they don't need.
-
-AFT **hoists** itself into opencode's built-in tool slots. The `read`, `write`, `edit`,
-`apply_patch`, `ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics` tools are replaced
-by AFT-enhanced versions — same names the agent already knows, but now backed by the Rust binary
-for backups, formatting, inline diagnostics, and symbol-aware operations. With the experimental
-search index enabled, `grep` and `glob` are also hoisted with a trigram index for sub-millisecond
-search on any project size.
-
-The toolkit is a two-component system: a Rust binary that does the heavy lifting (parsing,
-analysis, edits, formatting) and a TypeScript plugin that integrates with OpenCode. The binary
-ships pre-built for all major platforms and downloads automatically on first use — no install
-ceremony required.
+Details on how each operation is structured live in [**Tool Reference**](#tool-reference).
 
 ---
 
 ## How it Helps Agents
 
-**The token problem.** A 500-line file costs ~375 tokens to read. Most of the time, the agent
-needs one function. `aft_zoom` with a `symbol` param returns that function plus a few lines of
-context: ~40 tokens. Over a multi-step task, the savings compound fast.
+Three pain points agents hit every session:
 
-**The fragile-edit problem.** Line-number edits break the moment anything above the target moves.
-`edit` in symbol mode addresses the function by name. The agent writes the new body; AFT finds
-the symbol, replaces it, validates syntax, and runs the formatter. Nothing to count.
+- **Token blow-up** — reading whole files to find one function wastes context.
+- **Line-number fragility** — edits made by line break the moment something above them moves.
+- **Blind navigation** — "who calls this?" and "what does this break?" require grep + cross-file reads.
 
-**The navigation problem.** "Where is this function called?" means grep or reading every importer.
-`aft_navigate` with `callers` mode returns every call site across the workspace in one round trip.
-`impact` mode goes further: it tells the agent what else breaks if that function's signature changes.
+Each of the tools below solves one. Full parameter list + every output field is in
+[Tool Reference](#tool-reference); this section picks a flagship subset and shows the `[desc] / [input] / [output]` shape that repeats across every AFT tool.
 
-Here's a typical agent workflow:
+---
 
-**1. Get the file structure:**
+#### `aft_outline`
+
+**desc.** Structural outline of a file, files, or directory. Returns every top-level symbol
+(functions, classes, types, vars) with kind, visibility, signature, and line range — no bodies.
+Typically 10 % of the tokens a full `read` costs on the same file.
+
+**input.**
 
 ```json
-// aft_outline
 { "filePath": "src/auth/session.ts" }
 ```
+
+**output.**
 
 ```
 src/auth/session.ts
@@ -305,20 +334,28 @@ src/auth/session.ts
   E var   SESSION_TTL 3:3
 ```
 
-**2. Zoom into the specific function:**
+`E` = exported, `-` = private. Kinds: `fn`, `class`, `type`, `var`, `const`, etc.
+
+---
+
+#### `aft_zoom`
+
+**desc.** Read a single symbol with call-graph annotations. Shows the body, who it calls out to,
+and who calls it in — in one request, instead of three separate `read` + `grep` sequences.
+
+**input.**
 
 ```json
-// aft_zoom
 { "filePath": "src/auth/session.ts", "symbol": "validateToken" }
 ```
+
+**output.**
 
 ```
 src/auth/session.ts:40-52
   calls_out: verifyJwt (src/auth/jwt.ts:8), isExpired (src/auth/utils.ts:15)
   called_by: authMiddleware (src/middleware/auth.ts:22), handleLogin (src/routes/login.ts:45)
 
-  37: // --- context_before ---
-  38:
   39: /** Validate a JWT token and check expiration. */
   40: export function validateToken(token: string): boolean {
   41:   if (!token) return false;
@@ -326,15 +363,19 @@ src/auth/session.ts:40-52
   43:   if (!decoded) return false;
   44:   return !isExpired(decoded.exp);
   45: }
-  46:
-  47: // --- context_after ---
-  48: export function refreshSession(sessionId: string): Promise<Session> {
 ```
 
-**3. Edit it by name:**
+---
+
+#### `edit` (symbol mode)
+
+**desc.** Replace a named symbol in-place. AFT finds the symbol's AST node, swaps the body, runs
+the language's formatter, validates the parse, and writes a backup. No line counting, no diff
+that breaks when something above it shifts.
+
+**input.**
 
 ```json
-// edit
 {
   "filePath": "src/auth/session.ts",
   "symbol": "validateToken",
@@ -342,12 +383,47 @@ src/auth/session.ts:40-52
 }
 ```
 
-**4. Check who calls it before changing its signature:**
+**output.** The file is rewritten; the response carries the diff summary:
+
+```
+edit ok: src/auth/session.ts
+  symbol: validateToken  (lines 40-52 → 40-43, -8 +3)
+  formatter: biome (applied)
+  diagnostics: 0 errors, 0 warnings
+  backup: .aft/backups/src/auth/session.ts.bak.20260419-063312
+```
+
+---
+
+#### `aft_navigate` (callers / impact modes)
+
+**desc.** Workspace-wide call-graph lookup. `callers` mode returns every call site that lands on
+a symbol. `impact` mode walks the transitive reverse graph and lists what would need to change
+if the target's signature changed.
+
+**input.**
 
 ```json
-// aft_navigate
 { "op": "callers", "filePath": "src/auth/session.ts", "symbol": "validateToken", "depth": 2 }
 ```
+
+**output.**
+
+```
+callers of validateToken (src/auth/session.ts)  total=3 files=3
+  src/middleware/auth.ts (1):
+    - authMiddleware:22
+  src/routes/login.ts (1):
+    - handleLogin:45
+  src/routes/api.ts (1):
+    - requireAuth:17  ← (depth=2, via authMiddleware)
+```
+
+---
+
+Same four-line structure (`desc / input / output`, plus notes) applies to every tool in
+[Tool Reference](#tool-reference), including fork-only additions like `dispatched_by`,
+`dispatches`, `implementations`, `writers`, and `similar`.
 
 ---
 
@@ -477,12 +553,25 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_transform` | Structural code transforms (members, derives, decorators) | `op`, `filePath`, `container`, `target` |
 | `aft_refactor` | Workspace-wide move, extract, inline | `op`, `filePath`, `symbol`, `destination` |
 
+**Fork-only commands (CLI):**
+
+| Command | Description |
+|---------|-------------|
+| `aft dispatched_by` | Reverse lookup: who registered this function as a dispatch handler? |
+| `aft dispatches` | Forward lookup: what handler is registered under this dispatch key? |
+| `aft implementations` | Which concrete types satisfy this interface? |
+| `aft writers` | Cross-package write-sites for a package-level variable or constant |
+| `aft similar` | Semantically similar symbols ranked by TF-IDF + call-graph co-citation |
+
 ---
 
 ### read
 
-Plain file reading and directory listing. Pass `filePath` to read a file, or a directory path to
-list its entries. Paginate large files with `startLine`/`endLine` or `offset`/`limit`.
+**desc.** Plain file reading and directory listing. Pass `filePath` to read a file or a directory
+path to list its entries. Paginate large files with `startLine`/`endLine` or `offset`/`limit`.
+Binary, image, and PDF files are detected automatically and return metadata rather than raw bytes.
+
+**input.** JSON object — `filePath` required; pagination params optional:
 
 ```json
 // Read full file
@@ -498,59 +587,63 @@ list its entries. Paginate large files with `startLine`/`endLine` or `offset`/`l
 { "filePath": "src/" }
 ```
 
-Returns line-numbered content (e.g. `1: const x = 1`). Directories return sorted entries with
-trailing `/` for subdirectories. Binary files return a size-only message. Image and PDF files
-return metadata suitable for UI preview. Output is capped at 50KB.
+**output.** Line-numbered content, one line per entry:
 
-For symbol inspection with call-graph annotations, use `aft_zoom`.
+```
+   1: import { createApp } from "./app"
+   2:
+   3: const server = createApp()
+   4: server.listen(3000)
+```
+
+Directories return sorted entries with trailing `/` for subdirectories. Output is capped at 50KB.
+For symbol inspection with call-graph annotations, use `aft_zoom` instead.
 
 ---
 
 ### write
 
-Write the full content of a file. Creates the file (and any missing parent directories) if it
-doesn't exist. Backs up any existing content before overwriting.
+**desc.** Write the full content of a file. Creates the file and any missing parent directories
+if they don't exist. Backs up any existing content before overwriting, and auto-formats using
+the project's configured formatter. Returns inline LSP diagnostics when type errors are introduced.
+
+**input.** JSON object with `filePath` and `content`:
 
 ```json
 { "filePath": "src/config.ts", "content": "export const TIMEOUT = 10000;\n" }
 ```
 
-Returns inline LSP diagnostics if type errors are introduced. Auto-formats using the project's
-configured formatter (biome, prettier, etc.).
+**output.** Confirmation with optional inline diagnostics:
 
-For partial edits (find/replace), use `edit` instead.
+```
+wrote src/config.ts (312 bytes)
+```
+
+For partial edits (find/replace or symbol replace), use `edit` instead.
 
 ---
 
 ### edit
 
-The main editing tool. Mode is determined by which parameters you pass:
+**desc.** The main editing tool. Supports four modes selected by the parameters you pass:
+find-and-replace (fuzzy 4-pass matching), symbol replace (by name), batch edits (atomic
+within a file), multi-file transaction (atomic with full rollback), and glob replace. All modes
+support `dryRun: true` and return inline LSP diagnostics when type errors are introduced.
 
-**Find and replace** — pass `filePath` + `oldString` + `newString`:
+**input.** JSON object — mode is determined by which fields are present:
 
 ```json
+// Find and replace (fuzzy matching, 4-pass)
 { "filePath": "src/config.ts", "oldString": "const TIMEOUT = 5000", "newString": "const TIMEOUT = 10000" }
-```
 
-Matching uses a 4-pass fuzzy fallback: exact match first, then trailing-whitespace trim, then
-both-ends trim, then Unicode normalization. Returns an error if multiple matches exist — use
-`occurrence: N` (0-indexed) to pick one, or `replaceAll: true` to replace all.
-
-**Symbol replace** — pass `filePath` + `symbol` + `content`:
-
-```json
+// Symbol replace (covers decorators, doc comments, attributes)
 {
   "filePath": "src/utils.ts",
   "symbol": "formatDate",
   "content": "export function formatDate(d: Date): string {\n  return d.toISOString().split('T')[0];\n}"
 }
-```
 
-Includes decorators, doc comments, and attributes in the replacement range.
-
-**Batch edits** — pass `filePath` + `edits` array. Atomic: all edits apply or none do.
-
-```json
+// Batch edits — atomic: all apply or none do
 {
   "filePath": "src/constants.ts",
   "edits": [
@@ -558,37 +651,37 @@ Includes decorators, doc comments, and attributes in the replacement range.
     { "startLine": 5, "endLine": 7, "content": "// updated header\n" }
   ]
 }
-```
 
-Set `content` to `""` to delete lines. Per-edit `occurrence` is supported.
-
-**Multi-file transaction** — pass `operations` array. Rolls back all files if any operation fails.
-
-```json
+// Multi-file transaction — rolls back all files on failure
 {
   "operations": [
     { "file": "a.ts", "command": "write", "content": "..." },
     { "file": "b.ts", "command": "edit_match", "match": "x", "replacement": "y" }
   ]
 }
-```
 
-**Glob replace** — use a glob as `filePath` with `replaceAll: true`:
-
-```json
+// Glob replace
 { "filePath": "src/**/*.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }
 ```
 
-All modes support `dryRun: true` to preview as a diff without modifying files. LSP diagnostics
-are returned automatically after every edit (unless `dryRun` is set) — if type errors are
-introduced, they appear inline in the response.
+**output.** Confirmation with diff summary; with `dryRun: true`, a unified diff:
+
+```
+edited src/config.ts (+1/-1)
+```
+
+If multiple matches exist for a find-and-replace, use `occurrence: N` (0-indexed) to target one
+or `replaceAll: true` to replace all occurrences. Set `content: ""` in a batch edit to delete lines.
 
 ---
 
 ### apply_patch
 
-Apply a multi-file patch using the `*** Begin Patch` format. Creates, updates, deletes, and
-renames files atomically — if any operation fails, all revert.
+**desc.** Apply a multi-file patch using the `*** Begin Patch` format. Creates, updates, deletes,
+and renames files atomically — if any operation fails, all changes revert. Context anchors use
+fuzzy matching to handle whitespace and Unicode differences.
+
+**input.** A `patchText` string in `*** Begin Patch` format:
 
 ```
 *** Begin Patch
@@ -603,52 +696,76 @@ renames files atomically — if any operation fails, all revert.
 *** End Patch
 ```
 
-Context anchors (`@@`) use fuzzy matching to handle whitespace and Unicode differences.
-Returns LSP diagnostics inline for any updated files that introduce type errors.
+**output.** Summary of files affected, with inline LSP diagnostics for any type errors introduced:
+
+```
+applied patch: 1 added, 1 updated, 1 deleted
+```
 
 ---
 
 ### ast_grep_search
 
-Search for structural code patterns using meta-variables. Patterns must be complete AST nodes.
+**desc.** Search for structural code patterns using ast-grep meta-variables. Patterns must be
+complete AST nodes — `$VAR` matches a single node, `$$$` matches multiple nodes (variadic). Returns
+matches with file, line, column, matched text, and captured variable values.
+
+**input.** JSON object with `pattern` and `lang`; optionally `paths[]`, `globs[]`, `contextLines`:
 
 ```json
 { "pattern": "console.log($MSG)", "lang": "typescript" }
 ```
 
-- `$VAR` matches a single AST node
-- `$$$` matches multiple nodes (variadic)
+**output.** Matches grouped by file with captured meta-variable values:
 
-Returns matches with file, line (1-based), column, matched text, and captured variable values.
-Add `contextLines: 3` to include surrounding lines.
-
-```json
-// Find all async functions in JS/TS
-{ "pattern": "async function $NAME($$$) { $$$ }", "lang": "typescript" }
 ```
+src/server.ts:42:5
+  console.log(req.method)
+  $MSG => req.method
+
+src/utils.ts:17:3
+  console.log("starting up")
+  $MSG => "starting up"
+
+Found 2 match(es) across 2 file(s).
+```
+
+Add `contextLines: 3` to include surrounding lines in each match.
 
 ---
 
 ### ast_grep_replace
 
-Replace structural code patterns across files. Applies changes by default — set `dryRun: true` to preview.
+**desc.** Replace structural code patterns across files using ast-grep. Meta-variables captured
+in `pattern` are available in `rewrite`. Applies changes by default (with backups); set
+`dryRun: true` to preview as unified diffs without writing any files.
+
+**input.** JSON object with `pattern`, `rewrite`, and `lang`; optional `dryRun`, `paths[]`, `globs[]`:
 
 ```json
 { "pattern": "console.log($MSG)", "rewrite": "logger.info($MSG)", "lang": "typescript" }
 ```
 
-Meta-variables captured in `pattern` are available in `rewrite`. Returns unified diffs per file
-in dry-run mode, or writes changes with backups when applied.
+**output.** Summary of files modified, or a diff per file in dry-run mode:
+
+```
+replaced 3 match(es) across 2 file(s)
+  src/server.ts (+1/-1)
+  src/utils.ts (+2/-2)
+```
 
 ---
 
 ### lsp_diagnostics
 
-Get errors, warnings, and hints from the language server. Lazily spawns the appropriate server
-(typescript-language-server, pyright, rust-analyzer, gopls) on first use.
+**desc.** Get errors, warnings, and hints from the language server for a file or directory.
+Lazily spawns the appropriate server (typescript-language-server, pyright, rust-analyzer, gopls)
+on first use; subsequent calls reuse the live server.
+
+**input.** JSON object — `filePath` or `directory`, optional `severity` and `waitMs`:
 
 ```json
-// Check a single file
+// Check a single file for errors only
 { "filePath": "src/api.ts", "severity": "error" }
 
 // Check all files in a directory
@@ -658,18 +775,27 @@ Get errors, warnings, and hints from the language server. Lazily spawns the appr
 { "filePath": "src/api.ts", "waitMs": 2000 }
 ```
 
-Returns `{ file, line, column, severity, message, code }` per diagnostic.
+**output.** One diagnostic per line as `{ file, line, column, severity, message, code }`:
+
+```json
+[
+  { "file": "src/api.ts", "line": 42, "column": 5, "severity": "error",
+    "message": "Type 'string' is not assignable to type 'number'", "code": 2322 },
+  { "file": "src/api.ts", "line": 67, "column": 12, "severity": "warning",
+    "message": "'result' is declared but never used", "code": 6133 }
+]
+```
 
 ---
 
 ### aft_outline
 
-Returns all top-level symbols in a file with their kind, name, line range, visibility, and nested
-`members` (methods in classes, sub-headings in Markdown). Accepts a single `filePath`, a `files`
-array, or a `directory` to outline all source files recursively.
+**desc.** Returns all top-level symbols in a file with their kind, name, line range, visibility,
+and nested `members` (methods in classes, sub-headings in Markdown). Accepts a single `filePath`,
+a `files` array, or a `directory` to outline all source files recursively. For Markdown files
+(`.md`, `.mdx`), returns heading hierarchy with section ranges.
 
-For **Markdown** files (`.md`, `.mdx`): returns heading hierarchy with section ranges — each
-heading becomes a symbol you can read by name.
+**input.** JSON object — one of `filePath`, `files[]`, or `directory`:
 
 ```json
 // Outline two files at once
@@ -679,15 +805,26 @@ heading becomes a symbol you can read by name.
 { "directory": "src/auth" }
 ```
 
+**output.** Symbols listed with kind, name, line range, and visibility:
+
+```
+src/server.ts
+  function  createApp          export  1:45
+  function  handleRequest      export  47:89
+  class     RequestContext             91:130
+    method  constructor                93:102
+    method  toJSON             export  104:110
+```
+
 ---
 
 ### aft_zoom
 
-Inspect code symbols with call-graph annotations. Returns the full source of named symbols with
-`calls_out` (what it calls) and `called_by` (what calls it) annotations.
+**desc.** Inspect a named symbol with full source and call-graph annotations. Returns the symbol's
+body alongside `calls_out` (what it calls) and `called_by` (who calls it). Use this when you need
+to understand a specific function, class, or type in detail rather than reading an entire file.
 
-Use this when you need to understand a specific function, class, or type in detail — not for
-reading entire files (use `read` for that).
+**input.** JSON object with `filePath` and `symbol` (or `symbols[]` for multiple):
 
 ```json
 // Inspect a single symbol
@@ -697,21 +834,43 @@ reading entire files (use `read` for that).
 { "filePath": "src/app.ts", "symbols": ["Config", "createApp"] }
 ```
 
+**output.** Symbol source annotated with callers and callees:
+
+```
+── handleRequest (function, export) src/app.ts:47-89 ──
+
+called_by:
+  createApp  src/app.ts:30
+  retryMiddleware  src/middleware.ts:12
+
+calls_out:
+  parseBody  src/utils.ts:8
+  sendResponse  src/utils.ts:44
+
+export async function handleRequest(req: Request): Promise<Response> {
+  const body = await parseBody(req)
+  ...
+}
+```
+
 For Markdown files, use the heading text as the symbol name (e.g. `"symbol": "Architecture"`).
 
 ---
 
 ### aft_conflicts
 
-Show all git merge conflicts across the repository in a single call. Auto-discovers conflicted
-files via `git ls-files --unmerged`, parses conflict markers, and returns line-numbered regions
-with 3 lines of surrounding context — the same format as `read` output.
+**desc.** Show all git merge conflicts across the repository in a single call. Auto-discovers
+conflicted files via `git ls-files --unmerged`, parses conflict markers, and returns line-numbered
+regions with 3 lines of surrounding context. When a `git merge` or `git rebase` produces conflicts,
+the plugin automatically appends a hint suggesting this tool.
+
+**input.** No parameters required:
 
 ```json
 {}
 ```
 
-No parameters required. Returns output like:
+**output.** All conflict regions across all conflicted files, grouped by file:
 
 ```
 9 files, 13 conflicts
@@ -731,26 +890,22 @@ No parameters required. Returns output like:
 
 Use `edit` with the full conflict block (including markers) as `oldString` to resolve each conflict.
 
-When a `git merge` or `git rebase` produces conflicts, the plugin automatically appends a hint
-suggesting `aft_conflicts` to the bash output.
-
 ---
 
 ### grep *(experimental)*
 
-Trigram-indexed regex search that hoists opencode's built-in `grep`. Requires
-`experimental_search_index: true` in config. The trigram index is built in a background thread
-at session start, persisted to disk for fast cold starts, and kept fresh via file watcher.
-Falls back to direct file scanning when the index isn't ready.
+**desc.** Trigram-indexed regex search that hoists opencode's built-in `grep`. The index is
+built in a background thread at session start, persisted to disk for fast cold starts, and kept
+fresh via file watcher. Falls back to direct ripgrep scanning for out-of-project paths or when
+the index is not yet ready. Requires `experimental_search_index: true` in config.
 
-For out-of-project paths, shells out to ripgrep matching opencode's exact flags.
+**input.** JSON object with `pattern` required; `path`, `include`, `exclude`, `case_sensitive` optional:
 
 ```json
 { "pattern": "handleRequest", "include": "*.ts" }
 ```
 
-Returns matches grouped by file with relative paths, sorted by modification time (newest first),
-capped at 100 matches:
+**output.** Matches grouped by file, sorted by modification time (newest first), capped at 100:
 
 ```
 src/server.ts
@@ -766,22 +921,21 @@ Found 3 match(es) across 2 file(s). [index: ready]
 Files with more than 5 matches show the first 5 and `... and N more matches`. Lines are truncated
 at 200 characters.
 
-Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path),
-`include` (glob filter, e.g. `"*.ts"`), `exclude` (negate glob), `case_sensitive` (default true).
-
 ---
 
 ### glob *(experimental)*
 
-Indexed file discovery that hoists opencode's built-in `glob`. Requires
-`experimental_search_index: true`. Returns absolute paths sorted by modification time,
-capped at 100 files.
+**desc.** Indexed file discovery that hoists opencode's built-in `glob`. Requires
+`experimental_search_index: true`. Returns relative paths sorted by modification time, capped
+at 100 files. Small result sets are listed flat; larger sets (>20 files) are grouped by directory.
+
+**input.** JSON object with `pattern` required; optional `path` to scope to a subdirectory:
 
 ```json
 { "pattern": "**/*.test.ts" }
 ```
 
-Returns relative paths. For small result sets, a flat list:
+**output.** Flat list for small results, directory-grouped for larger ones:
 
 ```
 3 files matching **/*.test.ts
@@ -790,8 +944,6 @@ src/server.test.ts
 src/utils.test.ts
 src/auth/login.test.ts
 ```
-
-For larger result sets (>20 files), groups by directory:
 
 ```
 20 files matching **/*.test.ts
@@ -805,30 +957,22 @@ src/auth/ (4 files)
 ... and 8 more files in 3 directories
 ```
 
-Parameters: `pattern` (required), `path` (optional — scope to subdirectory or absolute path).
-
 ---
 
 ### aft_search *(experimental)*
 
-Semantic code search — find code by describing what it does in natural language. Requires
-`experimental_semantic_search: true` and [ONNX Runtime](https://onnxruntime.ai/) installed on the system.
-Uses a local embedding model (all-MiniLM-L6-v2, ~22MB, downloaded on first use) to embed all
-symbols in the project and match queries by cosine similarity. No API keys or external services needed.
+**desc.** Semantic code search — find code by describing what it does in natural language.
+Uses a local embedding model (all-MiniLM-L6-v2, ~22MB, downloaded on first use) with cosine
+similarity ranking. No API keys needed. Requires `experimental_semantic_search: true` and
+[ONNX Runtime](https://onnxruntime.ai/) installed (`brew install onnxruntime` on macOS).
 
-**Install ONNX Runtime:**
-- **macOS:** `brew install onnxruntime`
-- **Linux (Debian/Ubuntu):** `apt install libonnxruntime`
-- **Linux (other):** Download from [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases)
-- **Windows:** `winget install Microsoft.ONNXRuntime`
-
-Without ONNX Runtime, all other AFT tools work normally — only `aft_search` is unavailable.
+**input.** JSON object with `query` required; optional `topK` (default 10):
 
 ```json
 { "query": "authentication middleware that validates JWT tokens" }
 ```
 
-Returns ranked results with relevance scores and code snippets:
+**output.** Ranked results with relevance scores and code snippets:
 
 ```
 crates/aft/src/commands/configure.rs
@@ -846,50 +990,58 @@ Found 10 results [semantic index: ready]
 ```
 
 The index is built in a background thread at session start, persisted to disk for fast cold
-start, and uses cAST-style enrichment (file path + kind + name + signature + body snippet)
-for better embedding quality.
-
-Parameters: `query` (required — natural language description), `topK` (optional — default 10).
+start, and uses cAST-style enrichment (file path + kind + name + signature + body snippet).
+Without ONNX Runtime, all other AFT tools work normally — only `aft_search` is unavailable.
 
 ---
 
 ### aft_delete
 
-Delete a file with an in-memory backup. The backup survives for the session and can be restored
-via `aft_safety`.
+**desc.** Delete a file with an in-memory backup that survives for the session and can be
+restored via `aft_safety`. Only available in the `all` tool surface tier.
+
+**input.** JSON object with `filePath`:
 
 ```json
 { "filePath": "src/deprecated/old-utils.ts" }
 ```
 
-Returns `{ file, deleted, backup_id }` on success.
+**output.** Confirmation with backup reference:
+
+```json
+{ "file": "src/deprecated/old-utils.ts", "deleted": true, "backup_id": "bk_1a2b3c" }
+```
 
 ---
 
 ### aft_move
 
-Move or rename a file. Creates parent directories for the destination automatically. Falls back
-to copy+delete for cross-filesystem moves. Backs up the original before moving.
+**desc.** Move or rename a file. Creates parent directories for the destination automatically,
+falls back to copy+delete for cross-filesystem moves, and backs up the original before moving.
+Only available in the `all` tool surface tier.
+
+**input.** JSON object with `filePath` and `destination`:
 
 ```json
 { "filePath": "src/helpers.ts", "destination": "src/utils/helpers.ts" }
 ```
 
-Returns `{ file, destination, moved, backup_id }` on success.
+**output.** Confirmation with source, destination, and backup reference:
+
+```json
+{ "file": "src/helpers.ts", "destination": "src/utils/helpers.ts", "moved": true, "backup_id": "bk_4d5e6f" }
+```
 
 ---
 
 ### aft_navigate
 
-Call graph and data-flow analysis across the workspace.
+**desc.** Call graph and data-flow analysis across the workspace. Supports five modes: forward
+call tree, reverse callers, execution trace-to, impact analysis, and data-flow tracing. Only
+available in the `all` tool surface tier — in the `recommended` tier, use the CLI commands
+`aft call_tree`, `aft callers`, `aft trace_to`, `aft impact`, and `aft trace_data` instead.
 
-| Mode | What it does |
-|------|-------------|
-| `call_tree` | What does this function call? (forward, default depth 5) |
-| `callers` | Where is this function called from? (reverse, default depth 1) |
-| `trace_to` | How does execution reach this function from entry points? |
-| `impact` | What callers are affected if this function changes? |
-| `trace_data` | Follow a value through assignments and parameters. Needs `expression`. |
+**input.** JSON object with `op`, `filePath`, `symbol`, and optional `depth` or `expression`:
 
 ```json
 // Find everything that would break if processPayment changes
@@ -901,11 +1053,28 @@ Call graph and data-flow analysis across the workspace.
 }
 ```
 
+**output.** Call graph tree or flat list of affected symbols depending on `op`:
+
+```
+impact: processPayment  (src/payments/processor.ts)
+  chargeCard  src/payments/card.ts:22
+    createInvoice  src/billing/invoice.ts:88
+    sendReceipt  src/notifications/email.ts:14
+  refundPayment  src/payments/refund.ts:45
+```
+
+Ops: `call_tree` (forward, default depth 5), `callers` (reverse, default depth 1),
+`trace_to` (entry-point paths), `impact` (affected callers), `trace_data` (value flow, needs `expression`).
+
 ---
 
 ### aft_import
 
-Language-aware import management for TS, JS, TSX, Python, Rust, and Go.
+**desc.** Language-aware import management for TS, JS, TSX, Python, Rust, and Go. Supports
+adding named imports with auto-grouping and deduplication, removing a single named import,
+and re-sorting and deduplicating all imports by language convention.
+
+**input.** JSON object with `op`, `filePath`, and operation-specific fields:
 
 ```json
 // Add named imports with auto-grouping and deduplication
@@ -923,19 +1092,23 @@ Language-aware import management for TS, JS, TSX, Python, Rust, and Go.
 { "op": "organize", "filePath": "src/api.ts" }
 ```
 
+**output.** Confirmation with the resulting import line(s):
+
+```
+added to src/api.ts:
+  import { useState, useEffect } from "react"
+```
+
 ---
 
 ### aft_transform
 
-Scope-aware structural transformations that handle indentation correctly.
+**desc.** Scope-aware structural code transformations that handle indentation correctly. Supports
+adding class/struct members, Rust derive macros (with deduplication), TS/JS try/catch wrapping,
+Python decorators, and Go struct field tags. All ops support `dryRun` and `validate`. Only
+available in the `all` tool surface tier.
 
-| Op | Description |
-|----|-------------|
-| `add_member` | Insert a method or field into a class, struct, or impl block |
-| `add_derive` | Add Rust derive macros (deduplicates) |
-| `wrap_try_catch` | Wrap a TS/JS function body in try/catch |
-| `add_decorator` | Add a Python decorator to a function or class |
-| `add_struct_tags` | Add or update Go struct field tags |
+**input.** JSON object with `op`, `filePath`, and op-specific fields:
 
 ```json
 // Add a method to a TypeScript class
@@ -948,7 +1121,14 @@ Scope-aware structural transformations that handle indentation correctly.
 }
 ```
 
-All ops support `dryRun` and `validate` (`"syntax"` or `"full"`).
+**output.** Confirmation or diff (with `dryRun: true`):
+
+```
+transformed src/user.ts: added member deleteUser to UserService
+```
+
+Ops: `add_member`, `add_derive`, `wrap_try_catch`, `add_decorator`, `add_struct_tags`.
+Use `validate: "full"` to run the type checker after the transform.
 
 ---
 
@@ -998,6 +1178,165 @@ Backup and recovery for risky edits.
 
 > **Note:** Backups are held in-memory for the session lifetime (lost on restart). Per-file undo
 > stack is capped at 20 entries — oldest snapshots are evicted when exceeded.
+
+---
+
+### aft dispatched_by
+
+**desc.** Reverse lookup on dispatch edges. Given a handler function (a function passed as a
+value somewhere in the codebase — Kafka consumers, asynq handlers, HTTP handlers, gRPC service
+registrations), returns every call site that registered it, the dispatch key string if one is
+present, and the fully-qualified name of the receiving call so the agent can distinguish
+`asynq.HandleFunc` from `redis.Set` from `logger.With`. Fork-only; design:
+[DESIGN-call-site-provenance.md](docs/DESIGN-call-site-provenance.md).
+
+**input.** Shell form (CLI wrapper):
+
+```bash
+aft dispatched_by server/asynq_handler.go HandleMerchantSettlementTask
+```
+
+**output.** Plain-text summary followed by structured JSON when requested:
+
+```
+dispatched_by HandleMerchantSettlementTask (server/asynq_handler.go)  total=1
+  - startAsyncQueueServer (server/asynq_server.go:69)
+      key=merchant_settlement:merchant_id
+      via (*github.com/hibiken/asynq.ServeMux).HandleFunc
+```
+
+Returns empty ("no dispatch registrations found") when the function isn't passed as a value
+anywhere, or when the registration goes through a pattern the helper can't resolve (reflection,
+runtime map lookup, closure with multiple in-project calls).
+
+---
+
+### aft dispatches
+
+**desc.** Forward lookup by dispatch key. Given a string that appears as a dispatch-key argument
+somewhere in the codebase (asynq task type, HTTP route pattern, Kafka topic constant — whatever
+the library uses), returns the handler(s) registered under that key and the registrars. Use
+`--prefix` to match all keys starting with a given prefix. Fork-only; design:
+[DESIGN-call-site-provenance.md](docs/DESIGN-call-site-provenance.md).
+
+**input.**
+
+```bash
+aft dispatches "merchant_settlement:merchant_id"
+aft dispatches "merchant_settlement:" --prefix
+```
+
+**output.**
+
+```
+dispatches key=merchant_settlement:merchant_id  total=1
+  - HandleMerchantSettlementTask (server/asynq_handler.go)
+      registered by startAsyncQueueServer (server/asynq_server.go:69)
+      via (*github.com/hibiken/asynq.ServeMux).HandleFunc
+```
+
+With `--prefix`, returns one block per matched key.
+
+---
+
+### aft implementations
+
+**desc.** Which concrete types satisfy an interface. Works across any file boundary (same-package
+and same-file pairs included — upstream filters these out, incorrectly assuming tree-sitter
+resolves them; Go's implements-relation is structural and needs the type checker). Mock
+directories (`**/mocks/**`) and mock-receiver types (`*Mock*`) are filtered by default;
+`--include-mocks` shows them. Fork-only; design:
+[DESIGN-interface-edges.md](docs/DESIGN-interface-edges.md).
+
+**input.**
+
+```bash
+aft implementations store/settlement_store.go SettlementStorer
+aft implementations store/settlement_store.go SettlementStorer --include-mocks
+```
+
+**output.**
+
+```
+implementations of SettlementStorer (store/settlement_store.go)  total=1
+  *store.settlementStore  (store):
+    - Create (store/settlement_store.go:125)
+    - FindOrCreate (store/settlement_store.go:501)
+    - ListByMerchantID (store/settlement_store.go:251)
+    - BulkInsert (store/settlement_store.go:389)
+    ... 39 more methods
+```
+
+With `--include-mocks`, mock-generated receiver types (e.g. `*store.mocks.SettlementStorer`)
+appear alongside the real implementations.
+
+---
+
+### aft writers
+
+**desc.** Who writes to a package-level variable (or const) across package boundaries.
+Same-package writes are filtered by the helper (tree-sitter already sees them in a single
+`aft zoom` / file read). Captures init-function writes too — SSA renders `var X = fn()` as a
+write from the synthetic `init()`. Fork-only; design:
+[DESIGN-variable-nodes.md](docs/DESIGN-variable-nodes.md).
+
+**input.**
+
+```bash
+aft writers server/registry.go handlerRegistry
+```
+
+**output.**
+
+```
+writers handlerRegistry (server/registry.go)  total=2
+  server/asynq_server.go (1):
+    - startAsyncQueueServer:47
+  server/asynq_server.go (1):
+    - init:12
+```
+
+Returns `(no cross-package writers found)` when the variable is only written from within its
+own package — that's the common case for well-encapsulated Go code.
+
+---
+
+### aft similar
+
+**desc.** Semantically similar symbols. Computed from identifier tokens (camelCase/snake_case
+split, Snowball-stemmed), weighted by project-wide TF-IDF, optionally expanded through a
+project-local synonym dict (`.aft/synonyms.toml`), and combined with call-graph co-citation
+(fraction of shared callees). No embedding model, no neural inference, no model download.
+Explainable: `--explain` shows which tokens and shared callees drove each match's score.
+Fork-only; design: [DESIGN-similarity.md](docs/DESIGN-similarity.md).
+
+**input.**
+
+```bash
+aft similar merchant_settlement/service.go SettleMerchantSettlement --top=5
+aft similar merchant_settlement/service.go SettleMerchantSettlement --dict --explain
+```
+
+**output.** Default (abbreviated):
+
+```json
+{
+  "query": {"file": "merchant_settlement/service.go", "symbol": "SettleMerchantSettlement"},
+  "matches": [
+    {"file": "early_settlement/service.go",    "symbol": "processEarlySettlementV3", "score": 0.72},
+    {"file": "merchant_settlement/service.go", "symbol": "OnHoldMerchantSettlement", "score": 0.68},
+    {"file": "realtime_settlement/service.go", "symbol": "settleRealtime",           "score": 0.64}
+  ]
+}
+```
+
+With `--explain` each match gains a `breakdown` object listing the contributing stem tokens
+with per-token TF-IDF product, the dict synonym expansions that fired (if `--dict`), and the
+shared callees driving co-citation. Useful for debugging why two things ranked near each other
+and for explaining rankings in docs.
+
+Optional flags: `--top=N` (default 10), `--min-score=F` (default 0.15), `--dict` (load
+`.aft/synonyms.toml` if present), `--explain` (verbose scoring breakdown per match).
 
 ---
 
