@@ -1,10 +1,10 @@
-# DESIGN — Persistent merged graph + incremental updates (Tier 2)
+# ADR-0004: Persistent merged graph and incremental updates
 
-Status: design (not implemented)
-Scope: disk-backed cache for the reverse call index + helper output. Incremental updates keyed on per-file `(mtime, size)`.
-Builds on: the existing per-file parse cache plan (see `project_aft_disk_cache_plan` memory).
+## Status
 
-## Motivation
+Accepted — shipped in commit f8a7ac9.
+
+## Context
 
 Each `aft` CLI invocation today spawns a fresh Rust process that:
 1. Walks every project file.
@@ -18,16 +18,20 @@ Repeat invocations within the same editing session (very common for agents: ten 
 
 The fix is a disk cache keyed on content staleness, with separate invalidation rules for the two data sources (tree-sitter parse = per-file, helper output = per-project).
 
-## Design principles (binding)
+This doc also establishes the cache directory structure used by ADR-0005-similarity.md's similarity index.
+
+Binding design principles:
 
 1. **Correctness over cleverness.** If we can't prove a cache hit is valid, we rebuild. A spurious invalidation is fine; a stale hit that reports wrong call edges is a correctness regression.
 2. **Atomic writes.** Cache files update via `write(tmp); rename(tmp, final)`. No partial writes visible.
 3. **Corruption recovery.** Corrupted or version-mismatched cache files cause full rebuild, never a crash.
-4. **Separate staleness for parse cache vs helper cache.** Tree-sitter cache invalidates per-file; helper cache invalidates per-project (for now — see Open questions for per-package incremental helper).
+4. **Separate staleness for parse cache vs helper cache.** Tree-sitter cache invalidates per-file; helper cache invalidates per-project (for now).
 5. **Cache is an optimization, never a correctness dependency.** `--no-cache` flag forces fresh parse + fresh helper run. CI should default to `--no-cache`.
 6. **No background processes.** No daemons, no file watchers. Each invocation reads cache, checks staleness, uses or rebuilds. Keeps the "just a CLI tool" mental model.
 
-## Storage layout
+## Decision
+
+### Storage layout
 
 ```
 $CACHE_ROOT/                                      # default: ~/.cache/aft/
@@ -97,7 +101,7 @@ The derived data structure (reverse index, forward index, dispatch-key secondary
 
 Cache hit rule: both parse-index and helper-output hashes present and valid, and `merged-graph.cbor`'s embedded header matches.
 
-## Invalidation flow
+### Invalidation flow
 
 ```
 start of aft invocation
@@ -122,7 +126,7 @@ start of aft invocation
   └─ answer the query
 ```
 
-## Atomic write invariant
+### Atomic write invariant
 
 Every cache file update:
 
@@ -137,7 +141,7 @@ rename(&tmp, &final_path)?;
 - `rename` is atomic on same-filesystem (POSIX, ext4, apfs, zfs, tmpfs). Different filesystems would need `copy + rm`, not supported here (cache should live on the same FS as `$HOME`).
 - PID in tmp name avoids concurrent-aft-process collisions.
 
-## Corruption recovery
+### Corruption recovery
 
 Every read:
 - Parse errors → log warning, delete file, rebuild.
@@ -146,7 +150,7 @@ Every read:
 
 Never crash on cache read. Cache is always optional.
 
-## Concurrency
+### Concurrency
 
 Two `aft` processes running simultaneously against the same project:
 - Reading is safe (CBOR files are read-only).
@@ -155,63 +159,41 @@ Two `aft` processes running simultaneously against the same project:
 
 Explicit non-goal: **do not** build cross-process coordination (locks, PID files). Real multi-process use (CI, parallel agent runs) is rare enough that "both processes do the same work twice" is an acceptable cost.
 
-## Performance budget
-
-| Metric | Target | Rationale |
-|---|---|---|
-| Cold-start penalty (first run) | < 10% over no-cache | We do extra bookkeeping (compute hashes, write cache). |
-| Warm-start time (no file changes) | < 300ms | Load meta + stat files + mmap parse-index + mmap merged-graph. |
-| Single-file edit re-parse | < 100ms | Tree-sitter on one file + merged-graph patch. |
-| Single-file edit helper penalty | < 30s on 100KLoC project | Helper re-runs whole project. |
-| Cache disk footprint | < 100MB per project | 1000-file project averages 50–80MB with parse + helper + merged. |
-
-If the 300ms warm-start target is missed, the cache is not delivering its value — revisit.
-
-## Incremental helper (deferred, see Open questions)
-
-The hard question is whether the helper can run per-package instead of whole-project. SSA + CHA are global analyses (interface resolution crosses package boundaries). A true incremental helper would need to invalidate only *downstream* packages that import the changed package — tractable via Go's build graph, but non-trivial.
-
-**First implementation: full project re-run on any change.** This doc fixes the common case (repeat queries with no changes = fast). Incremental helper is a separate future design doc.
-
-## Rollout / feature flag
+### Rollout / feature flag
 
 - Rust: `[cache] enabled = true` config knob. Default `true`.
 - CLI: `--no-cache` forces cache-less run (useful for debugging, CI).
 - Env: `AFT_DISABLE_CACHE=1` as a kill switch.
 - Cache-version-bump procedure: increment `schema_version` in Rust source; all existing caches auto-invalidate.
 
-## Tests
+## Consequences
 
-1. **Round-trip**
-   - Build cache, re-open, verify all queries return identical results.
+### Positive consequences
 
-2. **Invalidation**
-   - Edit a file (touch mtime) → that file re-parses, others reused.
-   - Delete a file → entry removed from parse-index.
-   - Rename a file → old entry dropped, new entry parsed.
+- Warm runs (no file changes) target < 300ms, vs the previous multi-second cold start on every invocation. Goal is 10x+ speedup on warm runs.
+- Single-file edits reparse only that file (< 100ms tree-sitter reparse + merged-graph patch).
+- The cache format is future-proof: similarity index (ADR-0005) stores under the same `$CACHE_ROOT/<project-hash>/` directory.
+- Corruption is never fatal — worst case is a full cold rebuild.
+- CI can opt out cleanly with `--no-cache` / `AFT_DISABLE_CACHE=1`.
 
-3. **Corruption**
-   - Truncate parse-index mid-file → detected, rebuild, no crash.
-   - Zero-byte merged-graph → rebuild.
-   - meta.json with wrong schema_version → full cache discard.
+### Trade-offs
 
-4. **Concurrent access**
-   - Two `aft` processes invoked simultaneously → both succeed, no data loss, final state consistent.
+- Single-file edit still triggers a full helper re-run (< 30s on 100KLoC). The helper is a global analysis (SSA + CHA cross package boundaries); per-package incremental is tractable but non-trivial and deferred.
+- Cold-start penalty: < 10% over no-cache (extra bookkeeping to compute hashes and write cache files).
+- Cache disk footprint: < 100MB per project (1000-file project averages 50–80MB with parse + helper + merged).
 
-5. **Benchmark**
-   - `aft callers` on 1000-file Go project: cold vs warm timings.
-   - Target: warm run 10x+ faster than cold.
+### Open follow-ups
 
-## Open questions for the implementer
+1. **Incremental helper:** full project re-run on any change is the accepted behavior for the current implementation. A future design doc could address per-package helper invocation (e.g., helper accepts `-package=pkg1,pkg2` and only reruns those + downstream packages based on the build graph). This is a separate PR + design doc.
 
-1. **Cache format for `FileParse`:** the current in-memory representation may not be serde-friendly. If refactoring is required, keep the serialized form stable across aft versions that share `schema_version`. Bump `schema_version` on any change.
-
-2. **Incremental helper:** deferred explicitly. If an implementer finds a cheap path to per-package helper invocation (e.g., helper accepts `-package=pkg1,pkg2` and only reruns those + downstream), that's a separate PR + design doc, not this one.
+2. **Cache format for `FileParse`:** the current in-memory representation may not be serde-friendly. If refactoring is required, keep the serialized form stable across aft versions that share `schema_version`. Bump `schema_version` on any change.
 
 3. **Shared cache across projects:** if two projects share source files (rare but possible with git worktrees), each project has its own cache dir. No cross-project sharing. Simpler + safer.
 
-4. **`search_index` / `semantic_index` locations:** existing memory plan mentions these. Align the new caches with the same `$CACHE_ROOT/<project-hash>/` structure so there's one cache dir per project across all AFT features.
+4. **`search_index` / `semantic_index` locations:** align with the same `$CACHE_ROOT/<project-hash>/` structure so there's one cache dir per project across all AFT features.
 
-## Summary
+## Alternatives considered
 
-Adds `$CACHE_ROOT/<project-hash>/` with parse cache (CBOR, per-file keyed on mtime+size), helper output cache (JSON, keyed on file-list hash), and derived merged graph (CBOR). Atomic writes, corruption-safe, no daemons, no cross-process coordination. Target: warm runs 10x faster than cold. Full-project helper re-run on file changes is accepted for the first implementation; per-package incremental is a future design doc.
+**Background daemon / file watcher** was explicitly rejected. A daemon adds complexity (startup, crash recovery, IPC), requires process management, and changes the mental model from "just a CLI tool" to "a service." The polling approach (stat on each invocation) is fast enough at ~5–10ms for 1000 files.
+
+**Per-package helper cache** rather than whole-project was considered and deferred. SSA + CHA are global analyses; a true incremental helper would need to invalidate only downstream packages of the changed package — tractable via Go's build graph but non-trivial. The current implementation fixes the common case (repeat queries with no changes) without that complexity.

@@ -171,16 +171,16 @@ richer output on this fork without any new command surface:
 
 ### Design docs and reproduction
 
-Each feature has a design doc under `docs/DESIGN-*.md` with the SSA mechanics, filter rules,
+Each feature has a design doc under `docs/ADR-*.md` with the SSA mechanics, filter rules,
 performance budget, and rollout strategy:
 
-- [DESIGN-dispatch-edges.md](docs/DESIGN-dispatch-edges.md) — dispatch, goroutine, defer edges.
-- [DESIGN-call-site-provenance.md](docs/DESIGN-call-site-provenance.md) — `dispatched_via` FQN + typed-constant resolution.
-- [DESIGN-interface-edges.md](docs/DESIGN-interface-edges.md) — `aft implementations` + implements edges.
-- [DESIGN-variable-nodes.md](docs/DESIGN-variable-nodes.md) — var/const outline + cross-package writes.
-- [DESIGN-control-flow-context.md](docs/DESIGN-control-flow-context.md) — call-context flags + per-return path conditions.
-- [DESIGN-similarity.md](docs/DESIGN-similarity.md) — tokenize / stem / TF-IDF / synonym dict / co-citation.
-- [DESIGN-persistent-graph.md](docs/DESIGN-persistent-graph.md) — CBOR cache + incremental updates.
+- [ADR-0001-dispatch-edges.md](docs/ADR-0001-dispatch-edges.md) — dispatch, goroutine, defer edges.
+- [ADR-0006-call-site-provenance.md](docs/ADR-0006-call-site-provenance.md) — `dispatched_via` FQN + typed-constant resolution.
+- [ADR-0002-interface-edges.md](docs/ADR-0002-interface-edges.md) — `aft implementations` + implements edges.
+- [ADR-0003-variable-nodes.md](docs/ADR-0003-variable-nodes.md) — var/const outline + cross-package writes.
+- [ADR-0007-control-flow-context.md](docs/ADR-0007-control-flow-context.md) — call-context flags + per-return path conditions.
+- [ADR-0005-similarity.md](docs/ADR-0005-similarity.md) — tokenize / stem / TF-IDF / synonym dict / co-citation.
+- [ADR-0004-persistent-graph.md](docs/ADR-0004-persistent-graph.md) — CBOR cache + incremental updates.
 
 Upstream cortexkit/aft remains the source of everything structural about AFT's core
 architecture (tree-sitter parser, edit primitives, Codex integration, etc.). This fork
@@ -605,7 +605,7 @@ For content search, use `aft grep`; `aft glob` is for path-only queries.
 
 The commands below only exist in this fork. Each is grounded in SSA + CHA data the Go helper
 already computes. Full design docs for the semantics — filter rules, edge cases, performance
-budgets — live under `docs/DESIGN-*.md`.
+budgets — live under `docs/ADR-*.md`.
 
 #### aft dispatched_by
 
@@ -614,7 +614,7 @@ value to a call somewhere (asynq handlers, HTTP handlers, Kafka consumers, gRPC 
 — returns every call site that registered it, the dispatch key if one is present, and the
 fully qualified name of the receiving call. The FQN lets an agent tell `asynq.HandleFunc`
 apart from `redis.Set` or `logger.With` without a library catalog. See
-[DESIGN-call-site-provenance.md](docs/DESIGN-call-site-provenance.md).
+[ADR-0006-call-site-provenance.md](docs/ADR-0006-call-site-provenance.md).
 
 ```bash
 aft dispatched_by server/asynq_handler.go HandleMerchantSettlementTask
@@ -662,7 +662,7 @@ Which concrete types satisfy an interface. Works across same-package and same-fi
 upstream filters those, incorrectly assuming tree-sitter resolves them; Go's implements-relation
 is structural and needs the type checker. Mocks (paths under `**/mocks/**` and receivers
 containing `Mock`) are filtered by default; pass `--include-mocks` to see them. See
-[DESIGN-interface-edges.md](docs/DESIGN-interface-edges.md).
+[ADR-0002-interface-edges.md](docs/ADR-0002-interface-edges.md).
 
 ```bash
 aft implementations store/settlement_store.go SettlementStorer
@@ -688,7 +688,7 @@ With `--include-mocks`, generated mock receivers appear alongside the real imple
 Who writes to a package-level variable or constant, across package boundaries. Same-package
 writes are filtered at the helper — tree-sitter already sees those in a single file view.
 Init-function writes show up too (SSA models `var X = fn()` as a write from the synthetic
-`init()`). See [DESIGN-variable-nodes.md](docs/DESIGN-variable-nodes.md).
+`init()`). See [ADR-0003-variable-nodes.md](docs/ADR-0003-variable-nodes.md).
 
 ```bash
 aft writers server/registry.go handlerRegistry
@@ -713,7 +713,7 @@ Semantically similar symbols — without an embedding model. Scoring is the weig
 three signals: TF-IDF cosine over tokenized + stemmed identifiers, optional synonym-dict
 expansion (load from `.aft/synonyms.toml` at the project root), and call-graph co-citation
 (fraction of shared callees). Explainable: `--explain` shows which tokens and shared callees
-drove each match's score. See [DESIGN-similarity.md](docs/DESIGN-similarity.md).
+drove each match's score. See [ADR-0005-similarity.md](docs/ADR-0005-similarity.md).
 
 ```bash
 aft similar merchant_settlement/service.go SettleMerchantSettlement --top=5
@@ -839,13 +839,13 @@ aft/
 │   └── *_test.go
 ├── docs/
 │   ├── helper-contract.md            # Binding schema for helper ↔ Rust JSON
-│   ├── DESIGN-dispatch-edges.md      # Tier 1.1/1.2/1.3
-│   ├── DESIGN-interface-edges.md     # Tier 1.4
-│   ├── DESIGN-variable-nodes.md      # Tier 1.5
-│   ├── DESIGN-persistent-graph.md    # Tier 2 (warm cache)
-│   ├── DESIGN-similarity.md          # Tier 3 (aft similar)
-│   ├── DESIGN-call-site-provenance.md  # dispatched_via + const resolution
-│   └── DESIGN-control-flow-context.md  # caller flags + return-path conditions
+│   ├── ADR-0001-dispatch-edges.md      # Tier 1.1/1.2/1.3
+│   ├── ADR-0002-interface-edges.md     # Tier 1.4
+│   ├── ADR-0003-variable-nodes.md      # Tier 1.5
+│   ├── ADR-0004-persistent-graph.md    # Tier 2 (warm cache)
+│   ├── ADR-0005-similarity.md          # Tier 3 (aft similar)
+│   ├── ADR-0006-call-site-provenance.md  # dispatched_via + const resolution
+│   └── ADR-0007-control-flow-context.md  # caller flags + return-path conditions
 ├── templates/
 │   ├── claude/                # SessionStart reminder + PreToolUse discovery gate
 │   ├── codex/                 # SessionStart reminder + UserPromptSubmit guidance
@@ -864,7 +864,7 @@ aft/
 
 **Adding a new command:**
 
-1. Design doc first — write `docs/DESIGN-<feature>.md` covering schema, semantics,
+1. Design doc first — write `docs/ADR-NNNN-<feature>.md` covering schema, semantics,
    performance budget, and feature flag. Existing docs in `docs/` are the template.
 2. Helper side (if Go-specific): extend `go-helper/main.go`; add golden fixtures under
    `go-helper/testdata/<feature>/`; respect the filter-at-source rule in

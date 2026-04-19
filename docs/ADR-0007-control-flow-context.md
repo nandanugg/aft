@@ -1,14 +1,14 @@
-# DESIGN — Control-flow context annotations
+# ADR-0007: Control-flow context annotations
 
-Status: design (not implemented)
-Scope: Go helper primary; Rust passthrough; one new output field on `aft zoom`. No new commands.
-Builds on: [`DESIGN-dispatch-edges.md`](DESIGN-dispatch-edges.md), [`DESIGN-call-site-provenance.md`](DESIGN-call-site-provenance.md).
+## Status
 
-## Motivation
+Accepted — shipped in commit 8f9c240 (final fix) and 03e4bf1 (initial implementation).
+
+## Context
 
 Two categories of documentation failure trace back to the same root cause: the agent sees a call or a return statement but can't see the **conditional context** around it.
 
-Examples of things the agent currently gets wrong:
+Examples of things agents currently get wrong:
 
 - *"On every request, the system fetches the merchant."* — true only if the call isn't inside `if cachedMerchant == nil { ... }`.
 - *"V3 returns `asynq.SkipRetry` on any error."* — true only if the `return SkipRetry` statement is dominated by a broad `if err != nil` and not guarded by something narrower.
@@ -16,16 +16,20 @@ Examples of things the agent currently gets wrong:
 
 SSA gives us the precise answer. We're not looking at it.
 
-## Design principles (binding)
+Builds on ADR-0001-dispatch-edges.md (edge kinds) and ADR-0006-call-site-provenance.md (call-site fields).
+
+Binding design principles:
 
 1. **Surface structural control-flow facts, don't interpret them.** The agent knows what `in_error_branch: true` means. The code just needs to tell it.
 2. **Heuristics only at the classification edge.** The underlying dominator analysis is deterministic. We label dominating conditionals (*"this If tests an error"*) using explicit, named rules — no black-box inference.
 3. **Bail on complexity.** When the path condition gets too deep, we emit a truncated representation rather than a wrong one.
 4. **Additive. Schema stays v1.**
 
-## Feature 1 — Caller-context booleans on call edges
+## Decision
 
-### New field on every emitted edge
+### Feature 1: Caller-context booleans on call edges
+
+#### New field on every emitted edge
 
 Optional (`Option` on Rust side, nil-able in Go). Applies to all edge kinds: `concrete`, `interface`, `dispatches`, `goroutine`, `defer`, `writes`. Not applicable to `implements` (interface-satisfaction edges have no call-site context).
 
@@ -44,19 +48,19 @@ Optional (`Option` on Rust side, nil-able in Go). Applies to all edge kinds: `co
 }
 ```
 
-### Field semantics
+#### Field semantics
 
-- **`in_defer`**: the call site is inside a `defer` statement. Detected by: the instruction is a `*ssa.Defer` directly, OR it's a regular call inside a function that is only reached as the target of a `*ssa.Defer` elsewhere. V1 ships only the direct case; the transitive case is follow-up work.
+- **`in_defer`**: the call site is inside a `defer` statement. Detected by: the instruction is a `*ssa.Defer` directly, OR it's a regular call inside a function that is only reached as the target of a `*ssa.Defer` elsewhere. The current implementation ships only the direct case; the transitive case is follow-up work.
 
-- **`in_goroutine`**: the call site is inside a `go func(){...}()` spawn. Direct case: the instruction is `*ssa.Go`. Indirect case: the call is inside a closure that is the target of a `*ssa.Go`. V1 ships direct; indirect is follow-up.
+- **`in_goroutine`**: the call site is inside a `go func(){...}()` spawn. Direct case: the instruction is `*ssa.Go`. Indirect case: the call is inside a closure that is the target of a `*ssa.Go`. The current implementation ships direct; indirect is follow-up.
 
-- **`in_loop`**: the call site's basic block is part of a loop body. Detected via dominator analysis — see §"Loop detection" below.
+- **`in_loop`**: the call site's basic block is part of a loop body. Detected via dominator analysis — see "Loop detection" below.
 
-- **`in_error_branch`**: the call site's basic block is dominated by an `*ssa.If` whose condition tests an error value, and we're on the branch taken when the condition is true (i.e. the error-handling branch). See §"Error-branch detection" below.
+- **`in_error_branch`**: the call site's basic block is dominated by an `*ssa.If` whose condition tests an error value, and we're on the branch taken when the condition is true (i.e. the error-handling branch). See "Error-branch detection" below.
 
 - **`branch_depth`**: number of dominating `*ssa.If` terminators between the call's block and the enclosing function's entry block. A rough proxy for how "nested" the call is. Useful for the agent to decide "this is main-path code" (depth 0-1) vs "deeply conditional" (depth 3+).
 
-### Loop detection (SSA back-edges)
+#### Loop detection (SSA back-edges)
 
 A basic block `B` is in a loop body iff there exists some block `B'` such that `B'` is a predecessor of some block `H`, `H` dominates `B'`, and `B` is dominated by `H` (i.e. `B` lives within the loop with header `H`).
 
@@ -93,9 +97,9 @@ func blocksInLoops(fn *ssa.Function, dt *ssa.DomTree, headers map[*ssa.BasicBloc
 
 A more precise variant walks the SCCs of the CFG, but the superset approximation is standard for this kind of annotation — the caller might be in a block dominated by a loop header but technically post-loop. Agent-facing, this rarely matters.
 
-**Note**: Go's `golang.org/x/tools/go/ssa` may not expose `ssa.DomTree` directly as a standalone struct; dominator info is accessed via `BasicBlock.Dominator()` and `BasicBlock.Idom()`. The implementation should use whichever API is current.
+**Note**: Go's `golang.org/x/tools/go/ssa` may not expose `ssa.DomTree` directly as a standalone struct; dominator info is accessed via `BasicBlock.Dominator()` and `BasicBlock.Idom()`. The implementation uses whichever API is current.
 
-### Error-branch detection (the heuristic)
+#### Error-branch detection (the heuristic)
 
 For each call site at block `B`, walk up the dominator chain. For each dominating block `D`:
 
@@ -110,28 +114,27 @@ For each call site at block `B`, walk up the dominator chain. For each dominatin
 5. Record: `(label, side)` for this dominating If.
 
 After walking the full chain, classify the call:
-- `in_error_branch: true` iff the nearest `label == "error-check"` dominator has us on its True branch AND that branch doesn't get overridden by a subsequent nested condition that inverts it.
-- Simpler v1: `in_error_branch: true` iff ANY dominator in the chain is `("error-check", True)`. False positives possible (rare). Acceptable for v1.
+- `in_error_branch: true` iff ANY dominator in the chain is `("error-check", True)`. False positives are possible (rare) and accepted for the current implementation.
 
-### Error type detection
+#### Error type detection
 
 The error-check rule needs to know if a value "is an error." Two approaches:
 
-1. **Structural**: `types.Implements(opType, errorInterface)` where `errorInterface` is the universe's `error` type (`types.Universe.Lookup("error").Type().Underlying()`). This catches custom error types and standard `error`.
-2. **Name-based fallback**: if the operand's name (from its `Pos()` and SSA-to-source name recovery) is `err`, treat it as an error. Pragmatic; handles cases where SSA type-inference didn't run on a package.
+1. **Structural**: `types.Implements(opType, errorInterface)` where `errorInterface` is the universe's `error` type. This catches custom error types and standard `error`.
+2. **Name-based fallback**: if the operand's name is `err`, treat it as an error. Pragmatic; handles cases where SSA type-inference didn't run on a package.
 
-V1 uses #1 primarily, falls back to #2 when type info is unavailable.
+The current implementation uses #1 primarily, falls back to #2 when type info is unavailable.
 
-### Performance budget
+#### Performance budget
 
 - Dominator info is already computed by SSA during construction. Free to use.
 - Per-call-edge cost: O(depth-of-dominator-chain) — typically 2-5 hops. Target-service has ~5000 emitted edges, so ~25k hop operations for a full run. Dwarfed by SSA construction itself.
-- JSON size: ~80 bytes per edge for the context object. Can compress by omitting fields with default values (no `false` booleans).
+- JSON size: ~80 bytes per edge for the context object. Can compress by omitting fields with default values (false booleans are omitted).
 - Expected helper runtime delta: < 5% over baseline.
 
-## Feature 2 — Conditional return-value analysis
+### Feature 2: Conditional return-value analysis
 
-### New output section on `aft zoom`
+#### New output section on `aft zoom`
 
 When the user runs `aft zoom <file> <symbol>`, include a `returns` section:
 
@@ -164,7 +167,7 @@ When the user runs `aft zoom <file> <symbol>`, include a `returns` section:
 }
 ```
 
-### Mechanism
+#### Mechanism
 
 For each `*ssa.Return` instruction in the function:
 
@@ -174,12 +177,12 @@ For each `*ssa.Return` instruction in the function:
    - Determine which side of the branch `R` is on (True or False).
    - Record the condition and side: `(D.If.Cond, side)`.
 4. The **path condition** is the conjunction of all recorded `(Cond, side)` pairs (negate Cond when on False side).
-5. **Render the path condition** as Go source (see §"Rendering" below).
+5. **Render the path condition** as Go source (see "Rendering" below).
 6. **Extract the return value**: `Return.Results[0]` if single-value; tuple if multi. For each result, try to render it as source (similar rendering challenge).
 
-### Rendering SSA values back to Go source
+#### Rendering SSA values back to Go source
 
-This is the part where "not witchcraft" meets "aesthetically imperfect." SSA values can be rendered using:
+SSA values can be rendered using:
 
 1. **Position-based recovery**: `val.Pos()` gives a `token.Pos`. If valid, we can read the source file at that position and extract the identifier/expression text. Works for named variables and most direct references.
 2. **Structural rendering**: for synthesized SSA (`BinOp`, `Convert`, etc.) without a source position, render using the SSA shape:
@@ -193,7 +196,7 @@ This is the part where "not witchcraft" meets "aesthetically imperfect." SSA val
 
 Mark `path_condition_simple: false` if we had to fall back to structural rendering on any sub-expression, or if the path involved a `Phi` or depth-truncation.
 
-### Path-condition simplification
+#### Path-condition simplification
 
 Before rendering, apply basic boolean simplification:
 
@@ -204,26 +207,13 @@ Before rendering, apply basic boolean simplification:
 
 Keep the simplification conservative. Don't try to prove propositional equivalence; just handle the obvious cases. A deeply redundant path gets an `unsimplified` flag so the consumer knows.
 
-### Handling Phi-merged returns
+#### Handling Phi-merged returns
 
-A `*ssa.Return` might have its value be a `*ssa.Phi` — meaning different branches assigned different values to the same "logical" return variable. Two options:
+A `*ssa.Return` might have its value be a `*ssa.Phi` — meaning different branches assigned different values to the same "logical" return variable. The current implementation splits: one return entry per incoming Phi edge. This matches what the user intuitively sees — "there are 4 possible returned values."
 
-- **Merge**: emit one return entry with `value: "(phi: ...)"` and a disjunction of path conditions.
-- **Split**: emit one entry per incoming Phi edge. This matches what the user intuitively sees — "there are 4 possible returned values."
+### Rust-side changes
 
-V1: split. More informative for docs.
-
-### Performance budget
-
-- Return-sites per function: typically 1-5, up to ~20 for complex validation functions.
-- Dominator walk: O(chain depth) — small.
-- Rendering: bounded by depth cap, so O(1) per return after bounding.
-- JSON output grows by a few hundred bytes per `aft zoom` invocation when returns are interesting. Trivial.
-- Expected per-zoom latency delta: < 10ms.
-
-## Rust-side changes
-
-### `HelperEdge.context`
+#### `HelperEdge.context`
 
 New optional field:
 
@@ -251,7 +241,7 @@ pub struct HelperEdge {
 
 Propagate `context` through `IndexedCallerSite` and persistent-cache serialization.
 
-### `aft zoom` output
+#### `aft zoom` output
 
 Add optional `returns` section. Implementation: new helper-side struct that gets serialized on every helper run, carried on the `HelperOutput`:
 
@@ -278,50 +268,46 @@ pub struct HelperOutput {
 
 `aft zoom` command looks up `ReturnInfo` by (file, symbol) and appends to its output when present.
 
-## Rollout / feature flag
+### Rollout / feature flag
 
 - Helper CLI flag: `-no-call-context` disables caller-context annotations.
 - Helper CLI flag: `-no-return-analysis` disables return-condition analysis.
 - Rust config: `[callgraph] emit_call_context = true`, `[callgraph] emit_return_analysis = true`. Both default true.
 - Env: `AFT_DISABLE_CALL_CONTEXT=1`, `AFT_DISABLE_RETURN_ANALYSIS=1`.
 
-Both features are independently togglable — one can cause performance regressions (return analysis is the bigger one), and we want the ability to disable just that.
+Both features are independently togglable — return analysis is the bigger performance variable, and the ability to disable just that without losing call context is intentional.
 
-## Tests
+## Consequences
 
-### Go helper goldens
+### Positive consequences
 
-Fixture at `go-helper/testdata/controlflow/`:
+- Agents reading `aft zoom` output now know which return values are conditional on errors, loops, or deep nesting — eliminating hallucinations like "always returns X" when the truth is "returns X only if `err != nil`".
+- `in_error_branch`, `in_loop`, `in_defer`, `in_goroutine` on every call edge give agents the flow-accuracy facts they previously had to guess at.
+- `branch_depth` lets agents distinguish main-path code from deeply-conditional cleanup code without reading the whole function.
+- The dominator walk is essentially free: SSA already computes dominators during construction.
+- Return analysis adds < 15% to helper runtime and < 40% to JSON output size on target-service benchmarks.
 
-- `error_branch.go` — `func Handle() { if err := do(); err != nil { cleanup() } }`. Assert the `cleanup()` call edge has `in_error_branch: true`.
-- `loop_body.go` — `for _, x := range xs { process(x) }`. Assert `process` call edge has `in_loop: true`.
-- `defer_call.go` — `defer closer()`. Assert `in_defer: true`.
-- `goroutine_spawn.go` — `go worker()`. Assert `in_goroutine: true`.
-- `nested_conditions.go` — three-level-deep `if ... { if ... { if err != nil { return Err } } }`. Assert `branch_depth: 3`, `in_error_branch: true` for the return site.
-- `return_paths.go` — function with 4 distinct return sites, each with different path conditions. Assert return-analysis output matches hand-written expected JSON.
-- `phi_return.go` — `v := default; if cond { v = other }; return v`. Assert split into two return entries.
+### Trade-offs
 
-### Rust-side
+- `in_error_branch: true` uses a superset approximation for loop-body detection, and a first-match heuristic for error-branch classification. False positives are possible when a block is dominated by a loop header but is actually post-loop, or when an error-check dominates a call that is also guarded by a later non-error condition.
+- Path condition rendering can produce strings with unrenderable sub-expressions (`?`) or depth-truncated conjunctions (`...and N more`). `path_condition_simple: false` flags these.
+- `in_defer` and `in_goroutine` cover only the direct case (current implementation). The transitive case (call inside a closure that is the target of a defer/goroutine) is not yet surfaced.
+- Switch statements are compiled by SSA into chains of If blocks, so path conditions for switch arms are verbose If-chains rather than readable `switch x case Y:` renderings.
 
-- `HelperEdge` round-trips with `context` populated.
-- `ReturnInfo` round-trips.
-- `aft zoom` CLI returns the `returns` section when present.
-- Old output (no `context` / no `returns`) still deserializes (additive schema compat).
+### Open follow-ups
 
-### Benchmark
+1. **Rendering unavailable for optimized-away values.** If SSA optimization elided a variable, we can't recover a name. Current implementation emits `?` and sets `path_condition_simple: false`.
 
-Run against `example/target-service`. Targets:
-- Helper runtime: < 15% over current baseline.
-- JSON output size: < 40% over current baseline.
-- `aft zoom` query latency: < 100ms on a 100-line function with 4 return sites.
+2. **Deeply nested branches.** Path conditions are capped at 4 AND terms; the rest are emitted as "...and N more". Agent can still work with it.
 
-## Open questions for the implementer
+3. **Loop iteration conditions.** A return inside a loop depends on the iteration state. Current implementation annotates with a `(inside loop)` marker and skips the iteration state itself.
 
-1. **Rendering unavailable for optimized-away values.** If SSA optimization elided a variable, we can't recover a name. Emit `?` in the rendered condition and set `path_condition_simple: false`. *Accept.*
-2. **Deeply nested branches.** A 6-level-deep conditional produces an unreadable path condition. *Default: cap at 4 AND terms, emit "...and N more" for the rest. Agent can still work with it.*
-3. **Loop iteration conditions.** A return inside a loop depends on the iteration state. *Default: annotate condition with a `(inside loop)` marker and skip the iteration state itself.*
-4. **Switch statements.** SSA compiles `switch` to chains of If blocks. The resulting path condition is verbose. *Default: detect switch patterns (tag-based Ifs sharing a scrutinee) and render `switch x case Y: ...` style. v1 can ship verbose If-chains; v2 polishes.*
+4. **Switch statement rendering.** Currently emits verbose If-chains. A future iteration could detect switch patterns (tag-based Ifs sharing a scrutinee) and render as `switch x case Y: ...`.
 
-## Summary
+5. **Transitive `in_defer` / `in_goroutine`.** The current implementation covers only direct cases. The transitive case (call inside a closure that is the target of a defer/goroutine) is follow-up work.
 
-Two SSA-backed features that give the agent the control-flow context it currently guesses at: per-edge caller-context booleans and per-return path-condition analysis. Both are deterministic dominator-tree walks with explicit classification rules; the only heuristic is the error-branch recognition, gated behind named rules. ~250 LOC Go for feature 1, ~400 LOC Go for feature 2, ~100 LOC Rust plumbing total. Schema stays v1. Expected to cut the modified/universal wrong-rate significantly by giving the agent flow-accuracy facts it currently hallucinates.
+## Alternatives considered
+
+**Black-box inference / ML classification** for "is this an error branch?" was rejected. The error-check rule using `types.Implements(opType, errorInterface)` is deterministic, explainable, and correct for the vast majority of Go error patterns. A name-based fallback (`err` variable name) handles the residual cases where type info is unavailable.
+
+**Merging Phi-valued returns** (one entry with a disjunction of path conditions) rather than splitting was considered and rejected. Splitting is more informative for documentation — "there are 4 possible returned values" is more useful to the agent than "one return with a disjunction".

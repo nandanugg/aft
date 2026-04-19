@@ -1,31 +1,31 @@
-# DESIGN — Variable / const nodes + write-site edges (Tier 1.5)
+# ADR-0003: Variable/const nodes and write-site edges
 
-Status: design (not implemented)
-Scope: one new tree-sitter symbol type, one new `EdgeKind`, one new command.
-Successor to: [`helper-contract.md`](helper-contract.md).
+## Status
 
-## Motivation
+Accepted — shipped in commit 43297f8.
 
-Today `aft outline` surfaces functions, methods, types, and interfaces. Package-level `var` and `const` declarations aren't treated as first-class symbols, so:
+## Context
 
-- `aft callers` can't answer "who writes to `globalRegistry`?"
-- `aft zoom` can't jump to a const definition.
-- Agents documenting flows can't ask "which file initializes `settlementConfig`?" without falling back to grep.
+`aft outline` surfaces functions, methods, types, and interfaces. Package-level `var` and `const` declarations are not treated as first-class symbols, so:
 
-Go SSA tracks writes to package-level variables through the `*ssa.Global` type. We're not using it.
+- `aft callers` cannot answer "who writes to `globalRegistry`?"
+- `aft zoom` cannot jump to a const definition.
+- Agents documenting flows must fall back to grep when asking "which file initializes `settlementConfig`?"
 
-## Design principles (binding)
+Go SSA tracks writes to package-level variables through the `*ssa.Global` type. This is unused.
+
+The design is governed by the helper contract (`docs/helper-contract.md`):
 
 1. **Two-layer implementation.** Tree-sitter surfaces declarations (cheap, all languages). The Go helper adds cross-package write-site edges (type-checked, language-specific).
 2. **Filter at source.** Same-file reads/writes are not emitted — tree-sitter already indexes the declaration; reading the file answers local-usage questions. Only cross-package writes get helper edges.
 3. **Not all vars/consts are equal.** Package-level `var`/`const` only — ignore function-local vars. Local-variable write tracking is what `aft trace_data` exists for.
 4. **Additive. Schema stays v1.**
 
-## Data model additions
+## Decision
 
 ### New tree-sitter symbol kind: `Variable` (and optionally `Constant`)
 
-`aft outline` gets one new line per package-level declaration:
+`aft outline` gains one new line per package-level declaration:
 
 ```
 merchant_settlement/service.go
@@ -62,7 +62,7 @@ A `writes` edge represents "function C assigns to package-level variable V":
 - `caller` = the function doing the write.
 - `callee` = the package-level var being written (`symbol` = var name, not method name).
 
-## Helper-side implementation
+### Helper-side implementation
 
 The helper walks SSA and looks for `*ssa.Store` instructions whose `Addr` operand is a `*ssa.Global`:
 
@@ -105,9 +105,9 @@ for _, fn := range allProjectFunctions(prog, root) {
 
 **Initialization writes (init functions, var declarations with function calls):** SSA represents these as stores in a synthetic `init` function. Treat `init` as a real caller — the edge is emitted with `caller.symbol = "init"`. Agents know what that means.
 
-## Rust-side changes
+### Rust-side changes
 
-### `crates/aft/src/go_helper.rs`
+#### `crates/aft/src/go_helper.rs`
 
 Add to `EdgeKind`:
 ```rust
@@ -118,21 +118,21 @@ pub enum EdgeKind {
 }
 ```
 
-### Tree-sitter side
+#### Tree-sitter side
 
 In the outline extractor, add emission of `Variable` / `Constant` kinds. The existing data structures probably have a `SymbolKind` enum — extend it.
 
 Impact on `aft outline` output: per-file symbol count goes up modestly (a Go service has dozens of top-level vars, not thousands). No performance concern.
 
-### Indexing
+#### Indexing
 
 `writes` edges go into the same reverse index as call edges. Callers lookup by callee_symbol works naturally: `aft callers server/registry.go handlerRegistry` would return all writers (with `kind: writes`).
 
 No secondary index needed — the existing callee-keyed index covers the lookup.
 
-## New command
+### New command
 
-### `aft writers <file> <variable_symbol>`
+#### `aft writers <file> <variable_symbol>`
 
 "Who writes to this package-level variable?"
 
@@ -158,48 +158,32 @@ Alias rationale: "writers" is what users will type. Agents will learn that `aft 
 - `aft callers` on a variable symbol returns `writes` edges (new kind, same command surface).
 - `aft zoom` on a variable symbol returns the declaration + initializer + list of writers.
 
-## Performance budget
-
-| Metric | Target | Notes |
-|---|---|---|
-| Added helper runtime | < 10% | SSA walk for Store instructions. |
-| Added JSON output size | < 5% | Typical service: few hundred writes edges × ~200 bytes = <100KB. |
-| Tree-sitter outline regression | < 5% extra symbols | Top-level var/const count is small. |
-| Query latency | unchanged | Reuses existing reverse index. |
-
-## Rollout / feature flag
+### Rollout / feature flag
 
 - Helper: `-no-writes` flag disables `writes` edge emission.
 - Rust: `[callgraph] enable_writes_edges = true`.
 - Tree-sitter variable extraction is not flagged — it's cheap, safe, and orthogonal.
 
-## Tests
+## Consequences
 
-1. **Tree-sitter extraction**
-   - Fixture with `var`, `const`, grouped (`var ( X = 1; Y = 2 )`), parenthesized.
-   - All emitted as `Variable`/`Constant` in `aft outline`.
+### Positive consequences
 
-2. **Helper golden tests**
-   - Cross-package var write → edge emitted.
-   - Same-package var write → no edge.
-   - `init` function write → edge with `caller.symbol = "init"`.
-   - Writes through pointer indirection (`*p = x` where `p` is a package var's address) — tricky; see open questions.
+- `aft outline` now shows package-level vars and consts alongside functions and types — agents no longer need grep to discover them.
+- `aft callers` / `aft writers` can answer "who writes to `globalRegistry`?" across package boundaries, which requires type info that tree-sitter doesn't have.
+- `init`-function writes are surfaced correctly (SSA represents `var X = fn()` as a store from synthetic `init`).
+- `writes` edges reuse the existing reverse index — no new data structure needed.
+- Less than 10% added helper runtime; less than 5% added JSON output size (typical service: few hundred edges × ~200 bytes = <100KB).
 
-3. **Rust deserialization**
-   - `EdgeKind::Writes` round-trips.
+### Trade-offs
 
-4. **Command tests**
-   - `aft writers file.go varName` returns expected list.
-   - Mock exclusion not relevant here (no mock vars).
+- Only cross-package writes are emitted; same-package writes are filtered. Agents must use `aft grep` or read the file for same-package write sites.
+- Only direct `*ssa.Store` with `*ssa.Global` as Addr — indirect writes through pointers are out of scope.
+- Struct field writes on package-level struct vars (`GlobalCache.Set(k, v)`) are method calls, already covered by `concrete` edges. Map/slice element writes on globals are skipped.
 
-## Open questions for the implementer
+### Open follow-ups
 
-1. **Indirect writes:** `p := &GlobalVar; *p = 5`. SSA can trace this in some cases but not all. *Default: emit edges only for direct `*ssa.Store` with `*ssa.Global` as Addr. Indirect writes are out of scope.*
+1. **Indirect writes:** `p := &GlobalVar; *p = 5`. SSA can trace this in some cases but not all. Currently out of scope (direct stores only).
 
-2. **Struct field writes on package-level struct vars:** `GlobalCache.Set(k, v)` vs `GlobalCache[k] = v`. The first is a method call (already covered by `concrete` edges). The second is a `*ssa.IndexAddr` write — not the same as a top-level var store. *Default: skip map/slice element writes on globals — they're "mutations", not var replacements.*
+2. **Struct field writes on package-level struct vars:** the first form (`GlobalCache.Set(k, v)`) is a method call and is already covered by `concrete` edges. The second form (`GlobalCache[k] = v`) is a `*ssa.IndexAddr` write — currently skipped.
 
-3. **Should `writes` edges include a `write_kind` sub-field?** (assignment vs compound assign vs increment) *Default: no — collapse all to `writes`, keep schema simple.*
-
-## Summary
-
-Tree-sitter gains `Variable`/`Constant` outline kinds. Helper gains a small SSA walk for cross-package `*ssa.Store` → `*ssa.Global`. One new `EdgeKind::Writes`. One new `aft writers` command (alias over `aft callers --kind=writes`). <10% helper runtime overhead, <100KB extra JSON.
+3. **Write-kind sub-field** (assignment vs compound assign vs increment): currently collapsed to `writes` to keep the schema simple.

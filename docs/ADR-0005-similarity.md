@@ -1,10 +1,10 @@
-# DESIGN — Similarity stack + `aft similar` (Tier 3)
+# ADR-0005: Similarity stack and `aft similar`
 
-Status: design (not implemented)
-Scope: Rust-side only. Five-layer similarity computation with optional project synonym dict. New `aft similar` command.
-No helper changes. No new `EdgeKind` values.
+## Status
 
-## Motivation
+Accepted — shipped in commit 90edba9.
+
+## Context
 
 CBM computes `SIMILAR_TO` edges via embeddings over function bodies / identifiers. An agent asks "what's similar to `calculateSettlementFee`" and gets semantically-related code even when identifiers differ.
 
@@ -12,7 +12,7 @@ AFT has no equivalent. An agent asking "what else handles money?" has to grep fo
 
 Embeddings are the brute-force solution: powerful, but require a local model (~200MB), GPU-friendly runtime, and opaque output (the cosine says so — can't explain why). For code specifically, a lighter dict-based stack captures 75–85% of the value at a small fraction of the infrastructure cost, and it's **explainable** (the output can show exactly why two symbols were judged similar).
 
-## Design principles (binding)
+Binding design principles:
 
 1. **No embeddings by default.** Keep install small. Deterministic, explainable output.
 2. **Explainability is a feature.** `--explain` shows the ranking logic — matched tokens, TF-IDF weights, synonym expansions, co-citation overlap. This is something embeddings fundamentally can't do.
@@ -20,11 +20,13 @@ Embeddings are the brute-force solution: powerful, but require a local model (~2
 4. **Stack, not one algorithm.** Five independent layers; each adds distinct signal. Each can be toggled.
 5. **Index at configure-time, query sub-100ms.** No query-time parsing of identifiers across the whole project.
 
-## Architecture
+## Decision
 
-Similarity has two phases: **index build** (runs once per configure, or incrementally with the persistent cache from `DESIGN-persistent-graph.md`) and **query** (hot path, must be fast).
+### Architecture
 
-### Index build
+Similarity has two phases: **index build** (runs once per configure, or incrementally with the persistent cache from ADR-0004-persistent-graph.md) and **query** (hot path, must be fast).
+
+#### Index build
 
 Input: list of all symbols in the project (from tree-sitter's outline data).
 
@@ -41,11 +43,11 @@ Project-wide products:
 Optional:
 - `synonyms: HashMap<StemToken, HashSet<StemToken>>` loaded from `.aft/synonyms.toml` if present.
 
-All stored in `similarity-index.cbor` under the project's cache dir (same cache infra as `DESIGN-persistent-graph.md`).
+All stored in `similarity-index.cbor` under the project's cache dir (same cache infrastructure as ADR-0004-persistent-graph.md).
 
 Build-time budget: under 500ms for 10k symbols. Tokenize+stem is microseconds per identifier.
 
-### Query
+#### Query
 
 `aft similar <file> <symbol> [--dict] [--explain] [--top=N] [--min-score=F]`
 
@@ -57,7 +59,7 @@ Build-time budget: under 500ms for 10k symbols. Tokenize+stem is microseconds pe
 
 Query-time budget: under 50ms for top-10 across 10k symbols. TF-IDF sparse cosine is ~microseconds per pairwise comparison; pruning by vocabulary overlap keeps the comparison set small.
 
-## Layer 1: Identifier tokenization
+### Layer 1: Identifier tokenization
 
 Rules (stateless, Unicode-aware):
 - Split at camelCase boundaries: `calculateSettlementFee` → `[calculate, Settlement, Fee]`.
@@ -69,9 +71,7 @@ Rules (stateless, Unicode-aware):
 
 Implementation: one small `tokenize_identifier(s: &str) -> Vec<String>` function. Pure, no external deps.
 
-Golden tests required for the full grammar of edge cases.
-
-## Layer 2: Snowball stemming
+### Layer 2: Snowball stemming
 
 Dependency: [`rust-stemmers`](https://crates.io/crates/rust-stemmers) (Snowball, Apache-2.0, zero-dep).
 
@@ -86,7 +86,7 @@ Why English only: Go identifiers are overwhelmingly English even in non-English 
 
 Implementation: wrap rust-stemmers in a `stem(tok) -> String` helper. Cache stem results per-session (the vocabulary is finite per-project; the stemmer gets called ~10k times per configure, worth caching to a HashMap).
 
-## Layer 3: TF-IDF weighting
+### Layer 3: TF-IDF weighting
 
 Built once per configure. For each stem token `t`:
 
@@ -107,7 +107,7 @@ Store sparse vectors. Normalize each vector to unit length (so cosine similarity
 
 **Effect:** tokens like `handler`, `service`, `get`, `new` appear in hundreds of symbols → very low IDF → near-zero contribution to similarity. Tokens like `settle`, `merchant`, `kafka` appear in a handful of symbols → high IDF → dominate similarity scoring. This is what makes the stack work without domain knowledge.
 
-## Layer 4: Project synonym dict (the differentiator)
+### Layer 4: Project synonym dict (the differentiator)
 
 `.aft/synonyms.toml` at project root. Opt-in — absent by default.
 
@@ -131,7 +131,7 @@ Schema errors (non-string values, malformed TOML): log a warning, proceed withou
 
 **This is the one thing CBM embeddings genuinely can't match** — they're trained on general code, not your codebase's vocabulary.
 
-## Layer 5: Call-graph co-citation
+### Layer 5: Call-graph co-citation
 
 Two functions are more similar if they share a large fraction of their callees. This is pure graph structure, no lexical input.
 
@@ -145,7 +145,7 @@ Jaccard index over callee sets. Computed on-demand at query time (not pre-indexe
 
 Configurable weight in final score.
 
-## Final score
+### Final score
 
 ```
 score(target, candidate) =
@@ -166,9 +166,9 @@ Weights sum to 1.0 for readability; final score is in [0, 1].
 
 `w_syn` is 0 when `--dict` is off (no synonym dict loaded, or flag off); in that case `w_lex` absorbs it for a total of 0.85 lex + 0.15 cit.
 
-## `aft similar` command
+### `aft similar` command
 
-### Signature
+#### Signature
 
 ```
 aft similar <file> <symbol> [--top=N] [--dict] [--explain] [--min-score=F]
@@ -180,7 +180,7 @@ Flags:
 - `--explain` — include per-candidate scoring breakdown in output.
 - `--min-score=F` — drop candidates with score below F. Default 0.15 (empirical noise floor).
 
-### Output (without `--explain`)
+#### Output (without `--explain`)
 
 ```json
 {
@@ -193,7 +193,7 @@ Flags:
 }
 ```
 
-### Output (with `--explain`)
+#### Output (with `--explain`)
 
 ```json
 {
@@ -222,76 +222,47 @@ Flags:
 }
 ```
 
-The `--explain` output is verbose but bounded: top 10 matches × top 5 contributors per match × short lists = few hundred KB max. It's also the output that makes AFT useful as a developer tool, not just an agent tool — an engineer debugging "why did AFT say these are similar" gets a real answer.
+The `--explain` output is verbose but bounded: top 10 matches × top 5 contributors per match × short lists = few hundred KB max.
 
-## Performance budget
-
-| Metric | Target | Notes |
-|---|---|---|
-| Index build (10k symbols) | < 500ms | Tokenize + stem + TF-IDF. Happens once per configure. |
-| Index disk footprint | < 5MB | Sparse vectors compress well. CBOR-encoded. |
-| Index memory | < 20MB | Sparse vectors stay in memory after load. |
-| Query latency (top-10) | < 50ms | Pairwise cosine with vocabulary overlap pruning. |
-| Co-citation computation | < 10ms per query | Set intersection on callee lists; small sets. |
-| `--explain` overhead | < 20ms extra | String building; bounded by top-N. |
-
-## Rollout / feature flag
+### Rollout / feature flag
 
 - Rust: `[similarity] enabled = true`, `[similarity] auto_build_index = true`.
 - CLI: `aft similar` is the only user-facing surface; no-op if index missing and `--no-auto-build` set.
 - Dict is opt-in via file presence; no flag needed to disable.
 
-## Tests
+## Consequences
 
-1. **Tokenizer golden tests**
-   - camelCase, snake_case, PascalCase, mixed.
-   - Acronyms: `HTTPHandler`, `JSONParse`, `URLMatcher`.
-   - Numbers: `V3`, `OAuth2`, `SHA256`.
-   - Non-ASCII: Unicode identifiers (rare but valid in Go).
-   - Noise-token drop: `err`, `ctx`, `i`, `ok`.
+### Positive consequences
 
-2. **Stemmer integration**
-   - `calculate`/`calculated`/`calculating` → same stem.
-   - Known false positives (e.g., `banner` ≠ `ban`) — document, don't try to fix.
+- `aft similar` provides semantically similar symbol lookup without a model file, without GPU, without a network call. Install size is unchanged.
+- The `--explain` output is the primary differentiator vs embedding-based approaches: agents and developers can see exactly which tokens and shared callees drove the similarity score.
+- The synonym dict lets teams encode domain vocabulary (settlement ↔ payout ↔ disburse) that no pre-trained model knows.
+- Index build < 500ms for 10k symbols; query < 50ms for top-10; index < 5MB on disk.
+- The similarity index stores under the same cache dir as ADR-0004-persistent-graph.md — one cache dir per project.
 
-3. **TF-IDF correctness**
-   - Known-weight case: in a 100-symbol corpus, a token in 1 symbol gets much higher IDF than a token in 50 symbols.
-   - Normalization: unit-length vectors, cosine bounded [-1, 1] (with non-negative weights, [0, 1]).
+### Trade-offs
 
-4. **Synonym dict**
-   - Load, validate, apply.
-   - Malformed TOML → warning, no crash.
-   - Chain synonyms: `A ↔ B ↔ C` — A's query finds C-containing symbols.
+- Estimated coverage is 75–85% of what embedding-based approaches achieve. Identifiers with no lexical overlap and no shared callees score zero even when semantically related.
+- English-only stemming: non-English identifiers pass through unchanged (no false-negative, just no stem normalization).
+- `co_citation` is computed on-demand at query time (not pre-indexed). For large projects with high fan-out, this could approach the 10ms budget ceiling.
+- The synonym dict requires manual curation. An absent or stale dict gives lower synonym coverage than a well-maintained one.
 
-5. **Co-citation**
-   - Synthetic call graph where two functions share callees but have unrelated names.
-   - Jaccard computed correctly.
+### Open follow-ups
 
-6. **End-to-end `aft similar`**
-   - Against a curated fixture project with known similarity relationships.
-   - `--explain` produces coherent breakdowns.
-   - `--top=N` and `--min-score=F` honored.
+1. **Stemming language detection:** Go projects are usually English, but if the project has 20%+ non-ASCII identifiers, a future iteration could skip stemming entirely. Currently: always English-stem; non-ASCII tokens pass through unchanged.
 
-7. **Benchmarks**
-   - 10k-symbol synthetic project: index build < 500ms, query < 50ms, top-10 correctness.
+2. **Function body content:** a future tier could use body text similarity, not just identifier similarity. Currently out of scope — identifier-only is cheap and sufficient for 80% of cases; body similarity is expensive and noisy (error-handling boilerplate dominates).
 
-## Open questions for the implementer
+3. **Multi-term synonym expansion:** if a target token has synonyms, those synonyms' synonyms are not expanded (one hop only). This prevents runaway expansion. Users write dict groups; groups are already clusters.
 
-1. **Stemming language detection:** Go projects are usually English, but if the project has 20%+ non-ASCII identifiers, should we skip stemming entirely? *Default: always English-stem. Non-ASCII tokens pass through unchanged via the stemmer's built-in behavior.*
+4. **Ranking tie-breaker:** at identical scores, ordering is alphabetical by qualified name. Deterministic; no surprise ranking shuffles across runs.
 
-2. **Function body content:** should similarity use body text, not just identifier? *Default: no. Identifier-only is cheap and sufficient for 80% of cases. Body similarity is a separate future tier; it's expensive and noisy (error-handling boilerplate dominates).*
+5. **Embeddings opt-in:** explicitly excluded per the no-embeddings principle. May be added later as `--embeddings` opt-in.
 
-3. **Multi-term synonym expansion:** if a target token has synonyms, do we expand each synonym's synonyms too (transitive closure)? *Default: no, one hop. Prevents runaway expansion. Users write dict groups; groups are already clusters.*
+6. **Cross-project similarity:** per-project only. Cross-project (org-wide codebase) similarity is out of scope.
 
-4. **Ranking tie-breaker:** at identical scores, how to order? *Default: alphabetical by qualified name. Deterministic; no surprise ranking shuffles across runs.*
+## Alternatives considered
 
-## Out of scope
+**Embeddings as the primary approach** was explicitly rejected. The infrastructure cost (local model, ~200MB download, GPU-friendly runtime) and opaque output (cosine says so — can't explain why) make it a poor fit for the "lightweight, deterministic, explainable" design goal. The dict-based stack captures 75–85% of the value at a fraction of the cost, and the synonym dict gives domain customization that pre-trained models cannot.
 
-- Embeddings (explicitly excluded per design principle 1). May be added later as `--embeddings` opt-in.
-- Cross-project similarity (e.g., "what in org-wide codebase is similar"). Per-project only.
-- Body / docstring similarity. Identifier-only for this tier.
-- Runtime similarity (e.g., "functions with similar execution profiles"). Out of AFT's static-analysis scope.
-
-## Summary
-
-Five-layer dict-based similarity: tokenize, Snowball stem, TF-IDF weighting, optional project synonym dict, call-graph co-citation. No embeddings, no model files, < 5MB index, < 50ms queries. `aft similar` with `--dict` and `--explain`. Synonym dict is AFT's differentiator vs CBM — project-specific jargon beats generic embeddings.
+**Body/docstring similarity** was considered and deferred. Identifier-only is sufficient for 80% of cases; body-level similarity is expensive to compute and noisy (error-handling boilerplate, parameter validation patterns dominate over domain signal).

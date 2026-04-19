@@ -729,7 +729,7 @@ func emitDispatchesFromCall(
 		// wraps a single named handler in a thin lambda. If the closure body
 		// contains exactly one call to a named in-project function, treat
 		// that function as the dispatched target (amendment to
-		// DESIGN-dispatch-edges.md §1.1). Zero or ≥2 in-project calls is
+		// ADR-0001-dispatch-edges.md §1.1). Zero or ≥2 in-project calls is
 		// genuinely ambiguous — drop.
 		if fn.Parent() != nil {
 			resolved := resolveClosureTarget(fn, fns, callerFn.Prog, root)
