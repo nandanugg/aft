@@ -35,6 +35,56 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Control-flow context for a call site. Present on all edge kinds except
+/// `implements`. Fields default to false/0 and are omitted when at default
+/// to keep JSON compact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CallContext {
+    /// The call site is inside a `defer` statement.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_defer: bool,
+    /// The call site is inside a `go func(){}()` spawn.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_goroutine: bool,
+    /// The call site's basic block is part of a loop body.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_loop: bool,
+    /// The call site is dominated by an error-checking If on its true branch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_error_branch: bool,
+    /// Number of dominating `*ssa.If` terminators between this call and the
+    /// enclosing function's entry block. Proxy for "how nested is this call".
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub branch_depth: u32,
+}
+
+/// One return site within a function, with the path condition that must hold
+/// for execution to reach it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReturnSite {
+    /// 1-based source line of the return statement.
+    pub line: u32,
+    /// Rendered return value (e.g. `"nil"`, `"err"`, `"asynq.SkipRetry"`).
+    pub value: String,
+    /// Conjunction of dominating branch conditions, rendered as Go source.
+    pub path_condition: String,
+    /// `true` when all sub-expressions were recoverable from source positions
+    /// (no structural rendering fallback, no Phi or depth truncation).
+    pub path_condition_simple: bool,
+}
+
+/// Per-function return analysis. One entry per in-project function that has
+/// at least one interesting return site.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReturnInfo {
+    /// File path (relative to project root).
+    pub file: String,
+    /// Enclosing top-level symbol name.
+    pub symbol: String,
+    /// Return sites, in SSA order.
+    pub returns: Vec<ReturnSite>,
+}
+
 /// Top-level document returned by `aft-go-helper -root <dir>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HelperOutput {
@@ -50,6 +100,11 @@ pub struct HelperOutput {
     /// falls back to tree-sitter for these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// Per-function return-site analysis. Present when the helper ran with
+    /// return analysis enabled (default). Empty slice when disabled or when
+    /// no functions have interesting returns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returns: Vec<ReturnInfo>,
 }
 
 /// A single resolved call edge.
@@ -75,6 +130,11 @@ pub struct HelperEdge {
     /// Absent when the callee cannot be resolved, or for non-dispatches kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_via: Option<String>,
+    /// Control-flow context for the call site. Present when the helper
+    /// ran with call-context annotation enabled (default). Absent for
+    /// `implements` edges and when all context fields are at default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CallContext>,
 }
 
 /// Caller-side position for an edge.
@@ -233,6 +293,12 @@ pub fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
+/// Serde skip helper — omit `false` booleans from serialized output.
+#[doc(hidden)]
+pub fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 
 /// Probe whether `go` is on PATH. Cheap (`go env GOROOT` is fast and
 /// doesn't touch any modules).
@@ -294,6 +360,15 @@ pub fn looks_like_go_project(root: &Path) -> bool {
     root.join("go.mod").is_file()
 }
 
+/// Feature flags controlling what the helper emits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HelperFlags {
+    /// When true, pass `-no-call-context` to suppress per-edge context annotations.
+    pub no_call_context: bool,
+    /// When true, pass `-no-return-analysis` to suppress return-site analysis.
+    pub no_return_analysis: bool,
+}
+
 /// Invoke the helper synchronously and parse its JSON output. Caller is
 /// responsible for putting this on a background thread if it shouldn't
 /// block the request loop.
@@ -304,12 +379,20 @@ pub fn run_helper(
     helper: &Path,
     root: &Path,
     timeout: Duration,
+    flags: HelperFlags,
 ) -> Result<HelperOutput, HelperError> {
     use std::io::Read;
 
-    let mut child = Command::new(helper)
-        .arg("-root")
-        .arg(root)
+    let mut cmd = Command::new(helper);
+    cmd.arg("-root").arg(root);
+    if flags.no_call_context {
+        cmd.arg("-no-call-context");
+    }
+    if flags.no_return_analysis {
+        cmd.arg("-no-return-analysis");
+    }
+
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -389,7 +472,11 @@ pub fn run_helper(
 /// Returns `Err(HelperError)` for every failure mode so callers can log
 /// once and silently continue. This is the entry point intended for
 /// `configure`-time use.
-pub fn resolve_for_root(root: &Path, timeout: Duration) -> Result<HelperOutput, HelperError> {
+pub fn resolve_for_root(
+    root: &Path,
+    timeout: Duration,
+    flags: HelperFlags,
+) -> Result<HelperOutput, HelperError> {
     if !looks_like_go_project(root) {
         return Err(HelperError::NotAGoProject);
     }
@@ -397,7 +484,7 @@ pub fn resolve_for_root(root: &Path, timeout: Duration) -> Result<HelperOutput, 
         return Err(HelperError::GoNotInstalled);
     }
     let helper = find_helper_binary().ok_or(HelperError::HelperNotFound)?;
-    run_helper(&helper, root, timeout)
+    run_helper(&helper, root, timeout, flags)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +620,10 @@ mod tests {
                 kind: EdgeKind::Static,
                 nearby_string: None,
                 dispatched_via: None,
+                context: None,
             }],
             skipped: vec![],
+            returns: vec![],
         };
         write_cached(&cache_root, &out).unwrap();
         let back = read_cached(&cache_root, &project_root).unwrap();
@@ -552,6 +641,7 @@ mod tests {
             root: project_root.to_string_lossy().into_owned(),
             edges: vec![],
             skipped: vec![],
+            returns: vec![],
         };
         write_cached(&cache_root, &out).unwrap();
         assert!(read_cached(&cache_root, &other_root).is_none());
@@ -703,6 +793,7 @@ mod tests {
             kind: EdgeKind::Dispatches,
             nearby_string: None,
             dispatched_via: None,
+            context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
@@ -727,6 +818,7 @@ mod tests {
             kind: EdgeKind::Dispatches,
             nearby_string: Some("send-email".to_string()),
             dispatched_via: None,
+            context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(s.contains("nearby_string"), "nearby_string=Some should be present: {s}");
@@ -820,6 +912,7 @@ mod tests {
             kind: EdgeKind::Writes,
             nearby_string: None,
             dispatched_via: None,
+            context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(s.contains("\"writes\""), "kind should be 'writes': {s}");
@@ -890,6 +983,7 @@ mod tests {
             kind: EdgeKind::Dispatches,
             nearby_string: Some("task-key".to_string()),
             dispatched_via: None,
+            context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(!s.contains("dispatched_via"), "dispatched_via=None should be omitted: {s}");
@@ -913,6 +1007,7 @@ mod tests {
             kind: EdgeKind::Dispatches,
             nearby_string: Some("task-key".to_string()),
             dispatched_via: Some("example.com/pkg.(*Mux).Register".to_string()),
+            context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(s.contains("dispatched_via"), "dispatched_via=Some should be present: {s}");
@@ -937,6 +1032,7 @@ mod tests {
             kind: EdgeKind::Dispatches,
             nearby_string: Some("merchant_settlement:merchant_id".to_string()),
             dispatched_via: Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
+            context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
         let back: HelperEdge = serde_json::from_str(&s).unwrap();

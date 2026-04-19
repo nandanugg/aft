@@ -1182,6 +1182,7 @@ impl CacheManager {
                             kind: None,
                             nearby_string: None,
                             dispatched_via: None,
+                            context: None,
                         })
                         .collect();
                     (sym, callers)

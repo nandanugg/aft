@@ -39,7 +39,7 @@ func TestDispatchEdgesAsynq(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true /* emitDispatches */, true /* emitImplements */, true /* emitWrites */)
+	out, err := analyze(absRoot, true /* emitDispatches */, true /* emitImplements */, true /* emitWrites */, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestDispatchEdgesHTTP(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestDispatchEdgesGoroutineDefer(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestNoDispatchesFlag(t *testing.T) {
 	}
 
 	// With emitDispatches=false, no dispatch/goroutine/defer edges should appear.
-	out, err := analyze(absRoot, false, true, true)
+	out, err := analyze(absRoot, false, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestBadAnonymousClosure(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestTypedConstNearbyString(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestDispatchedViaPresent(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestDispatchedViaNoStringConst(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestDispatchedViaInterfaceSite(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}
@@ -305,18 +305,6 @@ func TestDispatchedViaInterfaceSite(t *testing.T) {
 	}
 }
 
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
-		func() bool {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-			return false
-		}())
-}
-
 // TestDispatchGoldenJSON tests that the sorted dispatch edges match a golden file
 // if it exists. To regenerate: delete testdata/dispatch/expected.json and run the test.
 func TestDispatchGoldenJSON(t *testing.T) {
@@ -326,7 +314,7 @@ func TestDispatchGoldenJSON(t *testing.T) {
 		t.Fatalf("abs root: %v", err)
 	}
 
-	out, err := analyze(absRoot, true, true, true)
+	out, err := analyze(absRoot, true, true, true, true, true)
 	if err != nil {
 		t.Fatalf("analyze: %v", err)
 	}

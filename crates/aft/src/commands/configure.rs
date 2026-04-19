@@ -247,6 +247,28 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.config_mut().enable_writes_edges = v;
         }
     }
+    // [callgraph] emit_call_context — annotate edges with caller-context booleans.
+    // Env var `AFT_DISABLE_CALL_CONTEXT=1` is the kill switch.
+    if let Some(v) = req
+        .params
+        .get("emit_call_context")
+        .and_then(|v| v.as_bool())
+    {
+        if std::env::var("AFT_DISABLE_CALL_CONTEXT").as_deref() != Ok("1") {
+            ctx.config_mut().emit_call_context = v;
+        }
+    }
+    // [callgraph] emit_return_analysis — per-return path-condition analysis.
+    // Env var `AFT_DISABLE_RETURN_ANALYSIS=1` is the kill switch.
+    if let Some(v) = req
+        .params
+        .get("emit_return_analysis")
+        .and_then(|v| v.as_bool())
+    {
+        if std::env::var("AFT_DISABLE_RETURN_ANALYSIS").as_deref() != Ok("1") {
+            ctx.config_mut().emit_return_analysis = v;
+        }
+    }
     if let Some(v) = req.params.get("storage_dir").and_then(|v| v.as_str()) {
         let storage_dir = match validate_storage_dir(v) {
             Ok(path) => path,
@@ -557,11 +579,21 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Build helper feature flags from config.
+    let helper_flags = go_helper::HelperFlags {
+        no_call_context: !ctx.config().emit_call_context,
+        no_return_analysis: !ctx.config().emit_return_analysis,
+    };
+
     if wait_for_helper && !had_cache {
         // CLI path: block for helper so same-process queries see resolved
         // interface-dispatch edges. Bounded by the 60s timeout already in
         // run_helper (plus whatever packages.Load takes on cold cache).
-        match go_helper::resolve_for_root(&helper_root, std::time::Duration::from_secs(60)) {
+        match go_helper::resolve_for_root(
+            &helper_root,
+            std::time::Duration::from_secs(60),
+            helper_flags,
+        ) {
             Ok(data) => {
                 log::info!(
                     "[aft] go-helper: {} edges (sync), {} skipped pkgs",
@@ -590,6 +622,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             let result = go_helper::resolve_for_root(
                 &helper_root_bg,
                 std::time::Duration::from_secs(60),
+                helper_flags,
             );
             if let Ok(ref out) = result {
                 if let Err(e) = go_helper::write_cached(&helper_cache_bg, out) {
