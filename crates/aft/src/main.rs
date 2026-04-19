@@ -14,6 +14,18 @@ fn main() {
         return;
     }
 
+    // --no-cache: disable the persistent call-graph cache for this invocation.
+    // Sets AFT_DISABLE_CACHE=1 so that CacheManager sees it on all code paths
+    // regardless of when configure() is called.
+    let no_cache = std::env::args().any(|a| a == "--no-cache");
+    if no_cache {
+        // SAFETY: single-threaded at this point (before any thread::spawn calls).
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("AFT_DISABLE_CACHE", "1");
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             use std::io::Write;
@@ -30,7 +42,11 @@ fn main() {
 
     log::info!("started, pid {}", std::process::id());
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let mut config = Config::default();
+    if no_cache {
+        config.cache_enabled = false;
+    }
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
 
     let stdin = io::stdin();
     let reader = stdin.lock();
@@ -119,9 +135,14 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
+        "similar" => aft::commands::similar::handle_similar(&req, ctx),
         "status" => aft::commands::status::handle_status(&req, ctx),
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
         "callers" => aft::commands::callers::handle_callers(&req, ctx),
+        "dispatched_by" => aft::commands::dispatched_by::handle_dispatched_by(&req, ctx),
+        "dispatches" => aft::commands::dispatches::handle_dispatches(&req, ctx),
+        "implementations" => aft::commands::implementations::handle_implementations(&req, ctx),
+        "writers" => aft::commands::writers::handle_writers(&req, ctx),
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),

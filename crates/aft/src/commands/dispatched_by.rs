@@ -1,0 +1,103 @@
+use std::path::Path;
+
+use crate::context::AppContext;
+use crate::protocol::{RawRequest, Response};
+
+/// Handle a `dispatched_by` request.
+///
+/// Reverse lookup for dispatch edges: "who passes `<symbol>` as a function value?"
+///
+/// Expects:
+/// - `file` (string, required) — path to the file containing the target symbol
+/// - `symbol` (string, required) — name of the handler function to look up
+///
+/// Returns:
+/// ```json
+/// {
+///   "symbol": "HandleTask",
+///   "file": "server/handler.go",
+///   "dispatched_by": [
+///     {
+///       "caller": { "file": "server/register.go", "symbol": "startServer", "line": 42 },
+///       "nearby_string": "TypeTask"
+///     }
+///   ]
+/// }
+/// ```
+///
+/// Returns error if:
+/// - required params missing
+/// - call graph not initialized (configure not called)
+/// - symbol not found in the file
+pub fn handle_dispatched_by(req: &RawRequest, ctx: &AppContext) -> Response {
+    let file = match req.params.get("file").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "dispatched_by: missing required param 'file'",
+            );
+        }
+    };
+
+    let symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "dispatched_by: missing required param 'symbol'",
+            );
+        }
+    };
+
+    ctx.drain_go_helper();
+    let mut cg_ref = ctx.callgraph().borrow_mut();
+    let graph = match cg_ref.as_mut() {
+        Some(g) => g,
+        None => {
+            return Response::error(
+                &req.id,
+                "not_configured",
+                "dispatched_by: project not configured — send 'configure' first",
+            );
+        }
+    };
+
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+
+    // Build file data first to check if the symbol exists.
+    match graph.build_file(&file_path) {
+        Ok(data) => {
+            let has_symbol = data.calls_by_symbol.contains_key(symbol)
+                || data.exported_symbols.contains(&symbol.to_string())
+                || data.symbol_metadata.contains_key(symbol);
+            if !has_symbol {
+                return Response::error(
+                    &req.id,
+                    "symbol_not_found",
+                    format!("dispatched_by: symbol '{}' not found in {}", symbol, file),
+                );
+            }
+        }
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    }
+
+    match graph.dispatched_by(&file_path, symbol) {
+        Ok(result) => {
+            let text = result.render_text();
+            let mut result_json = serde_json::to_value(&result).unwrap_or_default();
+            if let Some(obj) = result_json.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::Value::String(text));
+            }
+            Response::success(&req.id, result_json)
+        }
+        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+    }
+}

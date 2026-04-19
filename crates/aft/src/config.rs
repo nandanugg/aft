@@ -101,6 +101,41 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// [callgraph] enable_dispatch_edges — include dispatches/goroutine/defer edges from
+    /// the Go helper in the reverse index and make them available to `callers`,
+    /// `call_tree`, `trace_to`, and the new `dispatched_by` / `dispatches` commands.
+    /// Default `true`. Set to `false` to revert to v1-semantic behavior.
+    /// Overridden to `false` by `AFT_DISABLE_DISPATCH_EDGES=1`.
+    pub enable_dispatch_edges: bool,
+    /// [callgraph] enable_implementation_edges — build the ImplementationIndex from
+    /// `implements` edges emitted by the Go helper (Tier 1.4). Powers the
+    /// `aft implementations` command and `aft callers --via-interface`.
+    /// Default `true`. Set to `false` to skip index construction.
+    /// Overridden to `false` by `AFT_DISABLE_IMPLEMENTATION_EDGES=1`.
+    pub enable_implementation_edges: bool,
+    /// [callgraph] enable_writes_edges — include cross-package variable-write edges from
+    /// the Go helper. These power `aft writers <file> <var>` lookups.
+    /// Default `true`. Set to `false` to disable.
+    /// Overridden to `false` by `AFT_DISABLE_WRITES_EDGES=1`.
+    pub enable_writes_edges: bool,
+    /// [callgraph] emit_call_context — annotate each helper edge with caller-context booleans
+    /// (in_defer, in_goroutine, in_loop, in_error_branch, branch_depth). Default `true`.
+    /// Overridden to `false` by `AFT_DISABLE_CALL_CONTEXT=1`.
+    pub emit_call_context: bool,
+    /// [callgraph] emit_return_analysis — include per-return path-condition analysis in the
+    /// helper output, surfaced by `aft zoom`. Default `true`.
+    /// Overridden to `false` by `AFT_DISABLE_RETURN_ANALYSIS=1`.
+    pub emit_return_analysis: bool,
+    /// Similarity index: enabled (default: true).
+    pub similarity_enabled: bool,
+    /// Similarity index: auto-build on configure (default: true).
+    pub similarity_auto_build_index: bool,
+    /// Similarity weights: (w_lex, w_syn, w_cit), must sum to 1.0.
+    pub similarity_weights: (f32, f32, f32),
+    /// When `true` (default), the persistent call-graph cache is active.
+    /// Disabled by `--no-cache` CLI flag, `AFT_DISABLE_CACHE=1` env var, or
+    /// `configure { "no_cache": true }` request param.
+    pub cache_enabled: bool,
 }
 
 impl Default for Config {
@@ -124,6 +159,29 @@ impl Default for Config {
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             storage_dir: None,
+            // Env var kill switch takes priority over config file value.
+            enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            // Env var kill switch takes priority over config file value.
+            enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            emit_call_context: std::env::var("AFT_DISABLE_CALL_CONTEXT")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            emit_return_analysis: std::env::var("AFT_DISABLE_RETURN_ANALYSIS")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            similarity_enabled: true,
+            similarity_auto_build_index: true,
+            similarity_weights: (0.70, 0.15, 0.15),
+            cache_enabled: std::env::var("AFT_DISABLE_CACHE")
+                .map(|v| v != "1")
+                .unwrap_or(true),
         }
     }
 }

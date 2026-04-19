@@ -1,0 +1,8 @@
+# AFT Similarity Synonym Dictionary
+# Format: each [groups] entry defines an equivalence class of terms.
+
+[groups]
+settlement = ["payout", "disburse", "settle"]
+merchant = ["seller", "vendor"]
+payment = ["transaction", "charge"]
+process = ["execute", "run", "handle"]

@@ -17,7 +17,7 @@ use crate::parser::{grammar_for, LangId};
 // ---------------------------------------------------------------------------
 
 /// What kind of import this is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImportKind {
     /// `import { X } from 'y'` or `import X from 'y'`
     Value,
@@ -37,7 +37,9 @@ pub enum ImportKind {
 ///   - Python:    Stdlib, External (third-party), Internal (relative `.`/`..`)
 ///   - Rust:      Stdlib (std/core/alloc), External (crates), Internal (crate/self/super)
 ///   - Go:        Stdlib (no dots in path), External (dots in path)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum ImportGroup {
     /// Standard library (Python stdlib, Rust std/core/alloc, Go stdlib).
     /// TS/JS don't use this group.
@@ -60,7 +62,7 @@ impl ImportGroup {
 }
 
 /// A single parsed import statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportStatement {
     /// The module path (e.g., `react`, `./utils`, `../config`).
     pub module_path: String,
@@ -81,7 +83,7 @@ pub struct ImportStatement {
 }
 
 /// A block of parsed imports from a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportBlock {
     /// All parsed import statements, in source order.
     pub imports: Vec<ImportStatement>,

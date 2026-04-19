@@ -26,15 +26,19 @@ pub mod error;
 pub mod extract;
 pub mod format;
 pub mod fuzzy_match;
+pub mod go_helper;
 pub mod imports;
+pub mod parse_cache;
 pub mod indent;
 pub mod language;
 pub mod lsp;
 pub mod lsp_hints;
 pub mod parser;
+pub mod persistent_cache;
 pub mod protocol;
 pub mod search_index;
 pub mod semantic_index;
+pub mod similarity;
 pub mod symbols;
 
 #[cfg(test)]

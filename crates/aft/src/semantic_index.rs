@@ -1318,6 +1318,7 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
         SymbolKind::Enum => "enum",
         SymbolKind::TypeAlias => "type",
         SymbolKind::Variable => "variable",
+        SymbolKind::Constant => "constant",
         SymbolKind::Heading => "heading",
     };
 
@@ -1447,6 +1448,7 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
         SymbolKind::TypeAlias => 6,
         SymbolKind::Variable => 7,
         SymbolKind::Heading => 8,
+        SymbolKind::Constant => 9,
     }
 }
 
@@ -1460,7 +1462,8 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         5 => SymbolKind::Enum,
         6 => SymbolKind::TypeAlias,
         7 => SymbolKind::Variable,
-        _ => SymbolKind::Heading,
+        8 => SymbolKind::Heading,
+        _ => SymbolKind::Constant,
     }
 }
 

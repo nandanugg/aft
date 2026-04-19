@@ -9,6 +9,11 @@ use crate::protocol::{RawRequest, Response};
 /// - `file` (string, required) — path to the source file containing the target symbol
 /// - `symbol` (string, required) — name of the symbol to find callers for
 /// - `depth` (number, optional, default 1) — recursive depth (1 = direct callers only)
+/// - `via_interface` (bool, optional, default false) — if true, also include
+///   concrete types from the ImplementationIndex when `symbol` is an interface method.
+///   Allows "who actually runs when this interface method is called?" in one query.
+/// - `include_mocks` (bool, optional, default false) — when `via_interface=true`,
+///   controls whether mock implementations are included in the result.
 ///
 /// Returns callers grouped by file with fields: `symbol`, `file`,
 /// `callers` (array of `{ file, callers: [{ symbol, line }] }`),
@@ -48,6 +53,20 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(1)
         .min(100) as usize;
 
+    let via_interface = req
+        .params
+        .get("via_interface")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let include_mocks = req
+        .params
+        .get("include_mocks")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+
+    ctx.drain_go_helper();
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -69,7 +88,8 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     match graph.build_file(&file_path) {
         Ok(data) => {
             let has_symbol = data.calls_by_symbol.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string());
+                || data.exported_symbols.contains(&symbol.to_string())
+                || data.symbol_metadata.contains_key(symbol);
             if !has_symbol {
                 return Response::error(
                     &req.id,
@@ -83,9 +103,19 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.callers_of(&file_path, symbol, depth) {
+    let result = if via_interface {
+        graph.callers_of_via_interface(&file_path, symbol, depth, include_mocks)
+    } else {
+        graph.callers_of(&file_path, symbol, depth)
+    };
+
+    match result {
         Ok(result) => {
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
+            let text = result.render_text();
+            let mut result_json = serde_json::to_value(&result).unwrap_or_default();
+            if let Some(obj) = result_json.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::Value::String(text));
+            }
             Response::success(&req.id, result_json)
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
