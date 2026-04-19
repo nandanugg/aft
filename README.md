@@ -774,47 +774,118 @@ synonym file), `--explain`.
 
 ## Development
 
-AFT is a monorepo: bun workspaces for TypeScript, cargo workspace for Rust.
+The fork has three build targets:
 
-**Requirements:** Bun ≥ 1.0, Rust stable toolchain (1.80+).
+1. The Rust binary (`crates/aft/`) — tree-sitter parsing, call-graph indexing, similarity index,
+   the CLI entry point and every command handler.
+2. The Go helper (`go-helper/`) — type-resolved edges via `golang.org/x/tools/go/ssa` +
+   class-hierarchy analysis. Emits the new edge kinds this fork adds (dispatch, implements,
+   writes, goroutine, defer) plus control-flow context and per-return path conditions.
+3. The upstream TypeScript OpenCode plugin (`packages/opencode-plugin/`) — **not published
+   from this fork**. Left in the tree for parity with upstream; build only if you're comparing
+   against upstream's OpenCode surface.
+
+**Requirements:**
+
+- Rust stable ≥ 1.80
+- Go ≥ 1.22 (only if you want `aft-go-helper`; AFT falls back to tree-sitter without it)
+- Bun ≥ 1.0 (only for the TypeScript plugin bits; not needed for the CLI surface this fork ships)
+
+**Build everything:**
 
 ```sh
-# Install JS dependencies
-bun install
-
-# Build the Rust binary
+# Rust binary
 cargo build --release
 
-# Build the TypeScript plugin
-bun run build
+# Go helper
+cd go-helper && go build -o ../target/release/aft-go-helper . && cd ..
 
-# Run all tests
-bun run test        # TypeScript tests
-cargo test          # Rust tests
+# Install the Claude Code / Codex hooks (copies the binaries into ~/.claude/hooks
+# and ~/.codex/hooks, writes settings.json, and drops the aft wrapper on PATH).
+./scripts/install-claude-hooks.sh
+./scripts/install-codex-hooks.sh
+```
 
-# Lint and format
-bun run lint        # biome check
-bun run lint:fix    # biome check --write
-bun run format      # biome format + cargo fmt
+**Fast iteration while hacking:**
+
+```sh
+# Type-check only — 5-10× faster than a release build
+cargo check --release
+
+# Compile-check the Go helper
+cd go-helper && go build ./... && cd ..
+
+# Run the test suites
+cargo test --lib --release         # ~490 Rust unit tests
+cd go-helper && go test ./...      # Go helper golden fixtures + unit tests
 ```
 
 **Project layout:**
 
 ```
-opencode-aft/
+aft/
 ├── crates/
-│   └── aft/              # Rust binary (tree-sitter core)
-│       └── src/
+│   └── aft/                   # Rust binary, tree-sitter core, all command handlers
+│       ├── src/
+│       │   ├── commands/      # One module per CLI verb
+│       │   ├── callgraph.rs   # Reverse index + dispatch/impl indexes
+│       │   ├── similarity.rs  # Tokenize + stem + TF-IDF + co-citation
+│       │   ├── persistent_cache.rs  # CBOR-backed warm-start cache (Tier 2)
+│       │   └── ...
+│       └── tests/             # Integration tests + fixtures
+├── go-helper/                 # Go SSA helper — dispatch, implements, writes, returns
+│   ├── main.go
+│   ├── testdata/              # Golden fixtures per edge kind
+│   └── *_test.go
+├── docs/
+│   ├── helper-contract.md            # Binding schema for helper ↔ Rust JSON
+│   ├── DESIGN-dispatch-edges.md      # Tier 1.1/1.2/1.3
+│   ├── DESIGN-interface-edges.md     # Tier 1.4
+│   ├── DESIGN-variable-nodes.md      # Tier 1.5
+│   ├── DESIGN-persistent-graph.md    # Tier 2 (warm cache)
+│   ├── DESIGN-similarity.md          # Tier 3 (aft similar)
+│   ├── DESIGN-call-site-provenance.md  # dispatched_via + const resolution
+│   └── DESIGN-control-flow-context.md  # caller flags + return-path conditions
+├── templates/
+│   ├── claude/                # SessionStart reminder + PreToolUse discovery gate
+│   ├── codex/                 # SessionStart reminder + UserPromptSubmit guidance
+│   └── aft-wrapper.sh         # Shared CLI wrapper template (substituted with binary path)
+├── scripts/
+│   ├── install-claude-hooks.sh
+│   ├── install-codex-hooks.sh
+│   ├── uninstall-claude-hooks.sh
+│   └── uninstall-codex-hooks.sh
+├── benchmarks/                # Per-tier benchmark scripts + recorded results
 ├── packages/
-│   ├── opencode-plugin/  # TypeScript OpenCode plugin (@cortexkit/aft-opencode)
-│   │   └── src/
-│   │       ├── tools/    # One file per tool group
-│   │       ├── config.ts # Config loading and schema
-│   │       └── downloader.ts
-│   └── npm/              # Platform-specific binary packages
-└── scripts/
-    └── version-sync.mjs  # Keeps npm and cargo versions in sync
+│   ├── opencode-plugin/       # Upstream TS plugin (not published from this fork)
+│   └── npm/                   # Upstream platform-specific binary packages
+└── tests/                     # Cross-component test fixtures
 ```
+
+**Adding a new command:**
+
+1. Design doc first — write `docs/DESIGN-<feature>.md` covering schema, semantics,
+   performance budget, and feature flag. Existing docs in `docs/` are the template.
+2. Helper side (if Go-specific): extend `go-helper/main.go`; add golden fixtures under
+   `go-helper/testdata/<feature>/`; respect the filter-at-source rule in
+   `docs/helper-contract.md`.
+3. Rust side: new handler under `crates/aft/src/commands/`, wire into
+   `crates/aft/src/main.rs` dispatch, add any new schema fields with `#[serde(default)]` for
+   backward compat.
+4. CLI surface: add a case arm in `scripts/install-claude-hooks.sh`'s shell-wrapper heredoc,
+   re-run the installer to regenerate `~/.claude/hooks/aft`.
+5. Tests: golden fixtures on both sides, unit tests on the Rust handler, an integration test
+   under `crates/aft/tests/integration/`.
+6. Benchmark: compare against a real Go project and record under `benchmarks/`.
+
+**Measuring documentation accuracy:**
+
+The fork's accuracy comparison is reproducible. The Dockerfiles and run scripts that produced
+the numbers in the [fork section](#accuracy-focused-fork-nandanuggaft) live in a sibling
+`aft-compare/` directory in the reference setup — three isolated containers (this fork, cbm,
+serena), five passes each, claims extracted by sonnet subagents, verified by an opus
+subagent. To reproduce against your own codebase, point the Dockerfile's project mount at it
+and rerun.
 
 ---
 
