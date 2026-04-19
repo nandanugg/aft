@@ -206,130 +206,20 @@ Details on how each operation is structured live in [**Tool Reference**](#tool-r
 
 ## How it Helps Agents
 
-Three pain points agents hit every session:
+Three pain points agents hit every session, each solved by one class of tool:
 
 - **Token blow-up** — reading whole files to find one function wastes context.
+  Addressed by `aft outline` and `aft zoom`.
 - **Line-number fragility** — edits made by line break the moment something above them moves.
-- **Blind navigation** — "who calls this?" and "what does this break?" require grep + cross-file reads.
+  Addressed on the OpenCode plugin surface by symbol-aware `edit`; not available through this
+  fork's CLI (see [Tool Reference](#tool-reference)).
+- **Blind navigation** — "who calls this?", "what does this break?", "which handler runs for
+  this key?" — each would normally mean grep plus a stack of cross-file reads.
+  Addressed by `aft callers` / `aft call_tree` / `aft trace_to` / `aft impact`, and on this
+  fork specifically by `aft dispatched_by` / `aft dispatches` / `aft implementations`.
 
-Each of the tools below solves one. Full parameter list + every output field is in
-[Tool Reference](#tool-reference); this section picks a flagship subset.
-
----
-
-#### `aft_outline`
-
-**desc.** Structural outline of a file, files, or directory. Returns every top-level symbol
-(functions, classes, types, vars) with kind, visibility, signature, and line range — no bodies.
-Typically 10 % of the tokens a full `read` costs on the same file.
-
-**input.**
-
-```json
-{ "filePath": "src/auth/session.ts" }
-```
-
-**output.**
-
-```
-src/auth/session.ts
-  E fn    createSession(userId: string, opts?: SessionOpts): Promise<Session> 12:38
-  E fn    validateToken(token: string): boolean 40:52
-  E fn    refreshSession(sessionId: string): Promise<Session> 54:71
-  - fn    signPayload(data: Record<string, unknown>): string 73:80
-  E type  SessionOpts 5:10
-  E var   SESSION_TTL 3:3
-```
-
-`E` = exported, `-` = private. Kinds: `fn`, `class`, `type`, `var`, `const`, etc.
-
----
-
-#### `aft_zoom`
-
-**desc.** Read a single symbol with call-graph annotations. Shows the body, who it calls out to,
-and who calls it in — in one request, instead of three separate `read` + `grep` sequences.
-
-**input.**
-
-```json
-{ "filePath": "src/auth/session.ts", "symbol": "validateToken" }
-```
-
-**output.**
-
-```
-src/auth/session.ts:40-52
-  calls_out: verifyJwt (src/auth/jwt.ts:8), isExpired (src/auth/utils.ts:15)
-  called_by: authMiddleware (src/middleware/auth.ts:22), handleLogin (src/routes/login.ts:45)
-
-  39: /** Validate a JWT token and check expiration. */
-  40: export function validateToken(token: string): boolean {
-  41:   if (!token) return false;
-  42:   const decoded = verifyJwt(token);
-  43:   if (!decoded) return false;
-  44:   return !isExpired(decoded.exp);
-  45: }
-```
-
----
-
-#### `edit` (symbol mode)
-
-**desc.** Replace a named symbol in-place. AFT finds the symbol's AST node, swaps the body, runs
-the language's formatter, validates the parse, and writes a backup. No line counting, no diff
-that breaks when something above it shifts.
-
-**input.**
-
-```json
-{
-  "filePath": "src/auth/session.ts",
-  "symbol": "validateToken",
-  "content": "export function validateToken(token: string): boolean {\n  if (!token) return false;\n  return verifyJwt(token);\n}"
-}
-```
-
-**output.** The file is rewritten; the response carries the diff summary:
-
-```
-edit ok: src/auth/session.ts
-  symbol: validateToken  (lines 40-52 → 40-43, -8 +3)
-  formatter: biome (applied)
-  diagnostics: 0 errors, 0 warnings
-  backup: .aft/backups/src/auth/session.ts.bak.20260419-063312
-```
-
----
-
-#### `aft_navigate` (callers / impact modes)
-
-**desc.** Workspace-wide call-graph lookup. `callers` mode returns every call site that lands on
-a symbol. `impact` mode walks the transitive reverse graph and lists what would need to change
-if the target's signature changed.
-
-**input.**
-
-```json
-{ "op": "callers", "filePath": "src/auth/session.ts", "symbol": "validateToken", "depth": 2 }
-```
-
-**output.**
-
-```
-callers of validateToken (src/auth/session.ts)  total=3 files=3
-  src/middleware/auth.ts (1):
-    - authMiddleware:22
-  src/routes/login.ts (1):
-    - handleLogin:45
-  src/routes/api.ts (1):
-    - requireAuth:17  ← (depth=2, via authMiddleware)
-```
-
----
-
-For the full set — including fork-only additions (`dispatched_by`, `dispatches`,
-`implementations`, `writers`, `similar`) — see [Tool Reference](#tool-reference).
+Every tool, its invocation, and a sample of its output live in
+[Tool Reference](#tool-reference).
 
 ---
 
