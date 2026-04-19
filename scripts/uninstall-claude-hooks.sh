@@ -18,6 +18,8 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 # Remove hook files
 [ -f "$HOOKS_DIR/aft" ] && rm "$HOOKS_DIR/aft" && info "Removed $HOOKS_DIR/aft"
 [ -f "$HOOKS_DIR/aft-hook.sh" ] && rm "$HOOKS_DIR/aft-hook.sh" && info "Removed $HOOKS_DIR/aft-hook.sh"
+[ -f "$HOOKS_DIR/aft-session-reminder.sh" ] && rm "$HOOKS_DIR/aft-session-reminder.sh" && info "Removed $HOOKS_DIR/aft-session-reminder.sh"
+[ -f "$HOOKS_DIR/aft-code-discovery-gate.sh" ] && rm "$HOOKS_DIR/aft-code-discovery-gate.sh" && info "Removed $HOOKS_DIR/aft-code-discovery-gate.sh"
 
 # Remove AFT.md
 [ -f "$CLAUDE_DIR/AFT.md" ] && rm "$CLAUDE_DIR/AFT.md" && info "Removed $CLAUDE_DIR/AFT.md"
@@ -35,9 +37,15 @@ SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 if [ -f "$SETTINGS_FILE" ] && command -v jq &>/dev/null; then
     TEMP_FILE=$(mktemp)
     jq '
-      .hooks.PreToolUse = [
-        .hooks.PreToolUse[] | select(.hooks[].command | contains("aft-hook.sh") | not)
-      ]
+      def drops_aft:
+        (.hooks // []) | map(
+          (.command // "") as $c
+          | ($c | contains("aft-hook.sh")) or
+            ($c | contains("aft-code-discovery-gate.sh")) or
+            ($c | contains("aft-session-reminder.sh"))
+        ) | any;
+      .hooks.PreToolUse = ((.hooks.PreToolUse // []) | map(select(drops_aft | not))) |
+      .hooks.SessionStart = ((.hooks.SessionStart // []) | map(select(drops_aft | not)))
     ' "$SETTINGS_FILE" > "$TEMP_FILE" 2>/dev/null && mv "$TEMP_FILE" "$SETTINGS_FILE" && \
         info "Removed AFT hooks from settings.json"
 fi
