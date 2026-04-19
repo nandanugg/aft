@@ -206,25 +206,21 @@ model; explainable rankings.
 **input.**
 
 ```bash
-aft similar merchant_settlement/service.go SettleMerchantSettlement --top=3 --explain
+aft similar merchant_settlement/service.go SettleMerchantSettlement --top=3
 ```
 
-**output.** (abbreviated)
+**output.**
 
-```json
-{
-  "query": {"file": "merchant_settlement/service.go", "symbol": "SettleMerchantSettlement"},
-  "matches": [
-    {"file": "early_settlement/service.go",    "symbol": "processEarlySettlementV3", "score": 0.72},
-    {"file": "merchant_settlement/service.go", "symbol": "OnHoldMerchantSettlement", "score": 0.68},
-    {"file": "realtime_settlement/service.go", "symbol": "settleRealtime",           "score": 0.64}
-  ]
-}
+```
+similar to SettleMerchantSettlement (merchant_settlement/service.go)  total=3
+   1. 0.850  SettleMerchantSettlement (core_banking_settlement/merchant_settlement/service.go)
+   2. 0.759  SettlementSettled (merchant_settlement/http_handler_test.go)
+   3. 0.737  TestSettleMerchantSettlement (merchant_settlement/service_test.go)
 ```
 
-With `--explain` each match includes a `breakdown` object listing the matching stem tokens with
-their TF-IDF contributions and the shared callees driving co-citation. Full params & field-level
-output: [Tool Reference ▸ `aft similar`](#aft-similar).
+With `--explain` each match is followed by a scoring breakdown — lex / synonym / co-citation
+components, the top token contributors, and shared callees driving co-citation. Full params &
+field-level output: [Tool Reference ▸ `aft similar`](#aft-similar).
 
 The remaining two commands (`aft dispatches` and `aft writers`) live in the
 [Tool Reference](#tool-reference).
@@ -1315,23 +1311,31 @@ aft similar merchant_settlement/service.go SettleMerchantSettlement --top=5
 aft similar merchant_settlement/service.go SettleMerchantSettlement --dict --explain
 ```
 
-**output.** Default (abbreviated):
+**output.**
 
-```json
-{
-  "query": {"file": "merchant_settlement/service.go", "symbol": "SettleMerchantSettlement"},
-  "matches": [
-    {"file": "early_settlement/service.go",    "symbol": "processEarlySettlementV3", "score": 0.72},
-    {"file": "merchant_settlement/service.go", "symbol": "OnHoldMerchantSettlement", "score": 0.68},
-    {"file": "realtime_settlement/service.go", "symbol": "settleRealtime",           "score": 0.64}
-  ]
-}
+```
+similar to SettleMerchantSettlement (merchant_settlement/service.go)  total=5
+   1. 0.850  SettleMerchantSettlement (core_banking_settlement/merchant_settlement/service.go)
+   2. 0.759  SettlementSettled (merchant_settlement/http_handler_test.go)
+   3. 0.737  TestSettleMerchantSettlement (merchant_settlement/service_test.go)
+   4. 0.680  OnHoldMerchantSettlement (merchant_settlement/service.go)
+   5. 0.640  settleRealtime (realtime_settlement/service.go)
 ```
 
-With `--explain` each match gains a `breakdown` object listing the contributing stem tokens
-with per-token TF-IDF product, the dict synonym expansions that fired (if `--dict`), and the
-shared callees driving co-citation. Useful for debugging why two things ranked near each other
-and for explaining rankings in docs.
+With `--explain`, each match is followed by an indented breakdown of the score:
+
+```
+   1. 0.820  processEarlySettlementV3 (early_settlement/service.go)
+       lex=0.65  synonyms=0.00  co_citation=0.81
+       tokens: settl=0.42·0.38=0.16  process=0.12·0.25=0.03
+       shared callees: FindOrCreateProcessingMerchantSettlement, GetMerchantByID
+```
+
+The `lex`, `synonyms`, and `co_citation` components sum (weighted) to the final score. Token
+contributions list the stem tokens that drove the lex component with per-side TF-IDF weights
+and their product. Shared callees are the symbols both the query and the candidate call,
+driving the co-citation component. JSON form (`.matches[].breakdown`) is still available when
+the caller wants structured access.
 
 Optional flags: `--top=N` (default 10), `--min-score=F` (default 0.15), `--dict` (load
 `.aft/synonyms.toml` if present), `--explain` (verbose scoring breakdown per match).

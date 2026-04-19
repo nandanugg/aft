@@ -145,7 +145,11 @@ pub fn handle_similar(req: &RawRequest, ctx: &AppContext) -> Response {
 
     match run_query(&working_index, &q) {
         Ok(result) => {
-            let json = serde_json::to_value(&result).unwrap_or_default();
+            let text = result.render_text();
+            let mut json = serde_json::to_value(&result).unwrap_or_default();
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::Value::String(text));
+            }
             Response::success(&req.id, json)
         }
         Err(e) => Response::error(&req.id, "symbol_not_found", e),

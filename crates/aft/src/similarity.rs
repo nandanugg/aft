@@ -636,6 +636,81 @@ pub struct SimilarityResult {
     pub matches: Vec<SimilarityMatch>,
 }
 
+impl SimilarityResult {
+    /// Render the result as human-readable plain text, mirroring the style
+    /// of other `aft` commands (callers, dispatched_by, dispatches, etc.).
+    ///
+    /// Without a breakdown per match, the output is a compact ranked list.
+    /// When `--explain` produced breakdowns, each match is followed by an
+    /// indented block showing the lex / synonym / co-citation components,
+    /// the top token contributors, and shared callees.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "similar to {} ({})  total={}\n",
+            self.query.symbol,
+            self.query.file,
+            self.matches.len()
+        ));
+
+        if self.matches.is_empty() {
+            out.push_str("  (no similar symbols found above min_score)\n");
+            return out;
+        }
+
+        // If we have target tokens (--explain), show them as context once.
+        if !self.target_tokens.is_empty() {
+            out.push_str("  target tokens (tf-idf):\n");
+            for t in self.target_tokens.iter().take(8) {
+                out.push_str(&format!("    {:<20}  {:.3}\n", t.token, t.tfidf));
+            }
+            out.push('\n');
+        }
+
+        for (i, m) in self.matches.iter().enumerate() {
+            let rel = m.file.display().to_string();
+            out.push_str(&format!(
+                "  {:>2}. {:.3}  {} ({})\n",
+                i + 1,
+                m.score,
+                m.symbol,
+                rel
+            ));
+            if let Some(b) = &m.breakdown {
+                out.push_str(&format!(
+                    "       lex={:.2}  synonyms={:.2}  co_citation={:.2}\n",
+                    b.lex, b.synonyms, b.co_citation
+                ));
+                if !b.lex_contributors.is_empty() {
+                    let shown: Vec<String> = b
+                        .lex_contributors
+                        .iter()
+                        .take(4)
+                        .map(|c| {
+                            format!(
+                                "{}={:.2}·{:.2}={:.2}",
+                                c.token, c.target_weight, c.candidate_weight, c.product
+                            )
+                        })
+                        .collect();
+                    out.push_str(&format!("       tokens: {}\n", shown.join("  ")));
+                }
+                if !b.shared_callees.is_empty() {
+                    let joined = b.shared_callees.join(", ");
+                    let shortened = if joined.len() > 120 {
+                        format!("{}…", &joined[..120])
+                    } else {
+                        joined
+                    };
+                    out.push_str(&format!("       shared callees: {}\n", shortened));
+                }
+            }
+        }
+
+        out
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryInfo {
     pub file: String,
