@@ -139,9 +139,8 @@ agent trust current code over stale priors.
 
 ### What this fork adds
 
-Each new command follows the standard `[desc] / [input] / [output]` shape. Full parameters and
-every output field live in [Tool Reference](#tool-reference); the blurbs here show typical
-shape. Fork-only additions are linked individually:
+Five new commands, each grounded in SSA + CHA data the Go helper already computes. Full
+parameters and every output field are in [Tool Reference](#tool-reference).
 
 - [`aft dispatched_by`](#aft-dispatched_by) — reverse lookup: who registered this as a handler?
 - [`aft dispatches`](#aft-dispatches) — forward lookup by dispatch key to its handler.
@@ -227,8 +226,8 @@ With `--explain` each match includes a `breakdown` object listing the matching s
 their TF-IDF contributions and the shared callees driving co-citation. Full params & field-level
 output: [Tool Reference ▸ `aft similar`](#aft-similar).
 
-`dispatches` and `writers` follow the same two-field (`desc / input / output`) shape — see their
-entries in the Tool Reference.
+The remaining two commands (`aft dispatches` and `aft writers`) live in the
+[Tool Reference](#tool-reference).
 
 ### New structural data the agent gets for free
 
@@ -306,7 +305,7 @@ Three pain points agents hit every session:
 - **Blind navigation** — "who calls this?" and "what does this break?" require grep + cross-file reads.
 
 Each of the tools below solves one. Full parameter list + every output field is in
-[Tool Reference](#tool-reference); this section picks a flagship subset and shows the `[desc] / [input] / [output]` shape that repeats across every AFT tool.
+[Tool Reference](#tool-reference); this section picks a flagship subset.
 
 ---
 
@@ -421,9 +420,8 @@ callers of validateToken (src/auth/session.ts)  total=3 files=3
 
 ---
 
-Same four-line structure (`desc / input / output`, plus notes) applies to every tool in
-[Tool Reference](#tool-reference), including fork-only additions like `dispatched_by`,
-`dispatches`, `implementations`, `writers`, and `similar`.
+For the full set — including fork-only additions (`dispatched_by`, `dispatches`,
+`implementations`, `writers`, `similar`) — see [Tool Reference](#tool-reference).
 
 ---
 
