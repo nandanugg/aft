@@ -61,6 +61,43 @@ aft call_tree service.ts run  # What does run() call?
 
 ---
 
+### Codex
+
+Run the install script to set up AFT guidance hooks for Codex:
+
+```bash
+./scripts/install-codex-hooks.sh
+```
+
+This installs:
+- **Prompt hooks** — Session-start and prompt-submit hooks inject AFT guidance into Codex
+- **CLI wrapper** — `aft` command for semantic commands (outline, zoom, call_tree, callers, etc.)
+- **Instructions** — `~/.codex/AFT.md` is added to your global Codex `AGENTS.md`
+- **Codex config** — `~/.codex/config.toml` is updated to enable `codex_hooks` and suppress the unstable-feature warning
+
+Codex hooks currently do **not** replace Codex's native non-Bash file tools, so this integration
+teaches Codex when to call `aft` explicitly via shell instead of transparently intercepting
+Read/Grep/Glob.
+
+After installation, restart Codex. Then use semantic commands via shell:
+
+```bash
+aft outline src/              # File structure (~10% of full read tokens)
+aft zoom main.go main         # Inspect function with call graph
+aft callers api.ts handler    # Find all callers
+aft call_tree service.ts run  # What does run() call?
+```
+
+<details>
+<summary>Uninstall</summary>
+
+```bash
+./scripts/uninstall-codex-hooks.sh
+```
+</details>
+
+---
+
 
 ### OpenCode
 
@@ -112,6 +149,99 @@ AFT ships a standalone CLI for setup, diagnostics, and issue reporting:
 **`doctor --force`** — Same as `doctor` but always clears the OpenCode plugin cache, forcing a fresh download of the latest plugin version. Use this when you're on an old version and `@latest` doesn't seem to update (OpenCode caches npm packages aggressively).
 
 **`doctor --issue`** — Collects a full diagnostic report, sanitizes your username and home path out of the logs, and opens a pre-filled GitHub issue on [cortexkit/aft](https://github.com/cortexkit/aft/issues). If you have `gh` installed, it submits directly; otherwise it writes the report to `./aft-issue-<timestamp>.md` and opens the GitHub new-issue page in your browser so you can paste it in.
+
+---
+
+## Accuracy-Focused Fork (nandanugg/aft)
+
+This is a **fork** of the upstream [cortexkit/aft](https://github.com/cortexkit/aft), adding
+features driven by one question: *does routing an AI coding agent's code exploration through
+richer structural tools actually make its generated documentation more accurate, or just more
+verbose?* The answer, after a five-iteration measurement study against two other tools in the
+same space, is **yes — and by a measurable margin**.
+
+### The study (brief)
+
+A settlement-flow documentation task was given to Claude Code running inside three isolated
+Docker containers, each configured with exactly one code-navigation tool: this fork, the
+[codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) server, and
+[Serena](https://github.com/oraios/serena). Each tool produced five independent documentation
+passes (15 runs total). Factual claims were extracted from each doc and verified against the
+real codebase (the example project's target-service: 473 Go files, ~10k symbols).
+
+**Results (lower is better):**
+
+| tool                                 | wrong-rate | stale-oracle catches |
+|--------------------------------------|-----------:|---------------------:|
+| **nandanugg/aft (this fork, v3)**    | **18.0 %** |                   16 |
+| codebase-memory-mcp                  |    20.2 %  |                   12 |
+| cortexkit/aft (upstream, baseline)   |    22.6 %  |                    3 |
+| Serena                               |    23.7 %  |                    3 |
+
+"Stale-oracle catches" = cases where the agent's doc disagreed with a prior knowledge-base
+summary AND the real code sided with the agent. Higher is better — the tool is helping the
+agent trust current code over stale priors.
+
+### What this fork adds beyond upstream
+
+**New semantic commands:**
+- `aft dispatched_by <file> <symbol>` — reverse lookup: which call sites pass this function as a handler?
+- `aft dispatches <key> [--prefix]` — forward lookup: what handler is registered under this dispatch key?
+- `aft implementations <file> <interface>` — which concrete types satisfy this interface? (mock-filtered by default)
+- `aft writers <file> <var>` — who writes to this package-level variable across package boundaries?
+- `aft similar <file> <symbol> [--top=N] [--dict] [--explain]` — semantically similar symbols, no embeddings required.
+
+**New edge types and structural data (surfaced via the Go helper's SSA + CHA passes):**
+- **Dispatch edges** (`kind: "dispatches"`) — function-value arguments, with `dispatched_via`
+  FQN of the receiving call and constant-resolved `nearby_string` keys. Catches
+  `asynq.HandleFunc(string(TypeX), handler)`-style patterns that upstream misses entirely.
+- **Goroutine and defer edges** — `go fn()` and `defer fn()` as distinct edge kinds.
+- **Interface implementation edges** (`kind: "implements"`) — explicit interface→concrete
+  relationships independent of call sites. Works across same-file pairs (upstream filtered these
+  out, incorrectly assuming tree-sitter resolved them — it can't, Go's implements-relation is
+  structural).
+- **Package-level variable and constant nodes** — first-class outline symbols with cross-package
+  write-site tracking.
+- **Call-context annotations** — every edge tagged with `in_defer`, `in_goroutine`, `in_loop`,
+  `in_error_branch`, and `branch_depth`. Derived from SSA dominator analysis, not grep heuristics.
+- **Per-return path-condition analysis** — `aft zoom` output includes the conditions under which
+  each `return` statement fires, so agents can write accurate descriptions of retry / error semantics
+  without guessing.
+
+**Performance & persistence:**
+- **Persistent merged-graph cache** — CBOR-encoded per-file (mtime, size) cache plus a merged
+  project-level graph. Warm runs on a 1000-file Go project land in ~50 ms vs ~1.8 s cold.
+- **Similarity index** — identifier tokens + Snowball stemming + project-wide TF-IDF + optional
+  project synonym dict (`.aft/synonyms.toml`) + call-graph co-citation. Disk-cached; query
+  latency under 10 ms on 10k symbols.
+
+**Steering-layer changes (Claude Code integration):**
+- **SessionStart reminder hook** — injects an AFT code-discovery protocol at the top of every
+  session. Explicitly biases the agent toward AFT's semantic tools before raw Grep/Glob/Read,
+  and toward trusting the current code over stale prior knowledge.
+- **PreToolUse discovery gate** — blocks the *first* raw `Grep|Glob|Read|Search` of a session
+  with a nudge toward `aft outline` / `aft trace_to` / `aft callers`. One-shot per session;
+  subsequent calls pass through.
+
+### Single-shot closure resolution
+
+A particularly important refinement: when a Go codebase uses anonymous-lambda handler registration —
+`mux.HandleFunc("TypeX", func(ctx, task) error { return HandleXTask(ctx, task) })` — upstream AFT
+filters those closures and emits nothing. This fork detects the "single in-project call in the
+closure body" pattern and resolves through to the real handler, which recovered most of the
+measured accuracy gap on async dispatch documentation.
+
+### Design docs and reproduction
+
+Each feature has a design doc under `docs/DESIGN-*.md` with the SSA mechanics, filter rules,
+performance budget, and rollout strategy. The comparison study's raw outputs and verification
+data are kept in a sibling directory (`../aft-compare/results/` in the reference setup) — the
+Dockerfiles and run scripts are preserved if you want to reproduce against a different codebase.
+
+Upstream cortexkit/aft remains the source of everything structural about AFT's architecture
+(tree-sitter parser, edit primitives, OpenCode/Codex integration, etc.). This fork contributes
+the extensions above and the accuracy-centered measurement work. Features may or may not be
+accepted upstream; this fork exists regardless.
 
 ---
 
@@ -274,6 +404,17 @@ instant cold starts and stays fresh via file watcher and mtime verification.
 - **Call tree & callers** — forward call graph and reverse lookup across the workspace
 - **Trace-to & impact analysis** — how does execution reach this function? what breaks if it changes?
 - **Data flow tracing** — follow a value through assignments and parameters across files
+- **Dispatch edges & keys** *(fork)* — function-value registrations (`asynq.HandleFunc("X", h)`) with
+  receiving-call FQN and constant-resolved dispatch-key strings; queryable via `aft dispatched_by` / `aft dispatches`
+- **Interface implementation edges** *(fork)* — cross-package and same-file implements relationships,
+  mock-filtered by default; queryable via `aft implementations`
+- **Variable/const nodes** *(fork)* — package-level declarations as first-class symbols,
+  with cross-package write tracking via `aft writers`
+- **Control-flow context** *(fork)* — per-edge `in_defer` / `in_goroutine` / `in_loop` / `in_error_branch`
+  flags and per-return path-condition analysis surfaced in `aft zoom`
+- **Semantic similarity** *(fork, no embeddings)* — `aft similar` ranks by TF-IDF on stemmed identifier
+  tokens plus call-graph co-citation plus optional project synonym dict
+- **Persistent merged-graph cache** *(fork)* — warm runs 10-30× faster via CBOR-encoded per-file cache
 - **Auto-format & auto-backup** — every edit formats the file and saves a snapshot for undo
 - **Import management** — add, remove, organize imports language-aware (TS/JS/TSX/Python/Rust/Go)
 - **Structural transforms** — add class members, Rust derive macros, Python decorators, Go struct tags, wrap try/catch
