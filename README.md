@@ -10,19 +10,18 @@
 </p>
 
 <p align="center">
-  <a href="https://crates.io/crates/agent-file-tools"><img src="https://img.shields.io/crates/v/agent-file-tools?label=crate&color=blue&style=flat-square" alt="crates.io"></a>
-  <a href="https://www.npmjs.com/package/@cortexkit/aft-opencode"><img src="https://img.shields.io/npm/v/@cortexkit/aft-opencode?color=blue&style=flat-square" alt="npm"></a>
-  <a href="https://github.com/cortexkit/aft/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License"></a>
+  <a href="https://github.com/nandanugg/aft"><img src="https://img.shields.io/badge/fork-nandanugg%2Faft-blue?style=flat-square" alt="fork"></a>
+  <a href="https://github.com/cortexkit/aft"><img src="https://img.shields.io/badge/upstream-cortexkit%2Faft-lightgrey?style=flat-square" alt="upstream"></a>
+  <a href="https://github.com/nandanugg/aft/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License"></a>
 </p>
 
 <p align="center">
   <a href="#get-started">Get Started</a> ·
-  <a href="#what-is-aft">What is AFT?</a> ·
-  <a href="#search-benchmarks">Benchmarks</a> ·
-  <a href="#features">Features</a> ·
+  <a href="#accuracy-focused-fork-nandanuggaft">Fork</a> ·
+  <a href="#how-it-helps-agents">How it Helps Agents</a> ·
   <a href="#tool-reference">Tool Reference</a> ·
-  <a href="#configuration">Configuration</a> ·
-  <a href="#architecture">Architecture</a>
+  <a href="#search-benchmarks">Benchmarks</a> ·
+  <a href="#supported-languages">Supported Languages</a>
 </p>
 
 ---
@@ -750,122 +749,6 @@ Flags: `--top=N` (default 10), `--min-score=F` (default 0.15), `--dict` (load th
 synonym file), `--explain`.
 
 ---
-
-## Configuration
-
-AFT uses a two-level config system: user-level defaults plus project-level overrides.
-Both files are JSONC (comments allowed).
-
-**User config** — applies to all projects:
-```
-~/.config/opencode/aft.jsonc
-```
-
-**Project config** — overrides user config for a specific project:
-```
-.opencode/aft.jsonc
-```
-
-### Config Options
-
-```jsonc
-{
-  // Replace opencode's built-in read/write/edit/apply_patch and
-  // ast_grep_search/ast_grep_replace/lsp_diagnostics with AFT-enhanced versions.
-  // Default: true. Set to false to use aft_ prefix on all tools instead.
-  "hoist_builtin_tools": true,
-
-  // Auto-format files after every edit. Default: true
-  "format_on_edit": true,
-
-  // Auto-validate after edits: "syntax" (tree-sitter, fast) or "full" (runs type checker)
-  "validate_on_edit": "syntax",
-
-  // Per-language formatter overrides (auto-detected from project config files if omitted)
-  // Keys: "typescript", "python", "rust", "go"
-  // Values: "biome" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "none"
-  "formatter": {
-    "typescript": "biome",
-    "rust": "rustfmt"
-  },
-
-  // Per-language type checker overrides (auto-detected if omitted)
-  // Keys: "typescript", "python", "rust", "go"
-  // Values: "tsc" | "biome" | "pyright" | "ruff" | "cargo" | "go" | "staticcheck" | "none"
-  "checker": {
-    "typescript": "biome"
-  },
-
-  // Tool surface level: "minimal" | "recommended" (default) | "all"
-  // minimal:     aft_outline, aft_zoom, aft_safety only (no hoisting)
-  // recommended: minimal + hoisted tools + lsp_diagnostics + ast_grep + aft_import + aft_conflicts
-  //              + grep/glob (when experimental_search_index is enabled)
-  //              + aft_search (when experimental_semantic_search is enabled)
-  // all:         recommended + aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor
-  "tool_surface": "recommended",
-
-  // List of tool names to disable after surface filtering
-  "disabled_tools": [],
-
-  // --- Experimental ---
-
-  // Enable trigram-indexed grep/glob that hoist opencode's built-ins.
-  // Builds a background index on session start, persists to disk, updates via file watcher.
-  // Falls back to direct scanning when the index isn't ready or for out-of-project paths.
-  // Default: false
-  "experimental_search_index": false,
-
-  // Enable semantic code search (aft_search tool).
-  // Requires ONNX Runtime installed (brew install onnxruntime on macOS).
-  // Builds embeddings for all symbols using a local model (all-MiniLM-L6-v2, ~22MB).
-  // The model is downloaded on first use. Index persists to disk for fast cold start.
-  // Default: false
-  "experimental_semantic_search": false,
-
-  // Restrict all file operations to the project root directory.
-  // Default: false (matches opencode's permission-based model — operations prompt via ctx.ask)
-  "restrict_to_project_root": false
-}
-```
-
-AFT auto-detects the formatter and checker from project config files (`biome.json` → biome,
-`.prettierrc` → prettier, `Cargo.toml` → rustfmt, `pyproject.toml` → ruff/black, `go.mod` →
-goimports). Local tool binaries (biome, prettier, tsc, pyright) are discovered in
-`node_modules/.bin` before falling back to the system PATH. You only need per-language overrides
-if auto-detection picks the wrong tool or you want to pin a specific formatter.
-
----
-
-## Architecture
-
-AFT is two components that talk over JSON-over-stdio:
-
-```
-OpenCode agent
-     |
-     | tool calls
-     v
-@cortexkit/aft-opencode (TypeScript plugin)
-  - Hoists enhanced read/write/edit/apply_patch/ast_grep_*/lsp_diagnostics/grep/glob
-  - Registers aft_outline/navigate/import/transform/refactor/safety/delete/move/search
-  - Manages a BridgePool (one aft process per session)
-  - Resolves the binary path (cache → npm → PATH → cargo → download)
-     |
-     | JSON-over-stdio (newline-delimited)
-     v
-aft binary (Rust)
-  - tree-sitter parsing (14 language grammars)
-  - Symbol resolution, call graph, diff generation
-  - Format-on-edit (shells out to biome / rustfmt / etc.)
-  - Backup/checkpoint management
-  - Trigram search index (experimental: background thread, disk persistence, file watcher)
-  - Semantic search with local embeddings (experimental: fastembed + all-MiniLM-L6-v2)
-  - Persistent storage at ~/.local/share/opencode/storage/plugin/aft/
-```
-
-The binary speaks a simple request/response protocol: the plugin writes a JSON object to stdin,
-the binary writes a JSON object to stdout. One process per session stays alive for the session
-lifetime — warm parse trees, isolated undo history, no re-spawn overhead per call.
 
 ---
 
