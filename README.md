@@ -505,22 +505,16 @@ instant cold starts and stays fresh via file watcher and mtime verification.
 > **All line numbers are 1-based** (matching editor, git, and compiler conventions).
 > Line 1 is the first line of the file.
 
-### Hoisted tools
+### Hoisted tools (OpenCode-only)
 
-These replace opencode's built-ins. Registered under the same names by default. When
-`hoist_builtin_tools: false`, they get the `aft_` prefix instead (e.g. `aft_read`).
+Upstream AFT's OpenCode plugin **hoists** into opencode's built-in tool slots, so `read`,
+`write`, `edit`, `apply_patch`, `ast_grep_search`, `ast_grep_replace`, and `lsp_diagnostics`
+get AFT-backed implementations under the same names the agent already knows. This fork does
+not yet ship an OpenCode plugin (see [Get Started ▸ OpenCode](#get-started)), so the hoisting
+feature is not available through this repo.
 
-| Tool | Replaces | Description | Key Params |
-|------|----------|-------------|------------|
-| `read` | opencode read | File read, directory listing, image/PDF detection | `filePath`, `startLine`, `endLine`, `offset`, `limit` |
-| `write` | opencode write | Write file with auto-dirs, backup, format, inline diagnostics | `filePath`, `content` |
-| `edit` | opencode edit | Find/replace, symbol replace, batch, transaction, glob | `filePath`, `oldString`, `newString`, `symbol`, `content`, `edits[]` |
-| `apply_patch` | opencode apply_patch | `*** Begin Patch` multi-file patch format | `patchText` |
-| `ast_grep_search` | oh-my-opencode ast_grep | AST pattern search with meta-variables | `pattern`, `lang`, `paths[]`, `globs[]` |
-| `ast_grep_replace` | oh-my-opencode ast_grep | AST pattern replace (applies by default) | `pattern`, `rewrite`, `lang`, `dryRun` |
-| `lsp_diagnostics` | opencode lsp_diagnostics | Errors/warnings from language server | `filePath`, `directory`, `severity`, `waitMs` |
-| `grep` | opencode grep *(experimental)* | Trigram-indexed regex search with compressed output | `pattern`, `path`, `include`, `exclude` |
-| `glob` | opencode glob *(experimental)* | Indexed file discovery with compressed output | `pattern`, `path` |
+The list of hoisted tools and their full behavior is documented in upstream
+[cortexkit/aft ▸ Tool Reference ▸ Hoisted tools](https://github.com/cortexkit/aft#hoisted-tools).
 
 ### AFT-only tools
 
