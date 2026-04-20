@@ -85,22 +85,39 @@ After install, restart Codex. See the [Tool Reference](#tool-reference) for ever
 </details>
 
 <details>
-<summary><strong>OpenCode</strong> — not published for this fork</summary>
+<summary><strong>OpenCode</strong> — local source-checkout install</summary>
 
-The OpenCode integration lives as an npm package. **This fork has not published an OpenCode
-package**, so the plugin-based OpenCode install path is not available here.
+Run the install script:
 
-If you want AFT inside OpenCode *without* the fork's accuracy features (dispatch edges,
-implementation edges, control-flow context, similarity stack, etc.), install the upstream
-[cortexkit/aft](https://github.com/cortexkit/aft) OpenCode package:
+```bash
+./scripts/install-opencode-hooks.sh
+```
+
+This installs:
+- **Local server plugin** — `~/.config/opencode/opencode.json[c]` gets an absolute path to this checkout's `packages/opencode-plugin/src/index.ts`.
+- **Local TUI plugin** — `~/.config/opencode/tui.json[c]` gets an absolute path to this checkout's `packages/opencode-plugin/src/tui/index.tsx`.
+- **Repo binary** — the script builds `target/release/aft`, and the OpenCode plugin now prefers this checkout's binary over cached or published binaries.
+
+Because this fork is not published to npm, the installer points OpenCode at this checkout
+directly. If you move the repo later, rerun the install script so the absolute plugin paths are
+updated.
+
+If you would rather use the published upstream OpenCode package instead, see
+[cortexkit/aft](https://github.com/cortexkit/aft):
 
 ```bash
 bunx --bun @cortexkit/aft-opencode@latest setup
 ```
 
-That gets you upstream AFT's OpenCode integration, with none of this fork's additions. If you
-want this fork's features in OpenCode, either use Claude Code / Codex instead, or let us know
-via an issue so publishing priority can go up.
+That installs upstream AFT for OpenCode, not this fork's local plugin/binary path.
+
+After install, restart OpenCode. See the [Tool Reference](#tool-reference) for every command.
+
+**Uninstall:**
+
+```bash
+./scripts/uninstall-opencode-hooks.sh
+```
 
 </details>
 

@@ -2,7 +2,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ensureBinary, getCacheDir, getCachedBinaryPath } from "./downloader.js";
 import { log, warn } from "./logger.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
@@ -83,18 +83,54 @@ export function platformKey(
 }
 
 /**
+ * When the plugin is loaded straight from a source checkout, prefer the
+ * repo-built binary over caches or published binaries. This keeps a forked
+ * checkout from silently resolving to an upstream release that happens to
+ * share the same version number.
+ */
+export function findLocalCheckoutBinarySync(): string | null {
+  const ext = process.platform === "win32" ? ".exe" : "";
+
+  try {
+    const req = createRequire(import.meta.url);
+    const packageJsonPath = req.resolve("../package.json");
+    const packageRoot = dirname(packageJsonPath);
+    const repoRoot = resolve(packageRoot, "../..");
+    const candidates = [
+      join(repoRoot, "target", "release", `aft${ext}`),
+      join(repoRoot, "target", "debug", `aft${ext}`),
+    ];
+
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  } catch {
+    // Not running from a repo checkout, or package.json resolution failed.
+  }
+
+  return null;
+}
+
+/**
  * Locate the `aft` binary synchronously by checking (in order):
- * 1. Cached binary from previous auto-download (~/.cache/aft/bin/)
- * 2. npm platform package via `require.resolve(@cortexkit/aft-<platform>/bin/aft)`
- * 3. PATH lookup via `which aft` (or `where aft` on Windows)
- * 4. ~/.cargo/bin/aft (Rust cargo install location)
+ * 1. Local repo checkout (`target/release/aft`, then `target/debug/aft`)
+ * 2. Cached binary from previous auto-download (~/.cache/aft/bin/)
+ * 3. npm platform package via `require.resolve(@cortexkit/aft-<platform>/bin/aft)`
+ * 4. PATH lookup via `which aft` (or `where aft` on Windows)
+ * 5. ~/.cargo/bin/aft (Rust cargo install location)
  *
  * Returns the absolute path to the first binary found, or null if none found.
  */
 export function findBinarySync(): string | null {
   const ext = process.platform === "win32" ? ".exe" : "";
 
-  // 1. Check versioned cache for the plugin's own version first
+  // 1. Prefer a repo-local build when the plugin is loaded from source.
+  const localCheckoutBinary = findLocalCheckoutBinarySync();
+  if (localCheckoutBinary) return localCheckoutBinary;
+
+  // 2. Check versioned cache for the plugin's own version first
   const pluginVersion = (() => {
     try {
       const req = createRequire(import.meta.url);
@@ -108,7 +144,7 @@ export function findBinarySync(): string | null {
     if (versionCached) return versionCached;
   }
 
-  // 2. Check npm platform package — copy to versioned cache to avoid
+  // 3. Check npm platform package — copy to versioned cache to avoid
   // corruption when npm updates the package while a bridge is running
   try {
     const key = platformKey();
@@ -123,7 +159,7 @@ export function findBinarySync(): string | null {
     // npm package not installed or resolution failed
   }
 
-  // 3. Check PATH
+  // 4. Check PATH
   try {
     const whichCmd = process.platform === "win32" ? "where aft" : "which aft";
     const result = execSync(whichCmd, {
@@ -135,7 +171,7 @@ export function findBinarySync(): string | null {
     // not in PATH
   }
 
-  // 4. Check ~/.cargo/bin/aft
+  // 5. Check ~/.cargo/bin/aft
   const cargoPath = join(homedir(), ".cargo", "bin", `aft${ext}`);
   if (existsSync(cargoPath)) return cargoPath;
 
@@ -146,11 +182,12 @@ export function findBinarySync(): string | null {
  * Locate the `aft` binary, with auto-download as a last resort.
  *
  * Resolution order:
- *   1. Cached binary (~/.cache/aft/bin/)
- *   2. npm platform package (@cortexkit/aft-<platform>)
- *   3. PATH lookup (which aft)
- *   4. ~/.cargo/bin/aft
- *   5. Auto-download from GitHub releases
+ *   1. Local repo checkout (`target/release/aft`, then `target/debug/aft`)
+ *   2. Cached binary (~/.cache/aft/bin/)
+ *   3. npm platform package (@cortexkit/aft-<platform>)
+ *   4. PATH lookup (which aft)
+ *   5. ~/.cargo/bin/aft
+ *   6. Auto-download from GitHub releases
  *
  * Returns the absolute path to the binary.
  * Throws a descriptive error with install instructions if all sources fail.
@@ -174,6 +211,7 @@ export async function findBinary(): Promise<string> {
       "Could not find the `aft` binary.",
       "",
       "Attempted sources:",
+      "  - Local repo checkout (target/release/aft, target/debug/aft)",
       "  - Cache directory (~/.cache/aft/bin/)",
       "  - npm platform package (@cortexkit/aft-<platform>)",
       "  - PATH lookup (which aft)",

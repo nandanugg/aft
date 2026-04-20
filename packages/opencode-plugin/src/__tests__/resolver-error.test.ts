@@ -20,8 +20,16 @@ function mockNoBinaryEnvironment(downloadedBinary: string | null = null) {
     getCachedBinaryPath: () => null,
     ensureBinary: async () => downloadedBinary,
   }));
-  mock.module("node:fs", () => ({ existsSync: () => false }));
-  mock.module("node:child_process", () => ({ execSync: execMock }));
+  mock.module("node:fs", () => ({
+    chmodSync: () => undefined,
+    copyFileSync: () => undefined,
+    existsSync: () => false,
+    mkdirSync: () => undefined,
+  }));
+  mock.module("node:child_process", () => ({
+    execSync: execMock,
+    spawnSync: mock(() => ({ stdout: "", stderr: "", status: 1 })),
+  }));
   mock.module("node:module", () => ({
     createRequire: () => ({ resolve: resolveMock }),
   }));
@@ -35,6 +43,39 @@ afterEach(() => {
 });
 
 describe("resolver error paths", () => {
+  test("prefers a repo-local checkout binary before cache and PATH fallbacks", async () => {
+    const resolveMock = mock(() => "/repo/packages/opencode-plugin/package.json");
+    const execMock = mock(() => {
+      throw new Error("PATH lookup should not run");
+    });
+
+    mock.module(downloaderModulePath, () => ({
+      getCachedBinaryPath: () => "/cache/aft",
+      ensureBinary: async () => null,
+    }));
+    mock.module("node:fs", () => ({
+      chmodSync: () => undefined,
+      copyFileSync: () => undefined,
+      existsSync: (path: string) => path === "/repo/target/release/aft",
+      mkdirSync: () => undefined,
+    }));
+    mock.module("node:child_process", () => ({
+      execSync: execMock,
+      spawnSync: mock(() => ({ stdout: "", stderr: "", status: 1 })),
+    }));
+    mock.module("node:module", () => ({
+      createRequire: () => ({ resolve: resolveMock }),
+    }));
+    mock.module("node:os", () => ({ homedir: () => "/tmp/aft-home" }));
+
+    const { findBinarySync, findLocalCheckoutBinarySync } = await freshResolverImport();
+
+    expect(findLocalCheckoutBinarySync()).toBe("/repo/target/release/aft");
+    expect(findBinarySync()).toBe("/repo/target/release/aft");
+    expect(resolveMock).toHaveBeenCalled();
+    expect(execMock).not.toHaveBeenCalled();
+  });
+
   test("includes supported platforms when a platform key is missing", () => {
     expect(() => platformKey("plan9", "x64")).toThrow(
       "Unsupported platform: plan9 (arch: x64). Supported platforms: darwin, linux, win32",
@@ -46,7 +87,7 @@ describe("resolver error paths", () => {
     const { findBinarySync } = await freshResolverImport();
 
     expect(findBinarySync()).toBeNull();
-    expect(resolveMock).toHaveBeenCalledTimes(1);
+    expect(resolveMock).toHaveBeenCalledTimes(2);
     expect(execMock).toHaveBeenCalledTimes(1);
   });
 
