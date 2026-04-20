@@ -17,6 +17,7 @@
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target node --format esm --external @mariozechner/pi-coding-agent --external @mariozechner/pi-ai --external @mariozechner/pi-tui --external @sinclair/typebox && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
+    "test": "bun test src/__tests__/",
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
