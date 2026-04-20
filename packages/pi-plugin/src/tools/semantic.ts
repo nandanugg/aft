@@ -1,0 +1,40 @@
+/**
+ * aft_search — semantic (embedding-based) code search.
+ * Only registered when config.experimental_semantic_search is enabled AND
+ * the ONNX runtime / configured backend is available.
+ */
+
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { type Static, Type } from "@sinclair/typebox";
+import type { PluginContext } from "../types.js";
+import { bridgeFor, callBridge, textResult } from "./_shared.js";
+
+const SearchParams = Type.Object({
+  query: Type.String({ description: "Natural-language description of the code to find" }),
+  topK: Type.Optional(
+    Type.Number({ description: "Maximum number of results (default: 10, max: 100)" }),
+  ),
+});
+
+export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void {
+  pi.registerTool({
+    name: "aft_search",
+    label: "semantic search",
+    description:
+      "Search code by meaning using semantic similarity. Use when you don't know the exact name or text — describe what you're looking for in natural language and get the most relevant symbols, functions, and types.",
+    parameters: SearchParams,
+    async execute(
+      _toolCallId: string,
+      params: Static<typeof SearchParams>,
+      _signal,
+      _onUpdate,
+      extCtx,
+    ) {
+      const bridge = bridgeFor(ctx, extCtx.cwd);
+      const req: Record<string, unknown> = { query: params.query };
+      if (params.topK !== undefined) req.top_k = params.topK;
+      const response = await callBridge(bridge, "semantic_search", req);
+      return textResult((response.text as string | undefined) ?? JSON.stringify(response, null, 2));
+    },
+  });
+}

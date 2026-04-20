@@ -95,7 +95,7 @@ implementation edges, control-flow context, similarity stack, etc.), install the
 [cortexkit/aft](https://github.com/cortexkit/aft) OpenCode package:
 
 ```bash
-bunx @cortexkit/aft-opencode@latest setup
+bunx --bun @cortexkit/aft-opencode@latest setup
 ```
 
 That gets you upstream AFT's OpenCode integration, with none of this fork's additions. If you
@@ -105,6 +105,29 @@ via an issue so publishing priority can go up.
 </details>
 
 ---
+
+### Pi
+
+AFT also ships as an extension for the [Pi coding agent](https://github.com/badlogic/pi-mono):
+
+```bash
+pi install npm:@cortexkit/aft-pi
+```
+
+That's it. Pi loads the extension on the next session start. AFT replaces Pi's built-in
+`read`, `write`, `edit`, and `grep` with enhanced versions — all powered natively by AFT —
+plus adds the `aft_` family of semantic tools on top.
+
+See the [pi-plugin README](packages/pi-plugin/README.md) for detailed configuration.
+
+### CLI Commands
+
+| Command | What it does |
+|---|---|
+| `bunx --bun @cortexkit/aft-opencode@latest setup` | Interactive first-time setup — registers plugin entries, enables experimental features |
+| `bunx --bun @cortexkit/aft-opencode@latest doctor` | Check configuration and auto-fix common issues |
+| `bunx --bun @cortexkit/aft-opencode@latest doctor --force` | Force-clear the OpenCode plugin cache (fixes stale `@latest` resolution) |
+| `bunx --bun @cortexkit/aft-opencode@latest doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
 
 ## Accuracy-Focused Fork (nandanugg/aft)
 

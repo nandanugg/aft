@@ -1,0 +1,53 @@
+{
+  "name": "@cortexkit/aft-pi",
+  "version": "0.14.0",
+  "type": "module",
+  "description": "Pi coding agent extension for Agent File Tools (AFT) — tree-sitter and LSP-powered code analysis",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cortexkit/aft"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @mariozechner/pi-coding-agent --external @mariozechner/pi-ai --external @mariozechner/pi-tui --external @sinclair/typebox && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src/__tests__/",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.33"
+  },
+  "optionalDependencies": {
+    "@cortexkit/aft-darwin-arm64": "0.14.0",
+    "@cortexkit/aft-darwin-x64": "0.14.0",
+    "@cortexkit/aft-linux-arm64": "0.14.0",
+    "@cortexkit/aft-linux-x64": "0.14.0",
+    "@cortexkit/aft-win32-x64": "0.14.0"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

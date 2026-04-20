@@ -27,6 +27,7 @@ import { clearSharedBridgePool, setSharedBridgePool } from "./shared/runtime.js"
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
 import { cleanupUrlCache } from "./shared/url-fetch.js";
+import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
@@ -94,6 +95,22 @@ const PLUGIN_VERSION: string = (() => {
     return "0.0.0";
   }
 })();
+
+/**
+ * Release-notes identifier for the startup announcement dialog.
+ *
+ * This is intentionally decoupled from PLUGIN_VERSION so bugfix releases don't
+ * re-trigger a stale dialog. Bump this string and populate ANNOUNCEMENT_FEATURES
+ * ONLY when a release ships user-facing news worth surfacing once at startup.
+ * Leave ANNOUNCEMENT_VERSION empty (or ANNOUNCEMENT_FEATURES empty) to skip the
+ * dialog entirely for bugfix-only releases.
+ *
+ * Persistence (storage/last_announced_version) stores this value, so once a user
+ * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
+ * will not re-show it.
+ */
+const ANNOUNCEMENT_VERSION = "";
+const ANNOUNCEMENT_FEATURES: string[] = [];
 
 /**
  * AFT (Agent File Toolkit) plugin for OpenCode.
@@ -220,42 +237,55 @@ const plugin: Plugin = async (input) => {
 
   // Start RPC server for TUI plugin communication
   const rpcServer = new AftRpcServer(configOverrides.storage_dir as string, input.directory);
+
+  // Install process-level SIGTERM/SIGINT handlers so that child `aft` processes
+  // get an orderly shutdown when the Node host receives a termination signal.
+  // Without this, OS propagates SIGTERM to children before OpenCode calls dispose,
+  // and (together with bridge.ts signal handling) we want the shutdown path we
+  // control, not implicit process-group death. The returned unregister is called
+  // from dispose so plugin reloads don't leak stale cleanup callbacks.
+  const unregisterShutdown = registerShutdownCleanup(async () => {
+    try {
+      rpcServer.stop();
+    } catch {
+      // best-effort
+    }
+    await pool.shutdown();
+  });
   rpcServer.handle("status", async (params) => {
     const sessionID = (params.sessionID as string) || "rpc";
-    const bridge =
-      pool.getAnyActiveBridge(input.directory) ?? pool.getBridge(input.directory, sessionID);
-    return await bridge.send("status", {});
+    // Prefer an already-warm bridge (semantic/trigram indexes loaded) before
+    // spawning a cold one just to answer a status query.
+    const bridge = pool.getAnyActiveBridge(input.directory) ?? pool.getBridge(input.directory);
+    return await bridge.send("status", { session_id: sessionID });
   });
-  // Feature announcement data — TUI plugin calls this on startup to show dialog
+  // Feature announcement — TUI plugin calls this on startup to show a dialog.
+  // Uses ANNOUNCEMENT_VERSION (not PLUGIN_VERSION) so patch releases don't re-fire.
   const storageDir = configOverrides.storage_dir as string;
-  const featureList = [
-    "Semantic code search (`aft_search`) — enable with `experimental_semantic_search: true` in aft.jsonc",
-    "/aft-status command — live index health, disk usage, and runtime details",
-    "HTML outline and zoom — heading hierarchy for .html/.htm files",
-    "And many bugfixes",
-  ];
 
   rpcServer.handle("get-announcement", async () => {
-    // Check if already announced this version
+    if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
+      return { show: false };
+    }
     if (storageDir) {
       const versionFile = join(storageDir, "last_announced_version");
       try {
         if (existsSync(versionFile)) {
           const lastVersion = readFileSync(versionFile, "utf-8").trim();
-          if (lastVersion === PLUGIN_VERSION) return { show: false };
+          if (lastVersion === ANNOUNCEMENT_VERSION) return { show: false };
         }
       } catch {
         // proceed
       }
     }
-    return { show: true, version: PLUGIN_VERSION, features: featureList };
+    return { show: true, version: ANNOUNCEMENT_VERSION, features: ANNOUNCEMENT_FEATURES };
   });
 
   rpcServer.handle("mark-announced", async () => {
-    if (storageDir) {
+    if (storageDir && ANNOUNCEMENT_VERSION) {
       try {
         mkdirSync(storageDir, { recursive: true });
-        writeFileSync(join(storageDir, "last_announced_version"), PLUGIN_VERSION);
+        writeFileSync(join(storageDir, "last_announced_version"), ANNOUNCEMENT_VERSION);
       } catch {
         // best-effort
       }
@@ -300,11 +330,18 @@ const plugin: Plugin = async (input) => {
 
   // Feature announcements in TUI are handled by the TUI plugin via RPC (get-announcement + dialog).
   // In Desktop, sendFeatureAnnouncement sends an ignored message to the active session.
-  // Both share the same last_announced_version file — TUI checks first via RPC,
-  // Desktop fires with a delay to avoid racing the TUI path.
-  setTimeout(() => {
-    sendFeatureAnnouncement(notifyOpts, PLUGIN_VERSION, featureList, storageDir).catch(() => {});
-  }, 8000);
+  // Both share the same last_announced_version file and the same ANNOUNCEMENT_VERSION
+  // constant, so bugfix releases don't re-fire a stale dialog. No-op when empty.
+  if (ANNOUNCEMENT_VERSION && ANNOUNCEMENT_FEATURES.length > 0) {
+    setTimeout(() => {
+      sendFeatureAnnouncement(
+        notifyOpts,
+        ANNOUNCEMENT_VERSION,
+        ANNOUNCEMENT_FEATURES,
+        storageDir,
+      ).catch(() => {});
+    }, 8000);
+  }
 
   // Warn about ONNX Runtime if semantic search is enabled but ORT is unavailable
   if (
@@ -404,9 +441,8 @@ const plugin: Plugin = async (input) => {
 
       // Prefer an existing active bridge to get warm index status
       const bridge =
-        ctx.pool.getAnyActiveBridge(input.directory) ??
-        ctx.pool.getBridge(input.directory, commandInput.sessionID);
-      const response = await bridge.send("status", {});
+        ctx.pool.getAnyActiveBridge(input.directory) ?? ctx.pool.getBridge(input.directory);
+      const response = await bridge.send("status", { session_id: commandInput.sessionID });
       if (response.success === false) {
         throw new Error((response.message as string) || "status failed");
       }
@@ -457,6 +493,7 @@ const plugin: Plugin = async (input) => {
       };
     },
     dispose: () => {
+      unregisterShutdown();
       rpcServer.stop();
       clearSharedBridgePool();
       return pool.shutdown();

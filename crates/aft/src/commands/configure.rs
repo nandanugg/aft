@@ -15,7 +15,7 @@ use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir, walk_project_files, SearchIndex,
 };
 use crate::semantic_index::SemanticIndex;
-use crate::similarity::{SimilarityIndex, SynonymDict, SymbolRef};
+use crate::similarity::{SimilarityIndex, SymbolRef, SynonymDict};
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -675,8 +675,8 @@ pub fn build_similarity_index(
     project_root: &std::path::Path,
     weights: (f32, f32, f32),
 ) -> Option<SimilarityIndex> {
-    use std::collections::HashSet;
     use rayon::prelude::*;
+    use std::collections::HashSet;
 
     let _ = weights; // weights stored in index config, not in the index itself
 
@@ -722,15 +722,15 @@ pub fn build_similarity_index(
         return None;
     }
 
-    log::info!(
-        "[aft-similarity] tokenizing {} symbols",
-        symbol_data.len()
-    );
+    log::info!("[aft-similarity] tokenizing {} symbols", symbol_data.len());
 
     // Load synonym dict from project root
     let synonyms = SynonymDict::load(project_root);
     if !synonyms.is_empty() {
-        log::info!("[aft-similarity] loaded synonym dict ({} entries)", synonyms.map.len());
+        log::info!(
+            "[aft-similarity] loaded synonym dict ({} entries)",
+            synonyms.map.len()
+        );
     }
 
     let index = SimilarityIndex::build(symbol_data, synonyms);

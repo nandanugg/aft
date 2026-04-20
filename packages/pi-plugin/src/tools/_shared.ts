@@ -1,0 +1,64 @@
+/**
+ * Shared helpers used by every Pi tool wrapper.
+ */
+
+import type { AgentToolResult } from "@mariozechner/pi-coding-agent";
+import type { BinaryBridge } from "../bridge.js";
+import type { PluginContext } from "../types.js";
+
+/** Get the session bridge for the current working directory. */
+export function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {
+  return ctx.pool.getBridge(cwd);
+}
+
+/**
+ * Call a bridge command and throw a plain Error on failure.
+ * Every tool handler should guard with `if (response.success === false)`
+ * before accessing success-only fields — this helper does it uniformly.
+ */
+export async function callBridge(
+  bridge: BinaryBridge,
+  command: string,
+  params: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+  const response = await bridge.send(command, params);
+  if (response.success === false) {
+    const message =
+      typeof response.message === "string" && response.message.length > 0
+        ? response.message
+        : `${command} failed`;
+    throw new Error(message);
+  }
+  return response;
+}
+
+/**
+ * Build a text-only AgentToolResult.
+ * This is the standard result shape for most AFT tools.
+ */
+export function textResult<TDetails = unknown>(
+  text: string,
+  details?: TDetails,
+): AgentToolResult<TDetails> {
+  return {
+    content: [{ type: "text", text }],
+    details: details as TDetails,
+  };
+}
+
+/**
+ * Convert a bridge response into a pretty JSON string for the model.
+ * Strips undefined/null fields that just clutter the output.
+ */
+export function jsonTextResult<TDetails = unknown>(
+  response: Record<string, unknown>,
+  details?: TDetails,
+): AgentToolResult<TDetails> {
+  return textResult(JSON.stringify(response, null, 2), details);
+}
+
+/** Strip top-level success field before JSON stringifying. */
+export function stripSuccess(response: Record<string, unknown>): Record<string, unknown> {
+  const { success: _success, ...rest } = response;
+  return rest;
+}
