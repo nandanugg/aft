@@ -4,10 +4,24 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  accentPath,
+  asNumber,
+  asRecord,
+  asRecords,
+  asString,
+  extractStructuredPayload,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+  renderUnifiedDiff,
+  shortenPath,
+} from "./render-helpers.js";
 
 const RefactorParams = Type.Object({
   op: StringEnum(["move", "extract", "inline"] as const, { description: "Refactoring operation" }),
@@ -21,6 +35,92 @@ const RefactorParams = Type.Object({
   callSiteLine: Type.Optional(Type.Number({ description: "1-based call site line (for inline)" })),
   dryRun: Type.Optional(Type.Boolean({ description: "Preview as diff" })),
 });
+
+/** Exported for renderer unit tests. */
+export function buildRefactorSections(
+  args: Static<typeof RefactorParams>,
+  payload: unknown,
+  theme: Theme,
+): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No refactor result.")];
+
+  if (response.dry_run === true) {
+    const diffs = asRecords(response.diffs);
+    const sections = [theme.fg("warning", `[dry run] ${args.op}`)];
+    if (diffs.length === 0) {
+      sections.push(theme.fg("muted", "No diff available."));
+      return sections;
+    }
+    diffs.forEach((diff) => {
+      const file = shortenPath(asString(diff.file) ?? "(unknown file)");
+      const rendered =
+        renderUnifiedDiff(asString(diff.diff) ?? "") || theme.fg("muted", "No diff available.");
+      sections.push(`${theme.fg("accent", file)}\n${rendered}`);
+    });
+    return sections;
+  }
+
+  if (args.op === "move") {
+    const results = asRecords(response.results);
+    return [
+      `${theme.fg("success", "moved symbol")} ${theme.fg("toolOutput", args.symbol ?? "(symbol)")}`,
+      `${theme.fg("muted", "files modified")} ${asNumber(response.files_modified) ?? results.length}`,
+      `${theme.fg("muted", "consumers updated")} ${asNumber(response.consumers_updated) ?? 0}`,
+      results.length > 0
+        ? results
+            .map((entry) => `  ↳ ${shortenPath(asString(entry.file) ?? "(unknown file)")}`)
+            .join("\n")
+        : theme.fg("muted", "No files reported."),
+    ];
+  }
+
+  if (args.op === "extract") {
+    return [
+      `${theme.fg("success", "extracted")} ${theme.fg("toolOutput", asString(response.name) ?? args.name ?? "(function)")}`,
+      `${theme.fg("muted", "file")} ${theme.fg("accent", shortenPath(asString(response.file) ?? args.filePath))}`,
+      `${theme.fg("muted", "params")} ${Array.isArray(response.parameters) ? response.parameters.join(", ") || "none" : "none"}`,
+      `${theme.fg("muted", "return type")} ${asString(response.return_type) ?? "unknown"}`,
+    ];
+  }
+
+  return [
+    `${theme.fg("success", "inlined")} ${theme.fg("toolOutput", asString(response.symbol) ?? args.symbol ?? "(symbol)")}`,
+    `${theme.fg("muted", "file")} ${theme.fg("accent", shortenPath(asString(response.file) ?? args.filePath))}`,
+    `${theme.fg("muted", "context")} ${asString(response.call_context) ?? "unknown"}`,
+    `${theme.fg("muted", "substitutions")} ${asNumber(response.substitutions) ?? 0}`,
+  ];
+}
+
+/** Exported for renderer unit tests. */
+export function renderRefactorCall(
+  args: Static<typeof RefactorParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const summary = [
+    theme.fg("accent", args.op),
+    accentPath(theme, args.filePath),
+    args.symbol ? theme.fg("toolOutput", args.symbol) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return renderToolCall("refactor", summary, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderRefactorResult(
+  result: AgentToolResult<unknown>,
+  args: Static<typeof RefactorParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "refactor failed", theme, context);
+  return renderSections(
+    buildRefactorSections(args, extractStructuredPayload(result), theme),
+    context,
+  );
+}
 
 export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
@@ -56,6 +156,12 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (params.dryRun !== undefined) req.dry_run = params.dryRun;
       const response = await callBridge(bridge, commandMap[params.op], req);
       return textResult(JSON.stringify(response, null, 2));
+    },
+    renderCall(args, theme, context) {
+      return renderRefactorCall(args, theme, context);
+    },
+    renderResult(result, _options, theme, context) {
+      return renderRefactorResult(result, context.args, theme, context);
     },
   });
 }

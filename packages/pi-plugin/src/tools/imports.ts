@@ -4,10 +4,22 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  accentPath,
+  asNumber,
+  asRecord,
+  asRecords,
+  asString,
+  extractStructuredPayload,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+} from "./render-helpers.js";
 
 const ImportParams = Type.Object({
   op: StringEnum(["add", "remove", "organize"] as const, { description: "Import operation" }),
@@ -30,6 +42,87 @@ const ImportParams = Type.Object({
     }),
   ),
 });
+
+/** Exported for renderer unit tests. */
+export function buildImportSections(
+  args: Static<typeof ImportParams>,
+  payload: unknown,
+  theme: Theme,
+): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No import result.")];
+
+  if (response.dry_run === true) {
+    return [
+      theme.fg("warning", `[dry run] ${args.op}`),
+      asString(response.diff) || theme.fg("muted", "No diff available."),
+    ];
+  }
+
+  if (args.op === "organize") {
+    const groups = asRecords(response.groups);
+    const groupText =
+      groups.length > 0
+        ? groups
+            .map((group) => `${asString(group.name) ?? "unknown"}: ${asNumber(group.count) ?? 0}`)
+            .join(" · ")
+        : "No imports found";
+    return [
+      `${theme.fg("success", "organized")} ${theme.fg("accent", asString(response.file) ?? args.filePath)}`,
+      `${theme.fg("muted", "groups")} ${groupText}`,
+      `${theme.fg("muted", "duplicates removed")} ${asNumber(response.removed_duplicates) ?? 0}`,
+    ];
+  }
+
+  if (args.op === "add") {
+    const moduleName = asString(response.module) ?? args.module ?? "(module)";
+    const status =
+      response.already_present === true
+        ? theme.fg("warning", "already present")
+        : theme.fg("success", "added");
+    return [
+      `${status} ${theme.fg("accent", moduleName)}`,
+      `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.filePath)}`,
+      `${theme.fg("muted", "group")} ${asString(response.group) ?? "—"}`,
+    ];
+  }
+
+  return [
+    `${theme.fg("success", "removed")} ${theme.fg("accent", asString(response.module) ?? args.module ?? "(module)")}`,
+    `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.filePath)}`,
+    args.removeName
+      ? `${theme.fg("muted", "name")} ${args.removeName}`
+      : `${theme.fg("muted", "scope")} entire import`,
+  ];
+}
+
+/** Exported for renderer unit tests. */
+export function renderImportCall(
+  args: Static<typeof ImportParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const summary = [
+    theme.fg("accent", args.op),
+    accentPath(theme, args.filePath),
+    args.module ? theme.fg("toolOutput", args.module) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return renderToolCall("import", summary, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderImportResult(
+  result: AgentToolResult<unknown>,
+  args: Static<typeof ImportParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "import failed", theme, context);
+  const payload = extractStructuredPayload(result);
+  return renderSections(buildImportSections(args, payload, theme), context);
+}
 
 export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
@@ -65,6 +158,12 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
 
       const response = await callBridge(bridge, commandMap[params.op], req);
       return textResult(JSON.stringify(response, null, 2));
+    },
+    renderCall(args, theme, context) {
+      return renderImportCall(args, theme, context);
+    },
+    renderResult(result, _options, theme, context) {
+      return renderImportResult(result, context.args, theme, context);
     },
   });
 }

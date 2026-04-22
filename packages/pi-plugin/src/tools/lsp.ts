@@ -5,10 +5,26 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  accentPath,
+  asNumber,
+  asRecord,
+  asRecords,
+  asString,
+  distinctCount,
+  extractStructuredPayload,
+  groupByFile,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+  severityBadge,
+  shortenPath,
+} from "./render-helpers.js";
 
 const LspDiagnosticsParams = Type.Object({
   filePath: Type.Optional(
@@ -30,6 +46,76 @@ const LspDiagnosticsParams = Type.Object({
     }),
   ),
 });
+
+/** Exported for renderer unit tests. */
+export function buildDiagnosticsSections(payload: unknown, theme: Theme): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No diagnostics available.")];
+
+  const diagnostics = asRecords(response.diagnostics);
+  const total = asNumber(response.total) ?? diagnostics.length;
+  const filesWithErrors =
+    asNumber(response.files_with_errors) ??
+    distinctCount(
+      diagnostics
+        .filter((diag) => asString(diag.severity) === "error")
+        .map((diag) => asString(diag.file)),
+    );
+  const filesCount = distinctCount(diagnostics.map((diag) => asString(diag.file)));
+  const sections = [
+    `${theme.fg(total > 0 ? "warning" : "success", `${total} diagnostic${total === 1 ? "" : "s"}`)} ${theme.fg("muted", `across ${filesCount} file${filesCount === 1 ? "" : "s"}, ${filesWithErrors} error file${filesWithErrors === 1 ? "" : "s"}`)}`,
+  ];
+
+  if (diagnostics.length === 0) {
+    sections.push(theme.fg("muted", "No diagnostics found."));
+    return sections;
+  }
+
+  const grouped = groupByFile(diagnostics, (diag) => asString(diag.file));
+  for (const [file, fileDiagnostics] of grouped.entries()) {
+    const lines = [theme.fg("accent", shortenPath(file))];
+    fileDiagnostics.forEach((diagnostic) => {
+      const severity = asString(diagnostic.severity) ?? "information";
+      const line = asNumber(diagnostic.line) ?? 0;
+      const column = asNumber(diagnostic.column) ?? 0;
+      const code = asString(diagnostic.code);
+      const message = asString(diagnostic.message) ?? "(no message)";
+      const location = `${line}:${column}`;
+      lines.push(
+        `  ${severityBadge(theme, severity)} ${location}${code ? ` ${theme.fg("muted", code)}` : ""} ${message}`,
+      );
+    });
+    sections.push(lines.join("\n"));
+  }
+
+  return sections;
+}
+
+/** Exported for renderer unit tests. */
+export function renderDiagnosticsCall(
+  args: Static<typeof LspDiagnosticsParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const target = args.filePath ?? args.directory;
+  const summary = [
+    target ? accentPath(theme, target) : undefined,
+    args.severity ? theme.fg("toolOutput", args.severity) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return renderToolCall("lsp diagnostics", summary, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderDiagnosticsResult(
+  result: AgentToolResult<unknown>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "lsp diagnostics failed", theme, context);
+  return renderSections(buildDiagnosticsSections(extractStructuredPayload(result), theme), context);
+}
 
 export function registerLspTools(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
@@ -60,6 +146,12 @@ export function registerLspTools(pi: ExtensionAPI, ctx: PluginContext): void {
       if (params.waitMs !== undefined) req.wait_ms = params.waitMs;
       const response = await callBridge(bridge, "lsp_diagnostics", req);
       return textResult(JSON.stringify(response, null, 2));
+    },
+    renderCall(args, theme, context) {
+      return renderDiagnosticsCall(args, theme, context);
+    },
+    renderResult(result, _options, theme, context) {
+      return renderDiagnosticsResult(result, theme, context);
     },
   });
 }

@@ -4,10 +4,20 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  accentPath,
+  asRecord,
+  asString,
+  extractStructuredPayload,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+} from "./render-helpers.js";
 
 const TransformParams = Type.Object({
   op: StringEnum(
@@ -44,6 +54,68 @@ const TransformParams = Type.Object({
   ),
 });
 
+/** Exported for renderer unit tests. */
+export function buildTransformSections(
+  args: Static<typeof TransformParams>,
+  payload: unknown,
+  theme: Theme,
+): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No transform result.")];
+
+  if (response.dry_run === true) {
+    return [
+      theme.fg("warning", `[dry run] ${args.op}`),
+      asString(response.diff) ?? theme.fg("muted", "No diff available."),
+    ];
+  }
+
+  const target =
+    asString(response.target) ??
+    asString(response.scope) ??
+    args.target ??
+    args.container ??
+    args.field ??
+    args.filePath;
+
+  return [
+    `${theme.fg("success", "transformed")} ${theme.fg("accent", args.op)}`,
+    `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.filePath)}`,
+    target ? `${theme.fg("muted", "target")} ${target}` : theme.fg("muted", "No target metadata."),
+  ];
+}
+
+/** Exported for renderer unit tests. */
+export function renderTransformCall(
+  args: Static<typeof TransformParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const target = args.target ?? args.container ?? args.field;
+  const summary = [
+    theme.fg("accent", args.op),
+    accentPath(theme, args.filePath),
+    target ? theme.fg("toolOutput", target) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return renderToolCall("transform", summary, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderTransformResult(
+  result: AgentToolResult<unknown>,
+  args: Static<typeof TransformParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "transform failed", theme, context);
+  return renderSections(
+    buildTransformSections(args, extractStructuredPayload(result), theme),
+    context,
+  );
+}
+
 export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
     name: "aft_transform",
@@ -75,6 +147,12 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
       if (params.validate !== undefined) req.validate = params.validate;
       const response = await callBridge(bridge, params.op, req);
       return textResult(JSON.stringify(response, null, 2));
+    },
+    renderCall(args, theme, context) {
+      return renderTransformCall(args, theme, context);
+    },
+    renderResult(result, _options, theme, context) {
+      return renderTransformResult(result, context.args, theme, context);
     },
   });
 }

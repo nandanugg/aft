@@ -4,10 +4,26 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  asNumber,
+  asRecord,
+  asRecords,
+  asString,
+  collectTextContent,
+  extractStructuredPayload,
+  formatValue,
+  groupByFile,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+  renderUnifiedDiff,
+  shortenPath,
+} from "./render-helpers.js";
 
 const AstLang = StringEnum(["typescript", "tsx", "javascript", "python", "rust", "go"] as const, {
   description: "Target language",
@@ -44,6 +60,153 @@ export interface AstSurface {
   astReplace: boolean;
 }
 
+/** Exported for renderer unit tests. */
+export function buildAstSearchSections(payload: unknown, theme: Theme): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No AST search results.")];
+
+  const matches = asRecords(response.matches);
+  const totalMatches = asNumber(response.total_matches) ?? matches.length;
+  const filesWithMatches =
+    asNumber(response.files_with_matches) ??
+    groupByFile(matches, (match) => asString(match.file)).size;
+  const filesSearched = asNumber(response.files_searched);
+  const header = [
+    theme.fg("success", `${totalMatches} match${totalMatches === 1 ? "" : "es"}`),
+    theme.fg("accent", `${filesWithMatches} file${filesWithMatches === 1 ? "" : "s"}`),
+    filesSearched !== undefined ? theme.fg("muted", `${filesSearched} searched`) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  if (matches.length === 0) return [header, theme.fg("muted", "No AST matches found.")];
+
+  const grouped = groupByFile(matches, (match) => asString(match.file));
+  const sections = [header];
+  for (const [file, fileMatches] of grouped.entries()) {
+    const lines = [theme.fg("accent", shortenPath(file))];
+    fileMatches.forEach((match, index) => {
+      const line = asNumber(match.line) ?? 0;
+      const column = asNumber(match.column) ?? 0;
+      const snippet = asString(match.text)?.trim() || "(empty match)";
+      lines.push(`  ${index + 1}. ${theme.fg("muted", `${line}:${column}`)} ${snippet}`);
+
+      const metaVars = asRecord(match.meta_variables);
+      if (metaVars && Object.keys(metaVars).length > 0) {
+        Object.entries(metaVars).forEach(([name, value]) => {
+          lines.push(`     ${theme.fg("muted", `${name} =`)} ${formatValue(value)}`);
+        });
+      }
+
+      const context = asRecords(match.context);
+      context.forEach((ctxLine) => {
+        const ctxNumber = asNumber(ctxLine.line) ?? 0;
+        const prefix = ctxLine.is_match === true ? theme.fg("accent", ">") : theme.fg("muted", "|");
+        lines.push(`     ${prefix} ${ctxNumber}: ${asString(ctxLine.text) ?? ""}`);
+      });
+    });
+    sections.push(lines.join("\n"));
+  }
+
+  return sections;
+}
+
+/** Exported for renderer unit tests. */
+export function buildAstReplaceSections(payload: unknown, theme: Theme): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No AST replace results.")];
+
+  const files = asRecords(response.files);
+  const totalReplacements = asNumber(response.total_replacements) ?? 0;
+  const totalFiles = asNumber(response.total_files) ?? files.length;
+  const filesWithMatches = asNumber(response.files_with_matches);
+  const dryRun = response.dry_run === true;
+  const headerParts = [
+    dryRun ? theme.fg("warning", "[dry run]") : theme.fg("success", "[applied]"),
+    `${totalReplacements} replacement${totalReplacements === 1 ? "" : "s"}`,
+    `${totalFiles} file${totalFiles === 1 ? "" : "s"}`,
+    filesWithMatches !== undefined ? theme.fg("muted", `${filesWithMatches} matched`) : undefined,
+  ];
+  const sections = [headerParts.filter(Boolean).join(" ")];
+
+  if (files.length === 0) {
+    sections.push(theme.fg("muted", "No files changed."));
+    return sections;
+  }
+
+  files.forEach((fileResult) => {
+    const file = shortenPath(asString(fileResult.file) ?? "(unknown file)");
+    const replacements = asNumber(fileResult.replacements) ?? 0;
+    const error = asString(fileResult.error);
+    const diff = asString(fileResult.diff);
+    const lines = [
+      `${theme.fg("accent", file)} ${theme.fg("muted", `(${replacements} replacement${replacements === 1 ? "" : "s"})`)}`,
+    ];
+
+    if (error) {
+      lines.push(theme.fg("error", error));
+    } else if (diff) {
+      const rendered = renderUnifiedDiff(diff);
+      lines.push(rendered || theme.fg("muted", "No diff available."));
+    } else {
+      const backupId = asString(fileResult.backup_id);
+      lines.push(
+        backupId
+          ? `${theme.fg("success", "saved")} ${theme.fg("muted", backupId)}`
+          : theme.fg("success", "saved"),
+      );
+    }
+
+    sections.push(lines.join("\n"));
+  });
+
+  return sections;
+}
+
+/** Exported for renderer unit tests. */
+export function renderAstCall(
+  toolName: "ast_grep_search" | "ast_grep_replace",
+  args: Static<typeof SearchParams> | Static<typeof ReplaceParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const lang = theme.fg("accent", args.lang);
+  const summary =
+    toolName === "ast_grep_replace"
+      ? `${lang} ${theme.fg("toolOutput", `${(args as Static<typeof ReplaceParams>).pattern} → ${(args as Static<typeof ReplaceParams>).rewrite}`)}`
+      : `${lang} ${theme.fg("toolOutput", args.pattern)}`;
+  return renderToolCall(
+    toolName === "ast_grep_replace" ? "ast replace" : "ast search",
+    summary,
+    theme,
+    context,
+  );
+}
+
+/** Exported for renderer unit tests. */
+export function renderAstResult(
+  toolName: "ast_grep_search" | "ast_grep_replace",
+  result: AgentToolResult<unknown>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) {
+    return renderErrorResult(result, `${toolName} failed`, theme, context);
+  }
+
+  const payload = extractStructuredPayload(result);
+  if (!payload) {
+    const text = collectTextContent(result);
+    return renderSections([text || theme.fg("muted", "No result.")], context);
+  }
+
+  const sections =
+    toolName === "ast_grep_replace"
+      ? buildAstReplaceSections(payload, theme)
+      : buildAstSearchSections(payload, theme);
+  return renderSections(sections, context);
+}
+
 export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: AstSurface): void {
   if (surface.astSearch) {
     pi.registerTool({
@@ -69,6 +232,12 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
         const response = await callBridge(bridge, "ast_search", req);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
+      },
+      renderCall(args, theme, context) {
+        return renderAstCall("ast_grep_search", args, theme, context);
+      },
+      renderResult(result, _options, theme, context) {
+        return renderAstResult("ast_grep_search", result, theme, context);
       },
     });
   }
@@ -99,6 +268,12 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         req.dry_run = params.dryRun === true;
         const response = await callBridge(bridge, "ast_replace", req);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
+      },
+      renderCall(args, theme, context) {
+        return renderAstCall("ast_grep_replace", args, theme, context);
+      },
+      renderResult(result, _options, theme, context) {
+        return renderAstResult("ast_grep_replace", result, theme, context);
       },
     });
   }

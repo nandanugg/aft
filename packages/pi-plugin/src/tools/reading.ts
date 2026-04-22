@@ -5,11 +5,24 @@
 
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import { discoverSourceFiles } from "../shared/discover-files.js";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  accentPath,
+  asRecord,
+  asRecords,
+  asString,
+  collectTextContent,
+  extractStructuredPayload,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+  shortenPath,
+} from "./render-helpers.js";
 
 const OutlineParams = Type.Object({
   filePath: Type.Optional(
@@ -41,6 +54,134 @@ const ZoomParams = Type.Object({
 export interface ReadingSurface {
   outline: boolean;
   zoom: boolean;
+}
+
+/** Exported for renderer unit tests. */
+export function buildOutlineSections(text: string, theme: Theme): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [theme.fg("muted", "No outline available.")];
+
+  const lines = trimmed.split("\n");
+  if (lines.length === 1) return [theme.fg("accent", lines[0])];
+  return [theme.fg("accent", lines[0]), lines.slice(1).join("\n")];
+}
+
+/** Exported for renderer unit tests. */
+export function buildZoomSections(
+  args: Static<typeof ZoomParams>,
+  payload: unknown,
+  theme: Theme,
+): string[] {
+  const items = Array.isArray(payload) ? payload : payload ? [payload] : [];
+  if (items.length === 0) return [theme.fg("muted", "No zoom result available.")];
+
+  return items
+    .map((item) => {
+      const record = asRecord(item);
+      if (!record) return theme.fg("muted", "No zoom result available.");
+
+      const name = asString(record.name) ?? "(unknown symbol)";
+      const kind = asString(record.kind) ?? "symbol";
+      const range = asRecord(record.range);
+      const startLine =
+        range && typeof range.start_line === "number" ? range.start_line : undefined;
+      const endLine = range && typeof range.end_line === "number" ? range.end_line : undefined;
+      const location =
+        startLine !== undefined
+          ? `${shortenPath(args.filePath)}:${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ""}`
+          : shortenPath(args.filePath);
+      const lines = [`${theme.fg("accent", name)} ${theme.fg("muted", `[${kind}] ${location}`)}`];
+
+      const content = asString(record.content);
+      if (content) {
+        lines.push(
+          content
+            .split("\n")
+            .map((line) => `  ${line}`)
+            .join("\n"),
+        );
+      }
+
+      const annotations = asRecord(record.annotations);
+      const callsOut = annotations ? asRecords(annotations.calls_out) : [];
+      const calledBy = annotations ? asRecords(annotations.called_by) : [];
+      if (callsOut.length > 0) {
+        lines.push(
+          `${theme.fg("muted", "calls out")}`,
+          callsOut
+            .map(
+              (call) =>
+                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}`,
+            )
+            .join("\n"),
+        );
+      }
+      if (calledBy.length > 0) {
+        lines.push(
+          `${theme.fg("muted", "called by")}`,
+          calledBy
+            .map(
+              (call) =>
+                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}`,
+            )
+            .join("\n"),
+        );
+      }
+
+      return lines.join("\n");
+    })
+    .filter(Boolean);
+}
+
+/** Exported for renderer unit tests. */
+export function renderOutlineCall(
+  args: Static<typeof OutlineParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const summary = args.filePath
+    ? accentPath(theme, args.filePath)
+    : args.directory
+      ? `${theme.fg("muted", "dir")} ${accentPath(theme, args.directory)}`
+      : args.files && args.files.length > 0
+        ? theme.fg("accent", `${args.files.length} files`)
+        : undefined;
+  return renderToolCall("outline", summary, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderOutlineResult(
+  result: AgentToolResult<unknown>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "outline failed", theme, context);
+  return renderSections(buildOutlineSections(collectTextContent(result), theme), context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderZoomCall(
+  args: Static<typeof ZoomParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const target = args.symbol
+    ? theme.fg("toolOutput", args.symbol)
+    : args.symbols && args.symbols.length > 0
+      ? theme.fg("toolOutput", `${args.symbols.length} symbols`)
+      : theme.fg("toolOutput", "lines");
+  return renderToolCall("zoom", `${accentPath(theme, args.filePath)} ${target}`, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderZoomResult(
+  result: AgentToolResult<unknown>,
+  args: Static<typeof ZoomParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "zoom failed", theme, context);
+  return renderSections(buildZoomSections(args, extractStructuredPayload(result), theme), context);
 }
 
 export function registerReadingTools(
@@ -107,6 +248,12 @@ export function registerReadingTools(
         const response = await callBridge(bridge, "outline", { file: params.filePath });
         return textResult((response.text as string | undefined) ?? "");
       },
+      renderCall(args, theme, context) {
+        return renderOutlineCall(args, theme, context);
+      },
+      renderResult(result, _options, theme, context) {
+        return renderOutlineResult(result, theme, context);
+      },
     });
   }
 
@@ -143,6 +290,12 @@ export function registerReadingTools(
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
         const response = await callBridge(bridge, "zoom", req);
         return textResult(JSON.stringify(response, null, 2));
+      },
+      renderCall(args, theme, context) {
+        return renderZoomCall(args, theme, context);
+      },
+      renderResult(result, _options, theme, context) {
+        return renderZoomResult(result, context.args, theme, context);
       },
     });
   }
