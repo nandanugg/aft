@@ -82,7 +82,12 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Auto-backup existing file before overwriting
-    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), "write: pre-write backup") {
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        path.as_path(),
+        "write: pre-write backup",
+    ) {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());

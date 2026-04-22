@@ -189,7 +189,9 @@ impl AppContext {
     }
 
     /// Access the cached semantic embedding model.
-    pub fn semantic_embedding_model(&self) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
+    pub fn semantic_embedding_model(
+        &self,
+    ) -> &RefCell<Option<crate::semantic_index::EmbeddingModel>> {
         &self.semantic_embedding_model
     }
 
