@@ -255,6 +255,14 @@ jobs:
         run: bun run build
         working-directory: packages/pi-plugin
 
+      - name: Install CLI dependencies
+        run: bun install
+        working-directory: packages/aft-cli
+
+      - name: Build CLI
+        run: bun run build
+        working-directory: packages/aft-cli
+
       # Uses npm Trusted Publishing (OIDC) — configured per-package on npmjs.com
       - name: Publish platform packages
         run: |
@@ -269,6 +277,10 @@ jobs:
       - name: Publish @cortexkit/aft-pi
         run: npm publish --access public --provenance
         working-directory: packages/pi-plugin
+
+      - name: Publish @cortexkit/aft (unified CLI)
+        run: npm publish --access public --provenance
+        working-directory: packages/aft-cli
 
   github-release:
     name: Create GitHub Release

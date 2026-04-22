@@ -151,7 +151,11 @@ results.push(updateJsonFile(corePath, version, { optionalDependencies: true }, d
 const piPath = join(root, "packages", "pi-plugin", "package.json");
 results.push(updateJsonFile(piPath, version, { optionalDependencies: true }, dryRun));
 
-// 8: Cargo.toml
+// 8: @cortexkit/aft (unified CLI)
+const cliPath = join(root, "packages", "aft-cli", "package.json");
+results.push(updateJsonFile(cliPath, version, {}, dryRun));
+
+// 9: Cargo.toml
 const cargoPath = join(root, "crates", "aft", "Cargo.toml");
 results.push(updateCargoToml(cargoPath, version, dryRun));
 
