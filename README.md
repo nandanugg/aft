@@ -910,7 +910,14 @@ Both files are JSONC (comments allowed).
 
   // Restrict all file operations to the project root directory.
   // Default: false (matches opencode's permission-based model — operations prompt via ctx.ask)
-  "restrict_to_project_root": false
+  "restrict_to_project_root": false,
+
+  // Maximum source files allowed for call-graph operations (callers, trace_to,
+  // trace_data, impact). Projects above this size return "project_too_large"
+  // with guidance to open a specific subdirectory. Does not affect grep,
+  // glob, read, edit, or any other tool.
+  // Default: 20000 (covers typical monorepos; rejects OS-wide roots like ~/Work).
+  "max_callgraph_files": 20000
 }
 ```
 
@@ -919,6 +926,21 @@ AFT auto-detects the formatter and checker from project config files (`biome.jso
 goimports). Local tool binaries (biome, prettier, tsc, pyright) are discovered in
 `node_modules/.bin` before falling back to the system PATH. You only need per-language overrides
 if auto-detection picks the wrong tool or you want to pin a specific formatter.
+
+### Working with large repositories
+
+If you point AFT at a very large directory (monorepo root, `~/Work`, `/home`, etc.), certain
+features guard against unbounded work to keep the bridge responsive:
+
+- **Call-graph ops** (`callers`, `trace_to`, `trace_data`, `impact`) return `project_too_large`
+  above `max_callgraph_files` (default 20,000). The plugin logs a warning at startup when this
+  threshold is exceeded so you know before making a tool call.
+- **Semantic indexing** is skipped above 10,000 source files.
+- **`grep`, `glob`, `read`, `edit`, and other tools** work at any size.
+
+Commands with heavier workloads get longer per-call timeouts: 60s for `callers`, `trace_to`,
+`trace_data`, `impact`, `grep`, `glob`; 45s for `semantic_search`; 30s for everything else.
+For best results in very large trees, point AFT at a specific project subdirectory.
 
 ---
 

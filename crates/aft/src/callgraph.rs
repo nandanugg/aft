@@ -790,12 +790,54 @@ impl CallGraph {
         self.project_files.as_deref().unwrap_or(&[])
     }
 
+    /// Get the total number of project source files.
+    ///
+    /// Triggers project file discovery on first access and returns the cached
+    /// count thereafter. Prefer [`project_file_count_bounded`] when the caller
+    /// only needs to know whether a threshold is exceeded.
+    pub fn project_file_count(&mut self) -> usize {
+        self.project_files().len()
+    }
+
+    /// Count project source files, stopping after `limit + 1` so huge roots
+    /// do not pay for a full walk or allocate a giant vector.
+    ///
+    /// Returns the real count when ≤ `limit`, or `limit + 1` when exceeded.
+    /// Uses the cached `project_files` vec when it already exists (e.g. a
+    /// previous call-graph op succeeded at this cap), otherwise short-circuits
+    /// the underlying `ignore::Walk` iterator via `.take(limit + 1)`.
+    ///
+    /// CRITICAL: This method must NOT populate `self.project_files`. The whole
+    /// point is to reject oversized roots before the full walk-and-collect runs.
+    pub fn project_file_count_bounded(&self, limit: usize) -> usize {
+        if let Some(files) = self.project_files.as_deref() {
+            return files.len();
+        }
+        walk_project_files(&self.project_root)
+            .take(limit.saturating_add(1))
+            .count()
+    }
+
     /// Build the reverse index by scanning all project files.
     ///
     /// For each file, builds the call data (if not cached), then for each
     /// (symbol, call_sites) pair, resolves cross-file edges and inserts
     /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
-    fn build_reverse_index(&mut self) {
+    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
+        // Bounded count first — never populate project_files on oversized roots.
+        // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an
+        // iterator), so this costs at most (max_files + 1) directory entries
+        // worth of work, not a full O(N) walk of the whole tree.
+        let count = self.project_file_count_bounded(max_files);
+        if count > max_files {
+            return Err(AftError::ProjectTooLarge {
+                count,
+                max: max_files,
+            });
+        }
+
+        // TODO(v0.16): rust-side deadline for graceful timeout recovery
+        // (unbounded walks remain a soft cliff for users who raise the cap).
         // Discover all project files first
         let all_files = self.project_files().to_vec();
 
@@ -857,6 +899,7 @@ impl CallGraph {
         }
 
         self.reverse_index = Some(reverse);
+        Ok(())
     }
 
     fn reverse_sites(&self, file: &Path, symbol: &str) -> Option<&[IndexedCallerSite]> {
@@ -877,6 +920,7 @@ impl CallGraph {
         file: &Path,
         symbol: &str,
         depth: usize,
+        max_files: usize,
     ) -> Result<CallersResult, AftError> {
         let canon = self.canonicalize(file)?;
 
@@ -885,7 +929,7 @@ impl CallGraph {
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
 
         let scanned_files = self.project_files.as_ref().map(|f| f.len()).unwrap_or(0);
@@ -952,6 +996,7 @@ impl CallGraph {
         file: &Path,
         symbol: &str,
         max_depth: usize,
+        max_files: usize,
     ) -> Result<TraceToResult, AftError> {
         let canon = self.canonicalize(file)?;
 
@@ -960,7 +1005,7 @@ impl CallGraph {
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
 
         let target_rel = self.relative_path(&canon);
@@ -1168,6 +1213,7 @@ impl CallGraph {
         file: &Path,
         symbol: &str,
         depth: usize,
+        max_files: usize,
     ) -> Result<ImpactResult, AftError> {
         let canon = self.canonicalize(file)?;
 
@@ -1176,7 +1222,7 @@ impl CallGraph {
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
 
         let effective_depth = if depth == 0 { 1 } else { depth };
@@ -1305,6 +1351,7 @@ impl CallGraph {
         symbol: &str,
         expression: &str,
         max_depth: usize,
+        max_files: usize,
     ) -> Result<TraceDataResult, AftError> {
         let canon = self.canonicalize(file)?;
         let rel_file = self.relative_path(&canon);
@@ -1334,6 +1381,17 @@ impl CallGraph {
                     ),
                 });
             }
+        }
+
+        // Bounded count: short-circuits at `max_files + 1` so oversized roots
+        // reject in microseconds instead of paying the full walk/collect cost.
+        // Matches the guard used by build_reverse_index / callers_of / trace_to / impact.
+        let count = self.project_file_count_bounded(max_files);
+        if count > max_files {
+            return Err(AftError::ProjectTooLarge {
+                count,
+                max: max_files,
+            });
         }
 
         let mut hops = Vec::new();
@@ -2852,7 +2910,7 @@ export function funcB() {
 
         // helpers.ts:double is called by utils.ts:helper
         let result = graph
-            .callers_of(&dir.path().join("helpers.ts"), "double", 1)
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
             .unwrap();
 
         assert_eq!(result.symbol, "double");
@@ -2883,7 +2941,7 @@ export function funcB() {
 
         // main.ts:main is the entry point — nothing calls it
         let result = graph
-            .callers_of(&dir.path().join("main.ts"), "main", 1)
+            .callers_of(&dir.path().join("main.ts"), "main", 1, usize::MAX)
             .unwrap();
 
         assert_eq!(result.symbol, "main");
@@ -2900,7 +2958,7 @@ export function funcB() {
         // utils.ts:helper is called by main.ts:main
         // With depth=2, we should see both direct and transitive callers
         let result = graph
-            .callers_of(&dir.path().join("helpers.ts"), "double", 2)
+            .callers_of(&dir.path().join("helpers.ts"), "double", 2, usize::MAX)
             .unwrap();
 
         assert!(
@@ -2925,7 +2983,7 @@ export function funcB() {
 
         // Build callers to populate the reverse index
         let _ = graph
-            .callers_of(&dir.path().join("helpers.ts"), "double", 1)
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
             .unwrap();
         assert!(
             graph.reverse_index.is_some(),
@@ -3207,7 +3265,12 @@ function testValidation() {
         let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 10)
+            .trace_to(
+                &dir.path().join("helpers.ts"),
+                "checkFormat",
+                10,
+                usize::MAX,
+            )
             .unwrap();
 
         assert_eq!(result.target_symbol, "checkFormat");
@@ -3253,7 +3316,7 @@ function testValidation() {
         // processData is called from main, handleRequest
         // So validate has paths: main→processData→validate, handleRequest→processData→validate, testValidation→validate
         let result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "validate", 10)
+            .trace_to(&dir.path().join("helpers.ts"), "validate", 10, usize::MAX)
             .unwrap();
 
         assert_eq!(result.target_symbol, "validate");
@@ -3271,7 +3334,7 @@ function testValidation() {
 
         // funcA ↔ funcB cycle — should terminate
         let result = graph
-            .trace_to(&dir.path().join("a.ts"), "funcA", 10)
+            .trace_to(&dir.path().join("a.ts"), "funcA", 10, usize::MAX)
             .unwrap();
 
         // Should not hang — the fact we got here means cycle detection works
@@ -3285,7 +3348,7 @@ function testValidation() {
 
         // With max_depth=1, should not be able to reach entry points that are 3+ hops away
         let result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 1)
+            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 1, usize::MAX)
             .unwrap();
 
         // testValidation→validate→checkFormat is 2 hops, which requires depth >= 2
@@ -3295,7 +3358,12 @@ function testValidation() {
 
         // The shallow result should have fewer paths than the deep one
         let deep_result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 10)
+            .trace_to(
+                &dir.path().join("helpers.ts"),
+                "checkFormat",
+                10,
+                usize::MAX,
+            )
             .unwrap();
 
         assert!(
@@ -3313,7 +3381,7 @@ function testValidation() {
 
         // main is itself an entry point — should return a single trivial path
         let result = graph
-            .trace_to(&dir.path().join("main.ts"), "main", 10)
+            .trace_to(&dir.path().join("main.ts"), "main", 10, usize::MAX)
             .unwrap();
 
         assert_eq!(result.target_symbol, "main");

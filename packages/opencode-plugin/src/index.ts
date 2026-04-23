@@ -152,6 +152,8 @@ const plugin: Plugin = async (input) => {
   if (aftConfig.experimental_semantic_search !== undefined)
     configOverrides.experimental_semantic_search = aftConfig.experimental_semantic_search;
   if (aftConfig.semantic !== undefined) configOverrides.semantic = aftConfig.semantic;
+  if (aftConfig.max_callgraph_files !== undefined)
+    configOverrides.max_callgraph_files = aftConfig.max_callgraph_files;
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 

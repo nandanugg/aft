@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
 use crate::edit;
+use crate::error::AftError;
 use crate::imports;
 use crate::lsp_hints;
 use crate::parser::{detect_language, LangId};
@@ -264,9 +265,23 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, e.code(), e.to_string());
     }
 
-    let consumers = match graph.callers_of(source_path, symbol_name, 1) {
+    let consumers = match graph.callers_of(
+        source_path,
+        symbol_name,
+        1,
+        ctx.config().max_callgraph_files,
+    ) {
         Ok(result) => result.callers,
-        Err(_) => Vec::new(), // No callers found is fine
+        // ProjectTooLarge MUST surface — silently proceeding would move the
+        // symbol without rewriting consumer imports across the project and
+        // leave the workspace in a broken state. Every other caller-discovery
+        // failure (symbol not found, parse error, etc.) keeps the pre-0.15.1
+        // "no callers found is fine" fallback because those scenarios produce
+        // a zero-consumers result that is the same as a clean move.
+        Err(err @ AftError::ProjectTooLarge { .. }) => {
+            return Response::error(&req.id, "project_too_large", format!("{}", err));
+        }
+        Err(_) => Vec::new(),
     };
 
     // Collect consumer files that need import rewriting

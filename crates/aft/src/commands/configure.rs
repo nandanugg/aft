@@ -227,6 +227,42 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         ctx.config_mut().semantic = semantic;
     }
+    if let Some(raw) = req.params.get("max_callgraph_files") {
+        // Reject invalid values explicitly so user typos surface instead of
+        // being silently swallowed (Oracle v0.15.1 review blocker).
+        // Accepts: positive integers (u64).
+        // Rejects: 0, negatives, non-integers, non-numbers.
+        let parsed = raw.as_u64().filter(|v| *v >= 1);
+        match parsed {
+            Some(v) => ctx.config_mut().max_callgraph_files = v as usize,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "max_callgraph_files must be a positive integer (>= 1); got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
+
+    // Bounded count — `.take(max + 1)` short-circuits the `ignore::Walk`
+    // iterator so huge roots don't pay full walk cost here. `saturating_add`
+    // guards the pathological case where a user sets `max_callgraph_files`
+    // to `usize::MAX`.
+    let source_file_count = crate::callgraph::walk_project_files(&root_path)
+        .take(ctx.config().max_callgraph_files.saturating_add(1))
+        .count();
+    let exceeds = source_file_count > ctx.config().max_callgraph_files;
+    if exceeds {
+        log::warn!(
+            "[aft] project has >{} source files (max_callgraph_files={}). Call-graph operations (callers, trace_to, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
+            ctx.config().max_callgraph_files,
+            ctx.config().max_callgraph_files
+        );
+    }
 
     let experimental_search_index = ctx.config().experimental_search_index;
     let experimental_semantic_search = ctx.config().experimental_semantic_search;
@@ -470,7 +506,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     Response::success(
         &req.id,
-        serde_json::json!({ "project_root": root_path.display().to_string() }),
+        serde_json::json!({
+            "project_root": root_path.display().to_string(),
+            "source_file_count": source_file_count,
+            "source_file_count_exceeds_max": exceeds,
+            "max_callgraph_files": ctx.config().max_callgraph_files,
+        }),
     )
 }
 

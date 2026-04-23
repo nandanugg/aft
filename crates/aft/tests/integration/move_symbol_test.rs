@@ -519,3 +519,41 @@ fn move_symbol_file_not_found() {
 
     aft.shutdown();
 }
+
+/// `move_symbol` must surface `project_too_large` instead of silently moving
+/// the symbol. Moving without rewriting consumer imports leaves the workspace
+/// broken, so the fail-loud behavior is a correctness fix (Oracle v0.15.1
+/// review, bug #2). Pre-fix the callers_of Err branch caught every error
+/// including `project_too_large` and defaulted to zero consumers.
+#[test]
+fn move_symbol_project_too_large() {
+    let (_tmp, root) = setup_move_fixture();
+    let mut aft = AftProcess::spawn();
+
+    // Configure with an artificially low cap so the 7+ file fixture trips the
+    // guard. This asserts the guard fires BEFORE the move writes anything.
+    let resp = aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        root
+    ));
+    assert_eq!(resp["success"], true);
+
+    let source = format!("{}/service.ts", root);
+    let dest = format!("{}/utils.ts", root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
+        source, dest
+    ));
+
+    assert_eq!(resp["success"], false, "move should fail: {:?}", resp);
+    assert_eq!(resp["code"], "project_too_large");
+    let msg = resp["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("max_callgraph_files"),
+        "error should mention max_callgraph_files: {}",
+        msg
+    );
+
+    aft.shutdown();
+}

@@ -144,6 +144,7 @@ export class BinaryBridge {
   async send(
     command: string,
     params: Record<string, unknown> = {},
+    options?: { timeoutMs?: number },
   ): Promise<Record<string, unknown>> {
     if (this._shuttingDown) {
       throw new Error(`[aft-pi] Bridge is shutting down, cannot send "${command}"`);
@@ -171,6 +172,9 @@ export class BinaryBridge {
                   `[aft-pi] Configure failed: ${configResult.message ?? "unknown error"}`,
                 );
               }
+              // Large-repo warning is emitted by the Rust side via log::warn!
+              // and relayed through stderr → plugin log. No need to re-log here
+              // (doing so would just duplicate the same line in aft-pi.log).
               await this.checkVersion();
               // Re-check liveness after version check — checkVersion() swallows
               // errors as best-effort, so the bridge may have died without throwing.
@@ -195,18 +199,25 @@ export class BinaryBridge {
     const request = { id, command, ...params };
     const line = `${JSON.stringify(request)}\n`;
 
+    // Per-op timeout override: tool wrappers can pass longer budgets for
+    // commands that legitimately need them (callers, trace_to, grep on big
+    // repos). Defaults to the bridge-wide timeout otherwise.
+    const effectiveTimeoutMs = options?.timeoutMs ?? this.timeoutMs;
+
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         warn(
-          `Request "${command}" (id=${id}) timed out after ${this.timeoutMs}ms — restarting bridge`,
+          `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms — restarting bridge`,
         );
         reject(
-          new Error(`[aft-pi] Request "${command}" (id=${id}) timed out after ${this.timeoutMs}ms`),
+          new Error(
+            `[aft-pi] Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
+          ),
         );
         // Kill the hung process so the next request gets a fresh bridge
         this.handleTimeout();
-      }, this.timeoutMs);
+      }, effectiveTimeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
 

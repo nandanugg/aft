@@ -6,6 +6,29 @@ import type { AgentToolResult } from "@mariozechner/pi-coding-agent";
 import type { BinaryBridge } from "../bridge.js";
 import type { PluginContext } from "../types.js";
 
+/**
+ * Per-command timeout overrides (milliseconds).
+ *
+ * Commands not listed fall back to the bridge-wide default (30s). Only
+ * extend budgets for operations that legitimately walk the project
+ * file tree or wait on external I/O (embedding API, index build). The
+ * goal is to absorb slow first-call spikes without masking real hangs.
+ */
+export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
+  callers: 60_000,
+  trace_to: 60_000,
+  trace_data: 60_000,
+  impact: 60_000,
+  grep: 60_000,
+  glob: 60_000,
+  semantic_search: 45_000,
+};
+
+/** Returns the per-command timeout override, or undefined to use the bridge default. */
+export function timeoutForCommand(command: string): number | undefined {
+  return LONG_RUNNING_COMMAND_TIMEOUT_MS[command];
+}
+
 /** Get the session bridge for the current working directory. */
 export function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {
   return ctx.pool.getBridge(cwd);
@@ -21,7 +44,12 @@ export async function callBridge(
   command: string,
   params: Record<string, unknown> = {},
 ): Promise<Record<string, unknown>> {
-  const response = await bridge.send(command, params);
+  const timeoutMs = timeoutForCommand(command);
+  const response = await bridge.send(
+    command,
+    params,
+    timeoutMs !== undefined ? { timeoutMs } : undefined,
+  );
   if (response.success === false) {
     const message =
       typeof response.message === "string" && response.message.length > 0

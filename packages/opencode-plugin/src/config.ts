@@ -91,6 +91,13 @@ export const AftConfigSchema = z.object({
   experimental_semantic_search: z.boolean().optional(),
   /** External semantic backend configuration for embedding and retrieval. */
   semantic: SemanticConfigSchema.optional(),
+  /**
+   * Maximum source files allowed for call-graph operations (callers, trace_to,
+   * trace_data, impact). Projects above this size return `project_too_large`
+   * instead of attempting the reverse-index build. Does not affect grep,
+   * glob, read, edit, or any other tool. Default: 20000.
+   */
+  max_callgraph_files: z.number().int().positive().optional(),
 });
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;

@@ -52,6 +52,12 @@ export interface AftConfig {
   experimental_search_index?: boolean;
   experimental_semantic_search?: boolean;
   semantic?: SemanticConfig;
+  /**
+   * Maximum source files allowed for call-graph operations (callers, trace_to,
+   * trace_data, impact). Projects above this size return `project_too_large`.
+   * Default: 20000 (applied Rust-side; undefined here means "use default").
+   */
+  max_callgraph_files?: number;
 }
 
 // ---------------------------------------------------------------------------

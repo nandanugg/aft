@@ -1186,3 +1186,239 @@ fn callgraph_trace_data_approximation() {
 
     aft.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// max_callgraph_files guard: project_too_large error
+//
+// These tests configure a low cap so the guard trips deterministically. They
+// verify that huge roots no longer exhaust the bridge timeout — the user
+// reported this hitting ~/Work/OSS (557K files) in v0.15.0.
+// ---------------------------------------------------------------------------
+
+/// `configure` on a small repo leaves `source_file_count_exceeds_max` false so
+/// plugins do not surface a spurious large-repo warning.
+#[test]
+fn callgraph_configure_small_repo_does_not_flag_exceeds() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    // Default cap is 20_000; the 9-file fixture is nowhere near it.
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
+    assert_eq!(
+        resp["source_file_count_exceeds_max"], false,
+        "small fixture with default cap should NOT be flagged as exceeding"
+    );
+    // Real source_file_count reported when under the cap.
+    let count = resp["source_file_count"].as_u64().unwrap_or(0);
+    assert!(
+        count > 0 && count < 100,
+        "small fixture should report a real (non-capped) count, got {}",
+        count
+    );
+
+    aft.shutdown();
+}
+
+/// `configure` with `max_callgraph_files` below the project size reports the
+/// large-repo condition in its response, so plugins can surface a warning.
+#[test]
+fn callgraph_configure_reports_source_file_count_exceeds_max() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        root
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "configure should succeed: {:?}",
+        resp
+    );
+    assert_eq!(
+        resp["source_file_count_exceeds_max"], true,
+        "9-file fixture with cap=1 should be flagged as exceeding max"
+    );
+    assert_eq!(resp["max_callgraph_files"], 1);
+
+    aft.shutdown();
+}
+
+/// `callers` returns `project_too_large` when project exceeds `max_callgraph_files`.
+#[test]
+fn callgraph_callers_project_too_large() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    // Configure with cap=1 so the 9-file fixture trips the guard.
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        root
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "project_too_large");
+    // Error message should mention max_callgraph_files so users know what to tune.
+    let msg = resp["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("max_callgraph_files"),
+        "error message should mention max_callgraph_files: {}",
+        msg
+    );
+
+    aft.shutdown();
+}
+
+/// `trace_to` returns `project_too_large` when project exceeds `max_callgraph_files`.
+#[test]
+fn callgraph_trace_to_project_too_large() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        root
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_to","file":"{}/helpers.ts","symbol":"validate","depth":5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "project_too_large");
+
+    aft.shutdown();
+}
+
+/// `impact` returns `project_too_large` when project exceeds `max_callgraph_files`.
+#[test]
+fn callgraph_impact_project_too_large() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        root
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"impact","file":"{}/helpers.ts","symbol":"validate"}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "project_too_large");
+
+    aft.shutdown();
+}
+
+/// `trace_data` returns `project_too_large` when project exceeds `max_callgraph_files`.
+#[test]
+fn callgraph_trace_data_project_too_large() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        root
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"trace_data","file":"{}/data_flow.ts","symbol":"transformData","expression":"rawInput"}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "project_too_large");
+
+    aft.shutdown();
+}
+
+/// `configure` rejects `max_callgraph_files: 0` instead of silently clamping.
+/// Regression test for Oracle v0.15.1 review blocker: sub-1 values must surface
+/// as `invalid_request` so user typos are visible.
+#[test]
+fn callgraph_configure_rejects_zero_max_callgraph_files() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":0}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], false, "configure should reject 0");
+    assert_eq!(resp["code"], "invalid_request");
+    let msg = resp["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("max_callgraph_files"),
+        "error message should mention max_callgraph_files: {}",
+        msg
+    );
+
+    aft.shutdown();
+}
+
+/// `configure` rejects negative `max_callgraph_files` (via JSON number → `as_u64` returning None).
+#[test]
+fn callgraph_configure_rejects_negative_max_callgraph_files() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":-5}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], false, "configure should reject -5");
+    assert_eq!(resp["code"], "invalid_request");
+
+    aft.shutdown();
+}
+
+/// `configure` accepts any positive `max_callgraph_files` and reflects it back.
+/// Paired negative-cases above to prove the validator is not rejecting valid input.
+#[test]
+fn callgraph_configure_accepts_positive_max_callgraph_files() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":42}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["max_callgraph_files"], 42);
+
+    aft.shutdown();
+}

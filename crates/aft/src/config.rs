@@ -96,6 +96,13 @@ pub struct Config {
     pub experimental_semantic_search: bool,
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
+    /// Maximum number of source files allowed for call-graph operations
+    /// (`callers`, `trace_to`, `trace_data`, `impact`). When a project
+    /// exceeds this count the reverse index is not built and those
+    /// commands return a `project_too_large` error. Does not affect
+    /// `grep`, `glob`, `read`, `edit`, or other non-callgraph features.
+    /// Default: 20_000 (covers typical monorepos; rejects OS-wide roots).
+    pub max_callgraph_files: usize,
     pub semantic: SemanticBackendConfig,
     /// Persistent storage directory for indexes (trigram, semantic).
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
@@ -122,6 +129,11 @@ impl Default for Config {
             experimental_search_index: false,
             experimental_semantic_search: false,
             search_index_max_file_size: 1_048_576,
+            // Projects larger than this skip call-graph reverse index construction.
+            // Chosen to cover typical monorepos (AFT ~2K, OpenCode ~5K, Reth ~8K)
+            // while rejecting OS-wide roots (/home, ~/Work) that would otherwise
+            // walk hundreds of thousands of files per callers/trace_to query.
+            max_callgraph_files: 20_000,
             semantic: SemanticBackendConfig::default(),
             storage_dir: None,
         }
