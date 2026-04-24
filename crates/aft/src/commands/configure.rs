@@ -146,6 +146,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    let previous_project_root = ctx.config().project_root.clone();
+    if previous_project_root.as_ref() != Some(&root_path) {
+        crate::format::clear_tool_cache();
+    }
+
     // Set project root on config
     ctx.config_mut().project_root = Some(root_path.clone());
 
@@ -215,7 +220,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         };
         ctx.config_mut().storage_dir = Some(storage_dir.clone());
-        ctx.backup().borrow_mut().set_storage_dir(storage_dir);
+        let ttl_hours = ctx.config().checkpoint_ttl_hours;
+        ctx.backup()
+            .borrow_mut()
+            .set_storage_dir(storage_dir, ttl_hours);
     }
     if let Some(v) = req.params.get("semantic") {
         let current = ctx.config().semantic.clone();
@@ -268,6 +276,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let experimental_semantic_search = ctx.config().experimental_semantic_search;
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
     let semantic_config = ctx.config().semantic.clone();
+
+    let search_build_in_progress = ctx.search_index_rx().borrow().is_some();
+    let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
+    if search_build_in_progress {
+        log::warn!(
+            "[aft] configure called while search index build is still in progress; previous build will continue detached"
+        );
+    }
+    if semantic_build_in_progress {
+        log::warn!(
+            "[aft] configure called while semantic index build is still in progress; previous build will continue detached"
+        );
+    }
 
     *ctx.search_index().borrow_mut() = None;
     *ctx.search_index_rx().borrow_mut() = None;

@@ -136,7 +136,7 @@ export function registerHoistedTools(
         } else if (params.limit !== undefined) {
           req.end_line = params.limit;
         }
-        const response = await callBridge(bridge, "read", req);
+        const response = await callBridge(bridge, "read", req, extCtx);
         if (Array.isArray(response.entries)) {
           return textResult((response.entries as string[]).join("\n"));
         }
@@ -164,11 +164,17 @@ export function registerHoistedTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(bridge, "write", {
-          file: params.filePath,
-          content: params.content,
-          include_diff: true,
-        });
+        const response = await callBridge(
+          bridge,
+          "write",
+          {
+            file: params.filePath,
+            content: params.content,
+            diagnostics: true,
+            include_diff: true,
+          },
+          extCtx,
+        );
         return buildMutationResult(params.filePath, response);
       },
       renderCall(args, theme, context) {
@@ -205,12 +211,13 @@ export function registerHoistedTools(
           file: params.filePath,
           match: params.oldString ?? "",
           replacement: params.newString ?? "",
+          diagnostics: true,
           include_diff: true,
         };
         if (params.replaceAll === true) req.replace_all = true;
         if (params.occurrence !== undefined) req.occurrence = params.occurrence;
 
-        const response = await callBridge(bridge, "edit_match", req);
+        const response = await callBridge(bridge, "edit_match", req, extCtx);
         return buildMutationResult(params.filePath, response);
       },
       renderCall(args, theme, context) {
@@ -245,7 +252,7 @@ export function registerHoistedTools(
         if (params.caseSensitive !== undefined) req.case_sensitive = params.caseSensitive;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
 
-        const response = await callBridge(bridge, "grep", req);
+        const response = await callBridge(bridge, "grep", req, extCtx);
         const text = (response.text as string | undefined) ?? "";
         return textResult(text);
       },

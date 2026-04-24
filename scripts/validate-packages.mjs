@@ -3,9 +3,11 @@
 /**
  * validate-packages.mjs
  *
- * Validates all 6 AFT npm package.json files:
+ * Validates all 8 AFT npm package.json files:
  * - 5 platform packages under npm/{platform}/
- * - 1 root @cortexkit/aft-opencode package at opencode-plugin-aft/
+ * - @cortexkit/aft-opencode (opencode-plugin)
+ * - @cortexkit/aft-pi (pi-plugin)
+ * - @cortexkit/aft (aft-cli)
  *
  * Checks: os/cpu fields match directory, preferUnplugged, bin field,
  * optionalDependencies in core, version alignment, required fields.
@@ -111,6 +113,68 @@ if (core) {
   if (core.version) platformVersions.push({ name: label, version: core.version });
 }
 
+// --- Validate @cortexkit/aft-pi ---
+
+const piPath = join(root, "packages", "pi-plugin", "package.json");
+const pi = readPkg(piPath);
+
+if (pi) {
+  const label = "@cortexkit/aft-pi";
+
+  // Required fields
+  if (!pi.name) fail(label, "missing 'name'");
+  if (!pi.version) fail(label, "missing 'version'");
+  if (pi.name && pi.name !== "@cortexkit/aft-pi") {
+    fail(label, `name should be '@cortexkit/aft-pi', got '${pi.name}'`);
+  }
+  if (!pi.main) fail(label, "missing 'main'");
+  if (!pi.types) fail(label, "missing 'types'");
+  if (!pi.license) fail(label, "missing 'license'");
+  if (!pi.repository || typeof pi.repository !== "object" || !pi.repository.url) {
+    fail(label, "missing 'repository' with 'url'");
+  }
+
+  // optionalDependencies must list all 5 platform packages
+  const piOptDeps = pi.optionalDependencies || {};
+  for (const { dir } of PLATFORMS) {
+    const depName = `@cortexkit/aft-${dir}`;
+    if (!(depName in piOptDeps)) {
+      fail(label, `optionalDependencies missing '${depName}'`);
+    }
+  }
+
+  if (pi.version) platformVersions.push({ name: label, version: pi.version });
+}
+
+// --- Validate @cortexkit/aft (CLI) ---
+
+const cliPath = join(root, "packages", "aft-cli", "package.json");
+const cli = readPkg(cliPath);
+
+if (cli) {
+  const label = "@cortexkit/aft";
+
+  // Required fields
+  if (!cli.name) fail(label, "missing 'name'");
+  if (!cli.version) fail(label, "missing 'version'");
+  if (cli.name && cli.name !== "@cortexkit/aft") {
+    fail(label, `name should be '@cortexkit/aft', got '${cli.name}'`);
+  }
+  if (!cli.license) fail(label, "missing 'license'");
+  if (!cli.repository || typeof cli.repository !== "object" || !cli.repository.url) {
+    fail(label, "missing 'repository' with 'url'");
+  }
+
+  // bin field
+  if (!cli.bin || typeof cli.bin !== "object") {
+    fail(label, "missing 'bin' field");
+  } else if (!cli.bin.aft) {
+    fail(label, "bin field missing 'aft' entry");
+  }
+
+  if (cli.version) platformVersions.push({ name: label, version: cli.version });
+}
+
 // --- Version alignment ---
 
 if (platformVersions.length > 1) {
@@ -135,6 +199,18 @@ if (core?.version && core.optionalDependencies) {
   }
 }
 
+// Also check that optionalDependencies versions match the pi version
+if (pi?.version && pi.optionalDependencies) {
+  for (const [depName, depVersion] of Object.entries(pi.optionalDependencies)) {
+    if (depVersion !== pi.version) {
+      fail(
+        "version-alignment",
+        `@cortexkit/aft-pi optionalDependencies['${depName}'] is '${depVersion}' but pi version is '${pi.version}'`,
+      );
+    }
+  }
+}
+
 // --- Report ---
 
 if (errors.length > 0) {
@@ -145,11 +221,12 @@ if (errors.length > 0) {
   console.error(`\n${errors.length} error(s) found.`);
   process.exit(1);
 } else {
-  const count = PLATFORMS.length + 1;
+  const count = PLATFORMS.length + 3; // platform packages + opencode + pi + cli
   console.log(`✓ All ${count} packages validated successfully.`);
   console.log(`  Versions aligned at ${platformVersions[0]?.version || "unknown"}`);
   console.log("  Platform os/cpu fields correct");
   console.log("  preferUnplugged set on all platform packages");
-  console.log("  optionalDependencies complete in @cortexkit/aft-opencode");
+  console.log("  optionalDependencies complete in @cortexkit/aft-opencode and @cortexkit/aft-pi");
+  console.log("  bin, license, repository fields present in @cortexkit/aft and @cortexkit/aft-pi");
   process.exit(0);
 }

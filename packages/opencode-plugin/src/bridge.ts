@@ -21,8 +21,8 @@ const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
  * Returns: negative if a < b, 0 if equal, positive if a > b.
  */
 function compareSemver(a: string, b: string): number {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
+  const pa = a.split("-")[0].split(".").map(Number);
+  const pb = b.split("-")[0].split(".").map(Number);
   for (let i = 0; i < 3; i++) {
     const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
     if (diff !== 0) return diff;
@@ -354,6 +354,7 @@ export class BinaryBridge {
       stdio: ["pipe", "pipe", "pipe"],
       env,
     });
+    const currentChild = child;
 
     child.stdout?.on("data", (chunk: Buffer) => {
       this.onStdoutData(chunk.toString("utf-8"));
@@ -371,11 +372,13 @@ export class BinaryBridge {
     });
 
     child.on("error", (err) => {
+      if (this.process !== currentChild) return;
       error(`Process error: ${err.message}${this.formatStderrTail()}`);
       this.handleCrash();
     });
 
     child.on("exit", (code, signal) => {
+      if (this.process !== currentChild) return;
       if (this._shuttingDown) return;
       log(`Process exited: code=${code}, signal=${signal}`);
       // External termination signals (SIGTERM/SIGKILL/SIGHUP/SIGINT) are almost
@@ -504,10 +507,14 @@ export class BinaryBridge {
           }
         }
       }, delay);
+      // Also decay the counter over time so repeated crashes without any
+      // successful response don't permanently wedge the bridge.
+      this.scheduleRestartCountReset();
     } else {
       error(
         `Max restarts (${this.maxRestarts}) reached, giving up. Logs: ${getLogFilePath()}${tail}`,
       );
+      this.scheduleRestartCountReset();
     }
   }
 

@@ -144,7 +144,7 @@ export function registerLspTools(pi: ExtensionAPI, ctx: PluginContext): void {
       if (hasDir) req.directory = params.directory;
       if (params.severity !== undefined) req.severity = params.severity;
       if (params.waitMs !== undefined) req.wait_ms = params.waitMs;
-      const response = await callBridge(bridge, "lsp_diagnostics", req);
+      const response = await callBridge(bridge, "lsp_diagnostics", req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
     renderCall(args, theme, context) {

@@ -154,7 +154,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       }
       if (params.callSiteLine !== undefined) req.call_site_line = params.callSiteLine;
       if (params.dryRun !== undefined) req.dry_run = params.dryRun;
-      const response = await callBridge(bridge, commandMap[params.op], req);
+      const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
     renderCall(args, theme, context) {

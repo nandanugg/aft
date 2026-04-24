@@ -1,5 +1,5 @@
 import { execSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -41,7 +41,6 @@ function copyToVersionedCache(npmBinaryPath: string): string | null {
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
     }
-    const { renameSync } = require("node:fs") as typeof import("node:fs");
     renameSync(tmpPath, cachedPath);
     log(`Copied npm binary to versioned cache: ${cachedPath}`);
     return cachedPath;
@@ -182,7 +181,7 @@ export async function findBinary(): Promise<string> {
       "",
       "Install it using one of these methods:",
       "  npm install @cortexkit/aft-opencode        # installs platform-specific binary via npm",
-      "  cargo install aft             # from crates.io",
+      "  cargo install agent-file-tools             # from crates.io",
       "  cargo build --release         # from source (binary at target/release/aft)",
       "",
       "Or add the aft directory to your PATH.",

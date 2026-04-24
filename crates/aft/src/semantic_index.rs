@@ -30,6 +30,9 @@ const SEMANTIC_INDEX_VERSION_V2: u8 = 2;
 /// ext4 with nsec, NTFS). V1/V2 persisted whole-second mtimes only, which
 /// caused every restart to flag ~99% of files as stale and re-embed them.
 const SEMANTIC_INDEX_VERSION_V3: u8 = 3;
+/// V4 keeps the V3 on-disk layout but rebuilds persisted snippets once after
+/// fixing symbol ranges that were incorrectly treated as 1-based.
+const SEMANTIC_INDEX_VERSION_V4: u8 = 4;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
@@ -1071,6 +1074,16 @@ impl SemanticIndex {
         }
 
         let bytes = fs::read(&data_path).ok()?;
+        let version = bytes[0];
+        if version != SEMANTIC_INDEX_VERSION_V4 {
+            log::info!(
+                "[aft] cached semantic index version {} is older than {}, rebuilding",
+                version,
+                SEMANTIC_INDEX_VERSION_V4
+            );
+            let _ = fs::remove_file(&data_path);
+            return None;
+        }
         match Self::from_bytes(&bytes) {
             Ok(index) => {
                 if index.entries.is_empty() {
@@ -1117,7 +1130,7 @@ impl SemanticIndex {
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
-        // V3 (v0.15.2+) is the single write format. Layout:
+        // V4 (v0.16.0+) is the single write format. Layout matches V3:
         //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
         //     no bytes follow). Uniform format simplifies the reader.
         //   - mtimes stored as secs(u64) + subsec_nanos(u32). Preserves full
@@ -1125,7 +1138,9 @@ impl SemanticIndex {
         //     round-trips.
         //
         // V1/V2 remain readable for backward compatibility (see from_bytes).
-        let version = SEMANTIC_INDEX_VERSION_V3;
+        // V3 loads as the same format but is rejected on disk so snippets are
+        // rebuilt once after the symbol-range bug fixed in v0.16.0.
+        let version = SEMANTIC_INDEX_VERSION_V4;
         buf.push(version);
         buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
@@ -1201,16 +1216,19 @@ impl SemanticIndex {
         if version != SEMANTIC_INDEX_VERSION_V1
             && version != SEMANTIC_INDEX_VERSION_V2
             && version != SEMANTIC_INDEX_VERSION_V3
+            && version != SEMANTIC_INDEX_VERSION_V4
         {
             return Err(format!("unsupported version: {}", version));
         }
-        // V2 and V3 share the same header layout (V3 only differs in the
-        // per-mtime entry layout): version(1) + dimension(4) + entry_count(4)
-        // + fingerprint_len(4) + fingerprint bytes.
-        if (version == SEMANTIC_INDEX_VERSION_V2 || version == SEMANTIC_INDEX_VERSION_V3)
+        // V2, V3, and V4 share the same header layout (V3/V4 only differ from
+        // V2 in the per-mtime entry layout): version(1) + dimension(4) +
+        // entry_count(4) + fingerprint_len(4) + fingerprint bytes.
+        if (version == SEMANTIC_INDEX_VERSION_V2
+            || version == SEMANTIC_INDEX_VERSION_V3
+            || version == SEMANTIC_INDEX_VERSION_V4)
             && data.len() < HEADER_BYTES_V2
         {
-            return Err("data too short for semantic index v2/v3 header".to_string());
+            return Err("data too short for semantic index v2/v3/v4 header".to_string());
         }
 
         let dimension = read_u32(data, &mut pos)? as usize;
@@ -1227,8 +1245,9 @@ impl SemanticIndex {
         //   - V2: fingerprint_len + fingerprint bytes; always present (writer
         //     only emitted V2 when fingerprint was Some).
         //   - V3: fingerprint_len always present; fingerprint_len==0 ⇒ None.
-        let has_fingerprint_field =
-            version == SEMANTIC_INDEX_VERSION_V2 || version == SEMANTIC_INDEX_VERSION_V3;
+        let has_fingerprint_field = version == SEMANTIC_INDEX_VERSION_V2
+            || version == SEMANTIC_INDEX_VERSION_V3
+            || version == SEMANTIC_INDEX_VERSION_V4;
         let fingerprint = if has_fingerprint_field {
             let fingerprint_len = read_u32(data, &mut pos)? as usize;
             if pos + fingerprint_len > data.len() {
@@ -1271,11 +1290,12 @@ impl SemanticIndex {
             // causes one rebuild on upgrade (they never matched live APFS
             // mtimes anyway — the bug v0.15.2 fixes). After that rebuild,
             // the cache is persisted as V3 and stabilises.
-            let nanos = if version == SEMANTIC_INDEX_VERSION_V3 {
-                read_u32(data, &mut pos)?
-            } else {
-                0
-            };
+            let nanos =
+                if version == SEMANTIC_INDEX_VERSION_V3 || version == SEMANTIC_INDEX_VERSION_V4 {
+                    read_u32(data, &mut pos)?
+                } else {
+                    0
+                };
             // Hardening against corrupt / maliciously crafted cache files
             // (v0.15.2). `Duration::new(secs, nanos)` can panic when the
             // nanosecond carry overflows the second counter, and
@@ -1390,8 +1410,9 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
 
     // Add body snippet (first ~300 chars of symbol body)
     let lines: Vec<&str> = source.lines().collect();
-    let start = (symbol.range.start_line.saturating_sub(1) as usize).min(lines.len()); // 1-based to 0-based
-    let end = (symbol.range.end_line as usize).min(lines.len()); // 1-based inclusive
+    let start = (symbol.range.start_line as usize).min(lines.len());
+    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
+    let end = (symbol.range.end_line as usize + 1).min(lines.len());
     if start < end {
         let body: String = lines[start..end]
             .iter()
@@ -1413,8 +1434,9 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
 /// Build a display snippet from a symbol's source
 fn build_snippet(symbol: &Symbol, source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
-    let start = (symbol.range.start_line.saturating_sub(1) as usize).min(lines.len());
-    let end = (symbol.range.end_line as usize).min(lines.len());
+    let start = (symbol.range.start_line as usize).min(lines.len());
+    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
+    let end = (symbol.range.end_line as usize + 1).min(lines.len());
     if start < end {
         let snippet_lines: Vec<&str> = lines[start..end].iter().take(5).copied().collect();
         let mut snippet = snippet_lines.join("\n");
@@ -1720,6 +1742,29 @@ mod tests {
     }
 
     #[test]
+    fn single_line_symbol_builds_non_empty_snippet() {
+        let symbol = Symbol {
+            name: "answer".to_string(),
+            kind: SymbolKind::Variable,
+            range: crate::symbols::Range {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 24,
+            },
+            signature: Some("const answer = 42".to_string()),
+            scope_chain: Vec::new(),
+            exported: true,
+            parent: None,
+        };
+        let source = "export const answer = 42;\n";
+
+        let snippet = build_snippet(&symbol, source);
+
+        assert_eq!(snippet, "export const answer = 42;");
+    }
+
+    #[test]
     fn rejects_oversized_dimension_during_deserialization() {
         let mut bytes = Vec::new();
         bytes.push(1u8);
@@ -1883,5 +1928,51 @@ mod tests {
         assert!(
             SemanticIndex::read_from_disk(storage.path(), project_key, Some(&mismatched)).is_none()
         );
+    }
+
+    #[test]
+    fn read_from_disk_rejects_v3_cache_for_snippet_rebuild() {
+        let storage = tempfile::tempdir().unwrap();
+        let project_key = "proj-v3";
+        let dir = storage.path().join("semantic").join(project_key);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut index = SemanticIndex::new();
+        index.entries.push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("/src/main.rs"),
+                name: "handle_request".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 0,
+                exported: true,
+                embed_text: "file:src/main.rs kind:function name:handle_request".to_string(),
+                snippet: "fn handle_request() {}".to_string(),
+            },
+            vector: vec![0.1, 0.2, 0.3],
+        });
+        index.dimension = 3;
+        index
+            .file_mtimes
+            .insert(PathBuf::from("/src/main.rs"), SystemTime::UNIX_EPOCH);
+        let fingerprint = SemanticIndexFingerprint {
+            backend: "fastembed".to_string(),
+            model: "test".to_string(),
+            base_url: FALLBACK_BACKEND.to_string(),
+            dimension: 3,
+        };
+        index.set_fingerprint(fingerprint.clone());
+
+        let mut bytes = index.to_bytes();
+        bytes[0] = SEMANTIC_INDEX_VERSION_V3;
+        fs::write(dir.join("semantic.bin"), bytes).unwrap();
+
+        assert!(SemanticIndex::read_from_disk(
+            storage.path(),
+            project_key,
+            Some(&fingerprint.as_string())
+        )
+        .is_none());
+        assert!(!dir.join("semantic.bin").exists());
     }
 }

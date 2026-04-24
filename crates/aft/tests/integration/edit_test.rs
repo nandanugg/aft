@@ -272,8 +272,8 @@ fn edit_symbol_ambiguous() {
     ));
 
     assert_eq!(
-        resp["success"], true,
-        "ambiguous response should succeed: {:?}",
+        resp["success"], false,
+        "ambiguous response should be an error: {:?}",
         resp
     );
     assert_eq!(resp["code"], "ambiguous_symbol");

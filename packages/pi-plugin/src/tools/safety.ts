@@ -187,7 +187,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         if (params.filePath) req.file = params.filePath;
         if (params.files) req.files = params.files;
       }
-      const response = await callBridge(bridge, commandMap[params.op], req);
+      const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
     renderCall(args, theme, context) {

@@ -156,7 +156,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if (params.dryRun !== undefined) req.dry_run = params.dryRun;
       if (params.validate !== undefined) req.validate = params.validate;
 
-      const response = await callBridge(bridge, commandMap[params.op], req);
+      const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
     renderCall(args, theme, context) {

@@ -73,7 +73,7 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
     parameters: ConflictsParams,
     async execute(_toolCallId: string, _params, _signal, _onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const response = await callBridge(bridge, "git_conflicts");
+      const response = await callBridge(bridge, "git_conflicts", {}, extCtx);
       return textResult((response.text as string | undefined) ?? JSON.stringify(response, null, 2));
     },
     renderCall(_args, theme, context) {

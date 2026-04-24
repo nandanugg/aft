@@ -657,29 +657,60 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         throw new Error("Empty patch: no file operations found");
       }
 
-      // Resolve all paths and ask permission
-      const allPaths = hunks.map((h) =>
-        path.relative(context.worktree, path.resolve(context.directory, h.path)),
-      );
+      // Resolve every path this patch touches — SOURCES (h.path) and
+      // DESTINATIONS (h.move_path for move hunks). Move destinations have to
+      // be tracked because the old code only checkpointed sources; a partial
+      // move that succeeded at the destination but failed at source deletion
+      // left orphan files behind that rollback never cleaned up (audit #8).
+      const affectedAbs = new Set<string>();
+      // Files that did NOT exist before this patch — add targets plus move
+      // destinations whose path was empty. On rollback we delete these
+      // instead of restoring content that was never there.
+      const newlyCreatedAbs = new Set<string>();
+
+      for (const h of hunks) {
+        const srcAbs = path.resolve(context.directory, h.path);
+        affectedAbs.add(srcAbs);
+        if (h.type === "add") {
+          newlyCreatedAbs.add(srcAbs);
+        }
+        if (h.type === "update" && h.move_path) {
+          const dstAbs = path.resolve(context.directory, h.move_path);
+          affectedAbs.add(dstAbs);
+          // Snapshot the destination if it exists so rollback restores the
+          // original contents. If it doesn't exist, track it as newly
+          // created so rollback removes it.
+          if (!fs.existsSync(dstAbs)) {
+            newlyCreatedAbs.add(dstAbs);
+          }
+        }
+      }
+
+      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(context.worktree, abs));
 
       await context.ask({
         permission: "edit",
-        patterns: allPaths,
+        patterns: relPaths,
         always: ["*"],
         metadata: {},
       });
 
-      // Checkpoint all affected files for atomic rollback
+      // Checkpoint only files that exist pre-patch. Non-existent destinations
+      // are tracked in newlyCreatedAbs and reverted by deletion on rollback.
+      const checkpointPaths = Array.from(affectedAbs).filter((abs) => !newlyCreatedAbs.has(abs));
       const checkpointName = `apply_patch_${Date.now()}`;
       let checkpointCreated = false;
-      try {
-        await callBridge(ctx, context, "checkpoint", {
-          name: checkpointName,
-          files: allPaths.map((p) => path.resolve(context.directory, p)),
-        });
-        checkpointCreated = true;
-      } catch {
-        // Checkpoint failure is non-fatal — proceed without rollback protection
+      if (checkpointPaths.length > 0) {
+        try {
+          await callBridge(ctx, context, "checkpoint", {
+            name: checkpointName,
+            files: checkpointPaths,
+          });
+          checkpointCreated = true;
+        } catch {
+          // Checkpoint failure is non-fatal — proceed without rollback
+          // protection (the hunk loop still records perFileDiffs for the UI).
+        }
       }
 
       // Process each hunk, track per-file diffs for metadata
@@ -770,20 +801,48 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      // On failure, restore checkpoint to undo partial changes
+      // On failure, restore checkpoint AND delete files that were newly
+      // created by this patch (adds + move destinations that didn't exist
+      // pre-patch). Checkpoint restore alone only recovers files that
+      // existed before — it cannot undo a newly created file or the
+      // destination side of a partial move (audit #8).
       if (patchFailed) {
+        const rollbackNotes: string[] = [];
         if (checkpointCreated) {
           try {
             await callBridge(ctx, context, "restore_checkpoint", { name: checkpointName });
-            results.push("Patch failed — restored files to pre-patch state.");
+            rollbackNotes.push("restored pre-existing files from checkpoint");
           } catch {
-            results.push(
-              "Patch failed — checkpoint restore also failed, files may be inconsistent.",
+            rollbackNotes.push("checkpoint restore FAILED, pre-existing files may be inconsistent");
+          }
+        } else if (checkpointPaths.length > 0) {
+          rollbackNotes.push("no checkpoint was created, pre-existing files may be inconsistent");
+        }
+
+        // Delete any file we newly created. We call delete_file (which
+        // respects validate_path and backs up), and tolerate already-absent
+        // files so partial-create failures don't double-error.
+        let newlyDeleted = 0;
+        for (const createdAbs of newlyCreatedAbs) {
+          if (!fs.existsSync(createdAbs)) continue;
+          try {
+            await callBridge(ctx, context, "delete_file", { file: createdAbs });
+            newlyDeleted++;
+          } catch {
+            rollbackNotes.push(
+              `failed to delete newly-created ${path.relative(context.worktree, createdAbs)}`,
             );
           }
-        } else {
-          results.push("Patch failed — no checkpoint was created, files may be inconsistent.");
         }
+        if (newlyDeleted > 0) {
+          rollbackNotes.push(`removed ${newlyDeleted} newly-created file(s)`);
+        }
+
+        results.push(
+          rollbackNotes.length > 0
+            ? `Patch failed — ${rollbackNotes.join("; ")}.`
+            : "Patch failed — nothing to roll back.",
+        );
         return results.join("\n");
       }
 

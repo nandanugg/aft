@@ -430,15 +430,9 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
 
 fn rollback_rename(ctx: &AppContext, session: &str, snapshotted: &[PathBuf]) {
     for path in snapshotted.iter().rev() {
-        let backup_entry = {
-            let backup = ctx.backup().borrow();
-            backup.history(session, path).last().cloned()
-        };
-
-        if let Some(entry) = backup_entry {
-            if std::fs::write(path, &entry.content).is_ok() {
-                ctx.lsp_notify_file_changed(path, &entry.content);
-            }
+        let restored = ctx.backup().borrow_mut().restore_latest(session, path);
+        if let Ok((entry, _)) = restored {
+            ctx.lsp_notify_file_changed(path, &entry.content);
         }
     }
 }

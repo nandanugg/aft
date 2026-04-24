@@ -167,16 +167,17 @@ const plugin: Plugin = async (input) => {
   // The resolved path is passed to bridges via ORT_DYLIB_PATH env var.
   if (aftConfig.experimental_semantic_search && isFastembedSemanticBackend) {
     const storageDir = configOverrides.storage_dir as string;
-    ensureOnnxRuntime(storageDir).then(
-      (ortDir) => {
-        if (ortDir) {
-          configOverrides._ort_dylib_dir = ortDir;
-        } else if (!isOrtAutoDownloadSupported()) {
-          warn(`Semantic search requires ONNX Runtime. Install: ${getManualInstallHint()}`);
-        }
-      },
-      (err) => warn(`ONNX Runtime resolution failed: ${err}`),
-    );
+    const ortDylibDir = await ensureOnnxRuntime(storageDir).catch((err) => {
+      warn(
+        `ONNX Runtime setup failed: ${err instanceof Error ? err.message : String(err)}. Semantic search will be unavailable.`,
+      );
+      return null;
+    });
+    if (ortDylibDir) {
+      configOverrides._ort_dylib_dir = ortDylibDir;
+    } else if (!isOrtAutoDownloadSupported()) {
+      warn(`Semantic search requires ONNX Runtime. Install: ${getManualInstallHint()}`);
+    }
   }
 
   // Track which binary version we already attempted to upgrade from.

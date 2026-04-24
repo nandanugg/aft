@@ -101,7 +101,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(bridge, "delete_file", { file: params.filePath });
+        const response = await callBridge(bridge, "delete_file", { file: params.filePath }, extCtx);
         return textResult(`Deleted ${params.filePath}`, response);
       },
       renderCall(args, theme, context) {
@@ -128,10 +128,15 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(bridge, "move_file", {
-          file: params.filePath,
-          destination: params.destination,
-        });
+        const response = await callBridge(
+          bridge,
+          "move_file",
+          {
+            file: params.filePath,
+            destination: params.destination,
+          },
+          extCtx,
+        );
         return textResult(`Moved ${params.filePath} → ${params.destination}`, response);
       },
       renderCall(args, theme, context) {

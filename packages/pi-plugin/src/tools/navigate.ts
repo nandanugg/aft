@@ -217,7 +217,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       };
       if (params.depth !== undefined) req.depth = params.depth;
       if (params.expression !== undefined) req.expression = params.expression;
-      const response = await callBridge(bridge, params.op, req);
+      const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
     renderCall(args, theme, context) {

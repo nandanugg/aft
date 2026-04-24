@@ -17,7 +17,7 @@ export function registerStatusCommand(pi: ExtensionAPI, ctx: PluginContext): voi
     handler: async (_args: string, extCtx: ExtensionCommandContext) => {
       try {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(bridge, "status");
+        const response = await callBridge(bridge, "status", {}, extCtx);
         const snapshot = coerceAftStatus(response);
         const text = formatStatusDialogMessage(snapshot);
 

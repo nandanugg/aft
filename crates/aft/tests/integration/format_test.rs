@@ -22,6 +22,33 @@ fn is_on_path(binary: &str) -> bool {
         .is_ok()
 }
 
+#[cfg(unix)]
+fn install_tsc_stub(dir: &std::path::Path, file_name: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("tsc");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s(1,7): error TS2322: Type \\\"string\\\" is not assignable to type \\\"number\\\".\\n' '{}/{file_name}'\nexit 2\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&stub, perms).unwrap();
+}
+
+#[cfg(unix)]
+fn prepend_path(existing_path: &std::ffi::OsStr, dir: &std::path::Path) -> std::ffi::OsString {
+    let mut paths = std::env::split_paths(existing_path).collect::<Vec<_>>();
+    paths.insert(0, dir.join("node_modules").join(".bin"));
+    std::env::join_paths(paths).unwrap()
+}
+
 /// Create a temp directory scoped to format tests.
 /// Create a unique temp directory for each test invocation.
 fn format_test_dir(test_name: &str) -> std::path::PathBuf {
@@ -52,7 +79,8 @@ fn format_integration_applied_rustfmt() {
 
     let ugly_code = "fn  main( ){  let   x=1;  }";
 
-    let mut aft = AftProcess::spawn();
+    let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     aft.configure(&dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-1","command":"write","file":"{}","content":"{}"}}"#,
@@ -95,7 +123,8 @@ fn format_integration_unsupported_language() {
     let target = dir.join("format_unsupported.txt");
     let _ = fs::remove_file(&target);
 
-    let mut aft = AftProcess::spawn();
+    let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-2","command":"write","file":"{}","content":"hello world"}}"#,
         target.display()
@@ -326,6 +355,84 @@ fn validate_full_default_no_errors() {
     assert!(
         resp.get("validate_skipped_reason").is_none() || resp["validate_skipped_reason"].is_null(),
         "validate_skipped_reason should not be present without validate:full: {:?}",
+        resp
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn validate_on_edit_full_from_config_runs_checker() {
+    if !cfg!(unix) {
+        eprintln!("SKIP: tsc stub test requires unix executable permissions");
+        return;
+    }
+
+    let dir = format_test_dir("validate_config_full");
+    let target = dir.join("validate_config_full.ts");
+    let _ = fs::remove_file(&target);
+    fs::write(dir.join("tsconfig.json"), "{}\n").unwrap();
+    install_tsc_stub(&dir, "validate_config_full.ts");
+
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.send(&format!(
+        r#"{{"id":"cfg-val-full","command":"configure","project_root":"{}","validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
+        dir.display()
+    ));
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"val-config-full","command":"write","file":"{}","content":"const x: number = \"oops\";\n"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    let errors = resp["validation_errors"]
+        .as_array()
+        .expect("validate_on_edit:full should include validation_errors");
+    assert!(
+        !errors.is_empty(),
+        "broken TypeScript types should produce validation_errors: {:?}",
+        resp
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn validate_on_edit_off_from_config_skips_checker() {
+    let dir = format_test_dir("validate_config_off");
+    let target = dir.join("validate_config_off.ts");
+    let _ = fs::remove_file(&target);
+    fs::write(dir.join("tsconfig.json"), "{}\n").unwrap();
+    #[cfg(unix)]
+    install_tsc_stub(&dir, "validate_config_off.ts");
+
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.send(&format!(
+        r#"{{"id":"cfg-val-off","command":"configure","project_root":"{}","validate_on_edit":"off"}}"#,
+        dir.display()
+    ));
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"val-config-off","command":"write","file":"{}","content":"const x: number = \"oops\";\n"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    let has_errors = resp.get("validation_errors").is_some()
+        && !resp["validation_errors"].is_null()
+        && resp["validation_errors"]
+            .as_array()
+            .map_or(false, |errors| !errors.is_empty());
+    assert!(
+        !has_errors,
+        "validate_on_edit:off should not produce validation_errors: {:?}",
         resp
     );
 

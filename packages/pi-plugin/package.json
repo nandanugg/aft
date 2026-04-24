@@ -22,7 +22,8 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.33",
-    "diff": "^8.0.4"
+    "diff": "^8.0.4",
+    "zod": "^4.1.8"
   },
   "optionalDependencies": {
     "@cortexkit/aft-darwin-arm64": "0.15.3",

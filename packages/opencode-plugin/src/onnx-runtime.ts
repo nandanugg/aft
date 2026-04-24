@@ -169,16 +169,15 @@ async function downloadOnnxRuntime(
 
     // Download using curl (more reliable than fetch across Bun/Node runtimes,
     // especially for GitHub release redirects and large binary downloads)
-    const { execSync: execSyncDl } = await import("node:child_process");
-    execSyncDl(`curl -fsSL "${url}" -o "${archivePath}"`, {
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("curl", ["-fsSL", url, "-o", archivePath], {
       stdio: "pipe",
       timeout: 120_000,
     });
 
     // Extract
     if (info.archiveType === "tgz") {
-      const { execSync } = await import("node:child_process");
-      execSync(`tar xzf "${archivePath}" -C "${tmpDir}"`, { stdio: "pipe" });
+      execFileSync("tar", ["xzf", archivePath, "-C", tmpDir], { stdio: "pipe" });
     } else {
       await extractZipArchive(archivePath, tmpDir);
     }

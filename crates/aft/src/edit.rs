@@ -295,11 +295,12 @@ impl WriteResult {
 /// 1. `fs::write` — persist content
 /// 2. `auto_format` — run the project formatter (reads the written file, writes back)
 /// 3. `validate_syntax` — parse the (potentially formatted) file
-/// 4. `validate_full` — run type checker if `params.validate == "full"`
+/// 4. `validate_full` — run type checker if requested by params or config
 ///
 /// The `params` argument carries the original request parameters. When it
-/// contains `"validate": "full"`, the project's type checker is invoked after
-/// syntax validation and the results are included in `WriteResult`.
+/// contains `"validate": "full"`, or config sets `validate_on_edit: "full"`,
+/// the project's type checker is invoked after syntax validation and the
+/// results are included in `WriteResult`.
 pub fn write_format_validate(
     path: &Path,
     content: &str,
@@ -321,7 +322,11 @@ pub fn write_format_validate(
     };
 
     // Step 4: Full validation (type checker) — only when requested
-    let validate_requested = params.get("validate").and_then(|v| v.as_str()) == Some("full");
+    let param_validate = params.get("validate").and_then(|v| v.as_str());
+    let config_validate = config.validate_on_edit.as_deref();
+    // Explicit param overrides config. Valid values: "syntax" | "full" | "off".
+    let validate_mode = param_validate.or(config_validate).unwrap_or("off");
+    let validate_requested = validate_mode == "full";
     let (validation_errors, validate_skipped_reason) = if validate_requested {
         format::validate_full(path, config)
     } else {

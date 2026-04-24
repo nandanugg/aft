@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { error, log, warn } from "./logger.js";
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,54 @@ export interface AftConfig {
    */
   max_callgraph_files?: number;
 }
+
+// TODO: move this schema to a shared package/module with aft-opencode to avoid drift.
+
+const FormatterEnum = z.enum([
+  "biome",
+  "prettier",
+  "deno",
+  "ruff",
+  "black",
+  "rustfmt",
+  "goimports",
+  "gofmt",
+  "none",
+]);
+
+const CheckerEnum = z.enum([
+  "tsc",
+  "biome",
+  "pyright",
+  "ruff",
+  "cargo",
+  "go",
+  "staticcheck",
+  "none",
+]);
+
+const SemanticConfigSchema = z.object({
+  backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
+  model: z.string().trim().min(1).optional(),
+  base_url: z.string().trim().min(1).optional(),
+  api_key_env: z.string().trim().min(1).optional(),
+  timeout_ms: z.number().int().positive().optional(),
+  max_batch_size: z.number().int().positive().optional(),
+});
+
+export const AftConfigSchema = z.object({
+  format_on_edit: z.boolean().optional(),
+  validate_on_edit: z.enum(["syntax", "full"]).optional(),
+  formatter: z.record(z.string(), FormatterEnum).optional(),
+  checker: z.record(z.string(), CheckerEnum).optional(),
+  tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
+  disabled_tools: z.array(z.string()).optional(),
+  restrict_to_project_root: z.boolean().optional(),
+  experimental_search_index: z.boolean().optional(),
+  experimental_semantic_search: z.boolean().optional(),
+  semantic: SemanticConfigSchema.optional(),
+  max_callgraph_files: z.number().int().positive().optional(),
+});
 
 // ---------------------------------------------------------------------------
 // Minimal JSONC parser (strips comments + trailing commas before JSON.parse).
@@ -129,14 +178,56 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
   try {
     if (!existsSync(configPath)) return null;
     const content = readFileSync(configPath, "utf-8");
-    const parsed = JSON.parse(stripJsonc(content)) as AftConfig;
-    log(`Config loaded from ${configPath}`);
-    return parsed;
+    const parsed = JSON.parse(stripJsonc(content)) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      warn(`Config validation error in ${configPath}: root must be an object`);
+      return null;
+    }
+    const rawConfig = parsed as Record<string, unknown>;
+    const result = AftConfigSchema.safeParse(rawConfig);
+
+    if (result.success) {
+      log(`Config loaded from ${configPath}`);
+      return result.data;
+    }
+
+    const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
+    warn(`Config validation error in ${configPath}: ${errorMsg}`);
+    return parseConfigPartially(rawConfig);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
     return null;
   }
+}
+
+function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
+  const partialConfig: Record<string, unknown> = {};
+  const invalidSections: string[] = [];
+
+  for (const key of Object.keys(rawConfig)) {
+    const sectionResult = AftConfigSchema.safeParse({ [key]: rawConfig[key] });
+    if (sectionResult.success) {
+      const parsed = sectionResult.data as Record<string, unknown>;
+      if (parsed[key] !== undefined) {
+        partialConfig[key] = parsed[key];
+      }
+    } else {
+      const sectionErrors = sectionResult.error.issues
+        .filter((i) => i.path[0] === key)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join(", ");
+      if (sectionErrors) {
+        invalidSections.push(`${key}: ${sectionErrors}`);
+      }
+    }
+  }
+
+  if (invalidSections.length > 0) {
+    warn(`Partial config loaded — invalid sections skipped: ${invalidSections.join("; ")}`);
+  }
+
+  return partialConfig as AftConfig;
 }
 
 // ---------------------------------------------------------------------------

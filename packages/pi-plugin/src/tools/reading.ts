@@ -236,16 +236,16 @@ export function registerReadingTools(
           if (files.length === 0) {
             return textResult(`No source files found under ${dirArg}`);
           }
-          const response = await callBridge(bridge, "outline", { files });
+          const response = await callBridge(bridge, "outline", { files }, extCtx);
           return textResult((response.text as string | undefined) ?? "");
         }
 
         if (hasFiles) {
-          const response = await callBridge(bridge, "outline", { files: params.files });
+          const response = await callBridge(bridge, "outline", { files: params.files }, extCtx);
           return textResult((response.text as string | undefined) ?? "");
         }
 
-        const response = await callBridge(bridge, "outline", { file: params.filePath });
+        const response = await callBridge(bridge, "outline", { file: params.filePath }, extCtx);
         return textResult((response.text as string | undefined) ?? "");
       },
       renderCall(args, theme, context) {
@@ -288,7 +288,7 @@ export function registerReadingTools(
         const req: Record<string, unknown> = { file: params.filePath };
         if (params.symbol) req.symbol = params.symbol;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
-        const response = await callBridge(bridge, "zoom", req);
+        const response = await callBridge(bridge, "zoom", req, extCtx);
         return textResult(JSON.stringify(response, null, 2));
       },
       renderCall(args, theme, context) {

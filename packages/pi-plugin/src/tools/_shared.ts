@@ -2,7 +2,7 @@
  * Shared helpers used by every Pi tool wrapper.
  */
 
-import type { AgentToolResult } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BinaryBridge } from "../bridge.js";
 import type { PluginContext } from "../types.js";
 
@@ -35,19 +35,44 @@ export function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {
 }
 
 /**
+ * Resolve Pi's native session ID from the tool execution context so that
+ * `/new`, `/fork`, and `/resume` each scope their own undo/checkpoint
+ * namespace in AFT instead of sharing one extension-wide UUID.
+ *
+ * `sessionManager` is on every `ExtensionContext`; we read it defensively
+ * because Pi's public type surface is still evolving and we don't want a
+ * missing field at runtime to wedge tool execution.
+ */
+export function resolveSessionId(extCtx: ExtensionContext): string | undefined {
+  const manager = (extCtx as unknown as { sessionManager?: { getSessionId?: () => string } })
+    .sessionManager;
+  const id = manager?.getSessionId?.();
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/**
  * Call a bridge command and throw a plain Error on failure.
  * Every tool handler should guard with `if (response.success === false)`
  * before accessing success-only fields — this helper does it uniformly.
+ *
+ * `extCtx` is used to derive Pi's current session ID per call so Rust
+ * scopes backups/undo per Pi session rather than per extension instance.
  */
 export async function callBridge(
   bridge: BinaryBridge,
   command: string,
   params: Record<string, unknown> = {},
+  extCtx?: ExtensionContext,
 ): Promise<Record<string, unknown>> {
   const timeoutMs = timeoutForCommand(command);
+  const merged: Record<string, unknown> = { ...params };
+  const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
+  if (sessionId) {
+    merged.session_id = sessionId;
+  }
   const response = await bridge.send(
     command,
-    params,
+    merged,
     timeoutMs !== undefined ? { timeoutMs } : undefined,
   );
   if (response.success === false) {

@@ -156,9 +156,12 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         .map(|v| v as u32)
         .unwrap_or_else(|| (start_line + limit - 1).min(total_lines));
 
-    // Clamp to actual line count
+    // Clamp to actual line count. `.max(start_idx)` guards against agents
+    // sending inverted ranges (e.g. end_line < start_line) which would
+    // otherwise panic at `lines[start_idx..end_idx]` below. With this guard,
+    // inverted ranges yield an empty slice and return zero lines.
     let start_idx = (start_line.saturating_sub(1) as usize).min(lines.len());
-    let end_idx = (end_line as usize).min(lines.len());
+    let end_idx = (end_line as usize).min(lines.len()).max(start_idx);
 
     if start_idx >= lines.len() {
         return Response::success(

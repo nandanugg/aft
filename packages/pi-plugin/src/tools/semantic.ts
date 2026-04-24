@@ -121,7 +121,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = { query: params.query };
       if (params.topK !== undefined) req.top_k = params.topK;
-      const response = await callBridge(bridge, "semantic_search", req);
+      const response = await callBridge(bridge, "semantic_search", req, extCtx);
       return textResult((response.text as string | undefined) ?? JSON.stringify(response, null, 2));
     },
     renderCall(args, theme, context) {

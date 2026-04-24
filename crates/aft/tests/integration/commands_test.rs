@@ -332,6 +332,39 @@ fn test_read_rejects_files_larger_than_50mb() {
 }
 
 #[test]
+fn test_read_handles_inverted_line_range() {
+    // Regression for audit #1: read with start_line > end_line previously
+    // panicked at `lines[start_idx..end_idx]` because end_idx was clamped
+    // independently of start_idx. Must now return success with zero lines.
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let file = temp_dir.path().join("sample.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").expect("write sample");
+
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.configure(temp_dir.path());
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"read-inv","command":"read","file":"{}","start_line":8,"end_line":3}}"#,
+        file.display()
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "inverted range should not crash: {:?}",
+        resp
+    );
+    assert_eq!(resp["lines_read"], 0);
+
+    // Process must still be alive (would be dead on the old panic path).
+    let ping = aft.send(r#"{"id":"alive","command":"ping"}"#);
+    assert_eq!(ping["success"], true);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn test_zoom_symbol_not_found() {
     let mut aft = AftProcess::spawn();
     let file = fixture_path("calls.ts");

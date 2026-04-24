@@ -230,7 +230,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         if (params.paths !== undefined) req.paths = params.paths;
         if (params.globs !== undefined) req.globs = params.globs;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
-        const response = await callBridge(bridge, "ast_search", req);
+        const response = await callBridge(bridge, "ast_search", req, extCtx);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
       },
       renderCall(args, theme, context) {
@@ -266,7 +266,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         if (params.globs !== undefined) req.globs = params.globs;
         // Rust ast_replace defaults to dry_run=true; apply by default to match description.
         req.dry_run = params.dryRun === true;
-        const response = await callBridge(bridge, "ast_replace", req);
+        const response = await callBridge(bridge, "ast_replace", req, extCtx);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
       },
       renderCall(args, theme, context) {

@@ -287,14 +287,12 @@ fn write_roundtrip_preserves_subsecond_mtime_precision() {
     );
 }
 
-/// Backward-compat: V2 caches (pre-v0.15.2) must still load. Users upgrading
-/// from v0.15.1 should not see parse errors on their existing
-/// `~/.local/share/opencode/storage/plugin/aft/semantic/.../semantic.bin`
-/// files. The V2 load reports all files as stale (nanos round-trip to 0,
-/// so equality fails) which triggers one final rebuild — that rebuild then
-/// persists as V3 and stabilises forever.
+/// Migration: V2 caches must be discarded on disk so persisted snippets are
+/// rebuilt with V4 range handling. `from_bytes` still parses V2 for low-level
+/// compatibility, but `read_from_disk` rejects old cache files before serving
+/// stale embeddings.
 #[test]
-fn v2_cache_still_loads_for_backward_compat() {
+fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
     let project = tempfile::tempdir().expect("create project dir");
     let storage = tempfile::tempdir().expect("create storage dir");
     let (index, source_file) = build_test_index(project.path());
@@ -345,14 +343,8 @@ fn v2_cache_still_loads_for_backward_compat() {
     fs::create_dir_all(&semantic_dir).expect("create semantic dir");
     fs::write(semantic_dir.join("semantic.bin"), &bytes).expect("write v2 cache");
 
-    let restored = SemanticIndex::read_from_disk(storage.path(), "v2-project", Some(&fp_str))
-        .expect("V2 caches must still load post-upgrade");
-
-    assert_eq!(restored.len(), 1);
-    // V2 stored 0 nanos, so the live file (with real subsec nanos) will
-    // not match — that's the expected one-time rebuild on upgrade.
-    // We only assert the blob was parsed without error; the rebuild
-    // path is exercised by other tests.
+    assert!(SemanticIndex::read_from_disk(storage.path(), "v2-project", Some(&fp_str)).is_none());
+    assert!(!semantic_dir.join("semantic.bin").exists());
 }
 
 /// Hardening: corrupt / malicious V3 caches must be rejected cleanly,

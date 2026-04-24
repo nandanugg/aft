@@ -7,6 +7,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -52,6 +53,54 @@ describe("Pi BinaryBridge", () => {
       // under the 5s bridge default to prove the override took effect.
       expect(elapsed).toBeLessThan(2_000);
     } finally {
+      await rm(fakeBin).catch(() => {});
+    }
+  });
+
+  test("restart counter decays even after max restarts is reached", async () => {
+    bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", PROJECT_CWD, {
+      timeoutMs: 5_000,
+      maxRestarts: 1,
+    });
+    const originalResetMs = (BinaryBridge as any).RESTART_RESET_MS;
+
+    try {
+      (BinaryBridge as any).RESTART_RESET_MS = 20;
+      (bridge as any)._restartCount = 1;
+
+      (bridge as any).handleCrash();
+
+      expect(bridge.restartCount).toBe(1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(bridge.restartCount).toBe(0);
+    } finally {
+      (BinaryBridge as any).RESTART_RESET_MS = originalResetMs;
+    }
+  });
+
+  test("stale exit from replaced child is ignored", async () => {
+    const fakeBin = join(tmpdir(), `aft-pi-fake-stale-exit-${Date.now()}.sh`);
+    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+
+    let staleChild: ChildProcess | null = null;
+    try {
+      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
+        timeoutMs: 5_000,
+        maxRestarts: 0,
+      });
+
+      (bridge as any).spawnProcess();
+      staleChild = (bridge as any).process as ChildProcessWithoutNullStreams;
+      (bridge as any).spawnProcess();
+      const activeChild = (bridge as any).process as ChildProcessWithoutNullStreams;
+      (bridge as any).configured = true;
+
+      staleChild.emit("exit", 1, null);
+
+      expect((bridge as any).process).toBe(activeChild);
+      expect((bridge as any).configured).toBe(true);
+    } finally {
+      staleChild?.kill("SIGKILL");
       await rm(fakeBin).catch(() => {});
     }
   });

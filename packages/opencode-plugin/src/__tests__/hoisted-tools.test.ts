@@ -280,8 +280,12 @@ describe("Hoisted tool execute handlers", () => {
         }
       }
 
+      if (command === "delete_file") {
+        await rm(params.file as string, { force: true });
+        return { success: true };
+      }
+
       if (command === "restore_checkpoint") {
-        await rm(createdFile, { force: true });
         return { success: true };
       }
 
@@ -292,14 +296,79 @@ describe("Hoisted tool execute handlers", () => {
 
     expect(result).toContain("Created created.ts");
     expect(result).toContain("Failed to create broken.ts: Simulated patch failure");
-    expect(result).toContain("Patch failed — restored files to pre-patch state.");
-    expect(calls.map((call) => call.command)).toEqual([
-      "checkpoint",
-      "write",
-      "write",
-      "restore_checkpoint",
-    ]);
+    // Both hunks are adds (newly-created), so there is no checkpoint — rollback
+    // proceeds purely by deleting the newly-created file.
+    expect(result).toContain("removed 1 newly-created file(s)");
+    // No checkpoint call because both paths were newly-created (checkpointPaths empty).
+    expect(calls.map((call) => call.command)).toEqual(["write", "write", "delete_file"]);
     expect(existsSync(createdFile)).toBe(false);
+  });
+
+  test("apply_patch move rollback deletes orphan destination when source delete fails", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    // Pre-existing source file that's being moved; the move destination does
+    // not exist before the patch. On partial failure (source delete errors)
+    // the destination must be removed — otherwise the old and new files
+    // co-exist (audit #8 regression).
+    const sourceFile = resolve(tmpDir, "src/original.ts");
+    const destFile = resolve(tmpDir, "src/renamed.ts");
+    await writeFile(sourceFile, "export const x = 1;\n", { flag: "wx" }).catch(async () => {
+      // Parent dir doesn't exist yet — create it and retry.
+      const { mkdir } = await import("node:fs/promises");
+      await mkdir(resolve(tmpDir as string, "src"), { recursive: true });
+      await writeFile(sourceFile, "export const x = 1;\n");
+    });
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: src/original.ts",
+      "*** Move to: src/renamed.ts",
+      "@@",
+      "-export const x = 1;",
+      "+export const x = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    let destWritten = false;
+    const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") {
+        const file = params.file as string;
+        if (file === destFile) {
+          await writeFile(file, params.content as string);
+          destWritten = true;
+          return { success: true };
+        }
+      }
+      if (command === "delete_file") {
+        const file = params.file as string;
+        if (file === sourceFile) {
+          // Simulate the source delete failing mid-patch.
+          throw new Error("Simulated delete_file failure");
+        }
+        if (file === destFile) {
+          // Rollback's newly-created cleanup. Actually remove it.
+          await rm(destFile, { force: true });
+          return { success: true };
+        }
+      }
+      if (command === "restore_checkpoint") return { success: true };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = await tools.apply_patch.execute({ patchText }, sdkCtx);
+
+    expect(destWritten).toBe(true);
+    // The fix must remove the orphan destination.
+    expect(existsSync(destFile)).toBe(false);
+    // And report it in the rollback summary.
+    expect(result).toContain("removed 1 newly-created file(s)");
+    // Source should be restored via checkpoint (we checkpointed it pre-patch).
+    expect(calls.map((c) => c.command)).toContain("restore_checkpoint");
+    // Newly-created destination must have been deleted.
+    expect(calls.some((c) => c.command === "delete_file" && c.params.file === destFile)).toBe(true);
   });
 
   test("read returns binary-file messages without trying to split missing content", async () => {

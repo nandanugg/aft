@@ -369,11 +369,10 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
         // Skip language-specific receivers
         match lang {
             LangId::Rust => {
-                let normalized = trimmed.replace(' ', "");
-                if normalized == "self"
-                    || normalized == "&self"
-                    || normalized == "&mutself"
-                    || normalized == "mutself"
+                if trimmed == "self"
+                    || trimmed == "mut self"
+                    || trimmed.starts_with("&self")
+                    || trimmed.starts_with("&mut self")
                 {
                     continue;
                 }

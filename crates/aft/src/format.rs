@@ -142,22 +142,36 @@ const TOOL_CACHE_TTL: Duration = Duration::from_secs(60);
 static TOOL_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (bool, Instant)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn tool_cache_key(command: &str, project_root: Option<&Path>) -> String {
+    let root = project_root
+        .map(|path| path.to_string_lossy())
+        .unwrap_or_default();
+    format!("{}\0{}", command, root)
+}
+
+pub fn clear_tool_cache() {
+    if let Ok(mut cache) = TOOL_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 /// Check if a command exists by attempting to spawn it with `--version`.
 ///
 /// First checks `<project_root>/node_modules/.bin/<command>` (for locally installed tools
 /// like biome, prettier), then falls back to PATH lookup.
 /// Results are cached for 60 seconds to avoid repeated subprocess spawning.
-fn tool_available(command: &str) -> bool {
+fn tool_available(command: &str, project_root: Option<&Path>) -> bool {
+    let key = tool_cache_key(command, project_root);
     if let Ok(cache) = TOOL_CACHE.lock() {
-        if let Some((available, checked_at)) = cache.get(command) {
+        if let Some((available, checked_at)) = cache.get(&key) {
             if checked_at.elapsed() < TOOL_CACHE_TTL {
                 return *available;
             }
         }
     }
-    let result = resolve_tool(command, None).is_some();
+    let result = resolve_tool(command, project_root).is_some();
     if let Ok(mut cache) = TOOL_CACHE.lock() {
-        cache.insert(command.to_string(), (result, Instant::now()));
+        cache.insert(key, (result, Instant::now()));
     }
     result
 }
@@ -194,8 +208,29 @@ fn resolve_tool(command: &str, project_root: Option<&Path>) -> Option<String> {
 /// `NOT_YET_IMPLEMENTED_*` stubs instead of formatted code. We parse the
 /// version from `ruff --version` (format: "ruff X.Y.Z") and require >= 0.1.2.
 /// Falls back to false if ruff is not found or version cannot be parsed.
-fn ruff_format_available() -> bool {
-    let output = match Command::new("ruff")
+fn ruff_format_available(project_root: Option<&Path>) -> bool {
+    let key = tool_cache_key("ruff-format", project_root);
+    if let Ok(cache) = TOOL_CACHE.lock() {
+        if let Some((available, checked_at)) = cache.get(&key) {
+            if checked_at.elapsed() < TOOL_CACHE_TTL {
+                return *available;
+            }
+        }
+    }
+
+    let result = ruff_format_available_uncached(project_root);
+    if let Ok(mut cache) = TOOL_CACHE.lock() {
+        cache.insert(key, (result, Instant::now()));
+    }
+    result
+}
+
+fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
+    let command = match resolve_tool("ruff", project_root) {
+        Some(command) => command,
+        None => return false,
+    };
+    let output = match Command::new(&command)
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -306,7 +341,7 @@ pub fn detect_formatter(
             }
             // deno.json / deno.jsonc → deno fmt
             if has_project_config(project_root, &["deno.json", "deno.jsonc"])
-                && tool_available("deno")
+                && tool_available("deno", project_root)
             {
                 return Some(("deno".to_string(), vec!["fmt".to_string(), file_str]));
             }
@@ -317,12 +352,12 @@ pub fn detect_formatter(
             // ruff.toml or pyproject.toml with ruff config → ruff
             if (has_project_config(project_root, &["ruff.toml", ".ruff.toml"])
                 || has_pyproject_tool(project_root, "ruff"))
-                && ruff_format_available()
+                && ruff_format_available(project_root)
             {
                 return Some(("ruff".to_string(), vec!["format".to_string(), file_str]));
             }
             // pyproject.toml with black config → black
-            if has_pyproject_tool(project_root, "black") && tool_available("black") {
+            if has_pyproject_tool(project_root, "black") && tool_available("black", project_root) {
                 return Some(("black".to_string(), vec![file_str]));
             }
             // No config file found → do not format
@@ -330,7 +365,9 @@ pub fn detect_formatter(
         }
         LangId::Rust => {
             // Cargo.toml implies standard Rust formatting
-            if has_project_config(project_root, &["Cargo.toml"]) && tool_available("rustfmt") {
+            if has_project_config(project_root, &["Cargo.toml"])
+                && tool_available("rustfmt", project_root)
+            {
                 Some(("rustfmt".to_string(), vec![file_str]))
             } else {
                 None
@@ -339,9 +376,9 @@ pub fn detect_formatter(
         LangId::Go => {
             // go.mod implies a Go project
             if has_project_config(project_root, &["go.mod"]) {
-                if tool_available("goimports") {
+                if tool_available("goimports", project_root) {
                     Some(("goimports".to_string(), vec!["-w".to_string(), file_str]))
-                } else if tool_available("gofmt") {
+                } else if tool_available("gofmt", project_root) {
                     Some(("gofmt".to_string(), vec!["-w".to_string(), file_str]))
                 } else {
                     None
@@ -471,7 +508,15 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    match run_external_tool(&cmd, &arg_refs, None, config.formatter_timeout_secs) {
+    // Run the formatter in the project root so tool-local config files
+    // (biome.json, .prettierrc, rustfmt.toml, etc.) are discovered. The
+    // type-checker path (`validate_full`) already does this via
+    // `path.parent()`; formatters need the same treatment. Without it,
+    // formatters silently fall back to built-in defaults when the aft
+    // process CWD differs from the project root (audit #18).
+    let working_dir = config.project_root.as_deref();
+
+    match run_external_tool(&cmd, &arg_refs, working_dir, config.formatter_timeout_secs) {
         Ok(_) => {
             log::info!("format: {} ({})", path.display(), cmd);
             (true, None)
@@ -647,7 +692,7 @@ pub fn detect_type_checker(
                             "false".to_string(),
                         ],
                     ));
-                } else if tool_available("npx") {
+                } else if tool_available("npx", project_root) {
                     return Some((
                         "npx".to_string(),
                         vec![
@@ -673,7 +718,7 @@ pub fn detect_type_checker(
             // ruff.toml or pyproject.toml with ruff → ruff check
             if (has_project_config(project_root, &["ruff.toml", ".ruff.toml"])
                 || has_pyproject_tool(project_root, "ruff"))
-                && ruff_format_available()
+                && ruff_format_available(project_root)
             {
                 return Some((
                     "ruff".to_string(),
@@ -688,7 +733,9 @@ pub fn detect_type_checker(
         }
         LangId::Rust => {
             // Cargo.toml implies cargo check
-            if has_project_config(project_root, &["Cargo.toml"]) && tool_available("cargo") {
+            if has_project_config(project_root, &["Cargo.toml"])
+                && tool_available("cargo", project_root)
+            {
                 Some((
                     "cargo".to_string(),
                     vec!["check".to_string(), "--message-format=json".to_string()],
@@ -700,9 +747,9 @@ pub fn detect_type_checker(
         LangId::Go => {
             // go.mod implies Go project
             if has_project_config(project_root, &["go.mod"]) {
-                if tool_available("staticcheck") {
+                if tool_available("staticcheck", project_root) {
                     Some(("staticcheck".to_string(), vec![file_str]))
-                } else if tool_available("go") {
+                } else if tool_available("go", project_root) {
                     Some(("go".to_string(), vec!["vet".to_string(), file_str]))
                 } else {
                     None
@@ -1175,7 +1222,7 @@ mod tests {
             ..Config::default()
         };
         let result = detect_formatter(&path, LangId::Rust, &config);
-        if tool_available("rustfmt") {
+        if tool_available("rustfmt", config.project_root.as_deref()) {
             let (cmd, args) = result.unwrap();
             assert_eq!(cmd, "rustfmt");
             assert!(args.iter().any(|a| a.ends_with("test.rs")));
@@ -1194,11 +1241,11 @@ mod tests {
             ..Config::default()
         };
         let result = detect_formatter(&path, LangId::Go, &config);
-        if tool_available("goimports") {
+        if tool_available("goimports", config.project_root.as_deref()) {
             let (cmd, args) = result.unwrap();
             assert_eq!(cmd, "goimports");
             assert!(args.contains(&"-w".to_string()));
-        } else if tool_available("gofmt") {
+        } else if tool_available("gofmt", config.project_root.as_deref()) {
             let (cmd, args) = result.unwrap();
             assert_eq!(cmd, "gofmt");
             assert!(args.contains(&"-w".to_string()));
@@ -1217,7 +1264,7 @@ mod tests {
             ..Config::default()
         };
         let result = detect_formatter(&path, LangId::Python, &config);
-        if ruff_format_available() {
+        if ruff_format_available(config.project_root.as_deref()) {
             let (cmd, args) = result.unwrap();
             assert_eq!(cmd, "ruff");
             assert!(args.contains(&"format".to_string()));
@@ -1269,7 +1316,7 @@ mod tests {
 
     #[test]
     fn auto_format_happy_path_rustfmt() {
-        if !tool_available("rustfmt") {
+        if !tool_available("rustfmt", None) {
             log::warn!("skipping: rustfmt not available");
             return;
         }
@@ -1396,7 +1443,7 @@ mod tests {
             ..Config::default()
         };
         let result = detect_type_checker(&path, LangId::Rust, &config);
-        if tool_available("cargo") {
+        if tool_available("cargo", config.project_root.as_deref()) {
             let (cmd, args) = result.unwrap();
             assert_eq!(cmd, "cargo");
             assert!(args.contains(&"check".to_string()));
@@ -1415,7 +1462,7 @@ mod tests {
             ..Config::default()
         };
         let result = detect_type_checker(&path, LangId::Go, &config);
-        if tool_available("go") {
+        if tool_available("go", config.project_root.as_deref()) {
             let (cmd, _args) = result.unwrap();
             // Could be staticcheck or go vet depending on what's installed
             assert!(cmd == "go" || cmd == "staticcheck");
