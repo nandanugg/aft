@@ -5,7 +5,7 @@
 <h1 align="center">AFT — Agent File Toolkit</h1>
 
 <p align="center">
-  <strong>Tree-sitter powered code analysis tools for AI coding agents.</strong><br>
+  <strong>Tree-sitter powered code manipulation and analysis tools for AI coding agents.</strong><br>
   Semantic editing, call-graph navigation, and structural search — all in one toolkit.
 </p>
 
