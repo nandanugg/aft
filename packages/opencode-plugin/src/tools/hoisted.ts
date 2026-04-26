@@ -77,6 +77,42 @@ function buildUnifiedDiff(fp: string, before: string, after: string): string {
   return diff;
 }
 
+/**
+ * Count non-empty lines in a string. Used for unambiguous addition/deletion
+ * counts when one side of a diff is empty (apply_patch's add/delete hunks).
+ *
+ * `split("\n")` on a string with a trailing newline produces a trailing
+ * empty element which we drop, so the count matches "actual content lines"
+ * rather than "split slots". For empty input the count is 0.
+ */
+function lineCount(content: string): number {
+  if (content.length === 0) return 0;
+  const parts = content.split("\n");
+  // Drop the trailing empty element produced by a terminating "\n".
+  if (parts[parts.length - 1] === "") parts.pop();
+  return parts.length;
+}
+
+/**
+ * Count additions and deletions between two file contents using the same
+ * LCS path that powers buildUnifiedDiff. Used for apply_patch's *move*
+ * case where the Rust write diff would compare against an empty target
+ * (overcounting additions). For non-move updates we use the Rust counts
+ * directly.
+ */
+function countDiffLines(before: string, after: string): { additions: number; deletions: number } {
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+  const ops = diffLines(beforeLines, afterLines);
+  let additions = 0;
+  let deletions = 0;
+  for (const op of ops) {
+    if (op.tag === "ins") additions++;
+    else if (op.tag === "del") deletions++;
+  }
+  return { additions, deletions };
+}
+
 type DiffOp =
   | { tag: "eq"; beforeIdx: number; afterIdx: number; line: string }
   | { tag: "del"; beforeIdx: number; line: string }
@@ -887,9 +923,21 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      // Process each hunk, track per-file diffs for metadata
+      // Process each hunk, track per-file diffs for metadata.
+      // additions/deletions come from the Rust-side `similar`-crate diff
+      // (returned via `include_diff: true` on the write call) — same source
+      // as the edit/write tools, which produce correct counts. Avoid
+      // recomputing via TS-side LCS to keep one source of truth (issue: the
+      // `apply_patch` UI was reporting +N/-N≈filesize counts because the
+      // local count was diverging from the Rust truth).
       const results: string[] = [];
-      const perFileDiffs: Array<{ filePath: string; before: string; after: string }> = [];
+      const perFileDiffs: Array<{
+        filePath: string;
+        before: string;
+        after: string;
+        additions: number;
+        deletions: number;
+      }> = [];
       let patchFailed = false;
 
       for (const hunk of hunks) {
@@ -898,13 +946,27 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         switch (hunk.type) {
           case "add": {
             try {
-              await callBridge(ctx, context, "write", {
+              const content = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
+              const writeResult = await callBridge(ctx, context, "write", {
                 file: filePath,
-                content: hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`,
+                content,
                 create_dirs: true,
                 diagnostics: true,
+                include_diff: true,
               });
-              perFileDiffs.push({ filePath, before: "", after: hunk.contents });
+              const wrDiff = writeResult.diff as
+                | { before?: string; after?: string; additions?: number; deletions?: number }
+                | undefined;
+              perFileDiffs.push({
+                filePath,
+                before: "",
+                after: hunk.contents,
+                // For a brand-new file, additions = total lines, deletions = 0.
+                // Prefer Rust counts; fall back to a content line count if the
+                // bridge didn't include a diff (e.g. older binary).
+                additions: wrDiff?.additions ?? lineCount(content),
+                deletions: wrDiff?.deletions ?? 0,
+              });
               results.push(`Created ${hunk.path}`);
             } catch (e) {
               patchFailed = true;
@@ -917,7 +979,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             try {
               const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
               await callBridge(ctx, context, "delete_file", { file: filePath });
-              perFileDiffs.push({ filePath, before, after: "" });
+              // delete_file doesn't return a diff. The counts are unambiguous:
+              // every prior line is a deletion; nothing is added.
+              perFileDiffs.push({
+                filePath,
+                before,
+                after: "",
+                additions: 0,
+                deletions: lineCount(before),
+              });
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
               patchFailed = true;
@@ -941,6 +1011,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 content: newContent,
                 create_dirs: true,
                 diagnostics: true,
+                include_diff: true,
               });
 
               // Collect diagnostics from this file
@@ -956,8 +1027,32 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 }
               }
 
-              // Track per-file diff for metadata
-              perFileDiffs.push({ filePath, before: original, after: newContent });
+              // Track per-file diff for metadata. For a regular update the
+              // Rust write diff compares disk-before vs new content, which
+              // matches what we want. For a *move*, write goes to a fresh
+              // target (no prior content), so Rust would report the whole
+              // file as additions; we recompute via TS-side LCS instead.
+              // For non-move updates we still recompute as a fallback when
+              // the bridge didn't include a diff (older binary or a test
+              // mock without diff support).
+              const wrDiff = writeResult.diff as
+                | { before?: string; after?: string; additions?: number; deletions?: number }
+                | undefined;
+              const isMove = Boolean(hunk.move_path);
+              const { additions, deletions } =
+                isMove || wrDiff?.additions === undefined || wrDiff.deletions === undefined
+                  ? countDiffLines(original, newContent)
+                  : {
+                      additions: wrDiff.additions,
+                      deletions: wrDiff.deletions,
+                    };
+              perFileDiffs.push({
+                filePath,
+                before: original,
+                after: newContent,
+                additions,
+                deletions,
+              });
 
               if (hunk.move_path) {
                 await callBridge(ctx, context, "delete_file", { file: filePath });
@@ -1033,25 +1128,21 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         // the "apply_patch shows no diff in TUI/UI" report).
         const diffByPath = new Map(perFileDiffs.map((d) => [d.filePath, d]));
 
-        const countAddDel = (patch: string): { additions: number; deletions: number } => {
-          let additions = 0;
-          let deletions = 0;
-          for (const line of patch.split("\n")) {
-            // Skip diff metadata lines (---, +++) so they aren't counted as
-            // file additions/deletions. The metadata header for unified
-            // diffs starts with `--- ` / `+++ ` followed by a path.
-            if (line.startsWith("---") || line.startsWith("+++")) continue;
-            if (line.startsWith("+")) additions++;
-            else if (line.startsWith("-")) deletions++;
-          }
-          return { additions, deletions };
-        };
-
         // Build per-file metadata. OpenCode's apply_patch shape (see
         // packages/opencode/src/tool/apply_patch.ts:188) per file:
         //   { filePath, relativePath, type, patch, additions, deletions, movePath? }
         // `type` is normalised to "move" when an update hunk has a move target,
         // so the UI can label the row correctly.
+        //
+        // additions/deletions come from perFileDiffs, which were populated
+        // from the Rust-side `similar`-crate diff (via include_diff:true on
+        // each write call). This matches edit/write tool counts exactly.
+        // The TS-side LCS via buildUnifiedDiff is still used to build the
+        // *display* `patch` text — the diff is correct visually; only the
+        // line-count derivation through countAddDel was producing wrong
+        // numbers (e.g. +399/-400 for a single-line removal). See
+        // perFileDiffs population above for how counts are derived per
+        // hunk type.
         const files = hunks.map((h) => {
           const filePath = path.resolve(context.directory, h.path);
           // `move_path` only exists on UpdateHunk variants — narrow first.
@@ -1066,7 +1157,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           const patch = diffEntry
             ? buildUnifiedDiff(displayPath, diffEntry.before, diffEntry.after)
             : "";
-          const { additions, deletions } = countAddDel(patch);
+          const additions = diffEntry?.additions ?? 0;
+          const deletions = diffEntry?.deletions ?? 0;
 
           // Normalise type for UI: an "update" hunk with a move target is a
           // move, otherwise keep the parsed type as-is.
