@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Runtime configuration for the aft process.
@@ -40,6 +41,18 @@ pub struct SemanticBackendConfig {
     pub max_batch_size: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserServerDef {
+    pub id: String,
+    pub extensions: Vec<String>,
+    pub binary: String,
+    pub args: Vec<String>,
+    pub root_markers: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+    pub disabled: bool,
+}
+
 impl Default for SemanticBackendConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +76,7 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
@@ -83,10 +97,10 @@ pub struct Config {
     pub validate_on_edit: Option<String>,
     /// Per-language formatter overrides. Keys: "typescript", "python", "rust", "go".
     /// Values: "biome", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none".
-    pub formatter: std::collections::HashMap<String, String>,
+    pub formatter: HashMap<String, String>,
     /// Per-language type checker overrides. Keys: "typescript", "python", "rust", "go".
     /// Values: "tsc", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none".
-    pub checker: std::collections::HashMap<String, String>,
+    pub checker: HashMap<String, String>,
     /// Whether to restrict file operations to within `project_root` (default: false).
     /// When true, write-capable commands reject paths outside the project root.
     pub restrict_to_project_root: bool,
@@ -104,10 +118,21 @@ pub struct Config {
     /// Default: 20_000 (covers typical monorepos; rejects OS-wide roots).
     pub max_callgraph_files: usize,
     pub semantic: SemanticBackendConfig,
+    /// Enable Astral ty as an experimental Python LSP server (default: false).
+    pub experimental_lsp_ty: bool,
+    /// User-defined LSP servers registered by the OpenCode plugin.
+    pub lsp_servers: Vec<UserServerDef>,
+    /// Lowercase LSP server IDs disabled by user config.
+    pub disabled_lsp: HashSet<String>,
     /// Persistent storage directory for indexes (trigram, semantic).
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// Maximum number of (server, file) entries kept in the in-memory
+    /// diagnostic cache. Older entries are evicted in LRU order when the
+    /// cap is exceeded. Set to 0 to disable the cap entirely.
+    /// Default: 5000 (covers very large monorepos with bounded memory).
+    pub diagnostic_cache_size: usize,
 }
 
 impl Default for Config {
@@ -121,8 +146,8 @@ impl Default for Config {
             type_checker_timeout_secs: 30,
             format_on_edit: true,
             validate_on_edit: None,
-            formatter: std::collections::HashMap::new(),
-            checker: std::collections::HashMap::new(),
+            formatter: HashMap::new(),
+            checker: HashMap::new(),
             // Default to false to match OpenCode's existing permission-based model.
             // The plugin opts into root restriction explicitly when desired.
             restrict_to_project_root: false,
@@ -135,7 +160,11 @@ impl Default for Config {
             // walk hundreds of thousands of files per callers/trace_to query.
             max_callgraph_files: 20_000,
             semantic: SemanticBackendConfig::default(),
+            experimental_lsp_ty: false,
+            lsp_servers: Vec::new(),
+            disabled_lsp: HashSet::new(),
             storage_dir: None,
+            diagnostic_cache_size: 5000,
         }
     }
 }

@@ -6,7 +6,10 @@ use crate::lsp::registry::ServerKind;
 /// Walks up from the file's parent directory looking for any of the markers.
 /// Returns the deepest directory containing a marker (closest to the file).
 /// If no marker is found, returns None.
-pub fn find_workspace_root(file_path: &Path, markers: &[&str]) -> Option<PathBuf> {
+pub fn find_workspace_root<S>(file_path: &Path, markers: &[S]) -> Option<PathBuf>
+where
+    S: AsRef<str>,
+{
     let resolved_path = match std::fs::canonicalize(file_path) {
         Ok(path) => path,
         Err(_) => file_path.to_path_buf(),
@@ -20,7 +23,10 @@ pub fn find_workspace_root(file_path: &Path, markers: &[&str]) -> Option<PathBuf
 
     let mut current = Some(start_dir.as_path());
     while let Some(dir) = current {
-        if markers.iter().any(|marker| dir.join(marker).exists()) {
+        if markers
+            .iter()
+            .any(|marker| dir.join(marker.as_ref()).exists())
+        {
             return Some(dir.to_path_buf());
         }
 

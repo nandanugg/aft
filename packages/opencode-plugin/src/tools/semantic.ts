@@ -11,11 +11,32 @@ function arg(schema: unknown): ToolArg {
 
 export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
-    description:
-      "Search code by meaning using semantic similarity. Use when you don't know the exact name or text — describe what you're looking for in natural language and get the most relevant symbols, functions, and types.",
+    description: [
+      "Find symbols by concept when grep keywords fall short. Returns ranked code matches with similarity scores.",
+      "",
+      "When to reach for it:",
+      "- Exploring an unfamiliar area: 'where is rate limiting handled', 'how does auth flow work'",
+      "- Concept doesn't appear as a literal string: 'retry logic', 'cache invalidation', 'graceful shutdown'",
+      "- After 2+ grep attempts that came back empty or noisy",
+      "- You know roughly what the function does but not what it's named",
+      "",
+      "When NOT to use:",
+      "- You have a specific symbol name → use grep",
+      "- You have an error message or stack trace → use grep",
+      "- You want the file/module structure → use aft_outline",
+      "- You're following a call chain → use aft_navigate",
+      "",
+      "Scores below ~0.4 are usually weak matches; treat them as 'maybe relevant' and verify with read.",
+    ].join("\n"),
     args: {
-      query: arg(z.string().describe("Natural language search query")),
-      topK: arg(z.number().optional().describe("Number of results (default: 10)")),
+      query: arg(
+        z
+          .string()
+          .describe(
+            "Concept or capability to find, phrased as a programmer would describe the code. Examples: 'fuzzy match with whitespace tolerance', 'undo backup before edit', 'retry failed network request'.",
+          ),
+      ),
+      topK: arg(z.number().optional().describe("Number of results (default: 10, max: 100)")),
     },
     execute: async (args, context): Promise<string> => {
       const response = await callBridge(ctx, context, "semantic_search", {

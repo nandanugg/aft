@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
+use aft::config::{Config, UserServerDef};
 use aft::lsp::registry::{servers_for_file, ServerKind};
 use aft::lsp::roots::find_workspace_root;
 use tempfile::tempdir;
@@ -57,12 +60,107 @@ fn test_registry_and_root_combined() {
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
     fs::write(&file, "fn main() {}\n").unwrap();
 
-    let servers = servers_for_file(&file);
+    let config = Config::default();
+    let servers = servers_for_file(&file, &config);
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].kind, ServerKind::Rust);
     let expected_root = fs::canonicalize(&root).unwrap();
     assert_eq!(
-        find_workspace_root(&file, servers[0].root_markers),
+        find_workspace_root(&file, &servers[0].root_markers),
         Some(expected_root)
     );
+}
+
+#[test]
+fn test_bash_yaml_and_ty_registry_entries() {
+    let default_config = Config::default();
+    assert_eq!(
+        servers_for_file(std::path::Path::new("/tmp/script.bash"), &default_config)
+            .into_iter()
+            .map(|server| server.kind)
+            .collect::<Vec<_>>(),
+        vec![ServerKind::Bash]
+    );
+    assert_eq!(
+        servers_for_file(std::path::Path::new("/tmp/config.yml"), &default_config)
+            .into_iter()
+            .map(|server| server.kind)
+            .collect::<Vec<_>>(),
+        vec![ServerKind::Yaml]
+    );
+
+    let ty_config = Config {
+        experimental_lsp_ty: true,
+        ..Config::default()
+    };
+    assert_eq!(
+        servers_for_file(std::path::Path::new("/tmp/main.py"), &ty_config)
+            .into_iter()
+            .map(|server| server.kind)
+            .collect::<Vec<_>>(),
+        vec![ServerKind::Python, ServerKind::Ty]
+    );
+}
+
+#[test]
+fn test_ty_hidden_when_flag_off_but_visible_when_on() {
+    let default_kinds = servers_for_file(std::path::Path::new("/tmp/main.py"), &Config::default())
+        .into_iter()
+        .map(|server| server.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(default_kinds, vec![ServerKind::Python]);
+
+    let config = Config {
+        experimental_lsp_ty: true,
+        ..Config::default()
+    };
+    let enabled_kinds = servers_for_file(std::path::Path::new("/tmp/main.py"), &config)
+        .into_iter()
+        .map(|server| server.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(enabled_kinds, vec![ServerKind::Python, ServerKind::Ty]);
+}
+
+#[test]
+fn test_custom_server_registers_correctly() {
+    let config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "tinymist".to_string(),
+            extensions: vec!["typ".to_string()],
+            binary: "tinymist".to_string(),
+            args: Vec::new(),
+            root_markers: vec!["typst.toml".to_string()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+
+    let servers = servers_for_file(std::path::Path::new("/tmp/main.typ"), &config);
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].kind, ServerKind::Custom(Arc::from("tinymist")));
+    assert_eq!(servers[0].binary, "tinymist");
+}
+
+#[test]
+fn test_disabled_lsp_filters_builtins_and_custom_servers() {
+    let mut config = Config {
+        lsp_servers: vec![UserServerDef {
+            id: "Tinymist".to_string(),
+            extensions: vec!["typ".to_string()],
+            binary: "tinymist".to_string(),
+            args: Vec::new(),
+            root_markers: Vec::new(),
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+    config.disabled_lsp.insert("rust".to_string());
+    config.disabled_lsp.insert("tinymist".to_string());
+
+    assert!(servers_for_file(std::path::Path::new("/tmp/main.rs"), &config).is_empty());
+    assert!(servers_for_file(std::path::Path::new("/tmp/main.typ"), &config).is_empty());
 }

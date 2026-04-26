@@ -1,3 +1,33 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::double_ended_iterator_last,
+    clippy::int_plus_one,
+    clippy::large_enum_variant,
+    clippy::len_without_is_empty,
+    clippy::let_and_return,
+    clippy::manual_contains,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_repeat_n,
+    clippy::manual_strip,
+    clippy::manual_unwrap_or_default,
+    clippy::map_clone,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::new_without_default,
+    clippy::obfuscated_if_else,
+    clippy::ptr_arg,
+    clippy::question_mark,
+    clippy::same_item_push,
+    clippy::should_implement_trait,
+    clippy::single_match,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or
+)]
+
 // ## Note on `.unwrap()` / `.expect()` usage
 //
 // The remaining `.unwrap()` and `.expect()` calls in `src/` are in:

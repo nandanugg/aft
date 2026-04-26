@@ -35,7 +35,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { registerStatusCommand } from "./commands/aft-status.js";
-import { loadAftConfig } from "./config.js";
+import { loadAftConfig, resolveLspConfigForConfigure } from "./config.js";
 import { log, warn } from "./logger.js";
 import { ensureOnnxRuntime, getManualInstallHint } from "./onnx-runtime.js";
 import { BridgePool } from "./pool.js";
@@ -222,9 +222,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // `restrict_to_project_root: false` in their aft.jsonc.
   const configOverrides: Record<string, unknown> = {
     ...config,
+    ...resolveLspConfigForConfigure(config),
     restrict_to_project_root: config.restrict_to_project_root ?? true,
     storage_dir: storageDir,
   };
+  delete configOverrides.lsp;
   if (ortDylibDir) {
     (configOverrides as Record<string, unknown>)._ort_dylib_dir = ortDylibDir;
   }

@@ -66,7 +66,8 @@ pub fn handle_lsp_find_references(req: &RawRequest, ctx: &AppContext) -> Respons
 
     let server_keys = {
         let mut lsp = ctx.lsp();
-        match lsp.ensure_file_open(&file_path) {
+        let config = ctx.config();
+        match lsp.ensure_file_open(&file_path, &config) {
             Ok(keys) => keys,
             Err(err) => {
                 return Response::error(
@@ -122,7 +123,8 @@ pub fn handle_lsp_find_references(req: &RawRequest, ctx: &AppContext) -> Respons
 
     let result = {
         let mut lsp = ctx.lsp();
-        let client = match lsp.client_for_file_mut(&canonical_path) {
+        let config = ctx.config();
+        let client = match lsp.client_for_file_mut(&canonical_path, &config) {
             Some(client) => client,
             None => {
                 return Response::error(

@@ -1462,6 +1462,14 @@ fn symbols_to_chunks(
     let mut chunks = Vec::new();
 
     for symbol in symbols {
+        // Skip Markdown / HTML heading chunks: empirically they dominate result
+        // lists even for code-shaped queries because heading prose embeds well.
+        // Agents querying for code lose the actual matches under doc noise.
+        // README/docs queries are still served by grep on the same files.
+        if matches!(symbol.kind, SymbolKind::Heading) {
+            continue;
+        }
+
         // Skip very small symbols (single-line variables, etc.)
         let line_count = symbol
             .range
@@ -1974,5 +1982,77 @@ mod tests {
         )
         .is_none());
         assert!(!dir.join("semantic.bin").exists());
+    }
+
+    fn make_symbol(kind: SymbolKind, name: &str, start: u32, end: u32) -> crate::symbols::Symbol {
+        crate::symbols::Symbol {
+            name: name.to_string(),
+            kind,
+            range: crate::symbols::Range {
+                start_line: start,
+                start_col: 0,
+                end_line: end,
+                end_col: 0,
+            },
+            signature: None,
+            scope_chain: Vec::new(),
+            exported: false,
+            parent: None,
+        }
+    }
+
+    /// Heading symbols (Markdown / HTML headings) must NOT be indexed —
+    /// they overwhelmingly dominated semantic results even on code-shaped
+    /// queries because heading prose embeds far more strongly than code
+    /// chunks. Skipping headings keeps aft_search a code-finder.
+    #[test]
+    fn symbols_to_chunks_skips_heading_symbols() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("README.md");
+        let source = "# Title\n\nbody text\n\n## Section\n\nmore text\n";
+
+        let symbols = vec![
+            make_symbol(SymbolKind::Heading, "Title", 0, 2),
+            make_symbol(SymbolKind::Heading, "Section", 4, 6),
+        ];
+
+        let chunks = symbols_to_chunks(&file, &symbols, source, &project_root);
+        assert!(
+            chunks.is_empty(),
+            "Heading symbols must be filtered out before embedding; got {} chunk(s)",
+            chunks.len()
+        );
+    }
+
+    /// Code symbols (functions, classes, methods, structs, etc.) must still
+    /// be indexed alongside the heading skip — otherwise we'd starve the
+    /// index entirely.
+    #[test]
+    fn symbols_to_chunks_keeps_code_symbols_alongside_skipped_headings() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("src/lib.rs");
+        let source = "pub fn handle_request() -> bool {\n    true\n}\n";
+
+        let symbols = vec![
+            // A heading mixed in (e.g. from a doc comment block elsewhere).
+            make_symbol(SymbolKind::Heading, "doc heading", 0, 1),
+            make_symbol(SymbolKind::Function, "handle_request", 0, 2),
+            make_symbol(SymbolKind::Struct, "AuthService", 4, 6),
+        ];
+
+        let chunks = symbols_to_chunks(&file, &symbols, source, &project_root);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Expected 2 code chunks (Function + Struct), got {}",
+            chunks.len()
+        );
+        let names: Vec<&str> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"handle_request"));
+        assert!(names.contains(&"AuthService"));
+        assert!(
+            !names.contains(&"doc heading"),
+            "Heading symbol leaked into chunks: {names:?}"
+        );
     }
 }

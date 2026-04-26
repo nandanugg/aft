@@ -647,10 +647,27 @@ Parameters: `pattern` (required), `path` (optional — scope to subdirectory or 
 
 ### aft_search *(experimental)*
 
-Semantic code search — find code by describing what it does in natural language. Requires
-`experimental_semantic_search: true` and [ONNX Runtime](https://onnxruntime.ai/) installed on the system.
-Uses a local embedding model (all-MiniLM-L6-v2, ~22MB, downloaded on first use) to embed all
-symbols in the project and match queries by cosine similarity. No API keys or external services needed.
+Find symbols by **concept** when grep keywords fall short. Returns ranked code matches with
+similarity scores. Requires `experimental_semantic_search: true` and
+[ONNX Runtime](https://onnxruntime.ai/) installed on the system.
+
+**When to use it:**
+- Exploring an unfamiliar area: *"where is rate limiting handled"*
+- Concept doesn't appear as a literal string: *"retry logic"*, *"cache invalidation"*
+- After grep attempts came back empty or noisy
+- You know roughly what the function does but not its name
+
+**When NOT to use it:**
+- Specific symbol name → use grep
+- Error message or stack trace → use grep
+- File/module structure → use `aft_outline`
+- Following a call chain → use `aft_navigate`
+
+Uses a local embedding model (all-MiniLM-L6-v2, ~22MB, downloaded on first use) to embed
+**code symbols only** (functions, classes, methods, structs, etc.) and matches queries by
+cosine similarity. Markdown headings are **not** indexed — they tend to dominate result
+lists and crowd out actual code matches; use grep for prose. No API keys or external
+services needed.
 
 **Install ONNX Runtime:**
 - **macOS:** `brew install onnxruntime`
@@ -917,7 +934,31 @@ Both files are JSONC (comments allowed).
   // with guidance to open a specific subdirectory. Does not affect grep,
   // glob, read, edit, or any other tool.
   // Default: 20000 (covers typical monorepos; rejects OS-wide roots like ~/Work).
-  "max_callgraph_files": 20000
+  "max_callgraph_files": 20000,
+
+  // Language servers used for post-edit diagnostics.
+  //
+  // Built-in servers (auto-registered when their binary is on PATH):
+  //   typescript-language-server, pyright-langserver, rust-analyzer, gopls,
+  //   bash-language-server, yaml-language-server
+  //
+  // Add your own with `lsp.servers`. Disable any with `lsp.disabled`.
+  "lsp": {
+    "servers": {
+      "tinymist": {
+        "extensions": [".typ"],
+        "binary": "tinymist",
+        "args": [],
+        "root_markers": [".git", "typst.toml"]
+      }
+    },
+    "disabled": ["pyright"],
+    "python": "ty"   // "auto" (default) | "pyright" | "ty"
+  },
+
+  // Enable Astral's experimental ty Python type checker. Implied when lsp.python === "ty".
+  // Default: false
+  "experimental_lsp_ty": false
 }
 ```
 
@@ -926,6 +967,35 @@ AFT auto-detects the formatter and checker from project config files (`biome.jso
 goimports). Local tool binaries (biome, prettier, tsc, pyright) are discovered in
 `node_modules/.bin` before falling back to the system PATH. You only need per-language overrides
 if auto-detection picks the wrong tool or you want to pin a specific formatter.
+
+### Language servers (LSP)
+
+AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
+calls. Servers are spawned lazily — only when a file matching their extensions is touched, and
+only if their binary is on `PATH`.
+
+**Built-in servers** (auto-registered, no config needed):
+
+| Server | Languages | Binary |
+|---|---|---|
+| TypeScript Language Server | `.ts .tsx .js .jsx .mjs .cjs` | `typescript-language-server` |
+| Pyright | `.py .pyi` | `pyright-langserver` |
+| rust-analyzer | `.rs` | `rust-analyzer` |
+| gopls | `.go` | `gopls` |
+| bash-language-server | `.sh .bash .zsh` | `bash-language-server` |
+| yaml-language-server | `.yaml .yml` | `yaml-language-server` |
+
+**Experimental:** `ty` (Astral's Python type checker) — gated behind `experimental_lsp_ty: true`
+or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright unless you also disable Pyright
+via `lsp.disabled: ["pyright"]` (or use `lsp.python: "ty"` which does both automatically).
+
+**Registering a custom server:** add it under `lsp.servers` in your config. The example
+configuration above shows registering `tinymist` for Typst files. Required fields per server:
+`extensions` (array, leading `.` is stripped), `binary` (PATH lookup name). Optional:
+`args`, `root_markers` (defaults to `[".git"]`), `disabled`.
+
+**Disabling a built-in:** add the server's id (`"pyright"`, `"yaml-language-server"`, etc.) to
+`lsp.disabled`. IDs are case-insensitive.
 
 ### Working with large repositories
 

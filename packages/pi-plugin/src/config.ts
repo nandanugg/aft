@@ -40,6 +40,29 @@ export interface SemanticConfig {
   max_batch_size?: number;
 }
 
+export interface LspServerConfig {
+  id: string;
+  extensions: string[];
+  binary: string;
+  args: string[];
+  root_markers: string[];
+  disabled: boolean;
+  env?: Record<string, string>;
+  initialization_options?: unknown;
+}
+
+export interface LspConfig {
+  servers?: Record<string, Omit<LspServerConfig, "id">>;
+  disabled?: string[];
+  python?: "pyright" | "ty" | "auto";
+}
+
+export interface ConfigureLspOverrides {
+  experimental_lsp_ty?: boolean;
+  lsp_servers?: LspServerConfig[];
+  disabled_lsp?: string[];
+}
+
 export type ToolSurface = "minimal" | "recommended" | "all";
 
 export interface AftConfig {
@@ -52,6 +75,8 @@ export interface AftConfig {
   restrict_to_project_root?: boolean;
   experimental_search_index?: boolean;
   experimental_semantic_search?: boolean;
+  experimental_lsp_ty?: boolean;
+  lsp?: LspConfig;
   url_fetch_allow_private?: boolean;
   semantic?: SemanticConfig;
   /**
@@ -96,6 +121,36 @@ const SemanticConfigSchema = z.object({
   max_batch_size: z.number().int().positive().optional(),
 });
 
+const LspExtensionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => value.replace(/^\.+/, "").length > 0, {
+    message: "Extension must include characters other than leading dots",
+  });
+
+const LspServerEntrySchema = z.object({
+  extensions: z.array(LspExtensionSchema).min(1),
+  binary: z.string().trim().min(1),
+  args: z.array(z.string()).optional().default([]),
+  root_markers: z.array(z.string().trim().min(1)).optional().default([".git"]),
+  disabled: z.boolean().optional().default(false),
+  /** Extra environment variables passed to the LSP server child process. */
+  env: z.record(z.string().min(1), z.string()).optional(),
+  /** JSON value passed as `initializationOptions` in the LSP `initialize` request. */
+  initialization_options: z.unknown().optional(),
+});
+
+export const LspServerSchema = LspServerEntrySchema.extend({
+  id: z.string().trim().min(1),
+});
+
+const LspConfigSchema = z.object({
+  servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
+  disabled: z.array(z.string().trim().min(1)).optional(),
+  python: z.enum(["pyright", "ty", "auto"]).optional(),
+});
+
 export const AftConfigSchema = z.object({
   format_on_edit: z.boolean().optional(),
   validate_on_edit: z.enum(["syntax", "full"]).optional(),
@@ -106,10 +161,66 @@ export const AftConfigSchema = z.object({
   restrict_to_project_root: z.boolean().optional(),
   experimental_search_index: z.boolean().optional(),
   experimental_semantic_search: z.boolean().optional(),
+  experimental_lsp_ty: z.boolean().optional(),
+  lsp: LspConfigSchema.optional(),
   url_fetch_allow_private: z.boolean().optional(),
   semantic: SemanticConfigSchema.optional(),
   max_callgraph_files: z.number().int().positive().optional(),
 });
+
+function normalizeLspExtension(extension: string): string {
+  return extension.trim().replace(/^\.+/, "");
+}
+
+export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOverrides {
+  const overrides: ConfigureLspOverrides = {};
+  const disabled = new Set(config.lsp?.disabled ?? []);
+  let experimentalTy = config.experimental_lsp_ty;
+
+  switch (config.lsp?.python ?? "auto") {
+    case "ty":
+      experimentalTy = true;
+      disabled.add("pyright");
+      break;
+    case "pyright":
+      experimentalTy = false;
+      disabled.add("ty");
+      break;
+    case "auto":
+      break;
+  }
+
+  if (experimentalTy !== undefined) {
+    overrides.experimental_lsp_ty = experimentalTy;
+  }
+
+  const servers = Object.entries(config.lsp?.servers ?? {}).map(([id, server]) => {
+    const entry: LspServerConfig = {
+      id,
+      extensions: server.extensions.map(normalizeLspExtension),
+      binary: server.binary,
+      args: server.args,
+      root_markers: server.root_markers,
+      disabled: server.disabled,
+    };
+    if (server.env && Object.keys(server.env).length > 0) {
+      entry.env = server.env;
+    }
+    if (server.initialization_options !== undefined) {
+      entry.initialization_options = server.initialization_options;
+    }
+    return entry;
+  });
+  if (servers.length > 0) {
+    overrides.lsp_servers = servers;
+  }
+
+  if (disabled.size > 0) {
+    overrides.disabled_lsp = [...disabled];
+  }
+
+  return overrides;
+}
 
 // ---------------------------------------------------------------------------
 // Minimal JSONC parser (strips comments + trailing commas before JSON.parse).
@@ -260,6 +371,14 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const lspServers = { ...base.lsp?.servers, ...override.lsp?.servers };
+  const disabledLsp = [...(base.lsp?.disabled ?? []), ...(override.lsp?.disabled ?? [])];
+  const lsp = {
+    ...base.lsp,
+    ...override.lsp,
+    ...(Object.keys(lspServers).length > 0 ? { servers: lspServers } : {}),
+    ...(disabledLsp.length > 0 ? { disabled: [...new Set(disabledLsp)] } : {}),
+  };
 
   // SECURITY: Strip sensitive semantic fields from override before spreading.
   const { semantic: _stripSemantic, ...safeOverride } = override;
@@ -269,6 +388,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...safeOverride,
     ...(Object.keys(formatter).length > 0 ? { formatter } : {}),
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
+    ...(Object.values(lsp).some((value) => value !== undefined) ? { lsp } : {}),
     semantic,
     ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
   };

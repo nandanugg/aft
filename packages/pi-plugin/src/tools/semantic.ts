@@ -23,7 +23,10 @@ import {
 } from "./render-helpers.js";
 
 const SearchParams = Type.Object({
-  query: Type.String({ description: "Natural-language description of the code to find" }),
+  query: Type.String({
+    description:
+      "Concept or capability to find, phrased as a programmer would describe the code. Examples: 'fuzzy match with whitespace tolerance', 'undo backup before edit', 'retry failed network request'.",
+  }),
   topK: Type.Optional(
     Type.Number({ description: "Maximum number of results (default: 10, max: 100)" }),
   ),
@@ -108,8 +111,23 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
   pi.registerTool({
     name: "aft_search",
     label: "semantic search",
-    description:
-      "Search code by meaning using semantic similarity. Use when you don't know the exact name or text — describe what you're looking for in natural language and get the most relevant symbols, functions, and types.",
+    description: [
+      "Find symbols by concept when grep keywords fall short. Returns ranked code matches with similarity scores.",
+      "",
+      "When to reach for it:",
+      "- Exploring an unfamiliar area: 'where is rate limiting handled', 'how does auth flow work'",
+      "- Concept doesn't appear as a literal string: 'retry logic', 'cache invalidation', 'graceful shutdown'",
+      "- After 2+ grep attempts that came back empty or noisy",
+      "- You know roughly what the function does but not what it's named",
+      "",
+      "When NOT to use:",
+      "- You have a specific symbol name → use grep",
+      "- You have an error message or stack trace → use grep",
+      "- You want the file/module structure → use aft_outline",
+      "- You're following a call chain → use aft_navigate",
+      "",
+      "Scores below ~0.4 are usually weak matches; treat them as 'maybe relevant' and verify with read.",
+    ].join("\n"),
     parameters: SearchParams,
     async execute(
       _toolCallId: string,

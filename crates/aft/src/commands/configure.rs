@@ -5,9 +5,11 @@ use std::thread;
 
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
+use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::callgraph::CallGraph;
-use crate::config::{SemanticBackend, SemanticBackendConfig};
+use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
@@ -116,6 +118,147 @@ fn parse_semantic_config(
     Ok(semantic)
 }
 
+fn parse_lsp_servers(value: &Value) -> Result<Vec<UserServerDef>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err("configure: lsp_servers must be an array".to_string());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_lsp_server(entry, index))
+        .collect()
+}
+
+fn parse_lsp_server(value: &Value, index: usize) -> Result<UserServerDef, String> {
+    let Some(obj) = value.as_object() else {
+        return Err(format!("configure: lsp_servers[{index}] must be an object"));
+    };
+
+    let id = required_string(obj.get("id"), index, "id")?;
+    let extensions = required_string_array(obj.get("extensions"), index, "extensions")?;
+    let binary = required_string(obj.get("binary"), index, "binary")?;
+    let args = optional_string_array(obj.get("args"), index, "args")?;
+    let root_markers = optional_string_array(obj.get("root_markers"), index, "root_markers")?;
+    let env = parse_lsp_server_env(obj.get("env"), index)?;
+    let initialization_options = obj.get("initialization_options").cloned();
+    let disabled = obj
+        .get("disabled")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                format!("configure: lsp_servers[{index}].disabled must be a boolean")
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    Ok(UserServerDef {
+        id,
+        extensions,
+        binary,
+        args,
+        root_markers,
+        env,
+        initialization_options,
+        disabled,
+    })
+}
+
+fn parse_lsp_server_env(
+    value: Option<&Value>,
+    index: usize,
+) -> Result<HashMap<String, String>, String> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Some(obj) = value.as_object() else {
+        return Err(format!(
+            "configure: lsp_servers[{index}].env must be an object"
+        ));
+    };
+
+    let mut env = HashMap::with_capacity(obj.len());
+    for (key, value) in obj {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "configure: lsp_servers[{index}].env.{key} must be a string"
+            ));
+        };
+        env.insert(key.clone(), value.to_string());
+    }
+    Ok(env)
+}
+
+fn required_string(value: Option<&Value>, index: usize, field: &str) -> Result<String, String> {
+    let raw = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("configure: lsp_servers[{index}].{field} must be a string"))?
+        .trim();
+    if raw.is_empty() {
+        return Err(format!(
+            "configure: lsp_servers[{index}].{field} must not be empty"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+fn required_string_array(
+    value: Option<&Value>,
+    index: usize,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let values = optional_string_array(value, index, field)?;
+    if values.is_empty() {
+        return Err(format!(
+            "configure: lsp_servers[{index}].{field} must not be empty"
+        ));
+    }
+    Ok(values)
+}
+
+fn optional_string_array(
+    value: Option<&Value>,
+    index: usize,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(format!(
+            "configure: lsp_servers[{index}].{field} must be an array of strings"
+        ));
+    };
+
+    let mut values = Vec::with_capacity(entries.len());
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(format!(
+                "configure: lsp_servers[{index}].{field}[{entry_index}] must be a string"
+            ));
+        };
+        values.push(raw.trim().trim_start_matches('.').to_string());
+    }
+    Ok(values)
+}
+
+fn parse_disabled_lsp(value: &Value) -> Result<std::collections::HashSet<String>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err("configure: disabled_lsp must be an array of strings".to_string());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry
+                .as_str()
+                .map(|value| value.to_ascii_lowercase())
+                .ok_or_else(|| format!("configure: disabled_lsp[{index}] must be a string"))
+        })
+        .collect()
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -213,6 +356,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
     {
         ctx.config_mut().experimental_semantic_search = v;
+    }
+    if let Some(v) = req
+        .params
+        .get("experimental_lsp_ty")
+        .and_then(|v| v.as_bool())
+    {
+        ctx.config_mut().experimental_lsp_ty = v;
+    }
+    if let Some(v) = req.params.get("lsp_servers") {
+        let servers = match parse_lsp_servers(v) {
+            Ok(servers) => servers,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+        ctx.config_mut().lsp_servers = servers;
+    }
+    if let Some(v) = req.params.get("disabled_lsp") {
+        let disabled_lsp = match parse_disabled_lsp(v) {
+            Ok(disabled_lsp) => disabled_lsp,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+        ctx.config_mut().disabled_lsp = disabled_lsp;
     }
     if let Some(v) = req
         .params

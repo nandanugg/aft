@@ -101,12 +101,9 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         index.search(&query_vector, params.top_k.min(MAX_TOP_K))
     };
 
-    // Filter out low-relevance results below the minimum score threshold
-    const MIN_SCORE: f32 = 0.35;
-    let results: Vec<SemanticResult> = results
-        .into_iter()
-        .filter(|r| r.score >= MIN_SCORE)
-        .collect();
+    // No score threshold: silent filtering produced "0 results" even when the
+    // model had reasonable matches the agent could have judged. Surface every
+    // hit with its score so the caller can decide.
 
     *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
 

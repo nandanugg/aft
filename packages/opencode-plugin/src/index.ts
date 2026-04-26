@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import { loadAftConfig } from "./config.js";
+import { loadAftConfig, resolveLspConfigForConfigure } from "./config.js";
 import { ensureBinary } from "./downloader.js";
 import { error, log, warn } from "./logger.js";
 import { consumeToolMetadata } from "./metadata-store.js";
@@ -156,6 +156,7 @@ const plugin: Plugin = async (input) => {
     configOverrides.experimental_search_index = aftConfig.experimental_search_index;
   if (aftConfig.experimental_semantic_search !== undefined)
     configOverrides.experimental_semantic_search = aftConfig.experimental_semantic_search;
+  Object.assign(configOverrides, resolveLspConfigForConfigure(aftConfig));
   if (aftConfig.semantic !== undefined) configOverrides.semantic = aftConfig.semantic;
   if (aftConfig.max_callgraph_files !== undefined)
     configOverrides.max_callgraph_files = aftConfig.max_callgraph_files;
