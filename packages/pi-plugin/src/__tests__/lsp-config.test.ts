@@ -32,17 +32,18 @@ describe("Pi lsp configure forwarding", () => {
     });
   });
 
-  test('python="ty" enables ty and disables pyright', () => {
+  test('python="ty" enables ty and disables built-in python (pyright)', () => {
     const config = AftConfigSchema.parse({
       lsp: {
-        disabled: ["yamlls", "pyright"],
+        disabled: ["yamlls"],
         python: "ty",
       },
     });
 
     expect(resolveLspConfigForConfigure(config)).toEqual({
       experimental_lsp_ty: true,
-      disabled_lsp: ["yamlls", "pyright"],
+      // "python" is the Rust-side ServerKind id for the built-in Pyright server.
+      disabled_lsp: ["yamlls", "python"],
     });
   });
 
@@ -84,11 +85,12 @@ describe("Pi lsp configure forwarding", () => {
   test("disabled ids union with python resolution", () => {
     const config = AftConfigSchema.parse({
       lsp: {
-        disabled: ["pyright", "yamlls"],
+        disabled: ["yamlls"],
         python: "ty",
       },
     });
 
-    expect(resolveLspConfigForConfigure(config).disabled_lsp).toEqual(["pyright", "yamlls"]);
+    // python="ty" adds the built-in python (Pyright) id to the user's disabled set.
+    expect(resolveLspConfigForConfigure(config).disabled_lsp).toEqual(["yamlls", "python"]);
   });
 });

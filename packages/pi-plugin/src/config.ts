@@ -177,10 +177,13 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
   const disabled = new Set(config.lsp?.disabled ?? []);
   let experimentalTy = config.experimental_lsp_ty;
 
+  // Server IDs match Rust's `ServerKind::id_str()` — built-in Pyright is
+  // identified as "python", and the experimental Astral checker as "ty".
+  // Custom IDs are case-insensitive.
   switch (config.lsp?.python ?? "auto") {
     case "ty":
       experimentalTy = true;
-      disabled.add("pyright");
+      disabled.add("python");
       break;
     case "pyright":
       experimentalTy = false;

@@ -271,6 +271,25 @@ instant cold starts and stays fresh via file watcher and mtime verification.
 > **All line numbers are 1-based** (matching editor, git, and compiler conventions).
 > Line 1 is the first line of the file.
 
+### Response convention
+
+Tool responses follow a tri-state contract so agents can tell "didn't run" from "ran clean"
+from "ran but partial":
+
+- **`success: false`** — the work could not be performed. Always carries a `code` (e.g. `path_not_found`,
+  `no_lsp_server`, `project_too_large`, `invalid_request`, `ambiguous_match`) and a `message`.
+- **`success: true` with `complete: true`** — the result is trustworthy. Absence of items in the
+  result means the tool genuinely found nothing.
+- **`success: true` with `complete: false`** — the tool ran but the result is partial. The
+  response will name the gap with one or more of:
+  - `pending_files`, `unchecked_files`, `walk_truncated` — files the tool didn't get to
+  - `skipped_files: [{file, reason}]` — files intentionally skipped (parse error, unsupported language)
+  - `scope_warnings`, `no_files_matched_scope` — paths/globs that resolved to zero files
+- **Side-effect skips** — when the main work succeeded but a non-essential post-step was
+  skipped, the response carries a `<step>_skipped_reason`. Approved values:
+  - `format_skipped_reason`: `unsupported_language` | `no_formatter_configured` | `formatter_not_installed` | `timeout` | `error`
+  - `validate_skipped_reason`: `unsupported_language` | `no_checker_configured` | `checker_not_installed` | `timeout` | `error`
+
 ### Hoisted tools
 
 These replace opencode's built-ins. Registered under the same names by default. When
@@ -463,6 +482,11 @@ Add `contextLines: 3` to include surrounding lines.
 { "pattern": "async function $NAME($$$) { $$$ }", "lang": "typescript" }
 ```
 
+When the supplied `paths` or `globs` resolve to zero files (rather than matching files with no
+hits), the response carries `no_files_matched_scope: true` and `scope_warnings: [...]` listing
+each path/glob that contributed zero files. This is distinct from a successful search that
+returned no matches.
+
 ---
 
 ### ast_grep_replace
@@ -542,6 +566,10 @@ heading becomes a symbol you can read by name.
 // Outline all source files in a directory
 { "directory": "src/auth" }
 ```
+
+In `files` and `directory` modes, files that fail to parse or whose language is unsupported
+are listed under `skipped_files` with a per-file `reason` (e.g. `parse_error`,
+`unsupported_language`) instead of being silently dropped from the result.
 
 ---
 
@@ -804,6 +832,10 @@ Language-aware import management for TS, JS, TSX, Python, Rust, and Go.
 { "op": "organize", "filePath": "src/api.ts" }
 ```
 
+`op: "remove"` reports `removed: false` with a `reason` of `module_not_found` (the module
+was never imported) or `name_not_found` (the module is imported but the named symbol isn't
+in it) instead of pretending the removal succeeded.
+
 ---
 
 ### aft_transform
@@ -986,7 +1018,10 @@ Both files are JSONC (comments allowed).
         }
       }
     },
-    "disabled": ["pyright"],
+    // Disable any registered server by id. IDs are case-insensitive. Built-in
+    // ids: typescript, python, rust, go, bash, yaml, ty. Custom servers use
+    // the key under `lsp.servers` (e.g. `tinymist`).
+    "disabled": ["python"],
     "python": "ty",  // "auto" (default) | "pyright" | "ty"
 
     // LRU cap for the in-memory diagnostic cache.
@@ -1026,15 +1061,17 @@ only if their binary is on `PATH`.
 
 **Experimental:** `ty` (Astral's Python type checker) — gated behind `experimental_lsp_ty: true`
 or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright unless you also disable Pyright
-via `lsp.disabled: ["pyright"]` (or use `lsp.python: "ty"` which does both automatically).
+via `lsp.disabled: ["python"]` (or use `lsp.python: "ty"` which does both automatically).
 
 **Registering a custom server:** add it under `lsp.servers` in your config. The example
 configuration above shows registering `tinymist` for Typst files. Required fields per server:
 `extensions` (array, leading `.` is stripped), `binary` (PATH lookup name). Optional:
 `args`, `root_markers` (defaults to `[".git"]`), `disabled`.
 
-**Disabling a built-in:** add the server's id (`"pyright"`, `"yaml-language-server"`, etc.) to
-`lsp.disabled`. IDs are case-insensitive.
+**Disabling a built-in:** add the server's id to `lsp.disabled`. Built-in ids are
+`typescript`, `python` (Pyright), `rust` (rust-analyzer), `go` (gopls), `bash`,
+`yaml`, and `ty`. Custom servers use the key you registered them under in
+`lsp.servers`. IDs are case-insensitive.
 
 **Custom server fields:**
 
