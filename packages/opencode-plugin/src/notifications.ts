@@ -14,7 +14,7 @@
  * when no longer relevant (Desktop only — TUI toasts are inherently transient).
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { log } from "./logger.js";
@@ -404,9 +404,10 @@ function writeWarnedTools(storageDir: string, warned: Record<string, string>): v
   try {
     mkdirSync(storageDir, { recursive: true });
     const warnedToolsPath = join(storageDir, WARNED_TOOLS_FILE);
-    const tempPath = join(storageDir, `.${WARNED_TOOLS_FILE}.${process.pid}.${Date.now()}.tmp`);
-    writeFileSync(tempPath, `${JSON.stringify(warned, null, 2)}\n`);
-    renameSync(tempPath, warnedToolsPath);
+    // Direct write — this state is best-effort and rapid sequential calls
+    // (e.g. inside tests) hit Date.now() collisions on fast runners, making
+    // a temp+rename strategy no safer than a plain write here.
+    writeFileSync(warnedToolsPath, `${JSON.stringify(warned, null, 2)}\n`);
   } catch {
     // best-effort
   }
