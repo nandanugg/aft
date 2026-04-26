@@ -265,10 +265,13 @@ func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites b
 	}
 	cg.DeleteSyntheticNodes()
 
+	// Edges must be a non-nil slice so JSON marshals as `[]` instead of
+	// `null`. The Rust side declares `edges: Vec<HelperEdge>`, which serde
+	// will not coerce from a JSON null even with #[serde(default)].
 	out := &Output{
 		Version: helperSchemaVersion,
 		Root:    root,
-		Edges:   nil,
+		Edges:   []Edge{},
 		Skipped: skipped,
 	}
 

@@ -383,10 +383,19 @@ fn parse_ts_imports(source: &str, tree: &Tree) -> ImportBlock {
 
     loop {
         let node = cursor.node();
-        if node.kind() == "import_statement" {
-            if let Some(imp) = parse_single_ts_import(source, &node) {
-                imports.push(imp);
+        match node.kind() {
+            "import_statement" => {
+                if let Some(imp) = parse_single_ts_import(source, &node) {
+                    imports.push(imp);
+                }
             }
+            // CommonJS: `const x = require('./mod')` and friends. Tree-sitter
+            // models these as ordinary lexical/variable declarations — we have
+            // to walk into them ourselves and detect the require() call.
+            "lexical_declaration" | "variable_declaration" => {
+                parse_cjs_require_declaration(source, &node, &mut imports);
+            }
+            _ => {}
         }
         if !cursor.goto_next_sibling() {
             break;
@@ -399,6 +408,233 @@ fn parse_ts_imports(source: &str, tree: &Tree) -> ImportBlock {
         imports,
         byte_range,
     }
+}
+
+/// Parse top-level `const/let/var ... = require('./mod')` declarations into
+/// `ImportStatement`s.
+///
+/// Recognized shapes (the common ones in real CJS code):
+///
+/// - `const x = require('./mod')` → namespace import `x`
+/// - `const { a, b } = require('./mod')` → named imports `a`, `b`
+/// - `const { a: b, c: d } = require('./mod')` → named imports `a`, `c`
+///   (with synthesized `as` aliases in `raw_text` so the existing alias
+///   resolver picks up local names `b` and `d`)
+/// - `const x = require('./mod').y` → named import `y` (with synthesized
+///   `y as x` alias)
+///
+/// Aliased forms produce the same `ImportStatement` shape ES imports do, so
+/// the downstream resolver in `callgraph.rs` handles them without changes.
+fn parse_cjs_require_declaration(
+    source: &str,
+    declaration: &Node,
+    imports: &mut Vec<ImportStatement>,
+) {
+    let mut cursor = declaration.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind() == "variable_declarator" {
+            if let Some(imp) = parse_cjs_variable_declarator(source, &child) {
+                imports.push(imp);
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn parse_cjs_variable_declarator(source: &str, declarator: &Node) -> Option<ImportStatement> {
+    let name_node = declarator.child_by_field_name("name")?;
+    let value_node = declarator.child_by_field_name("value")?;
+
+    // Walk the RHS to find a require(...) call. Accepts both:
+    //   require('./mod')             → call_expression directly
+    //   require('./mod').sub         → member_expression wrapping call_expression
+    let (module_path, member_chain) = extract_require_target(source, &value_node)?;
+
+    let mut names: Vec<String> = Vec::new();
+    let default_import: Option<String> = None;
+    let mut namespace_import: Option<String> = None;
+    // Synthetic `original as alias` fragments appended to raw_text so the
+    // existing alias resolver can map local names back to their module
+    // origin without needing a new code path.
+    let mut alias_fragments: Vec<String> = Vec::new();
+
+    match name_node.kind() {
+        "identifier" => {
+            let local = source[name_node.byte_range()].to_string();
+            if let Some(member) = member_chain {
+                // const x = require('./mod').y → import y, locally named x.
+                names.push(member.clone());
+                if member != local {
+                    alias_fragments.push(format!("{member} as {local}"));
+                }
+            } else {
+                // const x = require('./mod') → namespace-style import.
+                namespace_import = Some(local);
+            }
+        }
+        "object_pattern" => {
+            extract_cjs_object_pattern(source, &name_node, &mut names, &mut alias_fragments);
+            if names.is_empty() {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    let raw_text = build_cjs_raw_text(source, declarator, &alias_fragments);
+    let byte_range = declarator.byte_range();
+    let kind = if names.is_empty() && default_import.is_none() && namespace_import.is_none() {
+        ImportKind::SideEffect
+    } else {
+        ImportKind::Value
+    };
+    let group = classify_group_ts(&module_path);
+
+    Some(ImportStatement {
+        module_path,
+        names,
+        default_import,
+        namespace_import,
+        kind,
+        group,
+        byte_range,
+        raw_text,
+    })
+}
+
+/// Walk a `variable_declarator`'s value side and, if it bottoms out at a
+/// `require('<module>')` call, return `(module_path, optional .member chain)`.
+/// The member chain is the tail of any `.foo.bar` accesses on the require
+/// result — only the first segment is meaningful for resolution today.
+fn extract_require_target(source: &str, value: &Node) -> Option<(String, Option<String>)> {
+    match value.kind() {
+        "call_expression" => {
+            let func = value.child_by_field_name("function")?;
+            if func.kind() != "identifier" || &source[func.byte_range()] != "require" {
+                return None;
+            }
+            let args = value.child_by_field_name("arguments")?;
+            let module_path = first_string_argument(source, &args)?;
+            Some((module_path, None))
+        }
+        "member_expression" => {
+            // `require('./mod').foo` — recurse into the object side.
+            let object = value.child_by_field_name("object")?;
+            let property = value.child_by_field_name("property")?;
+            let (module_path, _) = extract_require_target(source, &object)?;
+            let member = source[property.byte_range()].to_string();
+            Some((module_path, Some(member)))
+        }
+        "parenthesized_expression" => {
+            // `(require('./mod'))` — unwrap and try again.
+            let inner = value.named_child(0)?;
+            extract_require_target(source, &inner)
+        }
+        _ => None,
+    }
+}
+
+fn first_string_argument(source: &str, arguments: &Node) -> Option<String> {
+    let mut cursor = arguments.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind() == "string" {
+            let text = &source[child.byte_range()];
+            let stripped = text
+                .trim_start_matches(|c| c == '\'' || c == '"')
+                .trim_end_matches(|c| c == '\'' || c == '"');
+            return Some(stripped.to_string());
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    None
+}
+
+/// Drain an `object_pattern` (the `{ a, b: c }` LHS of a destructuring
+/// declarator) into module-side names and alias fragments.
+fn extract_cjs_object_pattern(
+    source: &str,
+    pattern: &Node,
+    names: &mut Vec<String>,
+    alias_fragments: &mut Vec<String>,
+) {
+    let mut cursor = pattern.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            // `{ foo }`  — same name on both sides
+            "shorthand_property_identifier_pattern" => {
+                names.push(source[child.byte_range()].to_string());
+            }
+            // `{ foo: bar }` or `{ foo: bar = default }`
+            "pair_pattern" => {
+                if let (Some(key), Some(value)) = (
+                    child.child_by_field_name("key"),
+                    child.child_by_field_name("value"),
+                ) {
+                    let key_text = source[key.byte_range()].to_string();
+                    // value can be an `identifier` (the local name) or
+                    // `assignment_pattern` (with default). Pull the local
+                    // identifier out either way.
+                    let local = match value.kind() {
+                        "identifier" => Some(source[value.byte_range()].to_string()),
+                        "assignment_pattern" => value
+                            .child_by_field_name("left")
+                            .filter(|n| n.kind() == "identifier")
+                            .map(|n| source[n.byte_range()].to_string()),
+                        _ => None,
+                    };
+                    names.push(key_text.clone());
+                    if let Some(local_name) = local {
+                        if local_name != key_text {
+                            alias_fragments.push(format!("{key_text} as {local_name}"));
+                        }
+                    }
+                }
+            }
+            // Skip `rest_pattern`, commas, braces, etc.
+            _ => {}
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+/// Build a raw_text snippet for the synthesized CJS `ImportStatement`. We
+/// keep the original declarator text (so debug/diagnostics show the actual
+/// source) and append `original as alias` fragments expected by
+/// `find_alias_original` so aliased local names round-trip through the
+/// existing resolver.
+fn build_cjs_raw_text(source: &str, declarator: &Node, alias_fragments: &[String]) -> String {
+    let base = source[declarator.byte_range()].to_string();
+    if alias_fragments.is_empty() {
+        return base;
+    }
+    let mut text = base;
+    text.push_str(" /* aliases: { ");
+    for (i, frag) in alias_fragments.iter().enumerate() {
+        if i > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(frag);
+    }
+    text.push_str(" } */");
+    text
 }
 
 /// Parse a single `import_statement` node into an `ImportStatement`.
@@ -1413,6 +1649,104 @@ mod tests {
     }
 
     // --- Basic parsing ---
+
+    // --- CommonJS require() parsing ---
+
+    #[test]
+    fn parse_cjs_destructured_require() {
+        let source = "const { queryDatabase, closeAllPools } = require('./postgres');\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 1, "expected one synthesized import");
+        let imp = &block.imports[0];
+        assert_eq!(imp.module_path, "./postgres");
+        assert!(imp.names.contains(&"queryDatabase".to_string()));
+        assert!(imp.names.contains(&"closeAllPools".to_string()));
+        assert!(imp.default_import.is_none());
+        assert!(imp.namespace_import.is_none());
+        assert_eq!(imp.kind, ImportKind::Value);
+        assert_eq!(imp.group, ImportGroup::Internal);
+    }
+
+    #[test]
+    fn parse_cjs_namespace_require() {
+        let source = "const pg = require('./postgres');\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 1);
+        let imp = &block.imports[0];
+        assert_eq!(imp.module_path, "./postgres");
+        assert!(imp.names.is_empty());
+        assert_eq!(imp.namespace_import.as_deref(), Some("pg"));
+    }
+
+    #[test]
+    fn parse_cjs_aliased_destructure_emits_alias_in_raw_text() {
+        // `find_alias_original` reads raw_text for `<orig> as <alias>`
+        // patterns; we synthesize that fragment so aliased local names
+        // resolve through the existing alias path.
+        let source = "const { queryDatabase: q } = require('./postgres');\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 1);
+        let imp = &block.imports[0];
+        assert!(imp.names.contains(&"queryDatabase".to_string()));
+        assert!(
+            imp.raw_text.contains("queryDatabase as q"),
+            "raw_text should expose alias for local name resolver: {:?}",
+            imp.raw_text,
+        );
+    }
+
+    #[test]
+    fn parse_cjs_member_access_after_require() {
+        // `const x = require('./mod').y` — y is the module export, x is the
+        // local binding. Treat as named import `y` aliased to `x`.
+        let source = "const helper = require('./utils').helper;\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 1);
+        let imp = &block.imports[0];
+        assert_eq!(imp.module_path, "./utils");
+        assert!(imp.names.contains(&"helper".to_string()));
+    }
+
+    #[test]
+    fn parse_cjs_var_destructure() {
+        let source = "var { foo } = require('./bar');\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 1);
+        assert!(block.imports[0].names.contains(&"foo".to_string()));
+    }
+
+    #[test]
+    fn parse_cjs_double_quotes_module_path() {
+        let source = "const { foo } = require(\"./bar\");\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 1);
+        assert_eq!(block.imports[0].module_path, "./bar");
+    }
+
+    #[test]
+    fn parse_cjs_ignores_non_require_calls() {
+        // `someOther('./foo')` must not be misread as an import.
+        let source = "const x = someOther('./foo');\n";
+        let (_, block) = parse_js(source);
+        assert!(block.imports.is_empty());
+    }
+
+    #[test]
+    fn parse_cjs_mixed_with_es_imports() {
+        let source = "import React from 'react';\nconst { fs } = require('fs');\n";
+        let (_, block) = parse_js(source);
+        assert_eq!(block.imports.len(), 2);
+        assert!(block
+            .imports
+            .iter()
+            .any(|i| i.default_import.as_deref() == Some("React")));
+        assert!(block
+            .imports
+            .iter()
+            .any(|i| i.module_path == "fs" && i.names.contains(&"fs".to_string())));
+    }
+
+    // --- ES imports ---
 
     #[test]
     fn parse_ts_named_imports() {

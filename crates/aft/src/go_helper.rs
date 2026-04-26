@@ -33,7 +33,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserializes a value, treating an explicit JSON `null` as `T::default()`.
+///
+/// Why: Go's `encoding/json` marshals a nil slice as `null`, not `[]`. Plain
+/// `#[serde(default)]` only fills in *missing* keys, so a `null` for a
+/// non-optional `Vec<T>` produces "invalid type: null, expected a sequence".
+/// Use this on every `Vec` (or other defaulting type) we receive from the
+/// Go helper or sidecar.
+fn null_as_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Control-flow context for a call site. Present on all edge kinds except
 /// `implements`. Fields default to false/0 and are omitted when at default
@@ -94,16 +109,24 @@ pub struct HelperOutput {
     pub root: String,
     /// Resolved call edges. Empty if the project has no in-project edges
     /// (e.g. a single file with only stdlib calls).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub edges: Vec<HelperEdge>,
     /// Packages skipped due to load errors. Reported for diagnostics; AFT
     /// falls back to tree-sitter for these.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub skipped: Vec<String>,
     /// Per-function return-site analysis. Present when the helper ran with
     /// return analysis enabled (default). Empty slice when disabled or when
     /// no functions have interesting returns.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub returns: Vec<ReturnInfo>,
 }
 
@@ -585,6 +608,24 @@ mod tests {
         let out: HelperOutput = serde_json::from_str(json).unwrap();
         assert_eq!(out.edges[0].caller.symbol, "");
         assert_eq!(out.edges[0].callee.pkg, "");
+    }
+
+    #[test]
+    fn null_slices_decode_as_empty() {
+        // Go's encoding/json marshals a nil slice as `null`. The Rust side
+        // must accept that for every slice field on HelperOutput, otherwise
+        // empty-edge projects fall back to local_helper.
+        let json = r#"{
+            "version": 1,
+            "root": "/x",
+            "edges": null,
+            "skipped": null,
+            "returns": null
+        }"#;
+        let out: HelperOutput = serde_json::from_str(json).unwrap();
+        assert!(out.edges.is_empty());
+        assert!(out.skipped.is_empty());
+        assert!(out.returns.is_empty());
     }
 
     #[test]

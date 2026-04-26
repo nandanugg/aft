@@ -462,3 +462,27 @@ func TestSidecarRefreshStatusGetSnapshotInvalidate(t *testing.T) {
 		t.Fatalf("expected fresh fp-2 snapshot: %+v", freshSnapshot)
 	}
 }
+
+// Output.Edges must marshal as `[]` even when no edges were produced. The
+// Rust side declares `edges: Vec<HelperEdge>` and rejects an explicit JSON
+// null. A regression here causes every empty-edge project to fall back to
+// local_helper with "decode sidecar result: invalid type: null, expected a
+// sequence".
+func TestOutputEdgesMarshalAsEmptyArrayWhenNil(t *testing.T) {
+	out := &Output{Version: helperSchemaVersion, Root: "/x", Edges: []Edge{}}
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal empty Output: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, ok := raw["edges"]
+	if !ok {
+		t.Fatalf("edges key missing from %s", data)
+	}
+	if string(got) != "[]" {
+		t.Fatalf("edges must marshal as []; got %s (full doc: %s)", got, data)
+	}
+}

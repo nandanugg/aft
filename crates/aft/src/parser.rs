@@ -797,6 +797,139 @@ fn is_exported(node: &Node, export_ranges: &[std::ops::Range<usize>]) -> bool {
         .any(|er| er.start <= r.start && r.end <= er.end)
 }
 
+/// Collect names exported from a JS/TS file via CommonJS conventions.
+///
+/// Recognized shapes — top-level only:
+///
+/// - `module.exports = { foo, bar }` → {foo, bar}
+/// - `module.exports = { foo: bar }` → {foo} (the public key callers see)
+/// - `module.exports.foo = …`        → {foo}
+/// - `exports.foo = …`               → {foo}
+///
+/// Skipped: `module.exports = function () {…}` (anonymous; nothing to flag),
+/// `Object.assign(module.exports, …)`, computed keys, spreads. Adding those
+/// is straightforward; this v1 covers the patterns that show up in the
+/// codebases we tested.
+fn collect_commonjs_exports(source: &str, root: &Node) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return names;
+    }
+    loop {
+        let stmt = cursor.node();
+        if stmt.kind() == "expression_statement" {
+            if let Some(assign) = stmt.named_child(0) {
+                if assign.kind() == "assignment_expression" {
+                    collect_cjs_export_from_assignment(source, &assign, &mut names);
+                }
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    names
+}
+
+fn collect_cjs_export_from_assignment(
+    source: &str,
+    assign: &Node,
+    names: &mut std::collections::HashSet<String>,
+) {
+    let Some(left) = assign.child_by_field_name("left") else {
+        return;
+    };
+    if left.kind() != "member_expression" {
+        return;
+    }
+    let Some(object) = left.child_by_field_name("object") else {
+        return;
+    };
+    let Some(property) = left.child_by_field_name("property") else {
+        return;
+    };
+    let property_text = source[property.byte_range()].to_string();
+
+    // Case 1: `exports.foo = …`
+    if object.kind() == "identifier" && &source[object.byte_range()] == "exports" {
+        names.insert(property_text);
+        return;
+    }
+
+    // Case 2: `module.exports.foo = …`
+    if object.kind() == "member_expression"
+        && member_expression_matches(source, &object, "module", "exports")
+    {
+        names.insert(property_text);
+        return;
+    }
+
+    // Case 3: `module.exports = { foo, bar: baz }`
+    if member_expression_matches(source, &left, "module", "exports") {
+        if let Some(right) = assign.child_by_field_name("right") {
+            if right.kind() == "object" {
+                collect_cjs_object_keys(source, &right, names);
+            }
+        }
+    }
+}
+
+fn member_expression_matches(source: &str, node: &Node, object: &str, property: &str) -> bool {
+    if node.kind() != "member_expression" {
+        return false;
+    }
+    let Some(obj) = node.child_by_field_name("object") else {
+        return false;
+    };
+    let Some(prop) = node.child_by_field_name("property") else {
+        return false;
+    };
+    obj.kind() == "identifier"
+        && &source[obj.byte_range()] == object
+        && &source[prop.byte_range()] == property
+}
+
+fn collect_cjs_object_keys(
+    source: &str,
+    object_node: &Node,
+    names: &mut std::collections::HashSet<String>,
+) {
+    let mut cursor = object_node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            // `{ foo }` shorthand — both export name and source value are foo.
+            "shorthand_property_identifier" => {
+                names.insert(source[child.byte_range()].to_string());
+            }
+            // `{ foo: bar }` — `foo` is the public key, `bar` is the local
+            // value. Flag the local symbol named `bar` as exported under
+            // its own name; downstream resolvers look up by the local name.
+            // We also insert `foo` so a caller writing `const { foo } = …`
+            // hits this file (the public-name path).
+            "pair" => {
+                if let Some(key) = child.child_by_field_name("key") {
+                    let key_text = source[key.byte_range()].to_string();
+                    names.insert(key_text);
+                }
+                if let Some(value) = child.child_by_field_name("value") {
+                    if value.kind() == "identifier" {
+                        names.insert(source[value.byte_range()].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
 /// Extract the first line of a node as its signature.
 fn extract_signature(source: &str, node: &Node) -> String {
     let text = node_text(source, node);
@@ -988,6 +1121,21 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
     // Deduplicate: methods can appear as both class and method captures
     dedup_symbols(&mut symbols);
+
+    // CommonJS exports — `module.exports = { foo }`, `module.exports.foo = …`,
+    // `exports.foo = …` — never produce an `export_statement` AST node, so
+    // `is_exported` above always returns false for CJS files. Walk the AST
+    // for those assignment patterns and OR the result into each matching
+    // symbol's `exported` flag.
+    let cjs_exports = collect_commonjs_exports(source, root);
+    if !cjs_exports.is_empty() {
+        for sym in &mut symbols {
+            if !sym.exported && cjs_exports.contains(&sym.name) {
+                sym.exported = true;
+            }
+        }
+    }
+
     Ok(symbols)
 }
 
@@ -1087,6 +1235,18 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     }
 
     dedup_symbols(&mut symbols);
+
+    // CommonJS exports — see the matching block in `extract_ts_symbols` for
+    // why this post-pass is needed.
+    let cjs_exports = collect_commonjs_exports(source, root);
+    if !cjs_exports.is_empty() {
+        for sym in &mut symbols {
+            if !sym.exported && cjs_exports.contains(&sym.name) {
+                sym.exported = true;
+            }
+        }
+    }
+
     Ok(symbols)
 }
 
@@ -4201,6 +4361,105 @@ mod tests {
                 symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
             );
         }
+    }
+
+    // --- CommonJS export detection ---
+
+    #[test]
+    fn js_module_exports_shorthand_marks_symbols_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("postgres.js");
+        std::fs::write(
+            &file,
+            r#"
+const queryDatabase = async (q) => q;
+const closeAllPools = async () => {};
+const internal = () => 1;
+module.exports = {
+    queryDatabase,
+    closeAllPools,
+};
+"#,
+        )
+        .unwrap();
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+        let by_name: std::collections::HashMap<_, _> =
+            symbols.iter().map(|s| (s.name.clone(), s.exported)).collect();
+        assert_eq!(by_name.get("queryDatabase").copied(), Some(true));
+        assert_eq!(by_name.get("closeAllPools").copied(), Some(true));
+        assert_eq!(
+            by_name.get("internal").copied(),
+            Some(false),
+            "non-exported symbol should stay non-exported"
+        );
+    }
+
+    #[test]
+    fn js_module_exports_property_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("util.js");
+        std::fs::write(
+            &file,
+            r#"
+function helper() { return 1; }
+function unused() { return 2; }
+module.exports.helper = helper;
+"#,
+        )
+        .unwrap();
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+        let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+        let unused = symbols.iter().find(|s| s.name == "unused").unwrap();
+        assert!(helper.exported);
+        assert!(!unused.exported);
+    }
+
+    #[test]
+    fn js_exports_short_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("util.js");
+        std::fs::write(
+            &file,
+            r#"
+function helper() { return 1; }
+exports.helper = helper;
+"#,
+        )
+        .unwrap();
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+        assert!(
+            symbols.iter().find(|s| s.name == "helper").unwrap().exported,
+            "exports.helper = … should mark helper as exported"
+        );
+    }
+
+    #[test]
+    fn js_module_exports_pair_marks_local_value() {
+        // `module.exports = { publicName: localName }` — both publicName
+        // (so cross-file imports via `const { publicName } = require(...)`
+        // can find this file) and localName (so the local symbol surfaces
+        // as exported in outline / completions) should be flagged.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("svc.js");
+        std::fs::write(
+            &file,
+            r#"
+function realImpl() { return 1; }
+module.exports = {
+    publicName: realImpl,
+};
+"#,
+        )
+        .unwrap();
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+        assert!(
+            symbols.iter().find(|s| s.name == "realImpl").unwrap().exported,
+            "local symbol named in `{{ publicName: realImpl }}` should be flagged"
+        );
     }
 
     // --- Symbol cache tests ---
