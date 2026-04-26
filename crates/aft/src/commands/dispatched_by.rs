@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::query_support::resolve_symbol_query;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -41,7 +42,7 @@ pub fn handle_dispatched_by(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
+    let raw_symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Response::error(
@@ -52,7 +53,14 @@ pub fn handle_dispatched_by(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    ctx.drain_go_helper();
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = ctx.require_go_overlay(&req.id, "dispatched_by", &file_path) {
+        return resp;
+    }
+
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -64,23 +72,25 @@ pub fn handle_dispatched_by(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+    let symbol = match resolve_symbol_query(ctx, &file_path, raw_symbol) {
+        Ok(symbol) => symbol,
+        Err(err) => return Response::error(&req.id, err.code(), err.to_string()),
     };
 
     // Build file data first to check if the symbol exists.
     match graph.build_file(&file_path) {
         Ok(data) => {
-            let has_symbol = data.calls_by_symbol.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string())
-                || data.symbol_metadata.contains_key(symbol);
+            let has_symbol = data.calls_by_symbol.contains_key(&symbol)
+                || data.exported_symbols.contains(&symbol)
+                || data.symbol_metadata.contains_key(&symbol);
             if !has_symbol {
                 return Response::error(
                     &req.id,
                     "symbol_not_found",
-                    format!("dispatched_by: symbol '{}' not found in {}", symbol, file),
+                    format!(
+                        "dispatched_by: symbol '{}' not found in {}",
+                        raw_symbol, file
+                    ),
                 );
             }
         }
@@ -89,7 +99,7 @@ pub fn handle_dispatched_by(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.dispatched_by(&file_path, symbol) {
+    match graph.dispatched_by(&file_path, &symbol) {
         Ok(result) => {
             let text = result.render_text();
             let mut result_json = serde_json::to_value(&result).unwrap_or_default();

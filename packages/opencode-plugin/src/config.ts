@@ -33,6 +33,13 @@ const CheckerEnum = z.enum([
 ]);
 
 const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
+const GoOverlayProviderEnum = z.enum([
+  "local_helper",
+  "local",
+  "aft_go_sidecar",
+  "sidecar",
+  "aft-go-sidecar",
+]);
 
 const SemanticConfigSchema = z.object({
   /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
@@ -89,6 +96,8 @@ export const AftConfigSchema = z.object({
   experimental_search_index: z.boolean().optional(),
   /** Enable experimental semantic search. Default: false. */
   experimental_semantic_search: z.boolean().optional(),
+  /** Go overlay provider override. `local_helper` uses local helper process, sidecar uses AFT-Go. */
+  go_overlay_provider: GoOverlayProviderEnum.optional(),
   /** External semantic backend configuration for embedding and retrieval. */
   semantic: SemanticConfigSchema.optional(),
 });

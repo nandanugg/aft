@@ -161,7 +161,6 @@ impl ImplementationsResult {
     }
 }
 
-
 /// One entry in the dispatch secondary index: a callee registered under a
 /// particular dispatch key, plus the registration call site.
 #[derive(Debug, Clone, Serialize)]
@@ -341,6 +340,30 @@ pub struct CallTreeNode {
     pub resolved: bool,
     /// Child calls (recursive).
     pub children: Vec<CallTreeNode>,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardEdge {
+    target_file: PathBuf,
+    target_symbol: String,
+    target_receiver: Option<String>,
+    call_site_line: u32,
+    target_line: Option<u32>,
+    resolved: bool,
+}
+
+fn push_forward_edge(edges: &mut Vec<ForwardEdge>, edge: ForwardEdge) {
+    if let Some(existing) = edges.iter_mut().find(|candidate| {
+        candidate.target_file == edge.target_file
+            && candidate.target_symbol == edge.target_symbol
+            && candidate.target_receiver == edge.target_receiver
+    }) {
+        if !existing.resolved && edge.resolved {
+            *existing = edge;
+        }
+        return;
+    }
+    edges.push(edge);
 }
 
 // ---------------------------------------------------------------------------
@@ -811,16 +834,12 @@ impl WritersResult {
             out.push_str("  (no cross-package writers found)\n");
         } else {
             for w in &self.writers {
-                out.push_str(&format!(
-                    "  - {} ({}:{})\n",
-                    w.symbol, w.file, w.line
-                ));
+                out.push_str(&format!("  - {} ({}:{})\n", w.symbol, w.file, w.line));
             }
         }
         out
     }
 }
-
 
 impl CallTreeNode {
     /// Compact LLM-friendly rendering (indented tree).
@@ -867,8 +886,7 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
                 // Walk the receiver parens to find its matching close.
                 if let Some(close) = first_top_level(&rest[1..], ')') {
                     // Absolute index of the char after the receiver's ')'.
-                    let receiver_abs_end =
-                        offset + (trimmed.len() - rest.len()) + 1 + close + 1;
+                    let receiver_abs_end = offset + (trimmed.len() - rest.len()) + 1 + close + 1;
                     receiver_abs_end
                 } else {
                     0
@@ -1430,66 +1448,67 @@ impl CallGraph {
         let mut children = Vec::new();
 
         if current_depth < max_depth {
-            for call_site in &call_sites {
-                let edge = self.resolve_cross_file_edge(
-                    &call_site.full_callee,
-                    &call_site.callee_name,
-                    &canon,
-                    &import_block,
-                );
-
-                // Go cross-file same-package fallback: if the regular
-                // resolver returned Unresolved, try a sibling in the same
-                // directory before giving up.
-                let edge = match edge {
-                    EdgeResolution::Unresolved { callee_name } => {
-                        match self.go_sibling_definer(&canon, &callee_name) {
-                            Some(sibling) => EdgeResolution::Resolved {
-                                file: sibling,
-                                symbol: callee_name,
-                            },
-                            None => EdgeResolution::Unresolved { callee_name },
-                        }
-                    }
-                    resolved => resolved,
-                };
-
-                match edge {
-                    EdgeResolution::Resolved {
-                        file: ref target_file,
-                        ref symbol,
-                    } => {
-                        match self.forward_tree_inner(
-                            target_file,
-                            symbol,
-                            max_depth,
-                            current_depth + 1,
-                            visited,
-                        ) {
-                            Ok(child) => children.push(child),
-                            Err(_) => {
-                                // Target file can't be parsed — mark as unresolved leaf
-                                children.push(CallTreeNode {
-                                    name: call_site.callee_name.clone(),
-                                    file: self.relative_path(target_file),
-                                    line: call_site.line,
-                                    signature: None,
-                                    resolved: false,
-                                    children: vec![],
-                                });
+            for edge in self.merged_forward_edges(&canon, symbol, &call_sites, &import_block) {
+                let helper_receiver_ambiguous = edge.target_receiver.as_deref().is_some_and(|_| {
+                    symbol_has_multiple_receiver_variants(&edge.target_file, &edge.target_symbol)
+                });
+                if helper_receiver_ambiguous {
+                    let receiver = edge.target_receiver.as_deref().unwrap_or_default();
+                    let (line, signature) = get_symbol_meta_for_receiver(
+                        &edge.target_file,
+                        &edge.target_symbol,
+                        receiver,
+                    );
+                    children.push(CallTreeNode {
+                        name: format!("{} ({})", edge.target_symbol, receiver_short_name(receiver)),
+                        file: self.relative_path(&edge.target_file),
+                        line: if line != 0 {
+                            line
+                        } else {
+                            edge.target_line.unwrap_or(edge.call_site_line)
+                        },
+                        signature,
+                        resolved: true,
+                        children: vec![],
+                    });
+                    continue;
+                }
+                if edge.resolved {
+                    match self.forward_tree_inner(
+                        &edge.target_file,
+                        &edge.target_symbol,
+                        max_depth,
+                        current_depth + 1,
+                        visited,
+                    ) {
+                        Ok(mut child) => {
+                            if edge.target_file == canon {
+                                child.line = edge.call_site_line;
+                            } else if let Some(line) = edge.target_line {
+                                child.line = line;
                             }
+                            children.push(child);
+                        }
+                        Err(_) => {
+                            children.push(CallTreeNode {
+                                name: edge.target_symbol,
+                                file: self.relative_path(&edge.target_file),
+                                line: edge.target_line.unwrap_or(edge.call_site_line),
+                                signature: None,
+                                resolved: false,
+                                children: vec![],
+                            });
                         }
                     }
-                    EdgeResolution::Unresolved { callee_name } => {
-                        children.push(CallTreeNode {
-                            name: callee_name,
-                            file: self.relative_path(&canon),
-                            line: call_site.line,
-                            signature: None,
-                            resolved: false,
-                            children: vec![],
-                        });
-                    }
+                } else {
+                    children.push(CallTreeNode {
+                        name: edge.target_symbol,
+                        file: self.relative_path(&edge.target_file),
+                        line: edge.call_site_line,
+                        signature: None,
+                        resolved: false,
+                        children: vec![],
+                    });
                 }
             }
         }
@@ -1571,11 +1590,7 @@ impl CallGraph {
                     Some(d) => d.to_path_buf(),
                     None => continue,
                 };
-                let data = match self
-                    .data
-                    .get(f)
-                    .or_else(|| self.data.get(&canon))
-                {
+                let data = match self.data.get(f).or_else(|| self.data.get(&canon)) {
                     Some(d) => d,
                     None => continue,
                 };
@@ -1738,7 +1753,6 @@ impl CallGraph {
                     continue;
                 }
 
-
                 // Feature flag: drop dispatches/goroutine/defer kinds when disabled.
                 let is_dispatch_kind = matches!(
                     edge.kind,
@@ -1753,15 +1767,12 @@ impl CallGraph {
                     continue;
                 }
 
-
                 let caller_abs = self.project_root.join(&edge.caller.file);
                 let callee_abs = self.project_root.join(&edge.callee.file);
 
-                let canon_caller = Arc::new(
-                    std::fs::canonicalize(&caller_abs).unwrap_or(caller_abs),
-                );
-                let canon_callee =
-                    std::fs::canonicalize(&callee_abs).unwrap_or(callee_abs.clone());
+                let canon_caller =
+                    Arc::new(std::fs::canonicalize(&caller_abs).unwrap_or(caller_abs));
+                let canon_callee = std::fs::canonicalize(&callee_abs).unwrap_or(callee_abs.clone());
 
                 let caller_sym: SharedStr = Arc::from(edge.caller.symbol.as_str());
 
@@ -1799,18 +1810,21 @@ impl CallGraph {
                             .ok()
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_else(|| edge.caller.file.clone());
-                        dispatch.entry(key.clone()).or_default().push(DispatchEntry {
-                            handler: DispatchCallee {
-                                file: callee_rel,
-                                symbol: edge.callee.symbol.clone(),
-                            },
-                            registered_by: DispatchRegistrar {
-                                file: caller_rel,
-                                symbol: edge.caller.symbol.clone(),
-                                line: edge.caller.line,
-                            },
-                            dispatched_via: edge.dispatched_via.clone(),
-                        });
+                        dispatch
+                            .entry(key.clone())
+                            .or_default()
+                            .push(DispatchEntry {
+                                handler: DispatchCallee {
+                                    file: callee_rel,
+                                    symbol: edge.callee.symbol.clone(),
+                                },
+                                registered_by: DispatchRegistrar {
+                                    file: caller_rel,
+                                    symbol: edge.caller.symbol.clone(),
+                                    line: edge.caller.line,
+                                },
+                                dispatched_via: edge.dispatched_via.clone(),
+                            });
                     }
                 }
             }
@@ -1919,6 +1933,116 @@ impl CallGraph {
             .map(Vec::as_slice)
     }
 
+    fn merged_forward_edges(
+        &mut self,
+        caller_file: &Path,
+        caller_symbol: &str,
+        call_sites: &[CallSite],
+        import_block: &ImportBlock,
+    ) -> Vec<ForwardEdge> {
+        let canon_caller =
+            std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.to_path_buf());
+        let mut edges = Vec::new();
+
+        for call_site in call_sites {
+            let edge = self.resolve_cross_file_edge(
+                &call_site.full_callee,
+                &call_site.callee_name,
+                &canon_caller,
+                import_block,
+            );
+
+            let merged = match edge {
+                EdgeResolution::Resolved { file, symbol } => ForwardEdge {
+                    target_file: file,
+                    target_symbol: symbol,
+                    target_receiver: None,
+                    call_site_line: call_site.line,
+                    target_line: None,
+                    resolved: true,
+                },
+                EdgeResolution::Unresolved { callee_name } => {
+                    match self.go_sibling_definer(&canon_caller, &callee_name) {
+                        Some(sibling) => ForwardEdge {
+                            target_file: sibling,
+                            target_symbol: callee_name,
+                            target_receiver: None,
+                            call_site_line: call_site.line,
+                            target_line: None,
+                            resolved: true,
+                        },
+                        None => ForwardEdge {
+                            target_file: canon_caller.clone(),
+                            target_symbol: callee_name,
+                            target_receiver: None,
+                            call_site_line: call_site.line,
+                            target_line: None,
+                            resolved: false,
+                        },
+                    }
+                }
+            };
+            push_forward_edge(&mut edges, merged);
+        }
+
+        let helper_edges = self.helper_forward_sites(&canon_caller, caller_symbol);
+        if !helper_edges.is_empty() {
+            let helper_targets: HashSet<(PathBuf, String)> = helper_edges
+                .iter()
+                .filter(|edge| edge.target_receiver.is_some())
+                .map(|edge| (edge.target_file.clone(), edge.target_symbol.clone()))
+                .collect();
+            edges.retain(|edge| {
+                !helper_targets.contains(&(edge.target_file.clone(), edge.target_symbol.clone()))
+            });
+        }
+
+        for edge in helper_edges {
+            push_forward_edge(&mut edges, edge);
+        }
+
+        edges
+    }
+
+    fn helper_forward_sites(&self, caller_file: &Path, caller_symbol: &str) -> Vec<ForwardEdge> {
+        let Some(helper) = &self.go_helper else {
+            return Vec::new();
+        };
+
+        let canon_caller =
+            std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.to_path_buf());
+        let mut sites = Vec::new();
+
+        for edge in &helper.edges {
+            if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Writes) {
+                continue;
+            }
+            if edge.caller.symbol != caller_symbol {
+                continue;
+            }
+
+            let edge_caller_abs = self.project_root.join(&edge.caller.file);
+            let edge_caller = std::fs::canonicalize(&edge_caller_abs).unwrap_or(edge_caller_abs);
+            if edge_caller != canon_caller {
+                continue;
+            }
+
+            let target_abs = self.project_root.join(&edge.callee.file);
+            let target_file = std::fs::canonicalize(&target_abs).unwrap_or(target_abs);
+            sites.push(ForwardEdge {
+                target_file,
+                target_symbol: edge.callee.symbol.clone(),
+                target_receiver: (!edge.callee.receiver.is_empty())
+                    .then(|| edge.callee.receiver.clone()),
+                call_site_line: edge.caller.line,
+                target_line: (edge.callee.line != 0).then_some(edge.callee.line),
+                resolved: true,
+            });
+        }
+
+        sites
+    }
+
     /// Ensure the dispatch index is built. Mirrors `build_reverse_index` laziness.
     fn ensure_dispatch_index(&mut self) {
         // Warm-load (`try_load_merged_graph`) only populates `reverse_index`,
@@ -1990,7 +2114,11 @@ impl CallGraph {
             .into_iter()
             .map(|((receiver, pkg), mut methods)| {
                 methods.sort_by(|a, b| a.name.cmp(&b.name));
-                ConcreteTypeImpl { receiver, pkg, methods }
+                ConcreteTypeImpl {
+                    receiver,
+                    pkg,
+                    methods,
+                }
             })
             .collect();
 
@@ -2002,7 +2130,6 @@ impl CallGraph {
             implementations,
         })
     }
-
 
     /// Exact-match lookup in the dispatch secondary index.
     /// Returns all dispatch entries whose `nearby_string` equals `key`.
@@ -2017,7 +2144,10 @@ impl CallGraph {
 
     /// Prefix-match lookup in the dispatch secondary index.
     /// Returns all dispatch entries whose `nearby_string` starts with `prefix`.
-    pub fn find_by_dispatch_key_prefix(&mut self, prefix: &str) -> Vec<(String, Vec<DispatchEntry>)> {
+    pub fn find_by_dispatch_key_prefix(
+        &mut self,
+        prefix: &str,
+    ) -> Vec<(String, Vec<DispatchEntry>)> {
         self.ensure_dispatch_index();
         let Some(di) = self.dispatch_index.as_ref() else {
             return vec![];
@@ -2076,11 +2206,7 @@ impl CallGraph {
     /// This is the backend for `aft writers <file> <var>`.
     /// Returns only edges with `kind == Writes` — same-package writes are
     /// filtered at the helper side (filter-at-source contract).
-    pub fn writers_of(
-        &mut self,
-        file: &Path,
-        symbol: &str,
-    ) -> Result<WritersResult, AftError> {
+    pub fn writers_of(&mut self, file: &Path, symbol: &str) -> Result<WritersResult, AftError> {
         let canon = self.canonicalize(file)?;
         self.build_file(&canon)?;
 
@@ -2108,7 +2234,6 @@ impl CallGraph {
             writers: sites,
         })
     }
-
 
     /// Get callers of a symbol in a file, grouped by calling file.
     ///
@@ -2154,8 +2279,7 @@ impl CallGraph {
         // type-accurate version wins and no duplicate appears in output.
         all_sites.sort_unstable_by_key(|s| if s.resolved { 0u8 } else { 1u8 });
         let mut seen: HashSet<(PathBuf, String, u32)> = HashSet::new();
-        all_sites
-            .retain(|s| seen.insert((s.caller_file.clone(), s.caller_symbol.clone(), s.line)));
+        all_sites.retain(|s| seen.insert((s.caller_file.clone(), s.caller_symbol.clone(), s.line)));
 
         // Group by file
         let mut groups_map: HashMap<PathBuf, Vec<CallerEntry>> = HashMap::new();
@@ -2264,7 +2388,10 @@ impl CallGraph {
 
         let extra_total: usize = extra.values().map(|v| v.len()).sum();
         for (file, entries) in extra {
-            result.callers.push(CallerGroup { file, callers: entries });
+            result.callers.push(CallerGroup {
+                file,
+                callers: entries,
+            });
         }
         result.total_callers += extra_total;
 
@@ -2853,9 +2980,8 @@ impl CallGraph {
                 // Emit a distinct `field_write` hop. Don't extend tracked_names
                 // with the compound path — downstream tracking treats names as
                 // bare identifiers, and "m.Field" would produce noisy matches.
-                let is_field_write = new_name.contains('.')
-                    || new_name.contains('[')
-                    || new_name.starts_with('*');
+                let is_field_write =
+                    new_name.contains('.') || new_name.contains('[') || new_name.starts_with('*');
 
                 if is_field_write {
                     hops.push(DataFlowHop {
@@ -3068,16 +3194,12 @@ impl CallGraph {
 
         // Detect method-call receiver: if the callee is a selector/member
         // expression (`<base>.Method`) and `<base>` references a tracked name.
-        let receiver_match: Option<ExprMatch> = node
-            .child_by_field_name("function")
-            .and_then(|fn_node| {
+        let receiver_match: Option<ExprMatch> =
+            node.child_by_field_name("function").and_then(|fn_node| {
                 let k = fn_node.kind();
                 if matches!(
                     k,
-                    "selector_expression"
-                        | "member_expression"
-                        | "field_expression"
-                        | "attribute"
+                    "selector_expression" | "member_expression" | "field_expression" | "attribute"
                 ) {
                     let base = fn_node
                         .child_by_field_name("operand")
@@ -3633,6 +3755,56 @@ fn get_symbol_meta(path: &Path, symbol_name: &str) -> (u32, Option<String>) {
     }
 }
 
+fn receiver_short_name(receiver: &str) -> String {
+    let (is_pointer, trimmed) = match receiver.strip_prefix('*') {
+        Some(rest) => (true, rest),
+        None => (false, receiver),
+    };
+    let short = trimmed.rsplit('.').next().unwrap_or(trimmed);
+    if is_pointer {
+        format!("*{}", short)
+    } else {
+        short.to_string()
+    }
+}
+
+fn signature_matches_receiver(signature: &str, receiver: &str) -> bool {
+    let short = receiver_short_name(receiver);
+    let bare = short.trim_start_matches('*');
+    signature.contains(&format!("({})", bare)) || signature.contains(&format!("(*{})", bare))
+}
+
+fn get_symbol_meta_for_receiver(
+    path: &Path,
+    symbol_name: &str,
+    receiver: &str,
+) -> (u32, Option<String>) {
+    let provider = crate::parser::TreeSitterProvider::new();
+    match provider.list_symbols(path) {
+        Ok(symbols) => {
+            for s in &symbols {
+                if s.name == symbol_name
+                    && s.signature
+                        .as_deref()
+                        .is_some_and(|sig| signature_matches_receiver(sig, receiver))
+                {
+                    return (s.range.start_line + 1, s.signature.clone());
+                }
+            }
+            get_symbol_meta(path, symbol_name)
+        }
+        Err(_) => get_symbol_meta(path, symbol_name),
+    }
+}
+
+fn symbol_has_multiple_receiver_variants(path: &Path, symbol_name: &str) -> bool {
+    let provider = crate::parser::TreeSitterProvider::new();
+    match provider.list_symbols(path) {
+        Ok(symbols) => symbols.iter().filter(|s| s.name == symbol_name).count() > 1,
+        Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data flow tracking helpers
 // ---------------------------------------------------------------------------
@@ -3980,13 +4152,8 @@ pub(crate) fn extract_receiver_name(signature: &str, lang: LangId) -> Option<Str
 pub(crate) fn known_writer_spec(full_callee: &str) -> Option<(Vec<usize>, Vec<usize>)> {
     match full_callee {
         // Go: Unmarshal-family — (data, &out)
-        "json.Unmarshal"
-        | "yaml.Unmarshal"
-        | "xml.Unmarshal"
-        | "toml.Unmarshal"
-        | "proto.Unmarshal"
-        | "bson.Unmarshal"
-        | "msgpack.Unmarshal" => Some((vec![0], vec![1])),
+        "json.Unmarshal" | "yaml.Unmarshal" | "xml.Unmarshal" | "toml.Unmarshal"
+        | "proto.Unmarshal" | "bson.Unmarshal" | "msgpack.Unmarshal" => Some((vec![0], vec![1])),
         _ => None,
     }
 }
@@ -5215,7 +5382,11 @@ function testValidation() {
     #[test]
     fn extract_parameters_go_method_no_params() {
         let params = extract_parameters("func (s *svc) noParams() int", LangId::Go);
-        assert!(params.is_empty(), "no params should yield empty, got {:?}", params);
+        assert!(
+            params.is_empty(),
+            "no params should yield empty, got {:?}",
+            params
+        );
     }
 
     #[test]
@@ -5366,7 +5537,7 @@ func interfaceCaller(d Doer, x int) int {
                 },
             ],
             skipped: vec![],
-       returns: vec![],
+            returns: vec![],
         }
     }
 
@@ -5490,7 +5661,9 @@ func interfaceCaller(d Doer, x int) int {
                     },
                     kind: EdgeKind::Dispatches,
                     nearby_string: Some("TypeMerchantTask".to_string()),
-                    dispatched_via: Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
+                    dispatched_via: Some(
+                        "github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string(),
+                    ),
                     context: None,
                 },
                 // dispatches edge with no nearby_string
@@ -5552,7 +5725,7 @@ func interfaceCaller(d Doer, x int) int {
                 },
             ],
             skipped: vec![],
-       returns: vec![],
+            returns: vec![],
         }
     }
 
@@ -5596,8 +5769,14 @@ func processRequest() {
         let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
         assert_eq!(result.symbol, "HandleMerchantTask");
         assert_eq!(result.dispatched_by.len(), 1);
-        assert_eq!(result.dispatched_by[0].caller.symbol, "startAsyncQueueServer");
-        assert_eq!(result.dispatched_by[0].nearby_string, Some("TypeMerchantTask".to_string()));
+        assert_eq!(
+            result.dispatched_by[0].caller.symbol,
+            "startAsyncQueueServer"
+        );
+        assert_eq!(
+            result.dispatched_by[0].nearby_string,
+            Some("TypeMerchantTask".to_string())
+        );
     }
 
     #[test]
@@ -5613,7 +5792,11 @@ func processRequest() {
 
         // workerLoop is registered via goroutine (not dispatches), so dispatched_by should be empty.
         let result = cg.dispatched_by(&go_file, "workerLoop").unwrap();
-        assert_eq!(result.dispatched_by.len(), 0, "goroutine edges should not appear in dispatched_by");
+        assert_eq!(
+            result.dispatched_by.len(),
+            0,
+            "goroutine edges should not appear in dispatched_by"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5695,8 +5878,7 @@ func processRequest() {
         let result = cg.dispatched_by(&go_file, "HandleGenericTask").unwrap();
         assert_eq!(result.dispatched_by.len(), 1);
         assert_eq!(
-            result.dispatched_by[0].dispatched_via,
-            None,
+            result.dispatched_by[0].dispatched_via, None,
             "dispatch site with no dispatched_via should return None"
         );
     }
@@ -5713,7 +5895,11 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         let entries = cg.find_by_dispatch_key("TypeMerchantTask");
-        assert_eq!(entries.len(), 1, "should find exactly one handler for TypeMerchantTask");
+        assert_eq!(
+            entries.len(),
+            1,
+            "should find exactly one handler for TypeMerchantTask"
+        );
         assert_eq!(entries[0].handler.symbol, "HandleMerchantTask");
         assert_eq!(entries[0].registered_by.symbol, "startAsyncQueueServer");
         assert_eq!(entries[0].registered_by.line, 10);
@@ -5731,7 +5917,11 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         let results = cg.find_by_dispatch_key_prefix("Type");
-        assert_eq!(results.len(), 1, "should find TypeMerchantTask with prefix 'Type'");
+        assert_eq!(
+            results.len(),
+            1,
+            "should find TypeMerchantTask with prefix 'Type'"
+        );
         assert_eq!(results[0].0, "TypeMerchantTask");
     }
 
@@ -5778,7 +5968,7 @@ func processRequest() {
                 context: None,
             }],
             skipped: vec![],
-       returns: vec![],
+            returns: vec![],
         };
 
         let mut cg = CallGraph::new(root.clone(), true);
@@ -5804,11 +5994,18 @@ func processRequest() {
 
         // No dispatch edges in reverse index.
         let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
-        assert_eq!(result.dispatched_by.len(), 0, "dispatch edges should be absent when flag is false");
+        assert_eq!(
+            result.dispatched_by.len(),
+            0,
+            "dispatch edges should be absent when flag is false"
+        );
 
         // Dispatch index should also be empty.
         let entries = cg.find_by_dispatch_key("TypeMerchantTask");
-        assert!(entries.is_empty(), "dispatch index should be empty when flag is false");
+        assert!(
+            entries.is_empty(),
+            "dispatch index should be empty when flag is false"
+        );
     }
 
     #[test]
@@ -5824,11 +6021,17 @@ func processRequest() {
 
         // workerLoop is started via goroutine — should appear in callers_of
         let callers = cg.callers_of(&go_file, "workerLoop", 1).unwrap();
-        assert!(callers.total_callers >= 1, "workerLoop should have at least one caller (goroutine)");
+        assert!(
+            callers.total_callers >= 1,
+            "workerLoop should have at least one caller (goroutine)"
+        );
 
         // cleanup is deferred — should appear in callers_of
         let callers = cg.callers_of(&go_file, "cleanup", 1).unwrap();
-        assert!(callers.total_callers >= 1, "cleanup should have at least one caller (defer)");
+        assert!(
+            callers.total_callers >= 1,
+            "cleanup should have at least one caller (defer)"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -5900,7 +6103,7 @@ func processRequest() {
                 },
             ],
             skipped: vec![],
-       returns: vec![],
+            returns: vec![],
         }
     }
 
@@ -5941,12 +6144,20 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let result = cg.implementations_of(&iface_file, "Storer", false).unwrap();
         assert_eq!(result.interface.symbol, "Storer");
         // storeImpl should be there (mocks excluded by default).
-        assert_eq!(result.implementations.len(), 1, "should find exactly one non-mock implementation");
+        assert_eq!(
+            result.implementations.len(),
+            1,
+            "should find exactly one non-mock implementation"
+        );
         let impl_type = &result.implementations[0];
         assert_eq!(impl_type.receiver, "*store.storeImpl");
         assert_eq!(impl_type.pkg, "example.com/store");
         // Both methods should appear.
-        assert_eq!(impl_type.methods.len(), 2, "should find Create and Delete methods");
+        assert_eq!(
+            impl_type.methods.len(),
+            2,
+            "should find Create and Delete methods"
+        );
         let method_names: Vec<&str> = impl_type.methods.iter().map(|m| m.name.as_str()).collect();
         assert!(method_names.contains(&"Create"), "Create should be listed");
         assert!(method_names.contains(&"Delete"), "Delete should be listed");
@@ -5965,10 +6176,24 @@ func (s *storeImpl) Delete(id int) error      { return nil }
 
         let result = cg.implementations_of(&iface_file, "Storer", true).unwrap();
         // With include_mocks=true, MockStorer should also appear.
-        assert_eq!(result.implementations.len(), 2, "should find 2 implementations with mocks");
-        let receivers: Vec<&str> = result.implementations.iter().map(|i| i.receiver.as_str()).collect();
-        assert!(receivers.contains(&"*store.storeImpl"), "storeImpl should be present");
-        assert!(receivers.contains(&"*mocks.MockStorer"), "MockStorer should be present with include_mocks=true");
+        assert_eq!(
+            result.implementations.len(),
+            2,
+            "should find 2 implementations with mocks"
+        );
+        let receivers: Vec<&str> = result
+            .implementations
+            .iter()
+            .map(|i| i.receiver.as_str())
+            .collect();
+        assert!(
+            receivers.contains(&"*store.storeImpl"),
+            "storeImpl should be present"
+        );
+        assert!(
+            receivers.contains(&"*mocks.MockStorer"),
+            "MockStorer should be present with include_mocks=true"
+        );
     }
 
     #[test]
@@ -5982,8 +6207,13 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.implementations_of(&iface_file, "NonExistentInterface", false).unwrap();
-        assert!(result.implementations.is_empty(), "should return empty for unknown interface");
+        let result = cg
+            .implementations_of(&iface_file, "NonExistentInterface", false)
+            .unwrap();
+        assert!(
+            result.implementations.is_empty(),
+            "should return empty for unknown interface"
+        );
     }
 
     #[test]
@@ -6054,7 +6284,10 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         };
 
         let json = serde_json::to_string(&edge).unwrap();
-        assert!(json.contains("\"implements\""), "should serialize as 'implements'");
+        assert!(
+            json.contains("\"implements\""),
+            "should serialize as 'implements'"
+        );
 
         let parsed: HelperEdge = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.kind, EdgeKind::Implements);
@@ -6078,5 +6311,184 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         let out: crate::go_helper::HelperOutput = serde_json::from_str(json).unwrap();
         assert_eq!(out.edges.len(), 1);
         assert_eq!(out.edges[0].kind, EdgeKind::Interface);
+    }
+
+    #[test]
+    fn forward_tree_uses_go_helper_edges_for_dynamic_calls() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/test\n\ngo 1.22\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            r#"package main
+
+type Doer interface {
+    Do(x int) int
+}
+
+type impl struct{}
+
+func (i *impl) Do(x int) int {
+    return helper(x)
+}
+
+func helper(x int) int {
+    return x + 1
+}
+
+func run(d Doer, x int) int {
+    return d.Do(x)
+}
+"#,
+        )
+        .unwrap();
+
+        let root = dir.path().to_path_buf();
+        let file = root.join("main.go");
+        let mut cg = CallGraph::new(root.clone(), true);
+        cg.set_go_helper(crate::go_helper::HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.to_string_lossy().into_owned(),
+            edges: vec![crate::go_helper::HelperEdge {
+                caller: crate::go_helper::HelperCaller {
+                    file: "main.go".to_string(),
+                    line: 16,
+                    symbol: "run".to_string(),
+                },
+                callee: crate::go_helper::HelperCallee {
+                    file: "main.go".to_string(),
+                    line: 8,
+                    symbol: "Do".to_string(),
+                    receiver: "*example.com/test.impl".to_string(),
+                    pkg: "example.com/test".to_string(),
+                },
+                kind: EdgeKind::Interface,
+                nearby_string: None,
+                dispatched_via: None,
+                context: None,
+            }],
+            skipped: vec![],
+            returns: vec![],
+        });
+
+        let tree = cg.forward_tree(&file, "run", 3).unwrap();
+        let do_child = tree
+            .children
+            .iter()
+            .find(|child| child.name == "Do" && child.resolved)
+            .expect("run should include helper-resolved Do child");
+        assert!(
+            do_child.children.iter().any(|child| child.name == "helper"),
+            "helper-resolved Do child should keep walking the tree: {:?}",
+            do_child.children
+        );
+    }
+
+    #[test]
+    fn forward_tree_preserves_multiple_helper_receivers_in_same_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/test\n\ngo 1.22\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            r#"package main
+
+type Doer interface {
+    Do(x int) int
+}
+
+type alpha struct{}
+
+func (alpha) Do(x int) int {
+    return x + 1
+}
+
+type beta struct{}
+
+func (beta) Do(x int) int {
+    return x + 2
+}
+
+func run(d Doer, x int) int {
+    return d.Do(x)
+}
+"#,
+        )
+        .unwrap();
+
+        let root = dir.path().to_path_buf();
+        let file = root.join("main.go");
+        let mut cg = CallGraph::new(root.clone(), true);
+        cg.set_go_helper(crate::go_helper::HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.to_string_lossy().into_owned(),
+            edges: vec![
+                crate::go_helper::HelperEdge {
+                    caller: crate::go_helper::HelperCaller {
+                        file: "main.go".to_string(),
+                        line: 17,
+                        symbol: "run".to_string(),
+                    },
+                    callee: crate::go_helper::HelperCallee {
+                        file: "main.go".to_string(),
+                        line: 8,
+                        symbol: "Do".to_string(),
+                        receiver: "example.com/test.alpha".to_string(),
+                        pkg: "example.com/test".to_string(),
+                    },
+                    kind: EdgeKind::Interface,
+                    nearby_string: None,
+                    dispatched_via: None,
+                    context: None,
+                },
+                crate::go_helper::HelperEdge {
+                    caller: crate::go_helper::HelperCaller {
+                        file: "main.go".to_string(),
+                        line: 17,
+                        symbol: "run".to_string(),
+                    },
+                    callee: crate::go_helper::HelperCallee {
+                        file: "main.go".to_string(),
+                        line: 13,
+                        symbol: "Do".to_string(),
+                        receiver: "example.com/test.beta".to_string(),
+                        pkg: "example.com/test".to_string(),
+                    },
+                    kind: EdgeKind::Interface,
+                    nearby_string: None,
+                    dispatched_via: None,
+                    context: None,
+                },
+            ],
+            skipped: vec![],
+            returns: vec![],
+        });
+
+        let tree = cg.forward_tree(&file, "run", 2).unwrap();
+        assert!(
+            tree.children
+                .iter()
+                .any(|child| child.name == "Do (alpha)" && child.resolved),
+            "run should keep alpha receiver variant visible: {:?}",
+            tree.children
+        );
+        assert!(
+            tree.children
+                .iter()
+                .any(|child| child.name == "Do (beta)" && child.resolved),
+            "run should keep beta receiver variant visible: {:?}",
+            tree.children
+        );
+        assert!(
+            tree.children.iter().all(|child| child.name != "Do"),
+            "run should not keep the generic unresolved Do edge once helper receiver variants exist: {:?}",
+            tree.children
+        );
     }
 }

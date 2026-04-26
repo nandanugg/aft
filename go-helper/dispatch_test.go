@@ -85,7 +85,7 @@ func TestDispatchEdgesHTTP(t *testing.T) {
 	}
 
 	wantKeys := map[dispatchEdgeKey]bool{
-		{callerSymbol: "RegisterHTTPHandlers", calleeSymbol: "handleHome", kind: "dispatches", nearbyString: "/"}: false,
+		{callerSymbol: "RegisterHTTPHandlers", calleeSymbol: "handleHome", kind: "dispatches", nearbyString: "/"}:   false,
 		{callerSymbol: "RegisterHTTPHandlers", calleeSymbol: "handleAPI", kind: "dispatches", nearbyString: "/api"}: false,
 	}
 	for _, e := range out.Edges {
@@ -119,7 +119,7 @@ func TestDispatchEdgesGoroutineDefer(t *testing.T) {
 
 	wantKeys := map[dispatchEdgeKey]bool{
 		{callerSymbol: "StartWorkers", calleeSymbol: "workerLoop", kind: "goroutine"}: false,
-		{callerSymbol: "StartWorkers", calleeSymbol: "process", kind: "goroutine"}:   false,
+		{callerSymbol: "StartWorkers", calleeSymbol: "process", kind: "goroutine"}:    false,
 		{callerSymbol: "WithDefer", calleeSymbol: "cleanup", kind: "defer"}:           false,
 	}
 	for _, e := range out.Edges {
@@ -197,7 +197,7 @@ func TestTypedConstNearbyString(t *testing.T) {
 	// string(TypeRefundCallback). Both should resolve to their string values.
 	wantKeys := map[dispatchEdgeKey]bool{
 		{callerSymbol: "RegisterTypedHandlers", calleeSymbol: "HandleMerchantSettlementTask", kind: "dispatches", nearbyString: "merchant_settlement:merchant_id"}: false,
-		{callerSymbol: "RegisterTypedHandlers", calleeSymbol: "HandleRefundCallbackTask", kind: "dispatches", nearbyString: "refund_callback:payment_id"}:         false,
+		{callerSymbol: "RegisterTypedHandlers", calleeSymbol: "HandleRefundCallbackTask", kind: "dispatches", nearbyString: "refund_callback:payment_id"}:          false,
 	}
 	for _, e := range out.Edges {
 		if !dispatchKinds[e.Kind] {
@@ -305,6 +305,94 @@ func TestDispatchedViaInterfaceSite(t *testing.T) {
 	}
 }
 
+func TestInterfaceFieldDispatchPreservesMultipleConcreteTargets(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	want := map[string]bool{
+		"example.com/dispatch.AlphaWorker": false,
+		"example.com/dispatch.BetaWorker":  false,
+	}
+	for _, e := range out.Edges {
+		if e.Caller.Symbol != "Run" || e.Callee.Symbol != "Handle" || e.Kind != "interface" {
+			continue
+		}
+		if _, ok := want[e.Callee.Receiver]; ok {
+			want[e.Callee.Receiver] = true
+		}
+	}
+
+	for recv, found := range want {
+		if !found {
+			t.Errorf("expected interface field dispatch edge for receiver %s not found", recv)
+		}
+	}
+}
+
+func TestClosureMethodDispatchResolvesConcreteMethod(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	for _, e := range out.Edges {
+		if e.Caller.Symbol != "RegisterClosureMethod" || e.Kind != "dispatches" {
+			continue
+		}
+		if e.Callee.Symbol == "Serve" && e.Callee.Receiver == "example.com/dispatch.ClosureMethodHandler" && e.NearbyString == "/closure-method" {
+			return
+		}
+	}
+
+	t.Fatal("expected dispatch edge from RegisterClosureMethod to ClosureMethodHandler.Serve not found")
+}
+
+func TestClosureInterfaceDispatchResolvesConcreteMethods(t *testing.T) {
+	root := filepath.Join("testdata", "dispatch")
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("abs root: %v", err)
+	}
+
+	out, err := analyze(absRoot, true, true, true, true, true)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	want := map[string]bool{
+		"example.com/dispatch.ClosureIfaceAlpha": false,
+		"example.com/dispatch.ClosureIfaceBeta":  false,
+	}
+	for _, e := range out.Edges {
+		if e.Caller.Symbol != "RegisterClosureInterfaceMethod" || e.Callee.Symbol != "Serve" || e.Kind != "dispatches" || e.NearbyString != "/closure-interface" {
+			continue
+		}
+		if _, ok := want[e.Callee.Receiver]; ok {
+			want[e.Callee.Receiver] = true
+		}
+	}
+
+	for recv, found := range want {
+		if !found {
+			t.Errorf("expected closure interface dispatch edge for receiver %s not found", recv)
+		}
+	}
+}
+
 // TestDispatchGoldenJSON tests that the sorted dispatch edges match a golden file
 // if it exists. To regenerate: delete testdata/dispatch/expected.json and run the test.
 func TestDispatchGoldenJSON(t *testing.T) {
@@ -337,6 +425,9 @@ func TestDispatchGoldenJSON(t *testing.T) {
 		}
 		if a.Callee.Symbol != b.Callee.Symbol {
 			return a.Callee.Symbol < b.Callee.Symbol
+		}
+		if a.Callee.Receiver != b.Callee.Receiver {
+			return a.Callee.Receiver < b.Callee.Receiver
 		}
 		return a.NearbyString < b.NearbyString
 	})

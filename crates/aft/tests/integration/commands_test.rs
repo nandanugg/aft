@@ -14,6 +14,15 @@ fn write_temp_file(root: &Path, relative: &str, content: &str) -> PathBuf {
     path
 }
 
+fn write_temp_go_project(root: &Path) -> PathBuf {
+    write_temp_file(root, "go.mod", "module example.com/test\n\ngo 1.22\n");
+    write_temp_file(
+        root,
+        "main.go",
+        "package main\n\nfunc helper() {}\n\nfunc main() {\n\thelper()\n}\n",
+    )
+}
+
 #[test]
 fn test_outline_typescript_nested_structure() {
     let mut aft = AftProcess::spawn();
@@ -516,6 +525,85 @@ fn test_zoom_supports_csharp_symbols() {
     let content = resp["content"].as_str().expect("content string");
     assert!(content.contains("public class Worker"));
     assert!(content.contains("public void Run()"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn test_status_reports_failed_go_overlay_backend_state() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let _main = write_temp_go_project(dir.path());
+    let fake_helper = write_temp_file(dir.path(), "fake-aft-go-helper", "not an executable");
+    let cache_dir = dir.path().join("cache");
+
+    let backend = std::ffi::OsStr::new("sidecar");
+    let envs = [
+        ("AFT_CACHE_DIR", cache_dir.as_os_str()),
+        ("AFT_GO_OVERLAY_BACKEND", backend),
+        ("AFT_GO_HELPER_PATH", fake_helper.as_os_str()),
+    ];
+
+    let mut aft = AftProcess::spawn_with_env(&envs);
+    let cfg = aft.configure(dir.path());
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+
+    let mut resp = aft.send(r#"{"id":"status-go-overlay","command":"status"}"#);
+    for _ in 0..20 {
+        if resp["go_overlay"]["state"] != "refreshing" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        resp = aft.send(r#"{"id":"status-go-overlay","command":"status"}"#);
+    }
+
+    assert_eq!(resp["success"], true, "status should succeed: {resp:?}");
+    assert_eq!(resp["go_overlay"]["backend"], "aft_go_sidecar");
+    assert_eq!(resp["go_overlay"]["state"], "failed");
+    assert!(
+        resp["go_overlay"]["last_error"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "status should surface the provider failure: {resp:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn test_go_commands_refuse_when_fresh_overlay_cannot_be_produced() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let main = write_temp_go_project(dir.path());
+    let fake_helper = write_temp_file(dir.path(), "fake-aft-go-helper", "not an executable");
+    let cache_dir = dir.path().join("cache");
+
+    let backend = std::ffi::OsStr::new("sidecar");
+    let envs = [
+        ("AFT_CACHE_DIR", cache_dir.as_os_str()),
+        ("AFT_GO_OVERLAY_BACKEND", backend),
+        ("AFT_GO_HELPER_PATH", fake_helper.as_os_str()),
+    ];
+
+    let mut aft = AftProcess::spawn_with_env(&envs);
+    let cfg = aft.configure(dir.path());
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"call-tree-go-overlay","command":"call_tree","file":"{}","symbol":"main","depth":2}}"#,
+        main.display()
+    ));
+
+    assert_eq!(resp["success"], false, "call_tree should refuse: {resp:?}");
+    assert_eq!(resp["code"], "go_overlay_unavailable");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fresh Go overlay unavailable"),
+        "response should explain the refusal: {resp:?}"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());

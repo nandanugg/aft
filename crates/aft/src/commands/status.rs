@@ -6,6 +6,8 @@ use crate::protocol::{RawRequest, Response};
 
 pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
+    let go_overlay_state = ctx.go_overlay_state();
+    let go_overlay_meta = ctx.go_overlay_meta();
 
     // Search index status
     let search_index_info = {
@@ -126,6 +128,28 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
+            "go_overlay": {
+                "backend": config.go_overlay_backend.as_str(),
+                "state": if go_overlay_state.refreshing {
+                    "refreshing"
+                } else if go_overlay_state.stale {
+                    "stale"
+                } else if go_overlay_state.last_error.is_some() && go_overlay_meta.is_none() {
+                    "failed"
+                } else if go_overlay_meta.is_some() {
+                    "ready"
+                } else {
+                    "idle"
+                },
+                "provider_id": go_overlay_meta.as_ref().map(|m| m.provider_id.as_str()),
+                "provider_version": go_overlay_meta.as_ref().map(|m| m.provider_version.as_str()),
+                "schema_version": go_overlay_meta.as_ref().map(|m| m.schema_version),
+                "feature_hash": go_overlay_meta.as_ref().map(|m| m.feature_hash.as_str()),
+                "env_hash": go_overlay_meta.as_ref().map(|m| m.env_hash.as_str()),
+                "source_fingerprint": go_overlay_meta.as_ref().map(|m| m.source_fingerprint.as_str()),
+                "produced_at": go_overlay_meta.as_ref().map(|m| m.produced_at.as_str()),
+                "last_error": go_overlay_state.last_error.as_deref(),
+            },
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,

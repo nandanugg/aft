@@ -13,10 +13,16 @@ CODEX_AGENTS_FILE="$CODEX_DIR/AGENTS.md"
 CODEX_HOOKS_FILE="$CODEX_DIR/hooks.json"
 CODEX_CONFIG_FILE="$CODEX_DIR/config.toml"
 CODEX_AFT_DOC="$CODEX_DIR/AFT.md"
+ZSH_CONFIG_FILE="$HOME/.zshrc"
+FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+ENV_BLOCK_START="# >>> aft-go-helper >>>"
+ENV_BLOCK_END="# <<< aft-go-helper <<<"
 
 WRAPPER_TEMPLATE="$AFT_ROOT/templates/aft-wrapper.sh"
+SESSION_RUNTIME_TEMPLATE="$AFT_ROOT/templates/aft-session-runtime.sh"
 CODEX_AFT_TEMPLATE="$AFT_ROOT/templates/codex/AFT.md"
 SESSION_START_TEMPLATE="$AFT_ROOT/templates/codex/aft-codex-session-start.sh"
+STOP_TEMPLATE="$AFT_ROOT/templates/codex/aft-codex-stop.sh"
 USER_PROMPT_TEMPLATE="$AFT_ROOT/templates/codex/aft-codex-user-prompt-submit.sh"
 
 RED='\033[0;31m'
@@ -53,6 +59,54 @@ copy_if_changed() {
   temp_file="$(mktemp)"
   cat "$source" > "$temp_file"
   overwrite_file "$temp_file" "$target"
+}
+
+install_templated_file() {
+  local source="$1"
+  local target="$2"
+  local replacement="$3"
+  local escaped
+  local temp_file
+  escaped="$(escape_sed_replacement "$replacement")"
+  temp_file="$(mktemp)"
+  sed "s|__AFT_BINARY_PATH__|$escaped|g" "$source" > "$temp_file"
+  overwrite_file "$temp_file" "$target"
+}
+
+strip_managed_block() {
+  local file="$1"
+  local temp_file
+  temp_file="$(mktemp)"
+  if [ -f "$file" ]; then
+    awk -v start="$ENV_BLOCK_START" -v end="$ENV_BLOCK_END" '
+      $0 == start { in_block = 1; next }
+      $0 == end { in_block = 0; next }
+      !in_block { print }
+    ' "$file" > "$temp_file" || error "Failed to update $file"
+  fi
+  printf '%s' "$temp_file"
+}
+
+upsert_shell_helper_env() {
+  local helper_path="$1"
+  local file="$2"
+  local shell_kind="$3"
+  local temp_file
+  temp_file="$(strip_managed_block "$file")"
+  mkdir -p "$(dirname "$file")"
+  if [ -s "$temp_file" ]; then
+    printf '\n' >> "$temp_file"
+  fi
+  {
+    printf '%s\n' "$ENV_BLOCK_START"
+    if [ "$shell_kind" = "fish" ]; then
+      printf 'set -gx AFT_GO_HELPER_PATH "%s"\n' "$helper_path"
+    else
+      printf 'export AFT_GO_HELPER_PATH="%s"\n' "$helper_path"
+    fi
+    printf '%s\n' "$ENV_BLOCK_END"
+  } >> "$temp_file"
+  overwrite_file "$temp_file" "$file"
 }
 
 can_query_toml_with_yq() {
@@ -193,8 +247,12 @@ if command -v go >/dev/null 2>&1; then
     GO_HELPER_BINARY=""
   fi
 else
-  warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
-  GO_HELPER_BINARY=""
+  if [ -x "$GO_HELPER_BINARY" ]; then
+    info "Using existing aft-go-helper: $GO_HELPER_BINARY"
+  else
+    warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
+    GO_HELPER_BINARY=""
+  fi
 fi
 
 mkdir -p "$CODEX_HOOKS_DIR" "$CODEX_BIN_DIR"
@@ -214,10 +272,22 @@ info "Installed CLI wrapper: $CODEX_BIN_DIR/aft"
 
 # Install Codex-specific instructions and hooks.
 copy_if_changed "$CODEX_AFT_TEMPLATE" "$CODEX_AFT_DOC"
-copy_if_changed "$SESSION_START_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-session-start.sh"
+install_templated_file "$SESSION_RUNTIME_TEMPLATE" "$CODEX_HOOKS_DIR/aft-session-runtime.sh" "$AFT_BINARY"
+install_templated_file "$SESSION_START_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" "$AFT_BINARY"
+install_templated_file "$STOP_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-stop.sh" "$AFT_BINARY"
 copy_if_changed "$USER_PROMPT_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh"
-chmod +x "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh"
+chmod +x \
+  "$CODEX_HOOKS_DIR/aft-session-runtime.sh" \
+  "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" \
+  "$CODEX_HOOKS_DIR/aft-codex-stop.sh" \
+  "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh"
 info "Installed Codex hook scripts and AFT.md"
+
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+  upsert_shell_helper_env "$GO_HELPER_BINARY" "$ZSH_CONFIG_FILE" "zsh"
+  upsert_shell_helper_env "$GO_HELPER_BINARY" "$FISH_CONFIG_FILE" "fish"
+  info "Configured AFT_GO_HELPER_PATH in $ZSH_CONFIG_FILE and $FISH_CONFIG_FILE"
+fi
 
 # Add AFT.md to the global Codex AGENTS.md include chain.
 if [ -f "$CODEX_AGENTS_FILE" ]; then
@@ -246,6 +316,7 @@ if [ -f "$CODEX_HOOKS_FILE" ]; then
   TEMP_FILE="$(mktemp)"
   jq \
     --arg session_cmd "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" \
+    --arg stop_cmd "$CODEX_HOOKS_DIR/aft-codex-stop.sh" \
     --arg prompt_cmd "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh" \
     '
       .hooks = (.hooks // {}) |
@@ -262,6 +333,23 @@ if [ -f "$CODEX_HOOKS_FILE" ]; then
                 "type": "command",
                 "command": $session_cmd,
                 "statusMessage": "Loading AFT guidance"
+              }
+            ]
+          }
+        ]
+      ) |
+      .hooks.Stop = (
+        ((.hooks.Stop // []) | map(
+          . as $entry |
+          (($entry.hooks // []) | map(select((.command // "") | contains("aft-codex-stop.sh"))) | length) as $aft |
+          if $aft > 0 then empty else $entry end
+        )) + [
+          {
+            "hooks": [
+              {
+                "type": "command",
+                "command": $stop_cmd,
+                "timeout": 5
               }
             ]
           }
@@ -299,6 +387,17 @@ else
             "type": "command",
             "command": "$CODEX_HOOKS_DIR/aft-codex-session-start.sh",
             "statusMessage": "Loading AFT guidance"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CODEX_HOOKS_DIR/aft-codex-stop.sh",
+            "timeout": 5
           }
         ]
       }
@@ -343,18 +442,23 @@ echo -e "${GREEN}AFT Codex integration installed successfully!${NC}"
 echo ""
 echo "Installed files:"
 echo "  $CODEX_BIN_DIR/aft                         - CLI wrapper"
+echo "  $CODEX_HOOKS_DIR/aft-session-runtime.sh   - Shared session lifecycle helper"
 echo "  $CODEX_HOOKS_DIR/aft-codex-session-start.sh - SessionStart hook"
+echo "  $CODEX_HOOKS_DIR/aft-codex-stop.sh        - Stop hook (session lease heartbeat)"
 echo "  $CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh - UserPromptSubmit hook"
 echo "  $CODEX_AFT_DOC                            - Codex AFT instructions"
 echo "  $CODEX_HOOKS_FILE                         - Codex hook configuration"
 echo "  $CODEX_CONFIG_FILE                        - Codex feature configuration"
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
   echo "  $GO_HELPER_BINARY                         - Go interface-dispatch resolver"
+  echo "  $ZSH_CONFIG_FILE / $FISH_CONFIG_FILE      - AFT_GO_HELPER_PATH"
 fi
 echo ""
 echo "Notes:"
-echo "  Codex hooks currently inject AFT guidance and prompt-time reminders."
+echo "  Codex hooks now prewarm AFT-Go on SessionStart and refresh the lease on Stop."
 echo "  They do not transparently replace Codex's non-Bash file tools."
+echo "  The installed aft wrapper defaults Go overlay queries to aft_go_sidecar."
+echo "  Override with AFT_GO_OVERLAY_PROVIDER or AFT_GO_OVERLAY_BACKEND if needed."
 echo ""
 echo "Usage:"
 echo "  aft outline src/         # Get file structure"

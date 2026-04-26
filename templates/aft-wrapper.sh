@@ -59,6 +59,7 @@ call_aft() {
   local cmd="$1"
   local params="$2"
   local anchor="${3:-}"
+  local go_overlay_provider="${AFT_GO_OVERLAY_PROVIDER:-${AFT_GO_OVERLAY_BACKEND:-aft_go_sidecar}}"
 
   local work_dir
   if [ -n "$anchor" ]; then
@@ -74,7 +75,11 @@ call_aft() {
   # written, and cross-package interface calls stay unresolved.
   local config_req
   local cmd_req
-  config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  if [ -n "$go_overlay_provider" ]; then
+    config_req=$(jq -cn --arg root "$work_dir" --arg provider "$go_overlay_provider" '{id:"cfg",command:"configure",project_root:$root,go_overlay_provider:$provider,wait_for_helper:true}')
+  else
+    config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  fi
   cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`

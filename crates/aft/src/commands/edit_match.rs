@@ -183,7 +183,12 @@ fn handle_glob_edit_match(
             Err(resp) => return resp,
         };
 
-        if let Err(e) = edit::auto_backup(ctx, req.session(), &validated_path, &format!("glob_edit_match: {}", match_str)) {
+        if let Err(e) = edit::auto_backup(
+            ctx,
+            req.session(),
+            &validated_path,
+            &format!("glob_edit_match: {}", match_str),
+        ) {
             return Response::error(&req.id, e.code(), e.to_string());
         }
 

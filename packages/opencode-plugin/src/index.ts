@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -152,6 +153,9 @@ const plugin: Plugin = async (input) => {
   if (aftConfig.experimental_semantic_search !== undefined)
     configOverrides.experimental_semantic_search = aftConfig.experimental_semantic_search;
   if (aftConfig.semantic !== undefined) configOverrides.semantic = aftConfig.semantic;
+  if (aftConfig.go_overlay_provider !== undefined) {
+    configOverrides.go_overlay_provider = aftConfig.go_overlay_provider;
+  }
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
@@ -235,6 +239,49 @@ const plugin: Plugin = async (input) => {
   };
   setSharedBridgePool(pool);
 
+  const goOverlayLeaseID = `opencode:${process.pid}:${randomUUID()}`;
+  const goOverlayProvider =
+    typeof configOverrides.go_overlay_provider === "string"
+      ? configOverrides.go_overlay_provider
+      : aftConfig.go_overlay_provider;
+  const manageGoOverlayLease =
+    !!input.directory &&
+    (goOverlayProvider === "aft_go_sidecar" ||
+      goOverlayProvider === "sidecar" ||
+      goOverlayProvider === "aft-go-sidecar");
+  let goOverlayLeaseClosed = false;
+
+  async function openGoOverlayLease(): Promise<void> {
+    if (!manageGoOverlayLease) return;
+    const bridge = pool.getBridge(input.directory);
+    await bridge.send("go_overlay_session_open", {
+      session_id: goOverlayLeaseID,
+      project_root: input.directory,
+      client: "opencode",
+    });
+  }
+
+  async function closeGoOverlayLease(): Promise<void> {
+    if (!manageGoOverlayLease || goOverlayLeaseClosed) return;
+    goOverlayLeaseClosed = true;
+    try {
+      const bridge = pool.getAnyActiveBridge(input.directory) ?? pool.getBridge(input.directory);
+      await bridge.send("go_overlay_session_close", {
+        session_id: goOverlayLeaseID,
+        project_root: input.directory,
+        client: "opencode",
+      });
+    } catch (err) {
+      warn(`go overlay session close failed: ${(err as Error).message}`);
+    }
+  }
+
+  if (manageGoOverlayLease) {
+    void openGoOverlayLease().catch((err) => {
+      warn(`go overlay session open failed: ${(err as Error).message}`);
+    });
+  }
+
   // Start RPC server for TUI plugin communication
   const rpcServer = new AftRpcServer(configOverrides.storage_dir as string, input.directory);
 
@@ -245,6 +292,7 @@ const plugin: Plugin = async (input) => {
   // control, not implicit process-group death. The returned unregister is called
   // from dispose so plugin reloads don't leak stale cleanup callbacks.
   const unregisterShutdown = registerShutdownCleanup(async () => {
+    await closeGoOverlayLease();
     try {
       rpcServer.stop();
     } catch {
@@ -496,7 +544,10 @@ const plugin: Plugin = async (input) => {
       unregisterShutdown();
       rpcServer.stop();
       clearSharedBridgePool();
-      return pool.shutdown();
+      return (async () => {
+        await closeGoOverlayLease();
+        await pool.shutdown();
+      })();
     },
   };
 };

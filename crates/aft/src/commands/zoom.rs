@@ -82,6 +82,9 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(path) => path,
         Err(resp) => return resp,
     };
+    if let Some(resp) = ctx.require_go_overlay(&req.id, "zoom", &path) {
+        return resp;
+    }
     if !path.exists() {
         return Response::error(
             &req.id,
@@ -434,11 +437,15 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                 helper
                     .returns
                     .iter()
-                    .find(|ri| ri.symbol == target.name && {
-                        // Allow suffix match: helper path vs resolved path.
-                        let ri_norm = ri.file.replace('\\', "/");
-                        let rel_norm = rel.replace('\\', "/");
-                        ri_norm == rel_norm || rel_norm.ends_with(&ri_norm) || ri_norm.ends_with(&rel_norm)
+                    .find(|ri| {
+                        ri.symbol == target.name && {
+                            // Allow suffix match: helper path vs resolved path.
+                            let ri_norm = ri.file.replace('\\', "/");
+                            let rel_norm = rel.replace('\\', "/");
+                            ri_norm == rel_norm
+                                || rel_norm.ends_with(&ri_norm)
+                                || ri_norm.ends_with(&rel_norm)
+                        }
                     })
                     .map(|ri| ri.returns.clone())
                     .filter(|v| !v.is_empty())

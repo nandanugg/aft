@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::query_support::resolve_symbol_query;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -49,7 +50,7 @@ pub fn handle_implementations(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
+    let raw_symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Response::error(
@@ -66,7 +67,14 @@ pub fn handle_implementations(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    ctx.drain_go_helper();
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = ctx.require_go_overlay(&req.id, "implementations", &file_path) {
+        return resp;
+    }
+
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -78,13 +86,12 @@ pub fn handle_implementations(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+    let symbol = match resolve_symbol_query(ctx, &file_path, raw_symbol) {
+        Ok(symbol) => symbol,
+        Err(err) => return Response::error(&req.id, err.code(), err.to_string()),
     };
 
-    match graph.implementations_of(&file_path, symbol, include_mocks) {
+    match graph.implementations_of(&file_path, &symbol, include_mocks) {
         Ok(result) => {
             let text = result.render_text();
             let mut result_json = serde_json::to_value(&result).unwrap_or_default();

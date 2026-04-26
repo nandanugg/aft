@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::query_support::{filter_callers_result, resolve_symbol_query};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -14,6 +15,8 @@ use crate::protocol::{RawRequest, Response};
 ///   Allows "who actually runs when this interface method is called?" in one query.
 /// - `include_mocks` (bool, optional, default false) — when `via_interface=true`,
 ///   controls whether mock implementations are included in the result.
+/// - `exclude_tests` (bool, optional, default false) — when true, drops caller
+///   groups whose file path looks like a test file/directory.
 ///
 /// Returns callers grouped by file with fields: `symbol`, `file`,
 /// `callers` (array of `{ file, callers: [{ symbol, line }] }`),
@@ -35,7 +38,7 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
+    let raw_symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Response::error(
@@ -64,9 +67,20 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         .get("include_mocks")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let exclude_tests = req
+        .params
+        .get("exclude_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = ctx.require_go_overlay(&req.id, "callers", &file_path) {
+        return resp;
+    }
 
-    ctx.drain_go_helper();
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -78,23 +92,22 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+    let symbol = match resolve_symbol_query(ctx, &file_path, raw_symbol) {
+        Ok(symbol) => symbol,
+        Err(err) => return Response::error(&req.id, err.code(), err.to_string()),
     };
 
     // Build file data first to check if the symbol exists
     match graph.build_file(&file_path) {
         Ok(data) => {
-            let has_symbol = data.calls_by_symbol.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string())
-                || data.symbol_metadata.contains_key(symbol);
+            let has_symbol = data.calls_by_symbol.contains_key(&symbol)
+                || data.exported_symbols.contains(&symbol)
+                || data.symbol_metadata.contains_key(&symbol);
             if !has_symbol {
                 return Response::error(
                     &req.id,
                     "symbol_not_found",
-                    format!("callers: symbol '{}' not found in {}", symbol, file),
+                    format!("callers: symbol '{}' not found in {}", raw_symbol, file),
                 );
             }
         }
@@ -104,13 +117,14 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let result = if via_interface {
-        graph.callers_of_via_interface(&file_path, symbol, depth, include_mocks)
+        graph.callers_of_via_interface(&file_path, &symbol, depth, include_mocks)
     } else {
-        graph.callers_of(&file_path, symbol, depth)
+        graph.callers_of(&file_path, &symbol, depth)
     };
 
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
+            filter_callers_result(&mut result, exclude_tests);
             let text = result.render_text();
             let mut result_json = serde_json::to_value(&result).unwrap_or_default();
             if let Some(obj) = result_json.as_object_mut() {

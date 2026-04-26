@@ -6,9 +6,7 @@ use serde::Deserialize;
 
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::protocol::{RawRequest, Response};
-use crate::semantic_index::{
-    EmbeddingModel, is_onnx_runtime_unavailable, SemanticResult,
-};
+use crate::semantic_index::{is_onnx_runtime_unavailable, EmbeddingModel, SemanticResult};
 use crate::symbols::SymbolKind;
 
 const DEFAULT_TOP_K: usize = 10;

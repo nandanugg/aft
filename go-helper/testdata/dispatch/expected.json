@@ -17,6 +17,70 @@
   },
   {
     "caller": {
+      "file": "closure_interface_dispatch.go",
+      "line": 24,
+      "symbol": "RegisterClosureInterfaceMethod"
+    },
+    "callee": {
+      "file": "closure_interface_dispatch.go",
+      "symbol": "Serve",
+      "receiver": "example.com/dispatch.ClosureIfaceAlpha",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "/closure-interface",
+    "dispatched_via": "(*example.com/dispatch.ClosureIfaceMux).HandleFunc"
+  },
+  {
+    "caller": {
+      "file": "closure_interface_dispatch.go",
+      "line": 24,
+      "symbol": "RegisterClosureInterfaceMethod"
+    },
+    "callee": {
+      "file": "closure_interface_dispatch.go",
+      "symbol": "Serve",
+      "receiver": "example.com/dispatch.ClosureIfaceBeta",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "/closure-interface",
+    "dispatched_via": "(*example.com/dispatch.ClosureIfaceMux).HandleFunc"
+  },
+  {
+    "caller": {
+      "file": "closure_interface_dispatch.go",
+      "line": 24,
+      "symbol": "RegisterClosureInterfaceMethod"
+    },
+    "callee": {
+      "file": "closure_method_dispatch.go",
+      "symbol": "Serve",
+      "receiver": "example.com/dispatch.ClosureMethodHandler",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "/closure-interface",
+    "dispatched_via": "(*example.com/dispatch.ClosureIfaceMux).HandleFunc"
+  },
+  {
+    "caller": {
+      "file": "closure_method_dispatch.go",
+      "line": 16,
+      "symbol": "RegisterClosureMethod"
+    },
+    "callee": {
+      "file": "closure_method_dispatch.go",
+      "symbol": "Serve",
+      "receiver": "example.com/dispatch.ClosureMethodHandler",
+      "pkg": "example.com/dispatch"
+    },
+    "kind": "dispatches",
+    "nearby_string": "/closure-method",
+    "dispatched_via": "(*example.com/dispatch.ClosureMethodMux).HandleFunc"
+  },
+  {
+    "caller": {
       "file": "http.go",
       "line": 12,
       "symbol": "RegisterHTTPHandlers"

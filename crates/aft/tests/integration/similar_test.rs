@@ -22,9 +22,7 @@ fn configure_similarity(aft: &mut AftProcess) -> String {
 #[test]
 fn similar_without_configure_returns_error() {
     let mut aft = AftProcess::spawn();
-    let resp = aft.send(
-        r#"{"id":"1","command":"similar","file":"a.go","symbol":"Foo"}"#,
-    );
+    let resp = aft.send(r#"{"id":"1","command":"similar","file":"a.go","symbol":"Foo"}"#);
     assert_eq!(resp["success"], false);
     assert_eq!(resp["code"], "not_configured");
     aft.shutdown();
@@ -84,7 +82,9 @@ fn similar_returns_ranked_matches() {
     let query = &resp["query"];
     assert_eq!(query["symbol"], "SettleMerchantSettlement");
 
-    let matches = resp["matches"].as_array().expect("matches should be an array");
+    let matches = resp["matches"]
+        .as_array()
+        .expect("matches should be an array");
     assert!(!matches.is_empty(), "should return at least one match");
     assert!(matches.len() <= 5, "should respect top=5");
 
@@ -95,7 +95,9 @@ fn similar_returns_ranked_matches() {
         assert!(
             prev >= curr,
             "scores should be descending: {} vs {} at position {}",
-            prev, curr, i
+            prev,
+            curr,
+            i
         );
     }
 
@@ -114,7 +116,9 @@ fn similar_settlement_symbols_score_higher_than_payment() {
 
     assert_eq!(resp["success"], true, "similar failed: {:?}", resp);
 
-    let matches = resp["matches"].as_array().expect("matches should be an array");
+    let matches = resp["matches"]
+        .as_array()
+        .expect("matches should be an array");
 
     // Find highest-scoring settlement match and highest payment match
     let settlement_max = matches
@@ -122,7 +126,9 @@ fn similar_settlement_symbols_score_higher_than_payment() {
         .filter(|m| {
             m["symbol"]
                 .as_str()
-                .map(|s| s.to_lowercase().contains("settle") || s.to_lowercase().contains("settlement"))
+                .map(|s| {
+                    s.to_lowercase().contains("settle") || s.to_lowercase().contains("settlement")
+                })
                 .unwrap_or(false)
         })
         .map(|m| m["score"].as_f64().unwrap_or(0.0))
@@ -133,7 +139,9 @@ fn similar_settlement_symbols_score_higher_than_payment() {
         .filter(|m| {
             m["symbol"]
                 .as_str()
-                .map(|s| s.to_lowercase().contains("payment") && !s.to_lowercase().contains("settle"))
+                .map(|s| {
+                    s.to_lowercase().contains("payment") && !s.to_lowercase().contains("settle")
+                })
                 .unwrap_or(false)
         })
         .map(|m| m["score"].as_f64().unwrap_or(0.0))
@@ -164,7 +172,11 @@ fn similar_top_n_honored() {
 
     assert_eq!(resp["success"], true, "similar failed: {:?}", resp);
     let matches = resp["matches"].as_array().expect("matches");
-    assert!(matches.len() <= 2, "top=2 should limit results to 2, got {}", matches.len());
+    assert!(
+        matches.len() <= 2,
+        "top=2 should limit results to 2, got {}",
+        matches.len()
+    );
 
     aft.shutdown();
 }
@@ -212,7 +224,10 @@ fn similar_explain_includes_breakdown() {
         );
         let bd = &m["breakdown"];
         assert!(bd.get("lex").is_some(), "breakdown should have lex score");
-        assert!(bd.get("co_citation").is_some(), "breakdown should have co_citation score");
+        assert!(
+            bd.get("co_citation").is_some(),
+            "breakdown should have co_citation score"
+        );
     }
 
     aft.shutdown();
@@ -252,14 +267,21 @@ fn similar_dict_flag_works_with_synonyms_file() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "similar with dict=true failed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "similar with dict=true failed: {:?}",
+        resp
+    );
 
     let matches = resp["matches"].as_array().expect("matches");
     // Should still return ordered results; dict should not break anything
     for i in 1..matches.len() {
         let prev = matches[i - 1]["score"].as_f64().unwrap_or(0.0);
         let curr = matches[i]["score"].as_f64().unwrap_or(0.0);
-        assert!(prev >= curr, "scores should remain descending with dict=true");
+        assert!(
+            prev >= curr,
+            "scores should remain descending with dict=true"
+        );
     }
 
     aft.shutdown();

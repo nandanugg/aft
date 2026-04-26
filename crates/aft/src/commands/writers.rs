@@ -53,7 +53,14 @@ pub fn handle_writers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    ctx.drain_go_helper();
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = ctx.require_go_overlay(&req.id, "writers", &file_path) {
+        return resp;
+    }
+
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -64,11 +71,6 @@ pub fn handle_writers(req: &RawRequest, ctx: &AppContext) -> Response {
                 "writers: project not configured — send 'configure' first",
             );
         }
-    };
-
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
-        Err(resp) => return resp,
     };
 
     match graph.writers_of(&file_path, symbol) {

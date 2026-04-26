@@ -89,8 +89,8 @@ pub fn write(cache_dir: &Path, source: &Path, data: &FileCallData) -> io::Result
         size,
         data: data.clone(),
     };
-    let body = serde_json::to_string(&entry)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body =
+        serde_json::to_string(&entry).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let cache_file = cache_path(cache_dir, source);
     if let Some(parent) = cache_file.parent() {

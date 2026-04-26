@@ -44,7 +44,9 @@ pub fn handle_dispatches(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    ctx.drain_go_helper();
+    if let Some(resp) = ctx.require_go_overlay_project(&req.id, "dispatches") {
+        return resp;
+    }
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -63,10 +65,7 @@ pub fn handle_dispatches(req: &RawRequest, ctx: &AppContext) -> Response {
         // Flatten into a list of DispatchesResult, one per matched key.
         let results: Vec<DispatchesResult> = matches
             .into_iter()
-            .map(|(k, handlers)| DispatchesResult {
-                key: k,
-                handlers,
-            })
+            .map(|(k, handlers)| DispatchesResult { key: k, handlers })
             .collect();
         let text = results
             .iter()

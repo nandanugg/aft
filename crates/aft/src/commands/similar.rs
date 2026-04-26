@@ -130,15 +130,18 @@ pub fn handle_similar(req: &RawRequest, ctx: &AppContext) -> Response {
     // If co-citation is needed, enrich the index with live callgraph data
     // before running the query. We do a lightweight callee extraction pass.
     let working_index = if weights.2 > 0.0 {
-        enrich_with_callgraph(index, &file_path, symbol, ctx)
-            .unwrap_or_else(|| {
-                // Reload from context (enrich_with_callgraph consumes index)
-                get_or_build_index(ctx, &{
+        enrich_with_callgraph(index, &file_path, symbol, ctx).unwrap_or_else(|| {
+            // Reload from context (enrich_with_callgraph consumes index)
+            get_or_build_index(
+                ctx,
+                &{
                     let cfg = ctx.config();
                     cfg.project_root.clone().unwrap_or_default()
-                }, weights)
-                .expect("index should be available after we just loaded it")
-            })
+                },
+                weights,
+            )
+            .expect("index should be available after we just loaded it")
+        })
     } else {
         index
     };
@@ -214,12 +217,7 @@ fn enrich_with_callgraph(
     let target_callees: HashSet<String> = file_data
         .calls_by_symbol
         .get(symbol)
-        .map(|sites| {
-            sites
-                .iter()
-                .map(|site| site.callee_name.clone())
-                .collect()
-        })
+        .map(|sites| sites.iter().map(|site| site.callee_name.clone()).collect())
         .unwrap_or_default();
 
     if !target_callees.is_empty() {

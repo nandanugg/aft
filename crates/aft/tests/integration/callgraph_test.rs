@@ -399,6 +399,39 @@ fn callgraph_callers_recursive() {
     aft.shutdown();
 }
 
+#[test]
+fn callgraph_callers_exclude_tests_filters_test_files() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        root
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1,"exclude_tests":true}}"#,
+        root
+    ));
+
+    assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
+    let callers = resp["callers"].as_array().expect("callers array");
+    assert!(
+        !callers.iter().any(|group| {
+            group["file"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("test_helpers.ts")
+        }),
+        "exclude_tests=true should drop test_helpers.ts: {:?}",
+        callers
+    );
+
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // trace_to command
 // ---------------------------------------------------------------------------
@@ -1214,19 +1247,26 @@ fn callgraph_trace_data_reference_arg() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "trace_data should succeed: {:?}",
+        resp
+    );
     let hops = resp["hops"].as_array().expect("hops array");
 
-    let param_hop = hops.iter().find(|h| {
-        h["flow_type"] == "parameter" && h["symbol"] == "saveRef"
-    });
+    let param_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "parameter" && h["symbol"] == "saveRef");
     assert!(
         param_hop.is_some(),
         "expected parameter hop into saveRef for &u, got hops: {:?}",
         hops
     );
     let ph = param_hop.unwrap();
-    assert_eq!(ph["variable"], "user", "should map to saveRef's param 'user'");
+    assert_eq!(
+        ph["variable"], "user",
+        "should map to saveRef's param 'user'"
+    );
     assert_eq!(
         ph["approximate"], false,
         "reference arg is a direct flow, not approximate"
@@ -1247,12 +1287,16 @@ fn callgraph_trace_data_field_access_arg() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "trace_data should succeed: {:?}",
+        resp
+    );
     let hops = resp["hops"].as_array().expect("hops array");
 
-    let param_hop = hops.iter().find(|h| {
-        h["flow_type"] == "parameter" && h["symbol"] == "consumeString"
-    });
+    let param_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "parameter" && h["symbol"] == "consumeString");
     assert!(
         param_hop.is_some(),
         "expected parameter hop into consumeString for u.Name, got hops: {:?}",
@@ -1281,26 +1325,31 @@ fn callgraph_trace_data_struct_literal_assign() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "trace_data should succeed: {:?}",
+        resp
+    );
     let hops = resp["hops"].as_array().expect("hops array");
 
-    let assign_hop = hops.iter().find(|h| {
-        h["flow_type"] == "assignment" && h["variable"] == "w"
-    });
+    let assign_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "assignment" && h["variable"] == "w");
     assert!(
         assign_hop.is_some(),
         "expected assignment hop binding 'w' from struct literal, got hops: {:?}",
         hops
     );
     assert_eq!(
-        assign_hop.unwrap()["approximate"], true,
+        assign_hop.unwrap()["approximate"],
+        true,
         "struct-literal wrap is approximate"
     );
 
     // The new binding `w` should propagate to saveWrapper's parameter.
-    let param_hop = hops.iter().find(|h| {
-        h["flow_type"] == "parameter" && h["symbol"] == "saveWrapper"
-    });
+    let param_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "parameter" && h["symbol"] == "saveWrapper");
     assert!(
         param_hop.is_some(),
         "struct-lit-bound name should propagate to saveWrapper's param, got hops: {:?}",
@@ -1324,13 +1373,16 @@ fn callgraph_trace_data_pointer_write_intrinsic() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "trace_data should succeed: {:?}",
+        resp
+    );
     let hops = resp["hops"].as_array().expect("hops array");
 
     // Should produce a "writer" hop (approximate) binding `user`.
     let writer_hop = hops.iter().find(|h| {
-        h["variable"] == "user"
-            && (h["flow_type"] == "writer" || h["flow_type"] == "assignment")
+        h["variable"] == "user" && (h["flow_type"] == "writer" || h["flow_type"] == "assignment")
     });
     assert!(
         writer_hop.is_some(),
@@ -1339,9 +1391,9 @@ fn callgraph_trace_data_pointer_write_intrinsic() {
     );
 
     // Should propagate to consumeUser's parameter as a direct flow.
-    let param_hop = hops.iter().find(|h| {
-        h["flow_type"] == "parameter" && h["symbol"] == "consumeUser"
-    });
+    let param_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "parameter" && h["symbol"] == "consumeUser");
     assert!(
         param_hop.is_some(),
         "writer-bound 'user' should propagate to consumeUser, got hops: {:?}",
@@ -1364,12 +1416,16 @@ fn callgraph_trace_data_method_receiver() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "trace_data should succeed: {:?}",
+        resp
+    );
     let hops = resp["hops"].as_array().expect("hops array");
 
-    let recv_hop = hops.iter().find(|h| {
-        h["flow_type"] == "parameter" && h["symbol"] == "saveMethod"
-    });
+    let recv_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "parameter" && h["symbol"] == "saveMethod");
     assert!(
         recv_hop.is_some(),
         "expected parameter hop into saveMethod's receiver, got hops: {:?}",
@@ -1393,12 +1449,16 @@ fn callgraph_trace_data_field_write() {
         root
     ));
 
-    assert_eq!(resp["success"], true, "trace_data should succeed: {:?}", resp);
+    assert_eq!(
+        resp["success"], true,
+        "trace_data should succeed: {:?}",
+        resp
+    );
     let hops = resp["hops"].as_array().expect("hops array");
 
-    let fw_hop = hops.iter().find(|h| {
-        h["flow_type"] == "field_write" && h["symbol"] == "fieldWriteCase"
-    });
+    let fw_hop = hops
+        .iter()
+        .find(|h| h["flow_type"] == "field_write" && h["symbol"] == "fieldWriteCase");
     assert!(
         fw_hop.is_some(),
         "expected field_write hop for m.Account = name, got hops: {:?}",

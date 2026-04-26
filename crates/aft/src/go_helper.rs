@@ -299,7 +299,6 @@ pub fn is_false(v: &bool) -> bool {
     !*v
 }
 
-
 /// Probe whether `go` is on PATH. Cheap (`go env GOROOT` is fast and
 /// doesn't touch any modules).
 pub fn is_go_available() -> bool {
@@ -796,8 +795,14 @@ mod tests {
             context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
-        assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
-        assert!(!s.contains("dispatched_via"), "dispatched_via=None should be omitted: {s}");
+        assert!(
+            !s.contains("nearby_string"),
+            "nearby_string=None should be omitted: {s}"
+        );
+        assert!(
+            !s.contains("dispatched_via"),
+            "dispatched_via=None should be omitted: {s}"
+        );
     }
 
     #[test]
@@ -821,7 +826,10 @@ mod tests {
             context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
-        assert!(s.contains("nearby_string"), "nearby_string=Some should be present: {s}");
+        assert!(
+            s.contains("nearby_string"),
+            "nearby_string=Some should be present: {s}"
+        );
         assert!(s.contains("send-email"));
     }
 
@@ -835,7 +843,10 @@ mod tests {
         assert_eq!(out, again);
         // All edges should have nearby_string=None (old format)
         for e in &out.edges {
-            assert_eq!(e.nearby_string, None, "old-format edges should have no nearby_string");
+            assert_eq!(
+                e.nearby_string, None,
+                "old-format edges should have no nearby_string"
+            );
         }
     }
 
@@ -916,7 +927,10 @@ mod tests {
         };
         let s = serde_json::to_string(&edge).unwrap();
         assert!(s.contains("\"writes\""), "kind should be 'writes': {s}");
-        assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
+        assert!(
+            !s.contains("nearby_string"),
+            "nearby_string=None should be omitted: {s}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -986,7 +1000,10 @@ mod tests {
             context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
-        assert!(!s.contains("dispatched_via"), "dispatched_via=None should be omitted: {s}");
+        assert!(
+            !s.contains("dispatched_via"),
+            "dispatched_via=None should be omitted: {s}"
+        );
     }
 
     #[test]
@@ -1010,7 +1027,10 @@ mod tests {
             context: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
-        assert!(s.contains("dispatched_via"), "dispatched_via=Some should be present: {s}");
+        assert!(
+            s.contains("dispatched_via"),
+            "dispatched_via=Some should be present: {s}"
+        );
         assert!(s.contains("example.com/pkg.(*Mux).Register"));
     }
 

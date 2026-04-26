@@ -72,8 +72,7 @@ pub fn resolve_project_cache_dir(project_root: &Path) -> Option<PathBuf> {
 /// Compute a stable, short project identifier: first 12 hex chars of
 /// SHA-256(canonical_absolute_root).
 pub fn project_hash(project_root: &Path) -> String {
-    let canon = fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canon = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let root_str = canon.to_string_lossy();
     let mut hasher = Sha256::new();
     hasher.update(root_str.as_bytes());
@@ -164,8 +163,8 @@ fn iso8601_now() -> String {
 }
 
 pub fn write_meta(cache_dir: &Path, meta: &CacheMeta) -> io::Result<()> {
-    let data = serde_json::to_vec_pretty(meta)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let data =
+        serde_json::to_vec_pretty(meta).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     atomic_write(&cache_dir.join("meta.json"), &data)
 }
 
@@ -420,10 +419,7 @@ impl From<&ImportBlock> for SerImportBlock {
     fn from(b: &ImportBlock) -> Self {
         SerImportBlock {
             imports: b.imports.iter().map(SerImportStatement::from).collect(),
-            byte_range: b
-                .byte_range
-                .as_ref()
-                .map(|r| [r.start, r.end]),
+            byte_range: b.byte_range.as_ref().map(|r| [r.start, r.end]),
         }
     }
 }
@@ -515,12 +511,7 @@ impl From<&crate::callgraph::FileCallData> for SerFileCallData {
             calls_by_symbol: d
                 .calls_by_symbol
                 .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        v.iter().map(SerCallSite::from).collect(),
-                    )
-                })
+                .map(|(k, v)| (k.clone(), v.iter().map(SerCallSite::from).collect()))
                 .collect(),
             exported_symbols: d.exported_symbols.clone(),
             symbol_metadata: d
@@ -541,7 +532,12 @@ impl From<SerFileCallData> for crate::callgraph::FileCallData {
                 .calls_by_symbol
                 .into_iter()
                 .map(|(k, v)| {
-                    (k, v.into_iter().map(crate::callgraph::CallSite::from).collect())
+                    (
+                        k,
+                        v.into_iter()
+                            .map(crate::callgraph::CallSite::from)
+                            .collect(),
+                    )
                 })
                 .collect(),
             exported_symbols: d.exported_symbols,
@@ -731,7 +727,7 @@ pub fn read_helper_output(cache_dir: &Path) -> Option<Vec<u8>> {
 /// A single entry in the serialised reverse index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergedCallerEntry {
-    pub caller_file: String,   // relative path
+    pub caller_file: String, // relative path
     pub caller_symbol: String,
     pub line: u32,
     pub col: u32,
@@ -830,9 +826,7 @@ impl CacheManager {
     /// If the cache is disabled (via env or flag), all operations are no-ops
     /// and queries always miss.
     pub fn new(project_root: PathBuf, no_cache: bool) -> Self {
-        if no_cache
-            || std::env::var_os("AFT_DISABLE_CACHE").is_some_and(|v| v == "1")
-        {
+        if no_cache || std::env::var_os("AFT_DISABLE_CACHE").is_some_and(|v| v == "1") {
             return CacheManager {
                 cache_dir: None,
                 project_root,
@@ -986,8 +980,7 @@ impl CacheManager {
         }
         // Compute the current hash if not yet done
         if self.current_helper_hash.is_none() {
-            self.current_helper_hash =
-                Some(compute_helper_input_hash(&self.project_root));
+            self.current_helper_hash = Some(compute_helper_input_hash(&self.project_root));
         }
         match (&self.cached_helper_hash, &self.current_helper_hash) {
             (Some(cached), Some(current)) => cached != current,
@@ -998,8 +991,7 @@ impl CacheManager {
     /// Return the current helper-input-hash (computed lazily).
     pub fn current_helper_hash(&mut self) -> Option<String> {
         if self.current_helper_hash.is_none() {
-            self.current_helper_hash =
-                Some(compute_helper_input_hash(&self.project_root));
+            self.current_helper_hash = Some(compute_helper_input_hash(&self.project_root));
         }
         self.current_helper_hash.clone()
     }
@@ -1409,8 +1401,7 @@ mod tests {
     #[test]
     fn merged_graph_round_trip() {
         let (_d, cache) = tmp_cache();
-        let mut reverse: HashMap<String, HashMap<String, Vec<MergedCallerEntry>>> =
-            HashMap::new();
+        let mut reverse: HashMap<String, HashMap<String, Vec<MergedCallerEntry>>> = HashMap::new();
         reverse
             .entry("util.go".to_string())
             .or_default()

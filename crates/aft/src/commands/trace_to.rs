@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::query_support::{filter_trace_to_result, resolve_symbol_query};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -12,6 +13,8 @@ use crate::protocol::{RawRequest, Response};
 /// - `file` (string, required) — path to the source file containing the target symbol
 /// - `symbol` (string, required) — name of the symbol to trace to entry points
 /// - `depth` (number, optional, default 10) — maximum backward traversal depth
+/// - `exclude_tests` (bool, optional, default false) — when true, drops complete
+///   paths that pass through files that look like tests.
 ///
 /// Returns `TraceToResult` with fields: `target_symbol`, `target_file`,
 /// `paths` (array of top-down hops), `total_paths`, `entry_points_found`,
@@ -33,7 +36,7 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
+    let raw_symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Response::error(
@@ -50,8 +53,20 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_u64())
         .unwrap_or(10)
         .min(100) as usize;
+    let exclude_tests = req
+        .params
+        .get("exclude_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    ctx.drain_go_helper();
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = ctx.require_go_overlay(&req.id, "trace_to", &file_path) {
+        return resp;
+    }
+
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -63,23 +78,22 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+    let symbol = match resolve_symbol_query(ctx, &file_path, raw_symbol) {
+        Ok(symbol) => symbol,
+        Err(err) => return Response::error(&req.id, err.code(), err.to_string()),
     };
 
     // Build file data first to check if the symbol exists
     match graph.build_file(&file_path) {
         Ok(data) => {
-            let has_symbol = data.calls_by_symbol.contains_key(symbol)
-                || data.exported_symbols.contains(&symbol.to_string())
-                || data.symbol_metadata.contains_key(symbol);
+            let has_symbol = data.calls_by_symbol.contains_key(&symbol)
+                || data.exported_symbols.contains(&symbol)
+                || data.symbol_metadata.contains_key(&symbol);
             if !has_symbol {
                 return Response::error(
                     &req.id,
                     "symbol_not_found",
-                    format!("trace_to: symbol '{}' not found in {}", symbol, file),
+                    format!("trace_to: symbol '{}' not found in {}", raw_symbol, file),
                 );
             }
         }
@@ -88,8 +102,9 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.trace_to(&file_path, symbol, depth) {
-        Ok(result) => {
+    match graph.trace_to(&file_path, &symbol, depth) {
+        Ok(mut result) => {
+            filter_trace_to_result(&mut result, exclude_tests);
             let text = result.render_text();
             let mut result_json = serde_json::to_value(&result).unwrap_or_default();
             if let Some(obj) = result_json.as_object_mut() {

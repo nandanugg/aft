@@ -8,8 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AFT_ROOT="$(dirname "$SCRIPT_DIR")"
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
+ZSH_CONFIG_FILE="$HOME/.zshrc"
+FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+ENV_BLOCK_START="# >>> aft-go-helper >>>"
+ENV_BLOCK_END="# <<< aft-go-helper <<<"
 
 SESSION_REMINDER_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-reminder.sh"
+SESSION_END_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-end.sh"
+SESSION_RUNTIME_TEMPLATE="$AFT_ROOT/templates/aft-session-runtime.sh"
 DISCOVERY_GATE_TEMPLATE="$AFT_ROOT/templates/claude/aft-code-discovery-gate.sh"
 
 # Colors
@@ -21,6 +27,71 @@ NC='\033[0m' # No Color
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+escape_sed_replacement() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  printf '%s' "$value"
+}
+
+strip_managed_block() {
+  local file="$1"
+  local temp_file
+  temp_file="$(mktemp)"
+  if [ -f "$file" ]; then
+    awk -v start="$ENV_BLOCK_START" -v end="$ENV_BLOCK_END" '
+      $0 == start { in_block = 1; next }
+      $0 == end { in_block = 0; next }
+      !in_block { print }
+    ' "$file" > "$temp_file" || error "Failed to update $file"
+  fi
+  printf '%s' "$temp_file"
+}
+
+upsert_shell_helper_env() {
+  local helper_path="$1"
+  local file="$2"
+  local shell_kind="$3"
+  local temp_file
+  temp_file="$(strip_managed_block "$file")"
+  mkdir -p "$(dirname "$file")"
+  if [ -s "$temp_file" ]; then
+    printf '\n' >> "$temp_file"
+  fi
+  {
+    printf '%s\n' "$ENV_BLOCK_START"
+    if [ "$shell_kind" = "fish" ]; then
+      printf 'set -gx AFT_GO_HELPER_PATH "%s"\n' "$helper_path"
+    else
+      printf 'export AFT_GO_HELPER_PATH="%s"\n' "$helper_path"
+    fi
+    printf '%s\n' "$ENV_BLOCK_END"
+  } >> "$temp_file"
+  overwrite_file "$temp_file" "$file"
+}
+
+overwrite_file() {
+  local source="$1"
+  local target="$2"
+  if [ -e "$target" ] && cmp -s "$source" "$target"; then
+    rm -f "$source"
+    return 0
+  fi
+  cat "$source" > "$target"
+  rm -f "$source"
+}
+
+install_templated_file() {
+  local source="$1"
+  local target="$2"
+  local replacement="$3"
+  local escaped
+  escaped="$(escape_sed_replacement "$replacement")"
+  cp "$source" "$target"
+  sed -i '' "s|__AFT_BINARY_PATH__|$escaped|g" "$target"
+  chmod +x "$target"
+}
 
 # Check for required tools
 command -v jq &>/dev/null || error "jq is required but not installed. Install with: brew install jq"
@@ -50,13 +121,22 @@ if command -v go &>/dev/null; then
     fi
     cd "$AFT_ROOT"
 else
-    warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
-    GO_HELPER_BINARY=""
+    if [ -x "$GO_HELPER_BINARY" ]; then
+        info "Using existing aft-go-helper: $GO_HELPER_BINARY"
+    else
+        warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
+        GO_HELPER_BINARY=""
+    fi
 fi
 
 # Create directories
 mkdir -p "$HOOKS_DIR"
 info "Created hooks directory: $HOOKS_DIR"
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+    upsert_shell_helper_env "$GO_HELPER_BINARY" "$ZSH_CONFIG_FILE" "zsh"
+    upsert_shell_helper_env "$GO_HELPER_BINARY" "$FISH_CONFIG_FILE" "fish"
+    info "Configured AFT_GO_HELPER_PATH in $ZSH_CONFIG_FILE and $FISH_CONFIG_FILE"
+fi
 
 # Write aft CLI wrapper
 cat > "$HOOKS_DIR/aft" << 'WRAPPER_EOF'
@@ -121,6 +201,7 @@ call_aft() {
   local cmd="$1"
   local params="$2"
   local anchor="${3:-}"
+  local go_overlay_provider="${AFT_GO_OVERLAY_PROVIDER:-${AFT_GO_OVERLAY_BACKEND:-aft_go_sidecar}}"
 
   local work_dir
   if [ -n "$anchor" ]; then
@@ -134,7 +215,12 @@ call_aft() {
   # interface-dispatch edges. Without it, the helper thread gets killed
   # when aft exits right after answering the command — cache never gets
   # written, and cross-package interface calls stay unresolved.
-  local config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  local config_req
+  if [ -n "$go_overlay_provider" ]; then
+    config_req=$(jq -cn --arg root "$work_dir" --arg provider "$go_overlay_provider" '{id:"cfg",command:"configure",project_root:$root,go_overlay_provider:$provider,wait_for_helper:true}')
+  else
+    config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  fi
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
@@ -506,9 +592,11 @@ info "Installed hook script: $HOOKS_DIR/aft-hook.sh"
 # toward AFT semantic tools before it reaches for raw Grep/Glob/Read.
 # Modeled on codebase-memory-mcp's equivalent pair.
 if [ -f "$SESSION_REMINDER_TEMPLATE" ]; then
-    cp "$SESSION_REMINDER_TEMPLATE" "$HOOKS_DIR/aft-session-reminder.sh"
-    chmod +x "$HOOKS_DIR/aft-session-reminder.sh"
+    install_templated_file "$SESSION_RUNTIME_TEMPLATE" "$HOOKS_DIR/aft-session-runtime.sh" "$AFT_BINARY"
+    install_templated_file "$SESSION_REMINDER_TEMPLATE" "$HOOKS_DIR/aft-session-reminder.sh" "$AFT_BINARY"
+    install_templated_file "$SESSION_END_TEMPLATE" "$HOOKS_DIR/aft-session-end.sh" "$AFT_BINARY"
     info "Installed hook script: $HOOKS_DIR/aft-session-reminder.sh"
+    info "Installed hook script: $HOOKS_DIR/aft-session-end.sh"
 else
     warn "Missing template: $SESSION_REMINDER_TEMPLATE — skipping session reminder"
 fi
@@ -737,19 +825,32 @@ if [ -f "$SETTINGS_FILE" ]; then
         )) + [
           {
             "matcher": "startup",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
           },
           {
             "matcher": "resume",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
           },
           {
             "matcher": "clear",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
           },
           {
             "matcher": "compact",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
+          }
+        ]
+      ) |
+      .hooks.SessionEnd = (
+        ((.hooks.SessionEnd // []) | map(
+          . as $entry
+          | ($entry.hooks // [])
+              | map(select((.command // "") | contains("aft-session-end.sh")))
+              | length as $aft
+          | if $aft > 0 then empty else $entry end
+        )) + [
+          {
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-end.sh"), "timeout": 5}]
           }
         ]
       )
@@ -789,19 +890,24 @@ else
     "SessionStart": [
       {
         "matcher": "startup",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       },
       {
         "matcher": "resume",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       },
       {
         "matcher": "clear",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       },
       {
         "matcher": "compact",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-end.sh", "timeout": 5}]
       }
     ]
   }
@@ -835,12 +941,15 @@ echo ""
 echo "Installed files:"
 echo "  $HOOKS_DIR/aft                         - CLI wrapper"
 echo "  $HOOKS_DIR/aft-hook.sh                 - Grep/Glob interceptor (routes through AFT)"
-echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart reminder (AFT discovery protocol)"
+echo "  $HOOKS_DIR/aft-session-runtime.sh      - Shared session lifecycle helper"
+echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart prewarm + reminder"
+echo "  $HOOKS_DIR/aft-session-end.sh          - SessionEnd cleanup hook"
 echo "  $HOOKS_DIR/aft-code-discovery-gate.sh  - PreToolUse gate (nudges toward AFT tools once per session)"
 echo "  $CLAUDE_DIR/AFT.md                     - Claude instructions"
 echo "  $CLAUDE_DIR/settings.json              - Hook configuration"
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-    echo "  $GO_HELPER_BINARY - Go interface-dispatch resolver"
+  echo "  $GO_HELPER_BINARY - Go interface-dispatch resolver"
+  echo "  $ZSH_CONFIG_FILE / $FISH_CONFIG_FILE - AFT_GO_HELPER_PATH"
 fi
 echo ""
 echo "Usage:"
@@ -849,8 +958,9 @@ echo "  aft zoom file.ts func    # Inspect function"
 echo "  aft callers file.ts func # Find all callers"
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
     echo ""
-    echo "Go interface dispatch is enabled. AFT will automatically resolve"
-    echo "interface method calls to their concrete implementations in Go projects."
+echo "Go overlay queries now default to the warm AFT-Go sidecar."
+echo "SessionStart now prewarms the sidecar, and SessionEnd releases its lease."
+echo "Override with AFT_GO_OVERLAY_PROVIDER or AFT_GO_OVERLAY_BACKEND if needed."
 fi
 echo ""
 echo "Restart Claude Code to activate hooks."

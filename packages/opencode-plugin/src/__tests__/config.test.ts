@@ -146,6 +146,44 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain(`Config loaded from ${fixture.projectConfigPath}`);
   });
 
+  test("validates and loads go_overlay_provider", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        go_overlay_provider: "aft_go_sidecar",
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({
+      go_overlay_provider: "aft_go_sidecar",
+    });
+  });
+
+  test("rejects invalid go_overlay_provider values", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        go_overlay_provider: "bad-sidecar",
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({});
+    expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
+    expect(result.stderr).toContain("go_overlay_provider");
+  });
+
   test("loads semantic config block and propagates nested fields", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -212,6 +250,31 @@ describe("loadAftConfig", () => {
         base_url: "http://localhost:11434",
         model: "all-MiniLM-L6-v2",
       },
+    });
+  });
+
+  test("project go_overlay_provider overrides user value", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        go_overlay_provider: "aft_go_sidecar",
+      }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        go_overlay_provider: "sidecar",
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({
+      go_overlay_provider: "sidecar",
     });
   });
 

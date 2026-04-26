@@ -7,9 +7,13 @@ use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
 
 use crate::callgraph::CallGraph;
-use crate::config::{SemanticBackend, SemanticBackendConfig};
+use crate::config::{GoOverlayBackend, SemanticBackend, SemanticBackendConfig};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
 use crate::go_helper;
+use crate::go_overlay::{
+    load_available_snapshot, refresh_now, spawn_refresh, GoOverlayRequest, GoOverlayRuntimeConfig,
+    DEFAULT_GO_OVERLAY_TIMEOUT,
+};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir, walk_project_files, SearchIndex,
@@ -293,6 +297,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(v) = req.params.get("no_cache").and_then(|v| v.as_bool()) {
         ctx.config_mut().cache_enabled = !v;
     }
+    if let Some(v) = req
+        .params
+        .get("go_overlay_provider")
+        .and_then(|v| v.as_str())
+    {
+        let backend = match GoOverlayBackend::from_name(v) {
+            Some(backend) => backend,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!("configure: invalid go_overlay_provider: {v}"),
+                );
+            }
+        };
+        ctx.config_mut().go_overlay_backend = backend;
+    }
 
     // [similarity] config section
     if let Some(v) = req.params.get("similarity") {
@@ -560,12 +581,26 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     //      and let AppContext drain it lazily on first query.
     let helper_root = root_path.clone();
     let helper_cache = resolve_cache_dir(&root_path, storage_dir.as_deref());
+    let helper_runtime =
+        GoOverlayRuntimeConfig::new(ctx.config().go_overlay_backend, helper_cache.clone());
 
-    let had_cache = if let Some(cached) = go_helper::read_cached(&helper_cache, &root_path) {
+    let helper_request = GoOverlayRequest::new(
+        helper_root.clone(),
+        DEFAULT_GO_OVERLAY_TIMEOUT,
+        go_helper::HelperFlags {
+            no_call_context: !ctx.config().emit_call_context,
+            no_return_analysis: !ctx.config().emit_return_analysis,
+        },
+        ctx.config().go_overlay_backend,
+    );
+
+    let had_cache = if let Some(cached) = load_available_snapshot(&helper_runtime, &helper_request)
+    {
         log::info!(
-            "[aft] go-helper: loaded {} cached edges from {}",
-            cached.edges.len(),
-            helper_cache.display()
+            "[aft] go-helper: loaded {} cached edges from {} via {}",
+            cached.output.edges.len(),
+            helper_cache.display(),
+            cached.meta.provider_id
         );
         ctx.install_go_helper(cached);
         true
@@ -579,28 +614,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Build helper feature flags from config.
-    let helper_flags = go_helper::HelperFlags {
-        no_call_context: !ctx.config().emit_call_context,
-        no_return_analysis: !ctx.config().emit_return_analysis,
-    };
-
     if wait_for_helper && !had_cache {
         // CLI path: block for helper so same-process queries see resolved
-        // interface-dispatch edges. Bounded by the 60s timeout already in
+        // interface-dispatch edges. Bounded by the configured Go overlay timeout
         // run_helper (plus whatever packages.Load takes on cold cache).
-        match go_helper::resolve_for_root(
-            &helper_root,
-            std::time::Duration::from_secs(60),
-            helper_flags,
-        ) {
+        match refresh_now(&helper_runtime, &helper_request) {
             Ok(data) => {
                 log::info!(
-                    "[aft] go-helper: {} edges (sync), {} skipped pkgs",
-                    data.edges.len(),
-                    data.skipped.len()
+                    "[aft] go-helper: {} edges (sync), {} skipped pkgs via {}",
+                    data.output.edges.len(),
+                    data.output.skipped.len(),
+                    data.meta.provider_id
                 );
-                if let Err(e) = go_helper::write_cached(&helper_cache, &data) {
+                if let Err(e) = crate::go_overlay::write_cached_snapshot(&helper_cache, &data) {
                     log::debug!("[aft] go-helper cache write failed: {e}");
                 }
                 ctx.install_go_helper(data);
@@ -614,23 +640,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     } else {
         // Daemon path (or cache hit — still refresh for next time).
-        let helper_cache_bg = helper_cache.clone();
-        let helper_root_bg = helper_root.clone();
-        let (helper_tx, helper_rx) = unbounded();
-        *ctx.go_helper_rx().borrow_mut() = Some(helper_rx);
-        thread::spawn(move || {
-            let result = go_helper::resolve_for_root(
-                &helper_root_bg,
-                std::time::Duration::from_secs(60),
-                helper_flags,
-            );
-            if let Ok(ref out) = result {
-                if let Err(e) = go_helper::write_cached(&helper_cache_bg, out) {
-                    log::debug!("[aft] go-helper cache write failed: {e}");
-                }
-            }
-            let _ = helper_tx.send(result);
-        });
+        ctx.mark_go_overlay_refreshing();
+        *ctx.go_helper_rx().borrow_mut() = Some(spawn_refresh(
+            helper_runtime.clone(),
+            helper_request.clone(),
+        ));
     }
 
     // Drop old watcher/receiver before creating new ones (re-configure)

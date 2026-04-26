@@ -1,6 +1,7 @@
 use std::cell::{Ref, RefCell, RefMut};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use notify::RecommendedWatcher;
 
@@ -9,8 +10,13 @@ use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::go_helper::{HelperError, HelperOutput};
+use crate::go_overlay::{
+    refresh_now, spawn_refresh, GoOverlayRequest, GoOverlayRuntimeConfig, GoOverlaySnapshot,
+    GoOverlaySnapshotMeta, DEFAULT_GO_OVERLAY_TIMEOUT,
+};
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
+use crate::protocol::Response;
 use crate::search_index::SearchIndex;
 use crate::semantic_index::SemanticIndex;
 use crate::similarity::SimilarityIndex;
@@ -37,6 +43,13 @@ pub enum SemanticIndexEvent {
     },
     Ready(SemanticIndex),
     Failed(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GoOverlayState {
+    pub stale: bool,
+    pub refreshing: bool,
+    pub last_error: Option<String>,
 }
 
 /// Normalize a path by resolving `.` and `..` components lexically,
@@ -115,10 +128,17 @@ pub struct AppContext {
     /// the project has no `go.mod`). Consumers should drain
     /// `go_helper_rx` first to surface a freshly-completed run.
     go_helper_data: RefCell<Option<HelperOutput>>,
+    /// Metadata for the installed Go overlay snapshot. Rust remains the
+    /// answer surface, but the provider/cache identity is tracked here so
+    /// configure-time installs and attach-time checks have a home.
+    go_overlay_meta: RefCell<Option<GoOverlaySnapshotMeta>>,
+    /// Runtime freshness/health state for the Go overlay provider.
+    go_overlay_state: RefCell<GoOverlayState>,
     /// Receiver for an in-flight helper run. Sent value is the parsed
     /// output, or the error that prevented producing one — both are
     /// useful for diagnostics.
-    go_helper_rx: RefCell<Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>>,
+    go_helper_rx:
+        RefCell<Option<crossbeam_channel::Receiver<Result<GoOverlaySnapshot, HelperError>>>>,
 }
 
 impl AppContext {
@@ -140,6 +160,8 @@ impl AppContext {
             watcher_rx: RefCell::new(None),
             lsp_manager: RefCell::new(LspManager::new()),
             go_helper_data: RefCell::new(None),
+            go_overlay_meta: RefCell::new(None),
+            go_overlay_state: RefCell::new(GoOverlayState::default()),
             go_helper_rx: RefCell::new(None),
         }
     }
@@ -156,10 +178,16 @@ impl AppContext {
     /// cache hit lets us skip the async helper thread, and from
     /// `poll_go_helper` when the async result arrives. Updates both the
     /// AppContext's cached copy and the CallGraph's resolver.
-    pub fn install_go_helper(&self, data: HelperOutput) {
-        *self.go_helper_data.borrow_mut() = Some(data.clone());
+    pub fn install_go_helper(&self, snapshot: GoOverlaySnapshot) {
+        *self.go_overlay_meta.borrow_mut() = Some(snapshot.meta.clone());
+        *self.go_helper_data.borrow_mut() = Some(snapshot.output.clone());
+        *self.go_overlay_state.borrow_mut() = GoOverlayState {
+            stale: false,
+            refreshing: false,
+            last_error: None,
+        };
         if let Some(graph) = self.callgraph.borrow_mut().as_mut() {
-            graph.set_go_helper(data);
+            graph.set_go_helper(snapshot.output);
         }
     }
 
@@ -176,7 +204,7 @@ impl AppContext {
     /// they should call `go_helper_data` which drains it.
     pub fn go_helper_rx(
         &self,
-    ) -> &RefCell<Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>> {
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<Result<GoOverlaySnapshot, HelperError>>>> {
         &self.go_helper_rx
     }
 
@@ -204,13 +232,17 @@ impl AppContext {
             match result {
                 Ok(out) => {
                     log::info!(
-                        "[aft] go-helper: {} edges, {} skipped pkgs",
-                        out.edges.len(),
-                        out.skipped.len()
+                        "[aft] go-helper: {} edges, {} skipped pkgs via {}",
+                        out.output.edges.len(),
+                        out.output.skipped.len(),
+                        out.meta.provider_id
                     );
                     self.install_go_helper(out);
                 }
                 Err(err) => {
+                    let mut state = self.go_overlay_state.borrow_mut();
+                    state.refreshing = false;
+                    state.last_error = Some(err.to_string());
                     // Most variants are normal (no go.mod, no go on PATH,
                     // helper not installed). Log at debug so we don't
                     // spam stderr on every Rust/Python project.
@@ -223,6 +255,180 @@ impl AppContext {
     /// Access the language provider.
     pub fn provider(&self) -> &dyn LanguageProvider {
         self.provider.as_ref()
+    }
+
+    /// Metadata for the currently-installed Go overlay snapshot.
+    pub fn go_overlay_meta(&self) -> Ref<'_, Option<GoOverlaySnapshotMeta>> {
+        self.go_overlay_meta.borrow()
+    }
+
+    pub fn go_overlay_state(&self) -> Ref<'_, GoOverlayState> {
+        self.go_overlay_state.borrow()
+    }
+
+    pub fn mark_go_overlay_stale(&self) {
+        let mut state = self.go_overlay_state.borrow_mut();
+        state.stale = true;
+        state.last_error = None;
+    }
+
+    pub fn mark_go_overlay_refreshing(&self) {
+        let mut state = self.go_overlay_state.borrow_mut();
+        state.refreshing = true;
+        state.last_error = None;
+    }
+
+    pub fn ensure_go_overlay_ready(
+        &self,
+        file: &Path,
+        timeout: Duration,
+    ) -> Result<(), HelperError> {
+        if file.extension().and_then(|e| e.to_str()) != Some("go") {
+            self.poll_go_helper();
+            return Ok(());
+        }
+
+        self.ensure_go_overlay_for_current_project(timeout)
+    }
+
+    pub fn require_go_overlay_project(&self, req_id: &str, command: &str) -> Option<Response> {
+        match self.ensure_go_overlay_for_current_project(DEFAULT_GO_OVERLAY_TIMEOUT) {
+            Ok(()) => None,
+            Err(err) => Some(Response::error(
+                req_id,
+                "go_overlay_unavailable",
+                format!("{command}: fresh Go overlay unavailable: {err}"),
+            )),
+        }
+    }
+
+    fn ensure_go_overlay_for_current_project(&self, timeout: Duration) -> Result<(), HelperError> {
+        let root = self
+            .config()
+            .project_root
+            .clone()
+            .ok_or_else(|| HelperError::Io("project not configured".into()))?;
+        if !root.join("go.mod").is_file() {
+            self.poll_go_helper();
+            return Ok(());
+        }
+
+        self.wait_go_helper(timeout);
+        {
+            let state = self.go_overlay_state.borrow();
+            if !state.stale && self.go_helper_data.borrow().is_some() {
+                return Ok(());
+            }
+            if state.refreshing {
+                drop(state);
+                self.wait_go_helper(timeout);
+            }
+        }
+
+        if !self.go_overlay_state.borrow().stale && self.go_helper_data.borrow().is_some() {
+            return Ok(());
+        }
+
+        let request = match self.current_go_overlay_request(timeout) {
+            Some(request) => request,
+            None => return Ok(()),
+        };
+        let runtime = self.current_go_overlay_runtime().ok_or_else(|| {
+            HelperError::Io("go overlay runtime unavailable without project root".into())
+        })?;
+        self.mark_go_overlay_refreshing();
+        match refresh_now(&runtime, &request) {
+            Ok(snapshot) => {
+                self.install_go_helper(snapshot);
+                Ok(())
+            }
+            Err(err) => {
+                let mut state = self.go_overlay_state.borrow_mut();
+                state.refreshing = false;
+                state.last_error = Some(err.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    pub fn require_go_overlay(&self, req_id: &str, command: &str, file: &Path) -> Option<Response> {
+        match self.ensure_go_overlay_ready(file, DEFAULT_GO_OVERLAY_TIMEOUT) {
+            Ok(()) => None,
+            Err(err) => Some(Response::error(
+                req_id,
+                "go_overlay_unavailable",
+                format!("{command}: fresh Go overlay unavailable: {err}"),
+            )),
+        }
+    }
+
+    pub fn schedule_go_overlay_refresh(&self, timeout: Duration) {
+        if self.go_helper_rx.borrow().is_some() {
+            self.mark_go_overlay_stale();
+            return;
+        }
+        let Some(runtime) = self.current_go_overlay_runtime() else {
+            return;
+        };
+        let Some(request) = self.current_go_overlay_request(timeout) else {
+            return;
+        };
+        self.mark_go_overlay_stale();
+        self.mark_go_overlay_refreshing();
+        *self.go_helper_rx.borrow_mut() = Some(spawn_refresh(runtime, request));
+    }
+
+    fn current_go_overlay_runtime(&self) -> Option<GoOverlayRuntimeConfig> {
+        let config = self.config();
+        let root = config.project_root.clone()?;
+        let cache_dir =
+            crate::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
+        Some(GoOverlayRuntimeConfig::new(
+            config.go_overlay_backend,
+            cache_dir,
+        ))
+    }
+
+    fn current_go_overlay_request(&self, timeout: Duration) -> Option<GoOverlayRequest> {
+        let config = self.config();
+        let root = config.project_root.clone()?;
+        Some(GoOverlayRequest::new(
+            root,
+            timeout,
+            crate::go_helper::HelperFlags {
+                no_call_context: !config.emit_call_context,
+                no_return_analysis: !config.emit_return_analysis,
+            },
+            config.go_overlay_backend,
+        ))
+    }
+
+    fn wait_go_helper(&self, timeout: Duration) {
+        let result = {
+            let rx_ref = self.go_helper_rx.borrow();
+            match rx_ref.as_ref() {
+                Some(rx) => match rx.recv_timeout(timeout) {
+                    Ok(v) => Some(v),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Some(Err(
+                        HelperError::Io("helper thread disconnected without sending".into()),
+                    )),
+                },
+                None => None,
+            }
+        };
+        if let Some(result) = result {
+            *self.go_helper_rx.borrow_mut() = None;
+            match result {
+                Ok(out) => self.install_go_helper(out),
+                Err(err) => {
+                    let mut state = self.go_overlay_state.borrow_mut();
+                    state.refreshing = false;
+                    state.last_error = Some(err.to_string());
+                    log::debug!("[aft] go-helper wait failed: {err}");
+                }
+            }
+        }
     }
 
     /// Access the backup store.

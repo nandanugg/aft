@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/aft-session-runtime.sh"
+
+HOOK_JSON="$(cat)"
+aft_session_open "$HOOK_JSON" "codex"
+
 cat <<'EOF'
 CRITICAL - AFT Code Discovery Protocol:
 1. ALWAYS use AFT tools FIRST for code exploration in an indexed project:

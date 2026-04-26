@@ -63,6 +63,29 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoOverlayBackend {
+    LocalHelper,
+    AftGoSidecar,
+}
+
+impl GoOverlayBackend {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalHelper => "local_helper",
+            Self::AftGoSidecar => "aft_go_sidecar",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "local_helper" | "local" => Some(Self::LocalHelper),
+            "aft_go_sidecar" | "sidecar" | "aft-go-sidecar" => Some(Self::AftGoSidecar),
+            _ => None,
+        }
+    }
+}
+
 pub struct Config {
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
@@ -136,6 +159,10 @@ pub struct Config {
     /// Disabled by `--no-cache` CLI flag, `AFT_DISABLE_CACHE=1` env var, or
     /// `configure { "no_cache": true }` request param.
     pub cache_enabled: bool,
+    /// Go overlay producer backend. `LocalHelper` preserves the current one-shot
+    /// helper path. `AftGoSidecar` routes Go overlay refreshes through a warm
+    /// sidecar process while Rust remains the answer surface.
+    pub go_overlay_backend: GoOverlayBackend,
 }
 
 impl Default for Config {
@@ -182,6 +209,11 @@ impl Default for Config {
             cache_enabled: std::env::var("AFT_DISABLE_CACHE")
                 .map(|v| v != "1")
                 .unwrap_or(true),
+            go_overlay_backend: std::env::var("AFT_GO_OVERLAY_BACKEND")
+                .ok()
+                .as_deref()
+                .and_then(GoOverlayBackend::from_name)
+                .unwrap_or(GoOverlayBackend::LocalHelper),
         }
     }
 }

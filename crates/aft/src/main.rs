@@ -74,6 +74,7 @@ fn main() {
                 // when the background-built index replaces it.
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
+                ctx.drain_go_helper();
                 drain_watcher_events(&ctx);
                 drain_lsp_events(&ctx);
                 dispatch(req, &ctx)
@@ -133,6 +134,15 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
+        "go_overlay_session_open" => {
+            aft::commands::go_overlay_session::handle_go_overlay_session_open(&req, ctx)
+        }
+        "go_overlay_session_touch" => {
+            aft::commands::go_overlay_session::handle_go_overlay_session_touch(&req, ctx)
+        }
+        "go_overlay_session_close" => {
+            aft::commands::go_overlay_session::handle_go_overlay_session_close(&req, ctx)
+        }
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
         "similar" => aft::commands::similar::handle_similar(&req, ctx),
@@ -311,6 +321,42 @@ fn drain_watcher_events(ctx: &AppContext) {
                 }
             }
         }
+    }
+
+    let go_overlay_runtime = {
+        let config = ctx.config();
+        let Some(root) = config.project_root.clone() else {
+            log::info!("invalidated {} files", changed.len());
+            return;
+        };
+        let cache_dir = aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
+        let runtime =
+            aft::go_overlay::GoOverlayRuntimeConfig::new(config.go_overlay_backend, cache_dir);
+        let request = aft::go_overlay::GoOverlayRequest::new(
+            root,
+            aft::go_overlay::DEFAULT_GO_OVERLAY_TIMEOUT,
+            aft::go_helper::HelperFlags {
+                no_call_context: !config.emit_call_context,
+                no_return_analysis: !config.emit_return_analysis,
+            },
+            config.go_overlay_backend,
+        );
+        (runtime, request)
+    };
+    let invalidation = aft::go_overlay::build_invalidation(
+        &go_overlay_runtime.1.root,
+        &changed.iter().cloned().collect::<Vec<_>>(),
+    );
+    if invalidation.module_dirty || !invalidation.dirty_files.is_empty() {
+        ctx.mark_go_overlay_stale();
+        ctx.schedule_go_overlay_refresh(aft::go_overlay::DEFAULT_GO_OVERLAY_TIMEOUT);
+    }
+    if let Err(err) = aft::go_overlay::invalidate_provider(
+        &go_overlay_runtime.0,
+        &go_overlay_runtime.1,
+        &invalidation,
+    ) {
+        log::debug!("[aft] go-overlay invalidate failed: {err}");
     }
 
     log::info!("invalidated {} files", changed.len());

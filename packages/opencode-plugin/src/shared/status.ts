@@ -1,6 +1,18 @@
 export interface AftStatusSnapshot {
   version: string;
   project_root: string | null;
+  go_overlay: {
+    backend: string;
+    state: string;
+    provider_id: string | null;
+    provider_version: string | null;
+    schema_version: number | null;
+    feature_hash: string | null;
+    env_hash: string | null;
+    source_fingerprint: string | null;
+    produced_at: string | null;
+    last_error: string | null;
+  };
   features: {
     format_on_edit: boolean;
     validate_on_edit: string;
@@ -95,6 +107,7 @@ export function formatBytes(bytes: number): string {
 
 export function coerceAftStatus(response: Record<string, unknown>): AftStatusSnapshot {
   const features = asRecord(response.features);
+  const goOverlay = asRecord(response.go_overlay);
   const searchIndex = asRecord(response.search_index);
   const semanticIndex = asRecord(response.semantic_index);
   const semanticConfig = {
@@ -108,6 +121,18 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   return {
     version: readString(response.version, "unknown"),
     project_root: readNullableString(response.project_root),
+    go_overlay: {
+      backend: readString(goOverlay.backend, "unknown"),
+      state: readString(goOverlay.state, "unknown"),
+      provider_id: readNullableString(goOverlay.provider_id),
+      provider_version: readNullableString(goOverlay.provider_version),
+      schema_version: readOptionalNumber(goOverlay.schema_version),
+      feature_hash: readNullableString(goOverlay.feature_hash),
+      env_hash: readNullableString(goOverlay.env_hash),
+      source_fingerprint: readNullableString(goOverlay.source_fingerprint),
+      produced_at: readNullableString(goOverlay.produced_at),
+      last_error: readNullableString(goOverlay.last_error),
+    },
     features: {
       format_on_edit: readBoolean(features.format_on_edit),
       validate_on_edit: readString(features.validate_on_edit, "off"),
@@ -156,6 +181,8 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   const lines = [
     `AFT version: ${status.version}`,
     `Project root: ${status.project_root ?? "(not configured)"}`,
+    `Go overlay backend: ${status.go_overlay.backend}`,
+    `Go overlay state: ${status.go_overlay.state}`,
     "",
     "Enabled features",
     `- format_on_edit: ${formatFlag(status.features.format_on_edit)}`,
@@ -219,6 +246,22 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   if (status.semantic_index.error) {
     lines.push("", "Semantic error", status.semantic_index.error);
   }
+  if (status.go_overlay.provider_id || status.go_overlay.provider_version || status.go_overlay.schema_version != null) {
+    lines.push(
+      "",
+      "Go overlay metadata",
+      `- provider_id: ${status.go_overlay.provider_id ?? "(unknown)"}`,
+      `- provider_version: ${status.go_overlay.provider_version ?? "(unknown)"}`,
+      `- schema_version: ${formatCount(status.go_overlay.schema_version)}`,
+      `- feature_hash: ${status.go_overlay.feature_hash ?? "(unknown)"}`,
+      `- env_hash: ${status.go_overlay.env_hash ?? "(unknown)"}`,
+      `- source_fingerprint: ${status.go_overlay.source_fingerprint ?? "(unknown)"}`,
+      `- produced_at: ${status.go_overlay.produced_at ?? "(not ready)"}`,
+    );
+  }
+  if (status.go_overlay.last_error) {
+    lines.push("", "Go overlay error", status.go_overlay.last_error);
+  }
 
   return lines.join("\n");
 }
@@ -229,6 +272,8 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     "",
     `- **Version:** \`${status.version}\``,
     `- **Project root:** \`${status.project_root ?? "(not configured)"}\``,
+    `- **Go overlay backend:** \`${status.go_overlay.backend}\``,
+    `- **Go overlay state:** \`${status.go_overlay.state}\``,
     "",
     "### Enabled features",
     `- \`format_on_edit\`: ${formatFlag(status.features.format_on_edit)}`,
@@ -268,6 +313,26 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
 
   if (status.semantic_index.error) {
     lines.push(`- **Error:** ${status.semantic_index.error}`);
+  }
+  if (
+    status.go_overlay.provider_id ||
+    status.go_overlay.provider_version ||
+    status.go_overlay.schema_version != null
+  ) {
+    lines.push(
+      "",
+      "### Go overlay metadata",
+      `- **Provider id:** ${status.go_overlay.provider_id ?? "(unknown)"}`,
+      `- **Provider version:** ${status.go_overlay.provider_version ?? "(unknown)"}`,
+      `- **Schema version:** ${formatCount(status.go_overlay.schema_version)}`,
+      `- **Feature hash:** ${status.go_overlay.feature_hash ?? "(unknown)"}`,
+      `- **Env hash:** ${status.go_overlay.env_hash ?? "(unknown)"}`,
+      `- **Source fingerprint:** ${status.go_overlay.source_fingerprint ?? "(unknown)"}`,
+      `- **Produced at:** ${status.go_overlay.produced_at ?? "(not ready)"}`,
+    );
+  }
+  if (status.go_overlay.last_error) {
+    lines.push(`- **Go overlay error:** ${status.go_overlay.last_error}`);
   }
 
   lines.push(

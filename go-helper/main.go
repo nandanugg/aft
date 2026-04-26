@@ -31,6 +31,8 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/packages"
@@ -38,6 +40,10 @@ import (
 	"golang.org/x/tools/go/ssa/ssautil"
 	"golang.org/x/tools/go/types/typeutil"
 )
+
+const helperSchemaVersion = 1
+const sidecarProviderID = "aft-go-sidecar"
+const sidecarProviderVersion = "0.1.0"
 
 // implKey is used for deduplication of implements edges.
 type implKey struct {
@@ -69,19 +75,19 @@ type Target struct {
 // inside a defer, goroutine, loop body, or error-handling branch. Emitted
 // on every edge except "implements" (which has no call-site context).
 type CallContext struct {
-	InDefer      bool `json:"in_defer,omitempty"`
-	InGoroutine  bool `json:"in_goroutine,omitempty"`
-	InLoop       bool `json:"in_loop,omitempty"`
+	InDefer       bool `json:"in_defer,omitempty"`
+	InGoroutine   bool `json:"in_goroutine,omitempty"`
+	InLoop        bool `json:"in_loop,omitempty"`
 	InErrorBranch bool `json:"in_error_branch,omitempty"`
-	BranchDepth  int  `json:"branch_depth,omitempty"`
+	BranchDepth   int  `json:"branch_depth,omitempty"`
 }
 
 // ReturnSite describes one return statement in a function and the path
 // condition that must hold for execution to reach it.
 type ReturnSite struct {
-	Line               int    `json:"line"`
-	Value              string `json:"value"`
-	PathCondition      string `json:"path_condition"`
+	Line                int    `json:"line"`
+	Value               string `json:"value"`
+	PathCondition       string `json:"path_condition"`
 	PathConditionSimple bool   `json:"path_condition_simple"`
 }
 
@@ -140,6 +146,7 @@ type edgeKey struct {
 	callerLine   int
 	callerSymbol string
 	calleeFile   string
+	calleeRecv   string
 	calleeSymbol string
 	kind         string
 	nearbyString string
@@ -153,6 +160,8 @@ func main() {
 		noWritesFlag         = flag.Bool("no-writes", false, "disable emission of writes edges for package-level variables")
 		noCallContextFlag    = flag.Bool("no-call-context", false, "disable caller-context annotations on edges")
 		noReturnAnalysisFlag = flag.Bool("no-return-analysis", false, "disable per-return path-condition analysis")
+		sidecarMode          = flag.Bool("sidecar", false, "run as a long-lived JSON protocol sidecar")
+		sidecarInfoFile      = flag.String("sidecar-info-file", "", "write sidecar discovery metadata to JSON file once listening")
 	)
 	flag.Parse()
 
@@ -160,6 +169,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aft-go-helper: resolve root: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *sidecarMode {
+		if err := runSidecar(root, *sidecarInfoFile); err != nil {
+			fmt.Fprintf(os.Stderr, "aft-go-helper: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	out, err := analyze(root, !*noDispatchesFlag, !*noImplementsFlag, !*noWritesFlag, !*noCallContextFlag, !*noReturnAnalysisFlag)
@@ -249,7 +266,7 @@ func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites b
 	cg.DeleteSyntheticNodes()
 
 	out := &Output{
-		Version: 1,
+		Version: helperSchemaVersion,
 		Root:    root,
 		Edges:   nil,
 		Skipped: skipped,
@@ -282,7 +299,7 @@ func analyze(root string, emitDispatches bool, emitImplements bool, emitWrites b
 			if f.Synthetic != "" {
 				continue
 			}
-			emitDispatchGoroutineDefer(out, prog.Fset, root, f, fns, seen)
+			emitDispatchGoroutineDefer(out, prog.Fset, root, f, fns, calleesOf, seen)
 		}
 	}
 
@@ -523,6 +540,7 @@ func emitDispatchGoroutineDefer(
 	root string,
 	f *ssa.Function,
 	fns map[*ssa.Function]bool,
+	calleesOf func(ssa.CallInstruction) []*ssa.Function,
 	seen map[edgeKey]bool,
 ) {
 	callerSym := containingName(f)
@@ -543,7 +561,7 @@ func emitDispatchGoroutineDefer(
 
 			case ssa.CallInstruction:
 				// Regular call — scan args for function values being passed.
-				emitDispatchesFromCall(out, fset, root, f, callerSym, v, fns, seen)
+				emitDispatchesFromCall(out, fset, root, f, callerSym, v, fns, calleesOf, seen)
 			}
 		}
 	}
@@ -606,6 +624,7 @@ func emitGoOrDeferEdge(
 		if calleeSym == "" {
 			continue
 		}
+		recv := funcReceiverText(callee)
 
 		calleeFile := funcFile(fset, root, callee)
 		if calleeFile == "" {
@@ -647,6 +666,7 @@ func emitGoOrDeferEdge(
 			callerLine:   callerLine,
 			callerSymbol: callerSym,
 			calleeFile:   calleeFile,
+			calleeRecv:   recv,
 			calleeSymbol: calleeSym,
 			kind:         kind,
 			nearbyString: nearby,
@@ -656,7 +676,6 @@ func emitGoOrDeferEdge(
 		}
 		seen[key] = true
 
-		recv := funcReceiverText(callee)
 		pkg := ""
 		if callee.Pkg != nil && callee.Pkg.Pkg != nil {
 			pkg = callee.Pkg.Pkg.Path()
@@ -698,6 +717,7 @@ func emitDispatchesFromCall(
 	callerSym string,
 	site ssa.CallInstruction,
 	fns map[*ssa.Function]bool,
+	calleesOf func(ssa.CallInstruction) []*ssa.Function,
 	seen map[edgeKey]bool,
 ) {
 	common := site.Common()
@@ -732,11 +752,14 @@ func emitDispatchesFromCall(
 		// ADR-0001-dispatch-edges.md §1.1). Zero or ≥2 in-project calls is
 		// genuinely ambiguous — drop.
 		if fn.Parent() != nil {
-			resolved := resolveClosureTarget(fn, fns, callerFn.Prog, root)
-			if resolved == nil {
+			resolved := resolveClosureTargets(fn, fns, callerFn.Prog, root, calleesOf)
+			if len(resolved) == 0 {
 				continue
 			}
-			fn = resolved
+			for _, target := range resolved {
+				dispatched = append(dispatched, dispatchArg{fn: target, idx: i})
+			}
+			continue
 		}
 		// Skip synthetic functions.
 		if fn.Synthetic != "" {
@@ -792,6 +815,7 @@ func emitDispatchesFromCall(
 		if calleeSym == "" {
 			continue
 		}
+		recv := funcReceiverText(callee)
 		calleeFile := funcFile(fset, root, callee)
 		if calleeFile == "" {
 			continue
@@ -802,6 +826,7 @@ func emitDispatchesFromCall(
 			callerLine:   callerLine,
 			callerSymbol: callerSym,
 			calleeFile:   calleeFile,
+			calleeRecv:   recv,
 			calleeSymbol: calleeSym,
 			kind:         "dispatches",
 			nearbyString: nearby,
@@ -811,7 +836,6 @@ func emitDispatchesFromCall(
 		}
 		seen[key] = true
 
-		recv := funcReceiverText(callee)
 		pkg := ""
 		if callee.Pkg != nil && callee.Pkg.Pkg != nil {
 			pkg = callee.Pkg.Pkg.Path()
@@ -854,28 +878,39 @@ func extractFuncValue(val ssa.Value) (*ssa.Function, bool) {
 	}
 }
 
-// resolveClosureTarget returns the single named in-project function that a
-// closure body dispatches to, if unambiguous. This supports the idiomatic
+// resolveClosureTargets returns the named in-project functions that a closure
+// body dispatches to, if unambiguous. This supports the idiomatic
 // registration pattern:
 //
 //	mux.HandleFunc("Type", func(ctx, task) error { return HandleXTask(ctx, task) })
 //
 // where the second argument is an anonymous lambda whose only purpose is to
 // forward to a real handler. Counting rules:
-//   - Only calls to named in-project functions (static call target, declared
-//     under project `root`) are counted. `fns` alone is insufficient because
-//     it also includes functions from monorepo-module-cache packages that
-//     happen to be loaded; we must additionally verify the callee's source
-//     file lives under `root`.
-//   - Exactly one distinct such callee → return it.
-//   - Zero or ≥2 distinct → return nil (drop the dispatch edge; ambiguous).
+//   - Only calls to named in-project functions are counted. `fns` alone is
+//     insufficient because it also includes functions from module-cache
+//     packages that happen to be loaded; we additionally verify that the
+//     callee's source file lives under `root`.
+//   - Exactly one top-level call site with one or more named in-project
+//     callees → return the distinct callee set for that call site.
+//   - Zero or ≥2 distinct top-level call sites with in-project callees →
+//     return nil (drop the dispatch edge; ambiguous).
 //   - Calls in nested closures inside the lambda are NOT recursed; only the
 //     top-level body is inspected. That keeps the heuristic conservative.
-func resolveClosureTarget(closure *ssa.Function, fns map[*ssa.Function]bool, prog *ssa.Program, root string) *ssa.Function {
+func resolveClosureTargets(
+	closure *ssa.Function,
+	fns map[*ssa.Function]bool,
+	prog *ssa.Program,
+	root string,
+	calleesOf func(ssa.CallInstruction) []*ssa.Function,
+) []*ssa.Function {
 	if closure == nil || closure.Parent() == nil {
 		return nil
 	}
-	var found *ssa.Function
+	if calleesOf == nil {
+		return nil
+	}
+	found := make(map[*ssa.Function]bool)
+	resolvedSites := 0
 	for _, b := range closure.Blocks {
 		for _, instr := range b.Instrs {
 			call, ok := instr.(ssa.CallInstruction)
@@ -886,37 +921,49 @@ func resolveClosureTarget(closure *ssa.Function, fns map[*ssa.Function]bool, pro
 			if common == nil {
 				continue
 			}
-			// Static callee only. Method/interface dispatch doesn't resolve
-			// to a single named function.
-			fn, ok := common.Value.(*ssa.Function)
-			if !ok || fn == nil {
+			var siteTargets []*ssa.Function
+			for _, fn := range calleesOf(call) {
+				if fn == nil || fn.Parent() != nil || fn.Synthetic != "" {
+					continue
+				}
+				if fn.Pos() == token.NoPos {
+					continue
+				}
+				pos := prog.Fset.Position(fn.Pos())
+				if pos.Filename == "" {
+					continue
+				}
+				if _, ok := relPath(root, pos.Filename); !ok {
+					continue
+				}
+				if !fns[fn] {
+					continue
+				}
+				siteTargets = append(siteTargets, fn)
+			}
+			if len(siteTargets) == 0 {
 				continue
 			}
-			if fn.Parent() != nil || fn.Synthetic != "" {
-				continue
-			}
-			// Must live under the project root (not module cache / vendored).
-			if fn.Pos() == token.NoPos {
-				continue
-			}
-			pos := prog.Fset.Position(fn.Pos())
-			if pos.Filename == "" {
-				continue
-			}
-			if _, ok := relPath(root, pos.Filename); !ok {
-				continue
-			}
-			if !fns[fn] {
-				continue
-			}
-			if found != nil && found != fn {
-				// Ambiguous — two different in-project calls.
+			resolvedSites++
+			if resolvedSites > 1 {
 				return nil
 			}
-			found = fn
+			for _, fn := range siteTargets {
+				found[fn] = true
+			}
 		}
 	}
-	return found
+	if resolvedSites != 1 || len(found) == 0 {
+		return nil
+	}
+	out := make([]*ssa.Function, 0, len(found))
+	for fn := range found {
+		out = append(out, fn)
+	}
+	slices.SortFunc(out, func(a, b *ssa.Function) int {
+		return strings.Compare(a.String(), b.String())
+	})
+	return out
 }
 
 // resolveStringConst resolves val to a string constant, unwrapping type
@@ -1107,6 +1154,7 @@ func emitEdge(out *Output, fset *token.FileSet, root string, e *callgraph.Edge, 
 		callerLine:   p.Line,
 		callerSymbol: callerSym,
 		calleeFile:   calleeFile,
+		calleeRecv:   calleeRecv,
 		calleeSymbol: calleeSym,
 		kind:         kind,
 		nearbyString: "",

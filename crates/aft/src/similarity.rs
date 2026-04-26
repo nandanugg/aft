@@ -208,7 +208,12 @@ impl SparseVec {
 
     /// Sort by id (required for dot product correctness).
     pub fn sort_by_id(&mut self) {
-        let mut pairs: Vec<(u32, f32)> = self.ids.iter().copied().zip(self.weights.iter().copied()).collect();
+        let mut pairs: Vec<(u32, f32)> = self
+            .ids
+            .iter()
+            .copied()
+            .zip(self.weights.iter().copied())
+            .collect();
         pairs.sort_unstable_by_key(|(id, _)| *id);
         self.ids = pairs.iter().map(|(id, _)| *id).collect();
         self.weights = pairs.iter().map(|(_, w)| *w).collect();
@@ -366,10 +371,7 @@ impl SimilarityIndex {
     ///
     /// `symbols`: iterator of `(SymbolRef, callees)` where callees are
     /// `file::symbol` strings for co-citation.
-    pub fn build(
-        symbol_data: Vec<(SymbolRef, HashSet<String>)>,
-        synonyms: SynonymDict,
-    ) -> Self {
+    pub fn build(symbol_data: Vec<(SymbolRef, HashSet<String>)>, synonyms: SynonymDict) -> Self {
         let n = symbol_data.len();
 
         // Step 1: tokenize + stem each symbol identifier
@@ -424,9 +426,7 @@ impl SimilarityIndex {
         let mut vectors: HashMap<SymbolRef, SparseVec> = HashMap::new();
         let mut symbol_tokens: HashMap<SymbolRef, Vec<String>> = HashMap::new();
 
-        for (i, ((sym_ref, stems), tf_map)) in
-            symbol_stems.iter().zip(tf_maps.iter()).enumerate()
-        {
+        for (i, ((sym_ref, stems), tf_map)) in symbol_stems.iter().zip(tf_maps.iter()).enumerate() {
             let _ = i;
             let mut vec = SparseVec::new();
             for (&id, &tf) in tf_map {
@@ -752,23 +752,36 @@ pub fn query(index: &SimilarityIndex, q: &SimilarityQuery) -> Result<SimilarityR
 
     // Build target token list for explain
     let target_tokens: Vec<TargetToken> = if q.explain {
-        let stems = index.symbol_tokens.get(&actual_target_ref).cloned().unwrap_or_default();
+        let stems = index
+            .symbol_tokens
+            .get(&actual_target_ref)
+            .cloned()
+            .unwrap_or_default();
         // Reconstruct per-token TF-IDF from the normalized vector by looking up ids
         // We'll use the raw weights (already normalized) with original idf values
         let mut tt = Vec::new();
         for stem in &stems {
             if let Some(&id) = index.vocab.get(stem.as_str()) {
-                let w = target_vec.weights.iter()
+                let w = target_vec
+                    .weights
+                    .iter()
                     .zip(target_vec.ids.iter())
                     .find(|(_, &vid)| vid == id)
                     .map(|(w, _)| *w)
                     .unwrap_or(0.0);
                 if w > 1e-10 {
-                    tt.push(TargetToken { token: stem.clone(), tfidf: w });
+                    tt.push(TargetToken {
+                        token: stem.clone(),
+                        tfidf: w,
+                    });
                 }
             }
         }
-        tt.sort_by(|a, b| b.tfidf.partial_cmp(&a.tfidf).unwrap_or(std::cmp::Ordering::Equal));
+        tt.sort_by(|a, b| {
+            b.tfidf
+                .partial_cmp(&a.tfidf)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         tt
     } else {
         Vec::new()
@@ -838,11 +851,7 @@ pub fn query(index: &SimilarityIndex, q: &SimilarityQuery) -> Result<SimilarityR
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                a.file
-                    .cmp(&b.file)
-                    .then_with(|| a.symbol.cmp(&b.symbol))
-            })
+            .then_with(|| a.file.cmp(&b.file).then_with(|| a.symbol.cmp(&b.symbol)))
     });
 
     scored.truncate(q.top);
@@ -911,7 +920,11 @@ fn build_contributors(
         .map(|(s, &id)| (id, s.as_str()))
         .collect();
 
-    let target_stems = index.symbol_tokens.get(target_ref).cloned().unwrap_or_default();
+    let target_stems = index
+        .symbol_tokens
+        .get(target_ref)
+        .cloned()
+        .unwrap_or_default();
 
     let mut contributors: Vec<TokenContributor> = Vec::new();
 
@@ -973,12 +986,18 @@ mod tests {
 
     #[test]
     fn tokenize_camel_case() {
-        assert_eq!(tok("calculateSettlementFee"), vec!["calculate", "settlement", "fee"]);
+        assert_eq!(
+            tok("calculateSettlementFee"),
+            vec!["calculate", "settlement", "fee"]
+        );
     }
 
     #[test]
     fn tokenize_snake_case() {
-        assert_eq!(tok("calculate_settlement_fee"), vec!["calculate", "settlement", "fee"]);
+        assert_eq!(
+            tok("calculate_settlement_fee"),
+            vec!["calculate", "settlement", "fee"]
+        );
     }
 
     #[test]
@@ -990,18 +1009,33 @@ mod tests {
     fn tokenize_acronym_http_handler() {
         let tokens = tok("HTTPHandler");
         // Should split: HTTP, Handler → [http, handler]
-        assert!(tokens.contains(&"http".to_string()), "expected 'http' in {:?}", tokens);
-        assert!(tokens.contains(&"handler".to_string()), "expected 'handler' in {:?}", tokens);
+        assert!(
+            tokens.contains(&"http".to_string()),
+            "expected 'http' in {:?}",
+            tokens
+        );
+        assert!(
+            tokens.contains(&"handler".to_string()),
+            "expected 'handler' in {:?}",
+            tokens
+        );
     }
 
     #[test]
     fn tokenize_acronym_json_parse() {
         let tokens = tok("JSONParse");
-        assert!(tokens.contains(&"json".to_string()) || tokens.contains(&"jsonpars".to_string()),
-            "got {:?}", tokens);
+        assert!(
+            tokens.contains(&"json".to_string()) || tokens.contains(&"jsonpars".to_string()),
+            "got {:?}",
+            tokens
+        );
         // At minimum we should have "parse" split
         let joined = tokens.join(",");
-        assert!(joined.contains("pars") || joined.contains("parse"), "got {:?}", tokens);
+        assert!(
+            joined.contains("pars") || joined.contains("parse"),
+            "got {:?}",
+            tokens
+        );
     }
 
     #[test]
@@ -1009,8 +1043,16 @@ mod tests {
         // V3, OAuth2, SHA256 — numbers stay attached in token
         let tokens = tok("processEarlySettlementV3");
         assert!(tokens.contains(&"process".to_string()), "got {:?}", tokens);
-        assert!(tokens.contains(&"earli".to_string()) || tokens.contains(&"early".to_string()), "got {:?}", tokens);
-        assert!(tokens.contains(&"settlement".to_string()), "got {:?}", tokens);
+        assert!(
+            tokens.contains(&"earli".to_string()) || tokens.contains(&"early".to_string()),
+            "got {:?}",
+            tokens
+        );
+        assert!(
+            tokens.contains(&"settlement".to_string()),
+            "got {:?}",
+            tokens
+        );
     }
 
     #[test]
@@ -1042,9 +1084,16 @@ mod tests {
     #[test]
     fn tokenize_mixed_case_snake() {
         let tokens = tok("getMerchant_byID");
-        assert!(tokens.contains(&"get".to_string()) || tokens.contains(&"getmerchant".to_string()),
-            "got {:?}", tokens);
-        assert!(tokens.contains(&"merchant".to_string()) || tokens.len() >= 2, "got {:?}", tokens);
+        assert!(
+            tokens.contains(&"get".to_string()) || tokens.contains(&"getmerchant".to_string()),
+            "got {:?}",
+            tokens
+        );
+        assert!(
+            tokens.contains(&"merchant".to_string()) || tokens.len() >= 2,
+            "got {:?}",
+            tokens
+        );
     }
 
     // --- Layer 2: stemmer integration ---
@@ -1070,7 +1119,11 @@ mod tests {
         let s1 = stem_token("disburse");
         let s2 = stem_token("disbursement");
         // Both should stem to "disburs" or similar
-        assert_eq!(s1, s2, "disburse/disbursement should have same stem, got: {:?} vs {:?}", s1, s2);
+        assert_eq!(
+            s1, s2,
+            "disburse/disbursement should have same stem, got: {:?} vs {:?}",
+            s1, s2
+        );
     }
 
     #[test]
@@ -1094,10 +1147,16 @@ mod tests {
         // Build a corpus: 100 symbols where only 1 has "settle", 50 have "handle"
         let mut symbol_data: Vec<(SymbolRef, HashSet<String>)> = Vec::new();
         for i in 0..50 {
-            symbol_data.push((make_symbol("a.go", &format!("handleFoo{}", i)), HashSet::new()));
+            symbol_data.push((
+                make_symbol("a.go", &format!("handleFoo{}", i)),
+                HashSet::new(),
+            ));
         }
         for i in 50..99 {
-            symbol_data.push((make_symbol("a.go", &format!("handleBar{}", i)), HashSet::new()));
+            symbol_data.push((
+                make_symbol("a.go", &format!("handleBar{}", i)),
+                HashSet::new(),
+            ));
         }
         symbol_data.push((make_symbol("a.go", "settleMerchant"), HashSet::new()));
 
@@ -1124,7 +1183,10 @@ mod tests {
     #[test]
     fn tfidf_vectors_unit_length() {
         let symbol_data = vec![
-            (make_symbol("a.go", "calculateSettlementFee"), HashSet::new()),
+            (
+                make_symbol("a.go", "calculateSettlementFee"),
+                HashSet::new(),
+            ),
             (make_symbol("b.go", "processPayment"), HashSet::new()),
             (make_symbol("c.go", "handleRequest"), HashSet::new()),
         ];
@@ -1156,7 +1218,11 @@ mod tests {
 
         if let (Some(va), Some(vb)) = (index.vectors.get(&a), index.vectors.get(&b)) {
             let sim = va.dot(vb);
-            assert!(sim > 0.99, "identical tokens should have sim ~1.0, got {}", sim);
+            assert!(
+                sim > 0.99,
+                "identical tokens should have sim ~1.0, got {}",
+                sim
+            );
         }
 
         // Also verify different symbols have lower similarity than identical ones
@@ -1164,7 +1230,11 @@ mod tests {
         let c = make_symbol("c.go", "unrelatedMethod");
         if let (Some(va), Some(vc)) = (index.vectors.get(&a), index.vectors.get(&c)) {
             let sim_diff = va.dot(vc);
-            assert!(sim_diff < 0.9, "different symbols should have sim < 0.9, got {}", sim_diff);
+            assert!(
+                sim_diff < 0.9,
+                "different symbols should have sim < 0.9, got {}",
+                sim_diff
+            );
         }
     }
 
@@ -1182,7 +1252,8 @@ mod tests {
 [groups]
 settlement = ["payout", "disburse", "settle"]
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let dict = SynonymDict::load(dir.path());
         assert!(!dict.is_empty());
@@ -1192,11 +1263,19 @@ settlement = ["payout", "disburse", "settle"]
         let settlement_stem = stem_token("settlement");
         let syns = dict.synonyms_of(&settle_stem);
         // The dict should have at least some synonym entries
-        assert!(!syns.is_empty(), "expected synonyms for '{}', got empty", settle_stem);
+        assert!(
+            !syns.is_empty(),
+            "expected synonyms for '{}', got empty",
+            settle_stem
+        );
 
         // Bidirectional: settlement → settle
         let syns2 = dict.synonyms_of(&settlement_stem);
-        assert!(!syns2.is_empty(), "expected synonyms for '{}', got empty", settlement_stem);
+        assert!(
+            !syns2.is_empty(),
+            "expected synonyms for '{}', got empty",
+            settlement_stem
+        );
     }
 
     #[test]
@@ -1270,11 +1349,26 @@ settlement = ["payout", "disburse", "settle"]
     #[test]
     fn query_returns_ranked_matches() {
         let symbol_data = vec![
-            (make_symbol("merchant_settlement/service.go", "SettleMerchantSettlement"), HashSet::new()),
-            (make_symbol("early_settlement/service.go", "processEarlySettlementV3"), HashSet::new()),
-            (make_symbol("realtime/service.go", "settleRealtime"), HashSet::new()),
-            (make_symbol("payment/service.go", "processPayment"), HashSet::new()),
-            (make_symbol("handler/http.go", "handleRequest"), HashSet::new()),
+            (
+                make_symbol("merchant_settlement/service.go", "SettleMerchantSettlement"),
+                HashSet::new(),
+            ),
+            (
+                make_symbol("early_settlement/service.go", "processEarlySettlementV3"),
+                HashSet::new(),
+            ),
+            (
+                make_symbol("realtime/service.go", "settleRealtime"),
+                HashSet::new(),
+            ),
+            (
+                make_symbol("payment/service.go", "processPayment"),
+                HashSet::new(),
+            ),
+            (
+                make_symbol("handler/http.go", "handleRequest"),
+                HashSet::new(),
+            ),
         ];
 
         let index = SimilarityIndex::build(symbol_data, SynonymDict::default());
@@ -1303,22 +1397,23 @@ settlement = ["payout", "disburse", "settle"]
             );
         }
         // Settlement-related symbols should score higher than handleRequest
-        let settle_match = result.matches.iter().find(|m| m.symbol.contains("Settle") || m.symbol.contains("settle"));
+        let settle_match = result
+            .matches
+            .iter()
+            .find(|m| m.symbol.contains("Settle") || m.symbol.contains("settle"));
         let handle_match = result.matches.iter().find(|m| m.symbol.contains("handle"));
         if let (Some(s), Some(h)) = (settle_match, handle_match) {
-            assert!(s.score >= h.score, "settlement symbols should score higher than handle");
+            assert!(
+                s.score >= h.score,
+                "settlement symbols should score higher than handle"
+            );
         }
     }
 
     #[test]
     fn query_top_n_honored() {
         let symbol_data: Vec<(SymbolRef, HashSet<String>)> = (0..20)
-            .map(|i| {
-                (
-                    make_symbol("a.go", &format!("settle{}", i)),
-                    HashSet::new(),
-                )
-            })
+            .map(|i| (make_symbol("a.go", &format!("settle{}", i)), HashSet::new()))
             .collect();
         let index = SimilarityIndex::build(symbol_data, SynonymDict::default());
 
@@ -1333,14 +1428,21 @@ settlement = ["payout", "disburse", "settle"]
         };
 
         let result = query(&index, &q).unwrap();
-        assert!(result.matches.len() <= 5, "should respect top=5, got {}", result.matches.len());
+        assert!(
+            result.matches.len() <= 5,
+            "should respect top=5, got {}",
+            result.matches.len()
+        );
     }
 
     #[test]
     fn query_min_score_filters() {
         let symbol_data = vec![
             (make_symbol("a.go", "settleA"), HashSet::new()),
-            (make_symbol("b.go", "somethingCompletelyDifferent"), HashSet::new()),
+            (
+                make_symbol("b.go", "somethingCompletelyDifferent"),
+                HashSet::new(),
+            ),
         ];
         let index = SimilarityIndex::build(symbol_data, SynonymDict::default());
 
@@ -1349,7 +1451,7 @@ settlement = ["payout", "disburse", "settle"]
             symbol: "settleA".to_string(),
             top: 10,
             use_dict: false,
-            min_score: 0.9,  // very high threshold
+            min_score: 0.9, // very high threshold
             explain: false,
             weights: (0.85, 0.0, 0.15),
         };
@@ -1381,7 +1483,11 @@ settlement = ["payout", "disburse", "settle"]
 
         let result = query(&index, &q).unwrap();
         for m in &result.matches {
-            assert!(m.breakdown.is_some(), "explain mode should include breakdown for {}", m.symbol);
+            assert!(
+                m.breakdown.is_some(),
+                "explain mode should include breakdown for {}",
+                m.symbol
+            );
         }
     }
 
@@ -1400,7 +1506,11 @@ settlement = ["payout", "disburse", "settle"]
         b.sort_by_id();
 
         let dot = a.dot(&b);
-        assert!((dot - 1.0).abs() < 1e-5, "dot product of identical unit vectors should be ~1.0, got {}", dot);
+        assert!(
+            (dot - 1.0).abs() < 1e-5,
+            "dot product of identical unit vectors should be ~1.0, got {}",
+            dot
+        );
     }
 
     #[test]
@@ -1410,6 +1520,10 @@ settlement = ["payout", "disburse", "settle"]
         v.push(1, 4.0);
         v.normalize();
         let norm = v.norm();
-        assert!((norm - 1.0).abs() < 1e-5, "normalized vector should have norm ~1.0, got {}", norm);
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "normalized vector should have norm ~1.0, got {}",
+            norm
+        );
     }
 }

@@ -167,12 +167,13 @@ pub fn handle_add_derive(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Auto-backup ---
-    let backup_id = match edit::auto_backup(ctx, req.session(), &path, "add_derive: pre-edit backup") {
-        Ok(id) => id,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
+    let backup_id =
+        match edit::auto_backup(ctx, req.session(), &path, "add_derive: pre-edit backup") {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        };
 
     // --- Write, format, and validate ---
     let mut write_result =

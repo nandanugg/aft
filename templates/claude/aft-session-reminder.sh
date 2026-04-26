@@ -1,6 +1,14 @@
 #!/bin/bash
-# SessionStart hook: remind agent to use AFT tools before raw Read/Grep/Glob.
-# Installed by AFT's install-claude-hooks.sh. Fires on startup/resume/clear/compact.
+# SessionStart hook: warm AFT-Go if needed, then remind the agent to use AFT.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/aft-session-runtime.sh"
+
+HOOK_JSON="$(cat)"
+aft_session_open "$HOOK_JSON" "claude"
+
 cat << 'REMINDER'
 CRITICAL - AFT Code Discovery Protocol:
 1. ALWAYS use AFT tools FIRST for code exploration in an indexed project:
