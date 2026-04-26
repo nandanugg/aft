@@ -60,6 +60,25 @@ export interface AstSurface {
   astReplace: boolean;
 }
 
+/** Append honest scope reporting (no_files_matched_scope + scope_warnings) when present. */
+function appendScopeSections(response: Record<string, unknown>, sections: string[], theme: Theme) {
+  if (response.no_files_matched_scope === true) {
+    sections.push(
+      theme.fg("warning", "No files matched the scope (paths/globs resolved to zero files)"),
+    );
+  }
+  const warnings = asRecords(response.scope_warnings);
+  // scope_warnings is an array of strings, not records — handle both shapes
+  const warningStrings = Array.isArray(response.scope_warnings)
+    ? (response.scope_warnings as unknown[]).filter((w): w is string => typeof w === "string")
+    : warnings.map((w) => asString(w.warning) ?? "").filter(Boolean);
+  if (warningStrings.length > 0) {
+    sections.push(
+      `${theme.fg("muted", "Scope warnings:")}\n${warningStrings.map((w) => `  ${w}`).join("\n")}`,
+    );
+  }
+}
+
 /** Exported for renderer unit tests. */
 export function buildAstSearchSections(payload: unknown, theme: Theme): string[] {
   const response = asRecord(payload);
@@ -79,7 +98,11 @@ export function buildAstSearchSections(payload: unknown, theme: Theme): string[]
     .filter(Boolean)
     .join(" · ");
 
-  if (matches.length === 0) return [header, theme.fg("muted", "No AST matches found.")];
+  if (matches.length === 0) {
+    const sections = [header, theme.fg("muted", "No AST matches found.")];
+    appendScopeSections(response, sections, theme);
+    return sections;
+  }
 
   const grouped = groupByFile(matches, (match) => asString(match.file));
   const sections = [header];
@@ -131,6 +154,7 @@ export function buildAstReplaceSections(payload: unknown, theme: Theme): string[
 
   if (files.length === 0) {
     sections.push(theme.fg("muted", "No files changed."));
+    appendScopeSections(response, sections, theme);
     return sections;
   }
 
