@@ -124,7 +124,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut result = serde_json::json!({
         "file": file,
         "destination": destination,
-        "moved": !source_delete_failed,
+        "moved": true,
     });
 
     if source_delete_failed {

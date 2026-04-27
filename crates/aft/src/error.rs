@@ -47,6 +47,10 @@ pub enum AftError {
         path: String,
         message: String,
     },
+    ProjectTooLarge {
+        count: usize,
+        max: usize,
+    },
 }
 
 impl AftError {
@@ -64,6 +68,7 @@ impl AftError {
             AftError::ScopeNotFound { .. } => "scope_not_found",
             AftError::MemberNotFound { .. } => "member_not_found",
             AftError::IoError { .. } => "io_error",
+            AftError::ProjectTooLarge { .. } => "project_too_large",
         }
     }
 
@@ -148,6 +153,12 @@ impl fmt::Display for AftError {
             }
             AftError::IoError { path, message } => {
                 write!(f, "I/O error on {}: {}", path, message)
+            }
+            AftError::ProjectTooLarge { count, max } => {
+                write!(
+                    f,
+                    "project has {count} source files, exceeding max_callgraph_files={max}. Call-graph operations (callers, trace_to, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
+                )
             }
         }
     }

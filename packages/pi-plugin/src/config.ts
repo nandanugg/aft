@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { error, log, warn } from "./logger.js";
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,29 @@ export interface SemanticConfig {
   max_batch_size?: number;
 }
 
+export interface LspServerConfig {
+  id: string;
+  extensions: string[];
+  binary: string;
+  args: string[];
+  root_markers: string[];
+  disabled: boolean;
+  env?: Record<string, string>;
+  initialization_options?: unknown;
+}
+
+export interface LspConfig {
+  servers?: Record<string, Omit<LspServerConfig, "id">>;
+  disabled?: string[];
+  python?: "pyright" | "ty" | "auto";
+}
+
+export interface ConfigureLspOverrides {
+  experimental_lsp_ty?: boolean;
+  lsp_servers?: LspServerConfig[];
+  disabled_lsp?: string[];
+}
+
 export type ToolSurface = "minimal" | "recommended" | "all";
 
 export interface AftConfig {
@@ -51,7 +75,154 @@ export interface AftConfig {
   restrict_to_project_root?: boolean;
   experimental_search_index?: boolean;
   experimental_semantic_search?: boolean;
+  experimental_lsp_ty?: boolean;
+  lsp?: LspConfig;
+  url_fetch_allow_private?: boolean;
   semantic?: SemanticConfig;
+  /**
+   * Maximum source files allowed for call-graph operations (callers, trace_to,
+   * trace_data, impact). Projects above this size return `project_too_large`.
+   * Default: 20000 (applied Rust-side; undefined here means "use default").
+   */
+  max_callgraph_files?: number;
+}
+
+// TODO: move this schema to a shared package/module with aft-opencode to avoid drift.
+
+const FormatterEnum = z.enum([
+  "biome",
+  "prettier",
+  "deno",
+  "ruff",
+  "black",
+  "rustfmt",
+  "goimports",
+  "gofmt",
+  "none",
+]);
+
+const CheckerEnum = z.enum([
+  "tsc",
+  "biome",
+  "pyright",
+  "ruff",
+  "cargo",
+  "go",
+  "staticcheck",
+  "none",
+]);
+
+const SemanticConfigSchema = z.object({
+  backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
+  model: z.string().trim().min(1).optional(),
+  base_url: z.string().trim().min(1).optional(),
+  api_key_env: z.string().trim().min(1).optional(),
+  timeout_ms: z.number().int().positive().optional(),
+  max_batch_size: z.number().int().positive().optional(),
+});
+
+const LspExtensionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => value.replace(/^\.+/, "").length > 0, {
+    message: "Extension must include characters other than leading dots",
+  });
+
+const LspServerEntrySchema = z.object({
+  extensions: z.array(LspExtensionSchema).min(1),
+  binary: z.string().trim().min(1),
+  args: z.array(z.string()).optional().default([]),
+  root_markers: z.array(z.string().trim().min(1)).optional().default([".git"]),
+  disabled: z.boolean().optional().default(false),
+  /** Extra environment variables passed to the LSP server child process. */
+  env: z.record(z.string().min(1), z.string()).optional(),
+  /** JSON value passed as `initializationOptions` in the LSP `initialize` request. */
+  initialization_options: z.unknown().optional(),
+});
+
+export const LspServerSchema = LspServerEntrySchema.extend({
+  id: z.string().trim().min(1),
+});
+
+const LspConfigSchema = z.object({
+  servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
+  disabled: z.array(z.string().trim().min(1)).optional(),
+  python: z.enum(["pyright", "ty", "auto"]).optional(),
+});
+
+export const AftConfigSchema = z.object({
+  format_on_edit: z.boolean().optional(),
+  validate_on_edit: z.enum(["syntax", "full"]).optional(),
+  formatter: z.record(z.string(), FormatterEnum).optional(),
+  checker: z.record(z.string(), CheckerEnum).optional(),
+  tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
+  disabled_tools: z.array(z.string()).optional(),
+  restrict_to_project_root: z.boolean().optional(),
+  experimental_search_index: z.boolean().optional(),
+  experimental_semantic_search: z.boolean().optional(),
+  experimental_lsp_ty: z.boolean().optional(),
+  lsp: LspConfigSchema.optional(),
+  url_fetch_allow_private: z.boolean().optional(),
+  semantic: SemanticConfigSchema.optional(),
+  max_callgraph_files: z.number().int().positive().optional(),
+});
+
+function normalizeLspExtension(extension: string): string {
+  return extension.trim().replace(/^\.+/, "");
+}
+
+export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOverrides {
+  const overrides: ConfigureLspOverrides = {};
+  const disabled = new Set(config.lsp?.disabled ?? []);
+  let experimentalTy = config.experimental_lsp_ty;
+
+  // Server IDs match Rust's `ServerKind::id_str()` — built-in Pyright is
+  // identified as "python", and the experimental Astral checker as "ty".
+  // Custom IDs are case-insensitive.
+  switch (config.lsp?.python ?? "auto") {
+    case "ty":
+      experimentalTy = true;
+      disabled.add("python");
+      break;
+    case "pyright":
+      experimentalTy = false;
+      disabled.add("ty");
+      break;
+    case "auto":
+      break;
+  }
+
+  if (experimentalTy !== undefined) {
+    overrides.experimental_lsp_ty = experimentalTy;
+  }
+
+  const servers = Object.entries(config.lsp?.servers ?? {}).map(([id, server]) => {
+    const entry: LspServerConfig = {
+      id,
+      extensions: server.extensions.map(normalizeLspExtension),
+      binary: server.binary,
+      args: server.args,
+      root_markers: server.root_markers,
+      disabled: server.disabled,
+    };
+    if (server.env && Object.keys(server.env).length > 0) {
+      entry.env = server.env;
+    }
+    if (server.initialization_options !== undefined) {
+      entry.initialization_options = server.initialization_options;
+    }
+    return entry;
+  });
+  if (servers.length > 0) {
+    overrides.lsp_servers = servers;
+  }
+
+  if (disabled.size > 0) {
+    overrides.disabled_lsp = [...disabled];
+  }
+
+  return overrides;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,14 +294,56 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
   try {
     if (!existsSync(configPath)) return null;
     const content = readFileSync(configPath, "utf-8");
-    const parsed = JSON.parse(stripJsonc(content)) as AftConfig;
-    log(`Config loaded from ${configPath}`);
-    return parsed;
+    const parsed = JSON.parse(stripJsonc(content)) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      warn(`Config validation error in ${configPath}: root must be an object`);
+      return null;
+    }
+    const rawConfig = parsed as Record<string, unknown>;
+    const result = AftConfigSchema.safeParse(rawConfig);
+
+    if (result.success) {
+      log(`Config loaded from ${configPath}`);
+      return result.data;
+    }
+
+    const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
+    warn(`Config validation error in ${configPath}: ${errorMsg}`);
+    return parseConfigPartially(rawConfig);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
     return null;
   }
+}
+
+function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
+  const partialConfig: Record<string, unknown> = {};
+  const invalidSections: string[] = [];
+
+  for (const key of Object.keys(rawConfig)) {
+    const sectionResult = AftConfigSchema.safeParse({ [key]: rawConfig[key] });
+    if (sectionResult.success) {
+      const parsed = sectionResult.data as Record<string, unknown>;
+      if (parsed[key] !== undefined) {
+        partialConfig[key] = parsed[key];
+      }
+    } else {
+      const sectionErrors = sectionResult.error.issues
+        .filter((i) => i.path[0] === key)
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join(", ");
+      if (sectionErrors) {
+        invalidSections.push(`${key}: ${sectionErrors}`);
+      }
+    }
+  }
+
+  if (invalidSections.length > 0) {
+    warn(`Partial config loaded — invalid sections skipped: ${invalidSections.join("; ")}`);
+  }
+
+  return partialConfig as AftConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +374,14 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const lspServers = { ...base.lsp?.servers, ...override.lsp?.servers };
+  const disabledLsp = [...(base.lsp?.disabled ?? []), ...(override.lsp?.disabled ?? [])];
+  const lsp = {
+    ...base.lsp,
+    ...override.lsp,
+    ...(Object.keys(lspServers).length > 0 ? { servers: lspServers } : {}),
+    ...(disabledLsp.length > 0 ? { disabled: [...new Set(disabledLsp)] } : {}),
+  };
 
   // SECURITY: Strip sensitive semantic fields from override before spreading.
   const { semantic: _stripSemantic, ...safeOverride } = override;
@@ -170,6 +391,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...safeOverride,
     ...(Object.keys(formatter).length > 0 ? { formatter } : {}),
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
+    ...(Object.values(lsp).some((value) => value !== undefined) ? { lsp } : {}),
     semantic,
     ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
   };

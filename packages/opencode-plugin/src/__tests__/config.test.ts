@@ -1,4 +1,4 @@
-// @ts-expect-error bun:test types are provided by Bun at test time.
+/// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -399,5 +399,157 @@ describe("loadAftConfig", () => {
 
     expect(JSON.parse(result.stdout)).toEqual({});
     expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
+  });
+
+  // Regression test for Oracle v0.15.1 review bug #3: `max_callgraph_files` was
+  // advertised in README + `.opencode/aft.jsonc` but not declared on the zod
+  // schema, so zod silently stripped it before the plugin could forward it to
+  // the Rust binary. This test verifies the knob is accepted and preserved so
+  // tuning the call-graph cap from project/user config actually works.
+  test("max_callgraph_files is accepted and forwarded through config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ max_callgraph_files: 5000 }, null, 2),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.max_callgraph_files).toBe(5000);
+    // No zod validation error in stderr — the schema accepts the field.
+    expect(result.stderr).not.toContain("max_callgraph_files");
+  });
+
+  test("max_callgraph_files rejects non-positive values via zod", () => {
+    const fixture = createConfigFixture();
+    // Zero, negatives, and floats are all invalid per `z.number().int().positive()`.
+    // Invalid sections are skipped but surrounding valid config still loads.
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ max_callgraph_files: 0, format_on_edit: true }, null, 2),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    // Invalid field is dropped
+    expect(config.max_callgraph_files).toBeUndefined();
+    // Valid surrounding field survives
+    expect(config.format_on_edit).toBe(true);
+  });
+
+  test("loads object-map lsp servers with entry defaults", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify(
+        {
+          lsp: {
+            servers: {
+              tinymist: {
+                extensions: [".typ"],
+                binary: "tinymist",
+              },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({
+      lsp: {
+        servers: {
+          tinymist: {
+            extensions: [".typ"],
+            binary: "tinymist",
+            args: [],
+            root_markers: [".git"],
+            disabled: false,
+          },
+        },
+      },
+    });
+  });
+
+  test("rejects malformed lsp servers but keeps other config sections", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify(
+        {
+          format_on_edit: false,
+          lsp: {
+            servers: {
+              tinymist: {
+                extensions: [".typ"],
+              },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.format_on_edit).toBe(false);
+    expect(config.lsp).toBeUndefined();
+    expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
+  });
+
+  test("merges lsp config maps and disabled ids across user and project config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        lsp: {
+          servers: {
+            tinymist: { extensions: [".typ"], binary: "tinymist" },
+          },
+          disabled: ["pyright"],
+        },
+      }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        lsp: {
+          servers: {
+            bashls: { extensions: ["sh"], binary: "bash-language-server" },
+          },
+          disabled: ["yamlls"],
+          python: "ty",
+        },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout);
+    expect(Object.keys(config.lsp.servers).sort()).toEqual(["bashls", "tinymist"]);
+    expect(config.lsp.disabled).toEqual(["pyright", "yamlls"]);
+    expect(config.lsp.python).toBe("ty");
   });
 });

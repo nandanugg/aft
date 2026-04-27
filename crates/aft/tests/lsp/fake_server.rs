@@ -178,24 +178,60 @@ fn main() -> io::Result<()> {
         match message {
             ServerMessage::Request { id, method, params } => match method.as_str() {
                 "initialize" => {
+                    // Capability variants controlled by env vars so tests
+                    // can exercise different code paths:
+                    //   AFT_FAKE_LSP_PULL=1         → declare diagnosticProvider
+                    //   AFT_FAKE_LSP_WORKSPACE=1    → also support workspace/diagnostic
+                    //   (no env)                    → push-only (legacy behavior)
+                    let pull_enabled =
+                        std::env::var("AFT_FAKE_LSP_PULL").ok().as_deref() == Some("1");
+                    let workspace_pull =
+                        std::env::var("AFT_FAKE_LSP_WORKSPACE").ok().as_deref() == Some("1");
+
+                    let mut capabilities = json!({
+                        "textDocumentSync": 1,
+                        "hoverProvider": true,
+                        "definitionProvider": true,
+                        "referencesProvider": true,
+                        "renameProvider": {
+                            "prepareProvider": true
+                        }
+                    });
+
+                    if pull_enabled {
+                        capabilities["diagnosticProvider"] = json!({
+                            "interFileDependencies": true,
+                            "workspaceDiagnostics": workspace_pull,
+                            "identifier": "fake-lsp"
+                        });
+                    }
+
                     write_response(
                         &mut writer,
                         id,
                         json!({
-                            "capabilities": {
-                                "textDocumentSync": 1,
-                                "hoverProvider": true,
-                                "definitionProvider": true,
-                                "referencesProvider": true,
-                                "renameProvider": {
-                                    "prepareProvider": true
-                                }
-                            },
+                            "capabilities": capabilities,
                             "serverInfo": {
                                 "name": "fake-lsp-server",
                                 "version": "0.1.0",
                             }
                         }),
+                    )?;
+                    write_notification(
+                        &mut writer,
+                        &Notification::new(
+                            "custom/initialized",
+                            Some(json!({
+                                "initializationOptions": params
+                                    .as_ref()
+                                    .and_then(|value| value.get("initializationOptions"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                                "env": {
+                                    "AFT_TEST_LSP_ENV": std::env::var("AFT_TEST_LSP_ENV").ok()
+                                }
+                            })),
+                        ),
                     )?;
                 }
                 "shutdown" => {
@@ -277,6 +313,99 @@ fn main() -> io::Result<()> {
                     } else {
                         write_response(&mut writer, id, Value::Null)?;
                     }
+                }
+                "textDocument/diagnostic" => {
+                    // LSP 3.17 pull diagnostics. Honor previousResultId for
+                    // unchanged-state replies. Fail-mode is controlled by
+                    // env var so tests can drive each branch.
+                    let force_unchanged =
+                        std::env::var("AFT_FAKE_LSP_PULL_UNCHANGED").ok().as_deref() == Some("1");
+                    let force_error =
+                        std::env::var("AFT_FAKE_LSP_PULL_ERROR").ok().as_deref() == Some("1");
+
+                    if force_error {
+                        write_json_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32603,
+                                    "message": "fake-lsp: forced pull error"
+                                }
+                            }),
+                        )?;
+                    } else if force_unchanged {
+                        write_response(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "unchanged",
+                                "resultId": "fake-result-1"
+                            }),
+                        )?;
+                    } else {
+                        write_response(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "full",
+                                "resultId": "fake-result-1",
+                                "items": [
+                                    {
+                                        "range": {
+                                            "start": { "line": 4, "character": 0 },
+                                            "end": { "line": 4, "character": 8 }
+                                        },
+                                        "severity": 1,
+                                        "code": "E0PULL",
+                                        "source": "fake-lsp",
+                                        "message": "test pull diagnostic"
+                                    }
+                                ]
+                            }),
+                        )?;
+                    }
+                }
+                "workspace/diagnostic" => {
+                    // LSP 3.17 workspace pull. Fake produces one report for
+                    // a synthetic URI. Test variants:
+                    //   AFT_FAKE_LSP_WS_TIMEOUT=1 → never reply (server hangs)
+                    //   AFT_FAKE_LSP_WS_PARTIAL=1 → reply with empty items
+                    let force_timeout =
+                        std::env::var("AFT_FAKE_LSP_WS_TIMEOUT").ok().as_deref() == Some("1");
+                    let force_partial =
+                        std::env::var("AFT_FAKE_LSP_WS_PARTIAL").ok().as_deref() == Some("1");
+
+                    if force_timeout {
+                        // Never respond — emulates a server still analyzing.
+                        // The client should hit its 10s timeout and cancel.
+                        continue;
+                    }
+
+                    let items = if force_partial {
+                        json!([])
+                    } else {
+                        json!([{
+                            "kind": "full",
+                            "uri": "file:///workspace-pull-target.ts",
+                            "resultId": "fake-ws-1",
+                            "items": [
+                                {
+                                    "range": {
+                                        "start": { "line": 7, "character": 0 },
+                                        "end": { "line": 7, "character": 5 }
+                                    },
+                                    "severity": 1,
+                                    "code": "E0WSP",
+                                    "source": "fake-lsp",
+                                    "message": "workspace pull diagnostic"
+                                }
+                            ]
+                        }])
+                    };
+
+                    write_response(&mut writer, id, json!({ "items": items }))?;
                 }
                 "textDocument/rename" => {
                     let uri_key = request_document_uri_string(&params);

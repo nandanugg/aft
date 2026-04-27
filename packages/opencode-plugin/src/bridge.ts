@@ -5,6 +5,7 @@ import { error, getLogFilePath, log, warn } from "./logger.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
+const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 
 // ## Note on TypeScript `as` type assertions
 //
@@ -17,15 +18,41 @@ const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 // per call with no practical safety benefit given the error guards.
 
 /**
- * Compare two semver version strings (major.minor.patch).
+ * Compare two semver version strings (major.minor.patch plus pre-release).
  * Returns: negative if a < b, 0 if equal, positive if a > b.
  */
-function compareSemver(a: string, b: string): number {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
+export function compareSemver(a: string, b: string): number {
+  const [aMain, aPre] = a.split("-", 2);
+  const [bMain, bPre] = b.split("-", 2);
+  const aParts = aMain.split(".").map(Number);
+  const bParts = bMain.split(".").map(Number);
   for (let i = 0; i < 3; i++) {
-    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (diff !== 0) return diff;
+    if (aParts[i] !== bParts[i]) return (aParts[i] ?? 0) - (bParts[i] ?? 0);
+  }
+  if (!aPre && !bPre) return 0;
+  if (!aPre) return 1;
+  if (!bPre) return -1;
+
+  const aIds = aPre.split(".");
+  const bIds = bPre.split(".");
+  for (let i = 0; i < Math.max(aIds.length, bIds.length); i++) {
+    const ai = aIds[i];
+    const bi = bIds[i];
+    if (ai === undefined) return -1;
+    if (bi === undefined) return 1;
+    const aNum = /^\d+$/.test(ai);
+    const bNum = /^\d+$/.test(bi);
+    if (aNum && bNum) {
+      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
+      if (diff !== 0) return diff;
+    } else if (aNum) {
+      return -1;
+    } else if (bNum) {
+      return 1;
+    } else {
+      const cmp = ai.localeCompare(bi);
+      if (cmp !== 0) return cmp;
+    }
   }
   return 0;
 }
@@ -72,6 +99,13 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface ConfigureWarningsContext {
+  projectRoot: string;
+  sessionId?: string;
+  client?: unknown;
+  warnings: unknown[];
+}
+
 export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
@@ -81,6 +115,13 @@ export interface BridgeOptions {
   minVersion?: string;
   /** Called when binary version is older than minVersion. Receives (binaryVersion, minVersion). */
   onVersionMismatch?: (binaryVersion: string, minVersion: string) => void;
+  /** Called after the first successful configure returns user-visible warnings. */
+  onConfigureWarnings?: (context: ConfigureWarningsContext) => void | Promise<void>;
+}
+
+interface SendOptions {
+  timeoutMs?: number;
+  configureWarningClient?: unknown;
 }
 
 /**
@@ -110,6 +151,9 @@ export class BinaryBridge {
   private configOverrides: Record<string, unknown>;
   private minVersion: string | undefined;
   private onVersionMismatch: ((binaryVersion: string, minVersion: string) => void) | undefined;
+  private onConfigureWarnings:
+    | ((context: ConfigureWarningsContext) => void | Promise<void>)
+    | undefined;
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
@@ -125,6 +169,7 @@ export class BinaryBridge {
     this.configOverrides = clampSemanticTimeout(configOverrides ?? {}, this.timeoutMs);
     this.minVersion = options?.minVersion;
     this.onVersionMismatch = options?.onVersionMismatch;
+    this.onConfigureWarnings = options?.onConfigureWarnings;
   }
 
   /** Number of times the binary has been restarted after a crash. */
@@ -144,6 +189,7 @@ export class BinaryBridge {
   async send(
     command: string,
     params: Record<string, unknown> = {},
+    options?: SendOptions,
   ): Promise<Record<string, unknown>> {
     if (this._shuttingDown) {
       throw new Error(`[aft-plugin] Bridge is shutting down, cannot send "${command}"`);
@@ -171,6 +217,10 @@ export class BinaryBridge {
                   `[aft-plugin] Configure failed: ${configResult.message ?? "unknown error"}`,
                 );
               }
+              // Large-repo warning is emitted by the Rust side via log::warn!
+              // and relayed through stderr → plugin log. No need to re-log here
+              // (doing so would just duplicate the same line in aft-plugin.log).
+              await this.deliverConfigureWarnings(configResult, params, options);
               await this.checkVersion();
               // Re-check liveness after version check — checkVersion() swallows
               // errors as best-effort, so the bridge may have died without throwing.
@@ -195,20 +245,25 @@ export class BinaryBridge {
     const request = { id, command, ...params };
     const line = `${JSON.stringify(request)}\n`;
 
+    // Per-op timeout override: tool wrappers can pass longer budgets for
+    // commands that legitimately need them (callers, trace_to, grep on big
+    // repos). Defaults to the bridge-wide timeout otherwise.
+    const effectiveTimeoutMs = options?.timeoutMs ?? this.timeoutMs;
+
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         warn(
-          `Request "${command}" (id=${id}) timed out after ${this.timeoutMs}ms — restarting bridge`,
+          `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms — restarting bridge`,
         );
         reject(
           new Error(
-            `[aft-plugin] Request "${command}" (id=${id}) timed out after ${this.timeoutMs}ms`,
+            `[aft-plugin] Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
           ),
         );
         // Kill the hung process so the next request gets a fresh bridge
         this.handleTimeout();
-      }, this.timeoutMs);
+      }, effectiveTimeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
 
@@ -230,6 +285,29 @@ export class BinaryBridge {
         }
       });
     });
+  }
+
+  private async deliverConfigureWarnings(
+    configResult: Record<string, unknown>,
+    params: Record<string, unknown>,
+    options: SendOptions | undefined,
+  ): Promise<void> {
+    if (!this.onConfigureWarnings || !Array.isArray(configResult.warnings)) return;
+    if (configResult.warnings.length === 0) return;
+
+    try {
+      const sessionId = typeof params.session_id === "string" ? params.session_id : undefined;
+      await this.onConfigureWarnings({
+        projectRoot: this.cwd,
+        sessionId,
+        client: options?.configureWarningClient,
+        warnings: configResult.warnings,
+      });
+    } catch (err) {
+      warn(
+        `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** Kill the child process and reject all pending requests. */
@@ -345,6 +423,7 @@ export class BinaryBridge {
       stdio: ["pipe", "pipe", "pipe"],
       env,
     });
+    const currentChild = child;
 
     child.stdout?.on("data", (chunk: Buffer) => {
       this.onStdoutData(chunk.toString("utf-8"));
@@ -362,11 +441,13 @@ export class BinaryBridge {
     });
 
     child.on("error", (err) => {
+      if (this.process !== currentChild) return;
       error(`Process error: ${err.message}${this.formatStderrTail()}`);
       this.handleCrash();
     });
 
     child.on("exit", (code, signal) => {
+      if (this.process !== currentChild) return;
       if (this._shuttingDown) return;
       log(`Process exited: code=${code}, signal=${signal}`);
       // External termination signals (SIGTERM/SIGKILL/SIGHUP/SIGINT) are almost
@@ -418,6 +499,12 @@ export class BinaryBridge {
 
   private onStdoutData(data: string): void {
     this.stdoutBuffer += data;
+    if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
+      this.handleCrash(
+        new Error(`aft bridge stdout buffer exceeded ${MAX_STDOUT_BUFFER} bytes — killing bridge`),
+      );
+      return;
+    }
 
     // Process complete lines
     let newlineIdx: number;
@@ -464,8 +551,12 @@ export class BinaryBridge {
     this.rejectAllPending(new Error(`[aft-plugin] Bridge restarted after timeout${tail}`));
   }
 
-  private handleCrash(): void {
+  private handleCrash(cause?: Error): void {
+    const proc = this.process;
     this.process = null;
+    if (proc && proc.exitCode === null && !proc.killed) {
+      proc.kill("SIGKILL");
+    }
     this.clearRestartResetTimer();
     this.configured = false; // Force reconfigure on next command after restart
 
@@ -477,7 +568,9 @@ export class BinaryBridge {
 
     // Reject all pending requests with the tail attached.
     this.rejectAllPending(
-      new Error(`[aft-plugin] Binary crashed (restarts: ${this._restartCount})${tail}`),
+      new Error(
+        `[aft-plugin] Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""}${tail}`,
+      ),
     );
 
     // Auto-restart with exponential backoff
@@ -495,10 +588,14 @@ export class BinaryBridge {
           }
         }
       }, delay);
+      // Also decay the counter over time so repeated crashes without any
+      // successful response don't permanently wedge the bridge.
+      this.scheduleRestartCountReset();
     } else {
       error(
         `Max restarts (${this.maxRestarts}) reached, giving up. Logs: ${getLogFilePath()}${tail}`,
       );
+      this.scheduleRestartCountReset();
     }
   }
 

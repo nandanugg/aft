@@ -4,10 +4,20 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  accentPath,
+  asRecord,
+  asString,
+  extractStructuredPayload,
+  type RenderContextLike,
+  renderErrorResult,
+  renderSections,
+  renderToolCall,
+} from "./render-helpers.js";
 
 const TransformParams = Type.Object({
   op: StringEnum(
@@ -44,6 +54,68 @@ const TransformParams = Type.Object({
   ),
 });
 
+/** Exported for renderer unit tests. */
+export function buildTransformSections(
+  args: Static<typeof TransformParams>,
+  payload: unknown,
+  theme: Theme,
+): string[] {
+  const response = asRecord(payload);
+  if (!response) return [theme.fg("muted", "No transform result.")];
+
+  if (response.dry_run === true) {
+    return [
+      theme.fg("warning", `[dry run] ${args.op}`),
+      asString(response.diff) ?? theme.fg("muted", "No diff available."),
+    ];
+  }
+
+  const target =
+    asString(response.target) ??
+    asString(response.scope) ??
+    args.target ??
+    args.container ??
+    args.field ??
+    args.filePath;
+
+  return [
+    `${theme.fg("success", "transformed")} ${theme.fg("accent", args.op)}`,
+    `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.filePath)}`,
+    target ? `${theme.fg("muted", "target")} ${target}` : theme.fg("muted", "No target metadata."),
+  ];
+}
+
+/** Exported for renderer unit tests. */
+export function renderTransformCall(
+  args: Static<typeof TransformParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  const target = args.target ?? args.container ?? args.field;
+  const summary = [
+    theme.fg("accent", args.op),
+    accentPath(theme, args.filePath),
+    target ? theme.fg("toolOutput", target) : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return renderToolCall("transform", summary, theme, context);
+}
+
+/** Exported for renderer unit tests. */
+export function renderTransformResult(
+  result: AgentToolResult<unknown>,
+  args: Static<typeof TransformParams>,
+  theme: Theme,
+  context: RenderContextLike,
+) {
+  if (context.isError) return renderErrorResult(result, "transform failed", theme, context);
+  return renderSections(
+    buildTransformSections(args, extractStructuredPayload(result), theme),
+    context,
+  );
+}
+
 export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
     name: "aft_transform",
@@ -58,6 +130,8 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
       _onUpdate,
       extCtx,
     ) {
+      validateTransformParams(params);
+
       const bridge = bridgeFor(ctx, extCtx.cwd);
       // Rust dispatch accepts the op name directly (add_member, add_derive, etc.)
       const req: Record<string, unknown> = { file: params.filePath };
@@ -73,8 +147,54 @@ export function registerStructureTool(pi: ExtensionAPI, ctx: PluginContext): voi
       if (params.position !== undefined) req.position = params.position;
       if (params.dryRun !== undefined) req.dry_run = params.dryRun;
       if (params.validate !== undefined) req.validate = params.validate;
-      const response = await callBridge(bridge, params.op, req);
+      const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },
+    renderCall(args, theme, context) {
+      return renderTransformCall(args, theme, context);
+    },
+    renderResult(result, _options, theme, context) {
+      return renderTransformResult(result, context.args, theme, context);
+    },
   });
+}
+
+function validateTransformParams(params: Static<typeof TransformParams>): void {
+  const op = params.op;
+
+  if (op === "add_member") {
+    if (typeof params.container !== "string") {
+      throw new Error("'container' is required for 'add_member' op");
+    }
+    if (typeof params.code !== "string") {
+      throw new Error("'code' is required for 'add_member' op");
+    }
+  }
+  if (
+    op === "add_derive" ||
+    op === "wrap_try_catch" ||
+    op === "add_decorator" ||
+    op === "add_struct_tags"
+  ) {
+    if (typeof params.target !== "string") {
+      throw new Error(`'target' is required for '${op}' op`);
+    }
+  }
+  if (op === "add_derive" && !Array.isArray(params.derives)) {
+    throw new Error("'derives' array is required for 'add_derive' op");
+  }
+  if (op === "add_decorator" && typeof params.decorator !== "string") {
+    throw new Error("'decorator' is required for 'add_decorator' op");
+  }
+  if (op === "add_struct_tags") {
+    if (typeof params.field !== "string") {
+      throw new Error("'field' is required for 'add_struct_tags' op");
+    }
+    if (typeof params.tag !== "string") {
+      throw new Error("'tag' is required for 'add_struct_tags' op");
+    }
+    if (typeof params.value !== "string") {
+      throw new Error("'value' is required for 'add_struct_tags' op");
+    }
+  }
 }

@@ -35,8 +35,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { registerStatusCommand } from "./commands/aft-status.js";
-import { loadAftConfig } from "./config.js";
+import { loadAftConfig, resolveLspConfigForConfigure } from "./config.js";
 import { log, warn } from "./logger.js";
+import { type ConfigureWarning, deliverConfigureWarnings } from "./notifications.js";
 import { ensureOnnxRuntime, getManualInstallHint } from "./onnx-runtime.js";
 import { BridgePool } from "./pool.js";
 import { findBinary } from "./resolver.js";
@@ -65,6 +66,29 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
+const ALL_ONLY_TOOLS = new Set([
+  "aft_navigate",
+  "aft_delete",
+  "aft_move",
+  "aft_transform",
+  "aft_refactor",
+]);
+
+function isConfigureWarning(value: unknown): value is ConfigureWarning {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const warning = value as Record<string, unknown>;
+  return (
+    (warning.kind === "formatter_not_installed" ||
+      warning.kind === "checker_not_installed" ||
+      warning.kind === "lsp_binary_missing") &&
+    typeof warning.hint === "string"
+  );
+}
+
+function coerceConfigureWarnings(warnings: unknown[]): ConfigureWarning[] {
+  return warnings.filter(isConfigureWarning);
+}
+
 /** Resolve the AFT storage directory (auth + semantic index + ONNX cache). */
 function resolveStorageDir(): string {
   // Pi doesn't expose its data dir via a public API; use ~/.pi/agent/aft as convention.
@@ -72,6 +96,10 @@ function resolveStorageDir(): string {
 }
 
 /**
+ * Tool surface mirrors opencode-plugin: navigate/delete/move/transform/refactor
+ * are all-only. recommended exposes hoisted + read/safety/import/ast/lsp/conflicts
+ * + experimental search/semantic when enabled.
+ *
  * Returns the set of AFT tool names that should be registered given the
  * configured surface + disabled_tools filter. Pi's built-in tools are always
  * present; registering an AFT tool with the same name replaces them.
@@ -99,6 +127,7 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   const surface = config.tool_surface ?? "recommended";
   const disabled = new Set(config.disabled_tools ?? []);
   const ok = (name: string): boolean => !disabled.has(name);
+  const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
 
   if (surface === "minimal") {
     return {
@@ -148,11 +177,11 @@ function resolveToolSurface(config: ReturnType<typeof loadAftConfig>): {
   if (surface === "all") {
     return {
       ...base,
-      navigate: ok("aft_navigate"),
-      delete: ok("aft_delete"),
-      move: ok("aft_move"),
-      structure: ok("aft_transform"),
-      refactor: ok("aft_refactor"),
+      navigate: allOnly("aft_navigate"),
+      delete: allOnly("aft_delete"),
+      move: allOnly("aft_move"),
+      structure: allOnly("aft_transform"),
+      refactor: allOnly("aft_refactor"),
     };
   }
 
@@ -201,15 +230,45 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   // Build configure-time overrides forwarded to every bridge on spawn.
+  // Default to restrict_to_project_root: true for plugin-hosted agents.
+  // The Rust CLI default is false (documented — for direct/scripted use), but
+  // when agents call `aft_outline`, `aft_read`, etc. through the plugin there
+  // is no interactive permission prompt for reads, so we must enforce the
+  // project-root boundary by default. Users can opt out by explicitly setting
+  // `restrict_to_project_root: false` in their aft.jsonc.
   const configOverrides: Record<string, unknown> = {
     ...config,
+    ...resolveLspConfigForConfigure(config),
+    restrict_to_project_root: config.restrict_to_project_root ?? true,
     storage_dir: storageDir,
   };
+  delete configOverrides.lsp;
   if (ortDylibDir) {
     (configOverrides as Record<string, unknown>)._ort_dylib_dir = ortDylibDir;
   }
 
-  const pool = new BridgePool(binaryPath, { minVersion: PLUGIN_VERSION }, configOverrides);
+  const pool = new BridgePool(
+    binaryPath,
+    {
+      minVersion: PLUGIN_VERSION,
+      onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
+        if (!sessionId || !client) return;
+        const validWarnings = coerceConfigureWarnings(warnings);
+        if (validWarnings.length === 0) return;
+        await deliverConfigureWarnings(
+          {
+            client,
+            sessionId,
+            storageDir,
+            pluginVersion: PLUGIN_VERSION,
+            projectRoot,
+          },
+          validWarnings,
+        );
+      },
+    },
+    configOverrides,
+  );
   const ctx: PluginContext = { pool, config, storageDir };
 
   const surface = resolveToolSurface(config);

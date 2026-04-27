@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::query_support::{filter_impact_result, resolve_symbol_query};
 use crate::context::AppContext;
+use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle an `impact` request.
@@ -102,7 +103,9 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    match graph.impact(&file_path, &symbol, depth) {
+    let max_files = ctx.config().max_callgraph_files;
+
+    match graph.impact(&file_path, &symbol, depth, max_files) {
         Ok(mut result) => {
             filter_impact_result(&mut result, exclude_tests);
             let text = result.render_text();
@@ -111,6 +114,9 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
                 obj.insert("text".to_string(), serde_json::Value::String(text));
             }
             Response::success(&req.id, result_json)
+        }
+        Err(err @ AftError::ProjectTooLarge { .. }) => {
+            Response::error(&req.id, "project_too_large", format!("{}", err))
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }

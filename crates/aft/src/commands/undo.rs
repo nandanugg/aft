@@ -1,7 +1,6 @@
-use std::path::Path;
-
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
+use std::path::Path;
 
 /// Handle the `undo` command: restore the most recent backup for a file.
 ///
@@ -19,18 +18,10 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Resolve relative paths against project_root so backup keys match
-    let config = ctx.config();
-    let resolved = if Path::new(file).is_relative() {
-        if let Some(ref root) = config.project_root {
-            root.join(file)
-        } else {
-            Path::new(file).to_path_buf()
-        }
-    } else {
-        Path::new(file).to_path_buf()
+    let resolved = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
     };
-    drop(config);
 
     let mut backup = ctx.backup().borrow_mut();
 

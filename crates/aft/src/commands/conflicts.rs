@@ -104,18 +104,24 @@ fn format_file_conflicts(
         conflict_word,
     ));
 
+    let mut last_printed_line = 0usize;
     for (i, region) in regions.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
 
         // Calculate context window (clamp to file bounds)
-        let ctx_start = if region.start_line > context_lines {
+        let calculated_ctx_start = if region.start_line > context_lines {
             region.start_line - context_lines
         } else {
             1
         };
+        let ctx_start = std::cmp::max(calculated_ctx_start, last_printed_line + 1);
         let ctx_end = std::cmp::min(region.end_line + context_lines, total_lines);
+
+        if ctx_start > ctx_end {
+            continue;
+        }
 
         // Output lines with line numbers (matching `read` format)
         for line_num in ctx_start..=ctx_end {
@@ -123,6 +129,7 @@ fn format_file_conflicts(
             // Right-align line numbers to match read output
             out.push_str(&format!("{:>4}: {}\n", line_num, line_content));
         }
+        last_printed_line = ctx_end;
     }
 
     out
@@ -171,9 +178,13 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
 
     for file_path in &files {
         let full_path = project_root.join(file_path);
+        let validated_path = match ctx.validate_path(&req.id, &full_path) {
+            Ok(path) => path,
+            Err(resp) => return resp,
+        };
 
         // Read file content
-        let content = match std::fs::read_to_string(&full_path) {
+        let content = match std::fs::read_to_string(&validated_path) {
             Ok(c) => c,
             Err(e) => {
                 output.push_str(&format!("── {} [error: {}] ──\n\n", file_path, e));

@@ -1,11 +1,12 @@
 //! Handler for the `ast_search` command: AST-aware pattern search using ast-grep.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ast_grep_core::tree_sitter::LanguageExt;
 
 use crate::ast_grep_lang::AstGrepLang;
+use crate::commands::ast_scope::collect_ast_files;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -84,6 +85,19 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
 
+    // Validate the pattern before searching. ast-grep-core can panic (via unwrap) on
+    // patterns that parse to multiple AST nodes (e.g. bare `catch` or `finally`
+    // clauses). Release builds use panic="unwind", so catch_unwind is effective,
+    // but returning an explicit pattern error gives callers a better signal.
+    use ast_grep_core::matcher::Pattern as AstPattern;
+    if let Err(err) = AstPattern::try_new(&pattern, lang.clone()) {
+        return Response::error(
+            &req.id,
+            "invalid_pattern",
+            format!("invalid AST pattern: {}", err),
+        );
+    }
+
     let config = ctx.config();
     let project_root = config
         .project_root
@@ -91,42 +105,28 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     drop(config);
 
-    let search_roots: Vec<PathBuf> = if paths.is_empty() {
-        vec![project_root.clone()]
-    } else {
-        paths
-            .iter()
-            .map(|p| {
-                let pb = PathBuf::from(p);
-                if pb.is_absolute() {
-                    pb
-                } else {
-                    project_root.join(p)
-                }
-            })
-            .collect()
+    let scope = match collect_ast_files(&req.id, "ast_search", &project_root, &lang, &paths, &globs)
+    {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
     };
 
-    let extensions = lang.extensions();
     let mut all_matches: Vec<serde_json::Value> = Vec::new();
     let mut files_searched: usize = 0;
     let mut files_with_matches: usize = 0;
 
-    for root in &search_roots {
-        let files = collect_files(root, extensions, &globs);
-        for file_path in files {
-            files_searched += 1;
-            let source = match std::fs::read_to_string(&file_path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+    for file_path in &scope.files {
+        files_searched += 1;
+        let source = match std::fs::read_to_string(file_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
 
-            let matches = search_file(&source, &file_path, &pattern, &lang, context_lines);
-            if !matches.is_empty() {
-                files_with_matches += 1;
-            }
-            all_matches.extend(matches);
+        let matches = search_file(&source, file_path, &pattern, &lang, context_lines);
+        if !matches.is_empty() {
+            files_with_matches += 1;
         }
+        all_matches.extend(matches);
     }
 
     let total_matches = all_matches.len();
@@ -138,6 +138,8 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
             "total_matches": total_matches,
             "files_with_matches": files_with_matches,
             "files_searched": files_searched,
+            "no_files_matched_scope": scope.no_files_matched_scope,
+            "scope_warnings": scope.scope_warnings,
         }),
     )
 }
@@ -156,8 +158,7 @@ fn search_file(
     let file_str = file_path.display().to_string();
 
     // Validate the pattern before searching. ast-grep-core panics (via unwrap) on patterns
-    // that parse to multiple AST nodes (e.g. bare `catch` or `finally` clauses), and the
-    // release binary uses panic="abort", so catch_unwind cannot save us.
+    // that parse to multiple AST nodes (e.g. bare `catch` or `finally` clauses).
     use ast_grep_core::matcher::Pattern as AstPattern;
     if AstPattern::try_new(pattern, lang.clone()).is_err() {
         return Vec::new();
@@ -231,75 +232,5 @@ fn search_file(
 
             result
         })
-        .collect()
-}
-
-/// Walk `root` and collect files whose extension is in `extensions`.
-///
-/// Respects `.gitignore` and skips common non-source dirs (`node_modules`, `target`, etc.).
-/// Use `globs` to further filter results; prefix `!` to exclude a pattern.
-pub fn collect_files(root: &Path, extensions: &[&str], globs: &[String]) -> Vec<PathBuf> {
-    use ignore::WalkBuilder;
-
-    let (include_globs, exclude_globs): (Vec<&str>, Vec<&str>) = globs
-        .iter()
-        .map(|s| s.as_str())
-        .partition(|s| !s.starts_with('!'));
-
-    let exclude_globs: Vec<&str> = exclude_globs
-        .iter()
-        .map(|s| s.trim_start_matches('!'))
-        .collect();
-
-    let mut override_builder = ignore::overrides::OverrideBuilder::new(root);
-    for g in &include_globs {
-        let _ = override_builder.add(g);
-    }
-    for g in &exclude_globs {
-        let _ = override_builder.add(&format!("!{}", g));
-    }
-    let overrides = override_builder.build().ok();
-
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        });
-
-    if let Some(ov) = overrides {
-        builder.overrides(ov);
-    }
-
-    builder
-        .build()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|e| e.to_str())
-                .map_or(false, |ext| extensions.contains(&ext))
-        })
-        .map(|entry| entry.into_path())
         .collect()
 }

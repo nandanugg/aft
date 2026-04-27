@@ -5,6 +5,10 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   id-token: write
@@ -42,6 +46,9 @@ jobs:
 
       - name: Lint
         run: bun run lint
+
+      - name: Build all JS packages (gate publish)
+        run: bun run --filter '*' build
 
   publish-crates:
     name: Publish to crates.io
@@ -172,6 +179,9 @@ jobs:
           path: target/x86_64-pc-windows-msvc/release/aft.exe
           if-no-files-found: error
 
+  # npm publish runs AFTER github-release so that checksums.sha256 is already
+  # available on the GitHub release page when ensureBinary() runs during
+  # @cortexkit/aft-opencode@latest install.
   publish-npm:
     name: Publish to npm
     runs-on: ubuntu-latest
@@ -181,6 +191,7 @@ jobs:
       - build-linux-arm64
       - build-linux-x64
       - build-win32-x64
+      - github-release
     steps:
       - uses: actions/checkout@v4
 
@@ -255,6 +266,14 @@ jobs:
         run: bun run build
         working-directory: packages/pi-plugin
 
+      - name: Install CLI dependencies
+        run: bun install
+        working-directory: packages/aft-cli
+
+      - name: Build CLI
+        run: bun run build
+        working-directory: packages/aft-cli
+
       # Uses npm Trusted Publishing (OIDC) — configured per-package on npmjs.com
       - name: Publish platform packages
         run: |
@@ -270,6 +289,15 @@ jobs:
         run: npm publish --access public --provenance
         working-directory: packages/pi-plugin
 
+      - name: Publish @cortexkit/aft (unified CLI)
+        run: npm publish --access public --provenance
+        working-directory: packages/aft-cli
+
+  # GitHub release must complete before npm publish so that checksums.sha256
+  # is available when freshly-installed @cortexkit/aft-opencode@latest triggers
+  # ensureBinary().  crates.io publish is also gated so that a failed crate
+  # publish blocks the release — no point shipping binaries if the Rust crate
+  # isn't available yet.
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -279,6 +307,7 @@ jobs:
       - build-linux-arm64
       - build-linux-x64
       - build-win32-x64
+      - publish-crates
     steps:
       - uses: actions/checkout@v4
 
@@ -300,7 +329,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd release-assets
-          shasum -a 256 aft-* > checksums.sha256
+          sha256sum aft-* > checksums.sha256
           cat checksums.sha256
 
       - name: Create GitHub Release

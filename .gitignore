@@ -57,3 +57,7 @@ tests/docker/fixtures/aft-linux-x64
 .claude/
 .serena/
 .claire/
+
+# E2E test fixture binary (locally-built aft, not committed)
+packages/pi-plugin/src/__tests__/e2e/fixtures/aft-bin
+packages/opencode-plugin/src/__tests__/e2e/fixtures/aft-bin

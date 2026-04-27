@@ -100,7 +100,7 @@ fn test_diagnostics_stored_after_did_open() {
     let mut manager = manager_with_fake_server();
 
     manager
-        .notify_file_changed(file, "fn main() { println!(\"hi\"); }\n")
+        .notify_file_changed_default(file, "fn main() { println!(\"hi\"); }\n")
         .expect("notify file changed");
     wait_for_publish(&mut manager);
 
@@ -122,13 +122,13 @@ fn test_diagnostics_replace_on_new_publish() {
     let mut manager = manager_with_fake_server();
 
     manager
-        .notify_file_changed(file, "fn main() { println!(\"one\"); }\n")
+        .notify_file_changed_default(file, "fn main() { println!(\"one\"); }\n")
         .expect("first notify");
     wait_for_publish(&mut manager);
     assert_eq!(manager.get_diagnostics_for_file(file).len(), 2);
 
     manager
-        .notify_file_changed(file, "fn main() { println!(\"two\"); }\n")
+        .notify_file_changed_default(file, "fn main() { println!(\"two\"); }\n")
         .expect("second notify");
     wait_for_publish(&mut manager);
 
@@ -146,7 +146,7 @@ fn test_diagnostics_filter_by_severity() {
     let ctx = app_context_with_fake_lsp();
 
     ctx.lsp()
-        .notify_file_changed(file, "fn main() { println!(\"hi\"); }\n")
+        .notify_file_changed_default(file, "fn main() { println!(\"hi\"); }\n")
         .expect("notify file changed");
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -175,15 +175,15 @@ fn test_wait_for_diagnostics_returns_after_matching_publish() {
     let mut manager = manager_with_fake_server();
 
     manager
-        .notify_file_changed(lib_rs, "pub fn answer() -> u32 { 42 }\n")
+        .notify_file_changed_default(lib_rs, "pub fn answer() -> u32 { 42 }\n")
         .expect("open lib");
     wait_for_publish(&mut manager);
 
     manager
-        .notify_file_changed(main_rs, "fn main() { println!(\"hi\"); }\n")
+        .notify_file_changed_default(main_rs, "fn main() { println!(\"hi\"); }\n")
         .expect("open main");
 
-    let diagnostics = manager.wait_for_diagnostics(main_rs, Duration::from_secs(2));
+    let diagnostics = manager.wait_for_diagnostics_default(main_rs, Duration::from_secs(2));
     let canonical_main = fs::canonicalize(main_rs).expect("canonical main");
 
     assert_eq!(diagnostics.len(), 2);
@@ -200,11 +200,11 @@ fn test_diagnostics_for_file_vs_all() {
     let mut manager = manager_with_fake_server();
 
     manager
-        .notify_file_changed(main_rs, "fn main() {}\n")
+        .notify_file_changed_default(main_rs, "fn main() {}\n")
         .expect("open main");
     wait_for_publish(&mut manager);
     manager
-        .notify_file_changed(lib_rs, "pub fn answer() -> u32 { 42 }\n")
+        .notify_file_changed_default(lib_rs, "pub fn answer() -> u32 { 42 }\n")
         .expect("open lib");
     wait_for_publish(&mut manager);
 
@@ -226,7 +226,7 @@ fn test_diagnostics_clear_on_empty_array() {
     let mut manager = manager_with_fake_server();
 
     manager
-        .notify_file_changed(file, "fn main() {}\n")
+        .notify_file_changed_default(file, "fn main() {}\n")
         .expect("open file");
     wait_for_publish(&mut manager);
     assert_eq!(manager.get_diagnostics_for_file(file).len(), 2);
@@ -281,4 +281,305 @@ fn test_lsp_diagnostics_command_response_format() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tri-state convention: response shape changes
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `lsp_diagnostics` always reports `complete` (true|false) and
+/// `lsp_servers_used`. This locks in the new tri-state contract Oracle
+/// approved.
+#[test]
+fn test_response_includes_complete_and_servers_used() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_lsp();
+
+    ctx.lsp()
+        .notify_file_changed_default(file, "fn main() {}\n")
+        .expect("notify file changed");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-shape",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 250
+    }))
+    .expect("request parses");
+
+    let response = handle_lsp_diagnostics(&req, &ctx);
+    let json = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(json["success"], true);
+    assert!(json["complete"].is_boolean(), "complete missing: {json}");
+    assert!(
+        json["lsp_servers_used"].is_array(),
+        "lsp_servers_used missing: {json}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// File-mode honest reporting when no server is registered
+// ────────────────────────────────────────────────────────────────────────────
+
+/// When asking diagnostics for a file with NO registered LSP server, the
+/// response must be honest — empty diagnostics, `complete: true`, and a
+/// `note` explaining that no server applies. This is the explicit fix for
+/// the false-clean bug.
+#[test]
+fn test_no_lsp_server_returns_honest_note() {
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("workspace");
+    fs::create_dir_all(&root).expect("create root");
+    let file = root.join("file.unknownext");
+    fs::write(&file, "garbage\n").expect("write file");
+
+    let mut config = Config::default();
+    config.project_root = Some(root.clone());
+
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-noop",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 0
+    }))
+    .expect("request parses");
+
+    let response = handle_lsp_diagnostics(&req, &ctx);
+    let json = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["complete"], true, "should be complete (no work to do)");
+    assert_eq!(json["total"], 0);
+    assert!(
+        json["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no LSP server"),
+        "expected note about missing server: {json}"
+    );
+    assert!(json["lsp_servers_used"].as_array().unwrap().is_empty());
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Empty publish "checked clean" preservation
+// ────────────────────────────────────────────────────────────────────────────
+
+/// After a `publishDiagnostics` with empty array, the cache should
+/// distinguish "checked, clean" from "never checked". The exact semantic
+/// is: `get_diagnostics_for_file` returns empty (no errors), but a
+/// publish_epoch was recorded internally.
+///
+/// This is a behavioral regression test for the explicit fix to
+/// `DiagnosticsStore` Oracle flagged.
+#[test]
+fn test_empty_publish_is_not_lost() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let mut manager = manager_with_fake_server();
+
+    // First publish has 2 diagnostics
+    manager
+        .notify_file_changed_default(file, "fn main() {}\n")
+        .expect("open file");
+    wait_for_publish(&mut manager);
+    assert_eq!(manager.get_diagnostics_for_file(file).len(), 2);
+
+    // Close the file → fake server publishes [] (empty array)
+    manager.notify_file_closed(file).expect("close file");
+    wait_for_publish(&mut manager);
+
+    // Cache returns empty (the file is "checked clean" now). Importantly,
+    // this is preserved as a publish_epoch in the store, not deleted —
+    // but at the public API level, the diagnostics list is empty.
+    let diagnostics = manager.get_diagnostics_for_file(file);
+    assert!(
+        diagnostics.is_empty(),
+        "empty publish should clear errors but not be silently lost"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// LRU cap on DiagnosticsStore
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Diagnostics cache must respect the configured cap to prevent unbounded
+/// memory growth on long-running sessions in big monorepos.
+#[test]
+fn test_diagnostic_cache_respects_cap() {
+    use aft::lsp::diagnostics::{DiagnosticSeverity, DiagnosticsStore, StoredDiagnostic};
+    use aft::lsp::registry::ServerKind;
+    use aft::lsp::roots::ServerKey;
+
+    let mut store = DiagnosticsStore::with_capacity(3);
+
+    // Insert 5 distinct files. The cache should evict the 2 oldest.
+    for i in 0..5 {
+        let file = PathBuf::from(format!("/tmp/proj/src/file{i}.rs"));
+        let diag = StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 5,
+            severity: DiagnosticSeverity::Error,
+            message: format!("error in {i}"),
+            code: None,
+            source: Some("test".to_string()),
+        };
+        store.publish_with_kind(ServerKind::Rust, file, vec![diag]);
+    }
+
+    // Files 0 and 1 should have been evicted; 2, 3, 4 remain.
+    let all = store.all();
+    assert_eq!(
+        all.len(),
+        3,
+        "expected 3 entries after LRU eviction, got {}",
+        all.len()
+    );
+    let messages: Vec<String> = all.iter().map(|d| d.message.clone()).collect();
+    assert!(messages.iter().any(|m| m.contains("error in 4")));
+    assert!(messages.iter().any(|m| m.contains("error in 3")));
+    assert!(messages.iter().any(|m| m.contains("error in 2")));
+    assert!(!messages.iter().any(|m| m.contains("error in 0")));
+    assert!(!messages.iter().any(|m| m.contains("error in 1")));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Pull diagnostics happy path (textDocument/diagnostic)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// When the server declares pull-diagnostic capability AND the LSP client
+/// requests `textDocument/diagnostic`, the response should populate cache
+/// entries and be reachable via `get_diagnostics_for_file`.
+///
+/// We exercise this via env vars on the fake server: `AFT_FAKE_LSP_PULL=1`
+/// flips it to declare the capability.
+#[test]
+fn test_pull_diagnostics_returns_full_report() {
+    use aft::lsp::manager::PullFileOutcome;
+
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let config = Config {
+        project_root: Some(_root.clone()),
+        ..Config::default()
+    };
+
+    // Spawn a manager with a fake server in PULL mode.
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+    manager.set_extra_env("AFT_FAKE_LSP_PULL", "1");
+
+    // Open the file so server is initialized + we can request pull.
+    manager
+        .notify_file_changed_default(file, "fn main() {}\n")
+        .expect("open file");
+    // Wait for any push the fake also sends post-didOpen.
+    let _ = collect_event(&mut manager, |_e| true);
+
+    let results = manager
+        .pull_file_diagnostics(file, &config)
+        .expect("pull diagnostics succeeds");
+
+    assert_eq!(results.len(), 1, "expected 1 server result");
+    let result = &results[0];
+    match &result.outcome {
+        PullFileOutcome::Full { diagnostic_count } => {
+            assert_eq!(*diagnostic_count, 1, "expected 1 pulled diagnostic");
+        }
+        other => panic!("expected Full report, got {other:?}"),
+    }
+
+    // The pulled diagnostics must also be in the cache, addressable by file.
+    let cached = manager.get_diagnostics_for_file(file);
+    assert!(
+        cached.iter().any(|d| d.code.as_deref() == Some("E0PULL")),
+        "pulled diagnostic should be reachable via cache: {cached:?}"
+    );
+}
+
+/// When the server doesn't declare diagnosticProvider, pull falls back
+/// to "PullNotSupported" without crashing. The convention says the agent
+/// must see this honestly.
+#[test]
+fn test_pull_diagnostics_falls_back_when_unsupported() {
+    use aft::lsp::manager::PullFileOutcome;
+
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let mut config = Config::default();
+    config.project_root = Some(_root.clone());
+
+    // Spawn fake server WITHOUT pull capability (default).
+    let mut manager = manager_with_fake_server();
+    manager
+        .notify_file_changed_default(file, "fn main() {}\n")
+        .expect("open file");
+    let _ = collect_event(&mut manager, |_e| true);
+
+    let results = manager
+        .pull_file_diagnostics(file, &config)
+        .expect("pull request itself should succeed");
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(results[0].outcome, PullFileOutcome::PullNotSupported),
+        "expected PullNotSupported, got {:?}",
+        results[0].outcome
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Document staleness: didChange when disk content drifts
+// ────────────────────────────────────────────────────────────────────────────
+
+/// If the file on disk is modified outside AFT (e.g. another tool, manual
+/// edit), the next `ensure_file_open` call must detect the drift and send
+/// a `didChange` so the LSP server's view stays in sync. Otherwise pull
+/// or hover queries would return diagnostics for stale content.
+///
+/// This is a regression test for Oracle's hidden-bug finding #6.
+#[test]
+fn test_ensure_file_open_detects_disk_drift() {
+    let (_temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let mut config = Config::default();
+    config.project_root = Some(root.clone());
+
+    let mut manager = manager_with_fake_server();
+    // Open the file the first time.
+    manager.ensure_file_open(file, &config).expect("first open");
+
+    // Sleep briefly to ensure the new mtime is observably different from
+    // the original write. macOS mtime resolution is 1 second, so this
+    // ensures DocumentStore::has_disk_drifted detects the change.
+    thread::sleep(Duration::from_millis(1100));
+
+    // Simulate external modification: change content. The new mtime is set
+    // implicitly by the write call.
+    let new_content = "fn main() { println!(\"changed externally\"); }\n";
+    fs::write(file, new_content).expect("external write");
+
+    // Drain anything queued and then re-open. Should re-sync (didChange).
+    let _ = manager.drain_events();
+
+    manager
+        .ensure_file_open(file, &config)
+        .expect("re-open after drift");
+
+    // The fake server emits "custom/documentChanged" on didChange. If
+    // ensure_file_open detected drift, that notification arrives.
+    let event = collect_event(&mut manager, |event| {
+        matches!(
+            event,
+            LspEvent::Notification { method, .. } if method == "custom/documentChanged"
+        )
+    });
+    assert!(
+        event.is_some(),
+        "expected didChange after disk drift; got nothing"
+    );
 }

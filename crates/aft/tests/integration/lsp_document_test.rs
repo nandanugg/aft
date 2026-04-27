@@ -91,7 +91,7 @@ fn test_notify_file_changed_sends_did_open() {
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
     manager
-        .notify_file_changed(&main_rs, "fn main() { println!(\"hi\"); }\n")
+        .notify_file_changed_default(&main_rs, "fn main() { println!(\"hi\"); }\n")
         .expect("notify file changed");
 
     let opened = custom_event(&mut manager, "custom/documentOpened");
@@ -107,14 +107,14 @@ fn test_notify_file_changed_twice_sends_did_change() {
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
     manager
-        .notify_file_changed(&main_rs, "fn main() { println!(\"one\"); }\n")
+        .notify_file_changed_default(&main_rs, "fn main() { println!(\"one\"); }\n")
         .expect("first notify");
     let opened = custom_event(&mut manager, "custom/documentOpened");
     assert_eq!(opened["uri"], expected_uri);
     assert_eq!(opened["version"], 0);
 
     manager
-        .notify_file_changed(&main_rs, "fn main() { println!(\"two\"); }\n")
+        .notify_file_changed_default(&main_rs, "fn main() { println!(\"two\"); }\n")
         .expect("second notify");
     let changed = custom_event(&mut manager, "custom/documentChanged");
     assert_eq!(changed["uri"], expected_uri);

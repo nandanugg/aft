@@ -10,10 +10,12 @@
  *   node scripts/version-sync.mjs --from-tag       # read from GITHUB_REF_NAME (e.g. v0.2.0)
  *   node scripts/version-sync.mjs 0.2.0 --dry-run  # preview changes without writing
  *
- * Updates 7 locations:
+ * Updates 9 locations:
  *   1-5. npm/{platform}/package.json  → version field
- *   6.   opencode-plugin-aft/package.json → version field + all optionalDependencies versions
- *   7.   Cargo.toml → version field
+ *   6.   aft-opencode/package.json → version field + all optionalDependencies versions
+ *   7.   aft-pi/package.json → version field + all optionalDependencies versions
+ *   8.   aft-cli/package.json → version field
+ *   9.   Cargo.toml → version field
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -151,7 +153,11 @@ results.push(updateJsonFile(corePath, version, { optionalDependencies: true }, d
 const piPath = join(root, "packages", "pi-plugin", "package.json");
 results.push(updateJsonFile(piPath, version, { optionalDependencies: true }, dryRun));
 
-// 8: Cargo.toml
+// 8: @cortexkit/aft (unified CLI)
+const cliPath = join(root, "packages", "aft-cli", "package.json");
+results.push(updateJsonFile(cliPath, version, {}, dryRun));
+
+// 9: Cargo.toml
 const cargoPath = join(root, "crates", "aft", "Cargo.toml");
 results.push(updateCargoToml(cargoPath, version, dryRun));
 

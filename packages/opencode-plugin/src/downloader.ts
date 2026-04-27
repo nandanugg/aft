@@ -184,12 +184,7 @@ export async function ensureBinary(version?: string): Promise<string | null> {
     log(`No cached binary for ${version}, downloading...`);
     return downloadBinary(version);
   }
-  // No version requested — check legacy flat cache, then download latest
-  const legacyCached = getCachedBinaryPath();
-  if (legacyCached) {
-    log(`Found cached binary: ${legacyCached}`);
-    return legacyCached;
-  }
+  // No version requested — download latest.
   log("No cached binary found, downloading latest...");
   return downloadBinary();
 }

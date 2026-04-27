@@ -5,13 +5,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import { loadAftConfig } from "./config.js";
+import { loadAftConfig, resolveLspConfigForConfigure } from "./config.js";
 import { ensureBinary } from "./downloader.js";
 import { error, log, warn } from "./logger.js";
 import { consumeToolMetadata } from "./metadata-store.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
 import {
+  type ConfigureWarning,
   cleanupWarnings,
+  deliverConfigureWarnings,
   type NotificationOptions,
   sendFeatureAnnouncement,
   sendWarning,
@@ -56,6 +58,21 @@ function isTuiMode(): boolean {
 
 function throwSentinel(command: string): never {
   throw new Error(`${SENTINEL_PREFIX}${command.toUpperCase().replace(/-/g, "_")}_HANDLED__`);
+}
+
+function isConfigureWarning(value: unknown): value is ConfigureWarning {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const warning = value as Record<string, unknown>;
+  return (
+    (warning.kind === "formatter_not_installed" ||
+      warning.kind === "checker_not_installed" ||
+      warning.kind === "lsp_binary_missing") &&
+    typeof warning.hint === "string"
+  );
+}
+
+function coerceConfigureWarnings(warnings: unknown[]): ConfigureWarning[] {
+  return warnings.filter(isConfigureWarning);
 }
 
 async function sendIgnoredMessage(client: unknown, sessionID: string, text: string): Promise<void> {
@@ -146,16 +163,24 @@ const plugin: Plugin = async (input) => {
     configOverrides.validate_on_edit = aftConfig.validate_on_edit;
   if (aftConfig.formatter !== undefined) configOverrides.formatter = aftConfig.formatter;
   if (aftConfig.checker !== undefined) configOverrides.checker = aftConfig.checker;
-  if (aftConfig.restrict_to_project_root !== undefined)
-    configOverrides.restrict_to_project_root = aftConfig.restrict_to_project_root;
+  // Default to restrict_to_project_root: true for plugin-hosted agents.
+  // The Rust CLI default is false (documented — for direct/scripted use), but
+  // when agents call `aft_outline`, `aft_read`, etc. through the plugin there
+  // is no interactive permission prompt for reads, so we must enforce the
+  // project-root boundary by default. Users can opt out by explicitly setting
+  // `restrict_to_project_root: false` in their aft.jsonc.
+  configOverrides.restrict_to_project_root = aftConfig.restrict_to_project_root ?? true;
   if (aftConfig.experimental_search_index !== undefined)
     configOverrides.experimental_search_index = aftConfig.experimental_search_index;
   if (aftConfig.experimental_semantic_search !== undefined)
     configOverrides.experimental_semantic_search = aftConfig.experimental_semantic_search;
+  Object.assign(configOverrides, resolveLspConfigForConfigure(aftConfig));
   if (aftConfig.semantic !== undefined) configOverrides.semantic = aftConfig.semantic;
   if (aftConfig.go_overlay_provider !== undefined) {
     configOverrides.go_overlay_provider = aftConfig.go_overlay_provider;
   }
+  if (aftConfig.max_callgraph_files !== undefined)
+    configOverrides.max_callgraph_files = aftConfig.max_callgraph_files;
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
 
@@ -169,16 +194,17 @@ const plugin: Plugin = async (input) => {
   // The resolved path is passed to bridges via ORT_DYLIB_PATH env var.
   if (aftConfig.experimental_semantic_search && isFastembedSemanticBackend) {
     const storageDir = configOverrides.storage_dir as string;
-    ensureOnnxRuntime(storageDir).then(
-      (ortDir) => {
-        if (ortDir) {
-          configOverrides._ort_dylib_dir = ortDir;
-        } else if (!isOrtAutoDownloadSupported()) {
-          warn(`Semantic search requires ONNX Runtime. Install: ${getManualInstallHint()}`);
-        }
-      },
-      (err) => warn(`ONNX Runtime resolution failed: ${err}`),
-    );
+    const ortDylibDir = await ensureOnnxRuntime(storageDir).catch((err) => {
+      warn(
+        `ONNX Runtime setup failed: ${err instanceof Error ? err.message : String(err)}. Semantic search will be unavailable.`,
+      );
+      return null;
+    });
+    if (ortDylibDir) {
+      configOverrides._ort_dylib_dir = ortDylibDir;
+    } else if (!isOrtAutoDownloadSupported()) {
+      warn(`Semantic search requires ONNX Runtime. Install: ${getManualInstallHint()}`);
+    }
   }
 
   // Track which binary version we already attempted to upgrade from.
@@ -226,6 +252,21 @@ const plugin: Plugin = async (input) => {
               `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
             );
           },
+        );
+      },
+      onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
+        if (!sessionId) return;
+        const validWarnings = coerceConfigureWarnings(warnings);
+        if (validWarnings.length === 0) return;
+        await deliverConfigureWarnings(
+          {
+            client: client ?? input.client,
+            sessionId,
+            storageDir: configOverrides.storage_dir as string,
+            pluginVersion: PLUGIN_VERSION,
+            projectRoot,
+          },
+          validWarnings,
         );
       },
     },

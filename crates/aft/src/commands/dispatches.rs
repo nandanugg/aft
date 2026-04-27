@@ -59,9 +59,10 @@ pub fn handle_dispatches(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    let max_files = ctx.config().max_callgraph_files;
     if prefix_mode {
         // Return a list of results grouped by matched key.
-        let matches = graph.find_by_dispatch_key_prefix(&key);
+        let matches = graph.find_by_dispatch_key_prefix(&key, max_files);
         // Flatten into a list of DispatchesResult, one per matched key.
         let results: Vec<DispatchesResult> = matches
             .into_iter()
@@ -78,7 +79,7 @@ pub fn handle_dispatches(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         Response::success(&req.id, json)
     } else {
-        let handlers = graph.find_by_dispatch_key(&key);
+        let handlers = graph.find_by_dispatch_key(&key, max_files);
         let result = DispatchesResult {
             key: key.clone(),
             handlers,

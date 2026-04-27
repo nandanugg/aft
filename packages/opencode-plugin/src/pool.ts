@@ -54,6 +54,7 @@ export class BridgePool {
       maxRestarts: options.maxRestarts,
       minVersion: options.minVersion,
       onVersionMismatch: options.onVersionMismatch,
+      onConfigureWarnings: options.onConfigureWarnings,
     };
     this.configOverrides = configOverrides;
     // Skip cleanup timer when idle timeout is Infinity (no-op) to avoid wasted cycles
@@ -163,14 +164,9 @@ export class BridgePool {
     // Old bridge processes are NOT killed — they continue running from the old
     // binary (safe on all platforms since the binary is loaded in memory) and will
     // exit naturally when their stdin/stdout are garbage collected.
-    for (const [, entry] of this.bridges) {
-      try {
-        entry.bridge.shutdown();
-      } catch {
-        // best-effort
-      }
-    }
+    const shutdowns = Array.from(this.bridges.values()).map((entry) => entry.bridge.shutdown());
     this.bridges.clear();
+    await Promise.allSettled(shutdowns);
     log(
       `Binary path updated to ${newPath}. All bridges cleared — next calls will use the new binary.`,
     );

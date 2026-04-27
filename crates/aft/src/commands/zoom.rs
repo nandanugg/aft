@@ -137,7 +137,8 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
 
             let start_idx = start - 1;
             // Clamp end_line to file length (same as batch edits)
-            let end_idx = (end - 1).min(lines.len() - 1);
+            let clamped_end = end.min(lines.len());
+            let end_idx = clamped_end - 1;
             if start_idx >= lines.len() {
                 return Response::error(
                     &req.id,
@@ -175,12 +176,12 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::success(
                 &req.id,
                 serde_json::json!({
-                    "name": format!("lines {}-{}", start, end),
+                    "name": format!("lines {}-{}", start, clamped_end),
                     "kind": "lines",
                     "range": {
                         "start_line": start,  // already 1-based from user input
                         "start_col": 1,
-                        "end_line": end,      // already 1-based from user input
+                        "end_line": clamped_end,
                         "end_col": end_col + 1,
                     },
                     "content": content,
@@ -230,19 +231,27 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     if matches.len() > 1 {
-        // Ambiguous — return qualified candidates
+        // Ambiguous — return qualified candidates with 1-based line ranges.
+        // Internal symbols.rs ranges are 0-based; we add 1 to both start and end.
         let candidates: Vec<String> = matches
             .iter()
             .map(|m| {
                 let sym = &m.symbol;
+                let start = sym.range.start_line + 1;
+                let end = sym.range.end_line + 1;
+                let line_range = if start == end {
+                    format!("{}", start)
+                } else {
+                    format!("{}-{}", start, end)
+                };
                 if sym.scope_chain.is_empty() {
-                    format!("{}:{}", sym.name, sym.range.start_line)
+                    format!("{}:{}", sym.name, line_range)
                 } else {
                     format!(
                         "{}::{}:{}",
                         sym.scope_chain.join("::"),
                         sym.name,
-                        sym.range.start_line
+                        line_range
                     )
                 }
             })
@@ -393,11 +402,12 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.drain_go_helper();
 
     // For Variable and Constant symbols, query the call graph for cross-package writers.
+    let max_files = ctx.config().max_callgraph_files;
     let writers = if matches!(target.kind, SymbolKind::Variable | SymbolKind::Constant) {
         let mut cg_ref = ctx.callgraph().borrow_mut();
         if let Some(graph) = cg_ref.as_mut() {
             let writers = graph
-                .writers_of(resolved_file_path, &target.name)
+                .writers_of(resolved_file_path, &target.name, max_files)
                 .unwrap_or_else(|_| crate::callgraph::WritersResult {
                     variable: target.name.clone(),
                     file: String::new(),

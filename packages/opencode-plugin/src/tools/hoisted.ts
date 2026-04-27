@@ -29,40 +29,250 @@ function relativeToWorktree(fp: string, worktree: string): string {
   return path.relative(worktree, fp);
 }
 
-/** Build a simple unified diff string from before/after content. */
+/** Test-only export. Production code uses buildUnifiedDiff directly. */
+export const _buildUnifiedDiffForTest = (fp: string, before: string, after: string): string =>
+  buildUnifiedDiff(fp, before, after);
+
+/**
+ * Build a unified diff string from before/after content using a proper
+ * LCS-based diff algorithm with grouped hunks and 3 lines of context.
+ *
+ * The previous implementation compared lines by index, so any insertion
+ * or deletion that shifted line numbers caused every subsequent line to
+ * compare unequal — emitting the entire rest of the file as "changed"
+ * (issue #22, regression introduced in v0.15.3 when apply_patch started
+ * sending diffs).
+ *
+ * Output matches GNU diff -u style: --- /+++ headers, @@ hunk markers,
+ * one hunk per change cluster (consecutive changes within 6 lines of
+ * each other are merged into a single hunk).
+ */
 function buildUnifiedDiff(fp: string, before: string, after: string): string {
   // Skip diff for very large files to avoid blocking the event loop
   const SIZE_CAP = 100 * 1024; // 100KB
   if (before.length > SIZE_CAP || after.length > SIZE_CAP) {
     return `Index: ${fp}\n(diff skipped: file exceeds ${SIZE_CAP / 1024}KB)\n`;
   }
+
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
-  let diff = `Index: ${fp}\n===================================================================\n--- ${fp}\n+++ ${fp}\n`;
-  let firstChange = -1;
-  let lastChange = -1;
-  const maxLen = Math.max(beforeLines.length, afterLines.length);
-  for (let i = 0; i < maxLen; i++) {
-    if ((beforeLines[i] ?? "") !== (afterLines[i] ?? "")) {
-      if (firstChange === -1) firstChange = i;
-      lastChange = i;
-    }
+  const ops = diffLines(beforeLines, afterLines);
+
+  // No changes → empty diff (caller decides whether to render the header).
+  if (ops.every((op) => op.tag === "eq")) {
+    return `Index: ${fp}\n===================================================================\n--- ${fp}\n+++ ${fp}\n`;
   }
-  if (firstChange === -1) return diff;
-  const ctxStart = Math.max(0, firstChange - 2);
-  const ctxEnd = Math.min(maxLen - 1, lastChange + 2);
-  diff += `@@ -${ctxStart + 1},${Math.min(beforeLines.length, ctxEnd + 1) - ctxStart} +${ctxStart + 1},${Math.min(afterLines.length, ctxEnd + 1) - ctxStart} @@\n`;
-  for (let i = ctxStart; i <= ctxEnd; i++) {
-    const bl = i < beforeLines.length ? beforeLines[i] : undefined;
-    const al = i < afterLines.length ? afterLines[i] : undefined;
-    if (bl === al) {
-      diff += ` ${bl}\n`;
-    } else {
-      if (bl !== undefined) diff += `-${bl}\n`;
-      if (al !== undefined) diff += `+${al}\n`;
+
+  const CONTEXT = 3;
+  const HUNK_GAP = CONTEXT * 2; // merge hunks closer than this
+  const hunks = groupIntoHunks(ops, CONTEXT, HUNK_GAP, beforeLines.length, afterLines.length);
+
+  let diff = `Index: ${fp}\n===================================================================\n--- ${fp}\n+++ ${fp}\n`;
+  for (const hunk of hunks) {
+    diff += `@@ -${hunk.beforeStart},${hunk.beforeCount} +${hunk.afterStart},${hunk.afterCount} @@\n`;
+    for (const line of hunk.lines) {
+      diff += `${line}\n`;
     }
   }
   return diff;
+}
+
+/**
+ * Count non-empty lines in a string. Used for unambiguous addition/deletion
+ * counts when one side of a diff is empty (apply_patch's add/delete hunks).
+ *
+ * `split("\n")` on a string with a trailing newline produces a trailing
+ * empty element which we drop, so the count matches "actual content lines"
+ * rather than "split slots". For empty input the count is 0.
+ */
+function lineCount(content: string): number {
+  if (content.length === 0) return 0;
+  const parts = content.split("\n");
+  // Drop the trailing empty element produced by a terminating "\n".
+  if (parts[parts.length - 1] === "") parts.pop();
+  return parts.length;
+}
+
+/**
+ * Count additions and deletions between two file contents using the same
+ * LCS path that powers buildUnifiedDiff. Used for apply_patch's *move*
+ * case where the Rust write diff would compare against an empty target
+ * (overcounting additions). For non-move updates we use the Rust counts
+ * directly.
+ */
+function countDiffLines(before: string, after: string): { additions: number; deletions: number } {
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+  const ops = diffLines(beforeLines, afterLines);
+  let additions = 0;
+  let deletions = 0;
+  for (const op of ops) {
+    if (op.tag === "ins") additions++;
+    else if (op.tag === "del") deletions++;
+  }
+  return { additions, deletions };
+}
+
+type DiffOp =
+  | { tag: "eq"; beforeIdx: number; afterIdx: number; line: string }
+  | { tag: "del"; beforeIdx: number; line: string }
+  | { tag: "ins"; afterIdx: number; line: string };
+
+/**
+ * LCS-based line diff. Builds a length table then walks back to produce ops.
+ * O(n*m) time and space — fine for the 100KB SIZE_CAP guard above.
+ */
+function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
+  const n = a.length;
+  const m = b.length;
+
+  // dp[i][j] = LCS length of a[0..i] and b[0..j]
+  // Use a flat Uint32Array for memory efficiency on large files.
+  const dp = new Uint32Array((n + 1) * (m + 1));
+  const w = m + 1;
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[i * w + j] = dp[(i - 1) * w + (j - 1)] + 1;
+      } else {
+        const up = dp[(i - 1) * w + j];
+        const left = dp[i * w + (j - 1)];
+        dp[i * w + j] = up >= left ? up : left;
+      }
+    }
+  }
+
+  // Walk back to produce ops in reverse, then reverse at the end.
+  const ops: DiffOp[] = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) {
+      ops.push({ tag: "eq", beforeIdx: i - 1, afterIdx: j - 1, line: a[i - 1] });
+      i--;
+      j--;
+    } else if (dp[(i - 1) * w + j] >= dp[i * w + (j - 1)]) {
+      ops.push({ tag: "del", beforeIdx: i - 1, line: a[i - 1] });
+      i--;
+    } else {
+      ops.push({ tag: "ins", afterIdx: j - 1, line: b[j - 1] });
+      j--;
+    }
+  }
+  while (i > 0) {
+    ops.push({ tag: "del", beforeIdx: i - 1, line: a[i - 1] });
+    i--;
+  }
+  while (j > 0) {
+    ops.push({ tag: "ins", afterIdx: j - 1, line: b[j - 1] });
+    j--;
+  }
+  ops.reverse();
+  return ops;
+}
+
+interface Hunk {
+  beforeStart: number; // 1-based
+  beforeCount: number;
+  afterStart: number; // 1-based
+  afterCount: number;
+  lines: string[]; // each prefixed with " ", "+", or "-"
+}
+
+/**
+ * Group ops into hunks. Consecutive change ops are clustered with `context`
+ * lines on each side; clusters closer than `gap` are merged into one hunk.
+ */
+function groupIntoHunks(
+  ops: DiffOp[],
+  context: number,
+  gap: number,
+  beforeLen: number,
+  afterLen: number,
+): Hunk[] {
+  // Find indices of change ops (ins or del).
+  const changeIdx: number[] = [];
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k].tag !== "eq") changeIdx.push(k);
+  }
+  if (changeIdx.length === 0) return [];
+
+  // Build hunk ranges in op-index space, then merge nearby ones.
+  const ranges: Array<[number, number]> = [];
+  for (const idx of changeIdx) {
+    const start = Math.max(0, idx - context);
+    const end = Math.min(ops.length - 1, idx + context);
+    if (ranges.length > 0 && start <= ranges[ranges.length - 1][1] + gap) {
+      ranges[ranges.length - 1][1] = Math.max(ranges[ranges.length - 1][1], end);
+    } else {
+      ranges.push([start, end]);
+    }
+  }
+
+  // Materialize each range as a hunk. Track 1-based line numbers from the
+  // first op's recorded indices.
+  const hunks: Hunk[] = [];
+  for (const [start, end] of ranges) {
+    let beforeStart = -1;
+    let afterStart = -1;
+    let beforeCount = 0;
+    let afterCount = 0;
+    const lines: string[] = [];
+    for (let k = start; k <= end; k++) {
+      const op = ops[k];
+      if (op.tag === "eq") {
+        if (beforeStart === -1) beforeStart = op.beforeIdx + 1;
+        if (afterStart === -1) afterStart = op.afterIdx + 1;
+        beforeCount++;
+        afterCount++;
+        lines.push(` ${op.line}`);
+      } else if (op.tag === "del") {
+        if (beforeStart === -1) beforeStart = op.beforeIdx + 1;
+        if (afterStart === -1) {
+          // Pure-deletion hunk at start: position after-cursor is one past
+          // the last preceding equal op. Walk forward to find the next
+          // ins/eq to anchor afterStart, otherwise clamp to end.
+          afterStart = inferAfterStart(ops, k, afterLen);
+        }
+        beforeCount++;
+        lines.push(`-${op.line}`);
+      } else {
+        if (afterStart === -1) afterStart = op.afterIdx + 1;
+        if (beforeStart === -1) {
+          beforeStart = inferBeforeStart(ops, k, beforeLen);
+        }
+        afterCount++;
+        lines.push(`+${op.line}`);
+      }
+    }
+    // Empty file edge case: GNU diff uses 0 for line numbers when count is 0.
+    if (beforeCount === 0) beforeStart = 0;
+    if (afterCount === 0) afterStart = 0;
+    hunks.push({ beforeStart, beforeCount, afterStart, afterCount, lines });
+  }
+  return hunks;
+}
+
+/** Find what afterStart should be when a hunk begins with deletions. */
+function inferAfterStart(ops: DiffOp[], from: number, afterLen: number): number {
+  // Look forward for any op carrying an afterIdx.
+  for (let k = from; k < ops.length; k++) {
+    const op = ops[k];
+    if (op.tag === "eq") return op.afterIdx + 1;
+    if (op.tag === "ins") return op.afterIdx + 1;
+  }
+  // No future after-line — point past the last line.
+  return afterLen;
+}
+
+/** Find what beforeStart should be when a hunk begins with insertions. */
+function inferBeforeStart(ops: DiffOp[], from: number, beforeLen: number): number {
+  for (let k = from; k < ops.length; k++) {
+    const op = ops[k];
+    if (op.tag === "eq") return op.beforeIdx + 1;
+    if (op.tag === "del") return op.beforeIdx + 1;
+  }
+  return beforeLen;
 }
 
 const z = tool.schema;
@@ -657,34 +867,77 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         throw new Error("Empty patch: no file operations found");
       }
 
-      // Resolve all paths and ask permission
-      const allPaths = hunks.map((h) =>
-        path.relative(context.worktree, path.resolve(context.directory, h.path)),
-      );
+      // Resolve every path this patch touches — SOURCES (h.path) and
+      // DESTINATIONS (h.move_path for move hunks). Move destinations have to
+      // be tracked because the old code only checkpointed sources; a partial
+      // move that succeeded at the destination but failed at source deletion
+      // left orphan files behind that rollback never cleaned up (audit #8).
+      const affectedAbs = new Set<string>();
+      // Files that did NOT exist before this patch — add targets plus move
+      // destinations whose path was empty. On rollback we delete these
+      // instead of restoring content that was never there.
+      const newlyCreatedAbs = new Set<string>();
+
+      for (const h of hunks) {
+        const srcAbs = path.resolve(context.directory, h.path);
+        affectedAbs.add(srcAbs);
+        if (h.type === "add") {
+          newlyCreatedAbs.add(srcAbs);
+        }
+        if (h.type === "update" && h.move_path) {
+          const dstAbs = path.resolve(context.directory, h.move_path);
+          affectedAbs.add(dstAbs);
+          // Snapshot the destination if it exists so rollback restores the
+          // original contents. If it doesn't exist, track it as newly
+          // created so rollback removes it.
+          if (!fs.existsSync(dstAbs)) {
+            newlyCreatedAbs.add(dstAbs);
+          }
+        }
+      }
+
+      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(context.worktree, abs));
 
       await context.ask({
         permission: "edit",
-        patterns: allPaths,
+        patterns: relPaths,
         always: ["*"],
         metadata: {},
       });
 
-      // Checkpoint all affected files for atomic rollback
+      // Checkpoint only files that exist pre-patch. Non-existent destinations
+      // are tracked in newlyCreatedAbs and reverted by deletion on rollback.
+      const checkpointPaths = Array.from(affectedAbs).filter((abs) => !newlyCreatedAbs.has(abs));
       const checkpointName = `apply_patch_${Date.now()}`;
       let checkpointCreated = false;
-      try {
-        await callBridge(ctx, context, "checkpoint", {
-          name: checkpointName,
-          files: allPaths.map((p) => path.resolve(context.directory, p)),
-        });
-        checkpointCreated = true;
-      } catch {
-        // Checkpoint failure is non-fatal — proceed without rollback protection
+      if (checkpointPaths.length > 0) {
+        try {
+          await callBridge(ctx, context, "checkpoint", {
+            name: checkpointName,
+            files: checkpointPaths,
+          });
+          checkpointCreated = true;
+        } catch {
+          // Checkpoint failure is non-fatal — proceed without rollback
+          // protection (the hunk loop still records perFileDiffs for the UI).
+        }
       }
 
-      // Process each hunk, track per-file diffs for metadata
+      // Process each hunk, track per-file diffs for metadata.
+      // additions/deletions come from the Rust-side `similar`-crate diff
+      // (returned via `include_diff: true` on the write call) — same source
+      // as the edit/write tools, which produce correct counts. Avoid
+      // recomputing via TS-side LCS to keep one source of truth (issue: the
+      // `apply_patch` UI was reporting +N/-N≈filesize counts because the
+      // local count was diverging from the Rust truth).
       const results: string[] = [];
-      const perFileDiffs: Array<{ filePath: string; before: string; after: string }> = [];
+      const perFileDiffs: Array<{
+        filePath: string;
+        before: string;
+        after: string;
+        additions: number;
+        deletions: number;
+      }> = [];
       let patchFailed = false;
 
       for (const hunk of hunks) {
@@ -693,13 +946,27 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         switch (hunk.type) {
           case "add": {
             try {
-              await callBridge(ctx, context, "write", {
+              const content = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
+              const writeResult = await callBridge(ctx, context, "write", {
                 file: filePath,
-                content: hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`,
+                content,
                 create_dirs: true,
                 diagnostics: true,
+                include_diff: true,
               });
-              perFileDiffs.push({ filePath, before: "", after: hunk.contents });
+              const wrDiff = writeResult.diff as
+                | { before?: string; after?: string; additions?: number; deletions?: number }
+                | undefined;
+              perFileDiffs.push({
+                filePath,
+                before: "",
+                after: hunk.contents,
+                // For a brand-new file, additions = total lines, deletions = 0.
+                // Prefer Rust counts; fall back to a content line count if the
+                // bridge didn't include a diff (e.g. older binary).
+                additions: wrDiff?.additions ?? lineCount(content),
+                deletions: wrDiff?.deletions ?? 0,
+              });
               results.push(`Created ${hunk.path}`);
             } catch (e) {
               patchFailed = true;
@@ -712,7 +979,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
             try {
               const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
               await callBridge(ctx, context, "delete_file", { file: filePath });
-              perFileDiffs.push({ filePath, before, after: "" });
+              // delete_file doesn't return a diff. The counts are unambiguous:
+              // every prior line is a deletion; nothing is added.
+              perFileDiffs.push({
+                filePath,
+                before,
+                after: "",
+                additions: 0,
+                deletions: lineCount(before),
+              });
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
               patchFailed = true;
@@ -736,6 +1011,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 content: newContent,
                 create_dirs: true,
                 diagnostics: true,
+                include_diff: true,
               });
 
               // Collect diagnostics from this file
@@ -751,8 +1027,32 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 }
               }
 
-              // Track per-file diff for metadata
-              perFileDiffs.push({ filePath, before: original, after: newContent });
+              // Track per-file diff for metadata. For a regular update the
+              // Rust write diff compares disk-before vs new content, which
+              // matches what we want. For a *move*, write goes to a fresh
+              // target (no prior content), so Rust would report the whole
+              // file as additions; we recompute via TS-side LCS instead.
+              // For non-move updates we still recompute as a fallback when
+              // the bridge didn't include a diff (older binary or a test
+              // mock without diff support).
+              const wrDiff = writeResult.diff as
+                | { before?: string; after?: string; additions?: number; deletions?: number }
+                | undefined;
+              const isMove = Boolean(hunk.move_path);
+              const { additions, deletions } =
+                isMove || wrDiff?.additions === undefined || wrDiff.deletions === undefined
+                  ? countDiffLines(original, newContent)
+                  : {
+                      additions: wrDiff.additions,
+                      deletions: wrDiff.deletions,
+                    };
+              perFileDiffs.push({
+                filePath,
+                before: original,
+                after: newContent,
+                additions,
+                deletions,
+              });
 
               if (hunk.move_path) {
                 await callBridge(ctx, context, "delete_file", { file: filePath });
@@ -770,33 +1070,109 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      // On failure, restore checkpoint to undo partial changes
+      // On failure, restore checkpoint AND delete files that were newly
+      // created by this patch (adds + move destinations that didn't exist
+      // pre-patch). Checkpoint restore alone only recovers files that
+      // existed before — it cannot undo a newly created file or the
+      // destination side of a partial move (audit #8).
       if (patchFailed) {
+        const rollbackNotes: string[] = [];
         if (checkpointCreated) {
           try {
             await callBridge(ctx, context, "restore_checkpoint", { name: checkpointName });
-            results.push("Patch failed — restored files to pre-patch state.");
+            rollbackNotes.push("restored pre-existing files from checkpoint");
           } catch {
-            results.push(
-              "Patch failed — checkpoint restore also failed, files may be inconsistent.",
+            rollbackNotes.push("checkpoint restore FAILED, pre-existing files may be inconsistent");
+          }
+        } else if (checkpointPaths.length > 0) {
+          rollbackNotes.push("no checkpoint was created, pre-existing files may be inconsistent");
+        }
+
+        // Delete any file we newly created. We call delete_file (which
+        // respects validate_path and backs up), and tolerate already-absent
+        // files so partial-create failures don't double-error.
+        let newlyDeleted = 0;
+        for (const createdAbs of newlyCreatedAbs) {
+          if (!fs.existsSync(createdAbs)) continue;
+          try {
+            await callBridge(ctx, context, "delete_file", { file: createdAbs });
+            newlyDeleted++;
+          } catch {
+            rollbackNotes.push(
+              `failed to delete newly-created ${path.relative(context.worktree, createdAbs)}`,
             );
           }
-        } else {
-          results.push("Patch failed — no checkpoint was created, files may be inconsistent.");
         }
+        if (newlyDeleted > 0) {
+          rollbackNotes.push(`removed ${newlyDeleted} newly-created file(s)`);
+        }
+
+        results.push(
+          rollbackNotes.length > 0
+            ? `Patch failed — ${rollbackNotes.join("; ")}.`
+            : "Patch failed — nothing to roll back.",
+        );
         return results.join("\n");
       }
 
       // Store metadata for tool.execute.after hook (match opencode built-in format)
       const callID = getCallID(context);
       if (callID) {
-        // Build per-file metadata matching opencode's files array
+        // Index per-file diffs by absolute filePath for fast lookup when
+        // building the metadata.files array. Each entry NEEDS to carry the
+        // per-file `patch` string plus `additions`/`deletions` counts —
+        // OpenCode's UI patchFile() at packages/ui/src/components/apply-patch-file.ts
+        // returns undefined for any file metadata that lacks all of `patch`,
+        // `before`, and `after`. Without this enrichment, the UI silently
+        // dropped every file entry and rendered no diffs (v0.15.2 fix for
+        // the "apply_patch shows no diff in TUI/UI" report).
+        const diffByPath = new Map(perFileDiffs.map((d) => [d.filePath, d]));
+
+        // Build per-file metadata. OpenCode's apply_patch shape (see
+        // packages/opencode/src/tool/apply_patch.ts:188) per file:
+        //   { filePath, relativePath, type, patch, additions, deletions, movePath? }
+        // `type` is normalised to "move" when an update hunk has a move target,
+        // so the UI can label the row correctly.
+        //
+        // additions/deletions come from perFileDiffs, which were populated
+        // from the Rust-side `similar`-crate diff (via include_diff:true on
+        // each write call). This matches edit/write tool counts exactly.
+        // The TS-side LCS via buildUnifiedDiff is still used to build the
+        // *display* `patch` text — the diff is correct visually; only the
+        // line-count derivation through countAddDel was producing wrong
+        // numbers (e.g. +399/-400 for a single-line removal). See
+        // perFileDiffs population above for how counts are derived per
+        // hunk type.
         const files = hunks.map((h) => {
-          const relPath = path.relative(context.worktree, path.resolve(context.directory, h.path));
+          const filePath = path.resolve(context.directory, h.path);
+          // `move_path` only exists on UpdateHunk variants — narrow first.
+          const rawMovePath = h.type === "update" ? h.move_path : undefined;
+          const movePath = rawMovePath ? path.resolve(context.directory, rawMovePath) : undefined;
+          // For moved files, render the destination path as the visible
+          // location (matches OpenCode's apply_patch behaviour).
+          const displayPath = movePath ?? filePath;
+          const relPath = path.relative(context.worktree, displayPath);
+
+          const diffEntry = diffByPath.get(filePath);
+          const patch = diffEntry
+            ? buildUnifiedDiff(displayPath, diffEntry.before, diffEntry.after)
+            : "";
+          const additions = diffEntry?.additions ?? 0;
+          const deletions = diffEntry?.deletions ?? 0;
+
+          // Normalise type for UI: an "update" hunk with a move target is a
+          // move, otherwise keep the parsed type as-is.
+          const uiType: "add" | "update" | "delete" | "move" =
+            h.type === "update" && rawMovePath ? "move" : h.type;
+
           return {
-            filePath: path.resolve(context.directory, h.path),
+            filePath,
             relativePath: relPath,
-            type: h.type,
+            type: uiType,
+            patch,
+            additions,
+            deletions,
+            ...(movePath ? { movePath } : {}),
           };
         });
 
@@ -809,9 +1185,11 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           .join("\n");
         const title = `Success. Updated the following files:\n${fileList}`;
 
-        // Build per-file diffs instead of concatenating content across files
-        const diffText = perFileDiffs
-          .map((d) => buildUnifiedDiff(d.filePath, d.before, d.after))
+        // Aggregate unified diff for the top-level metadata.diff field
+        // (OpenCode's renderer also uses this for some views).
+        const diffText = files
+          .map((f) => f.patch)
+          .filter(Boolean)
           .join("\n");
 
         storeToolMetadata(context.sessionID, callID, {

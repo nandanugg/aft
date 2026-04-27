@@ -25,6 +25,14 @@ const ONNX_RUNTIME_INSTALL_HINT: &str =
 
 const SEMANTIC_INDEX_VERSION_V1: u8 = 1;
 const SEMANTIC_INDEX_VERSION_V2: u8 = 2;
+/// V3 adds subsec_nanos to the file-mtime table so staleness detection survives
+/// restart round-trips on filesystems with subsecond mtime precision (APFS,
+/// ext4 with nsec, NTFS). V1/V2 persisted whole-second mtimes only, which
+/// caused every restart to flag ~99% of files as stale and re-embed them.
+const SEMANTIC_INDEX_VERSION_V3: u8 = 3;
+/// V4 keeps the V3 on-disk layout but rebuilds persisted snippets once after
+/// fixing symbol ranges that were incorrectly treated as 1-based.
+const SEMANTIC_INDEX_VERSION_V4: u8 = 4;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Must stay below the bridge timeout (30s) to avoid bridge kills on slow backends.
@@ -1066,6 +1074,16 @@ impl SemanticIndex {
         }
 
         let bytes = fs::read(&data_path).ok()?;
+        let version = bytes[0];
+        if version != SEMANTIC_INDEX_VERSION_V4 {
+            log::info!(
+                "[aft] cached semantic index version {} is older than {}, rebuilding",
+                version,
+                SEMANTIC_INDEX_VERSION_V4
+            );
+            let _ = fs::remove_file(&data_path);
+            return None;
+        }
         match Self::from_bytes(&bytes) {
             Ok(index) => {
                 if index.entries.is_empty() {
@@ -1110,21 +1128,28 @@ impl SemanticIndex {
             }
         });
 
-        // Header: version(1) + dimension(4) + entry_count(4) [+ fingerprint_len(4)]
-        let version = if fingerprint_bytes.is_some() {
-            SEMANTIC_INDEX_VERSION_V2
-        } else {
-            SEMANTIC_INDEX_VERSION_V1
-        };
+        // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
+        //
+        // V4 (v0.16.0+) is the single write format. Layout matches V3:
+        //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
+        //     no bytes follow). Uniform format simplifies the reader.
+        //   - mtimes stored as secs(u64) + subsec_nanos(u32). Preserves full
+        //     APFS/ext4/NTFS precision so staleness checks survive restart
+        //     round-trips.
+        //
+        // V1/V2 remain readable for backward compatibility (see from_bytes).
+        // V3 loads as the same format but is rejected on disk so snippets are
+        // rebuilt once after the symbol-range bug fixed in v0.16.0.
+        let version = SEMANTIC_INDEX_VERSION_V4;
         buf.push(version);
         buf.extend_from_slice(&(self.dimension as u32).to_le_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        if let Some(bytes) = &fingerprint_bytes {
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
+        let fp_bytes_ref: &[u8] = fingerprint_bytes.as_deref().unwrap_or(&[]);
+        buf.extend_from_slice(&(fp_bytes_ref.len() as u32).to_le_bytes());
+        buf.extend_from_slice(fp_bytes_ref);
 
         // File mtime table: count(4) + entries
+        // V3 layout per entry: path_len(4) + path + secs(8) + subsec_nanos(4)
         buf.extend_from_slice(&(self.file_mtimes.len() as u32).to_le_bytes());
         for (path, mtime) in &self.file_mtimes {
             let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -1134,6 +1159,7 @@ impl SemanticIndex {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default();
             buf.extend_from_slice(&duration.as_secs().to_le_bytes());
+            buf.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
         }
 
         // Entries: each is metadata + vector
@@ -1187,11 +1213,22 @@ impl SemanticIndex {
 
         let version = data[pos];
         pos += 1;
-        if version != SEMANTIC_INDEX_VERSION_V1 && version != SEMANTIC_INDEX_VERSION_V2 {
+        if version != SEMANTIC_INDEX_VERSION_V1
+            && version != SEMANTIC_INDEX_VERSION_V2
+            && version != SEMANTIC_INDEX_VERSION_V3
+            && version != SEMANTIC_INDEX_VERSION_V4
+        {
             return Err(format!("unsupported version: {}", version));
         }
-        if version == SEMANTIC_INDEX_VERSION_V2 && data.len() < HEADER_BYTES_V2 {
-            return Err("data too short for semantic index v2 header".to_string());
+        // V2, V3, and V4 share the same header layout (V3/V4 only differ from
+        // V2 in the per-mtime entry layout): version(1) + dimension(4) +
+        // entry_count(4) + fingerprint_len(4) + fingerprint bytes.
+        if (version == SEMANTIC_INDEX_VERSION_V2
+            || version == SEMANTIC_INDEX_VERSION_V3
+            || version == SEMANTIC_INDEX_VERSION_V4)
+            && data.len() < HEADER_BYTES_V2
+        {
+            return Err("data too short for semantic index v2/v3/v4 header".to_string());
         }
 
         let dimension = read_u32(data, &mut pos)? as usize;
@@ -1203,17 +1240,29 @@ impl SemanticIndex {
             return Err(format!("too many semantic index entries: {}", entry_count));
         }
 
-        let fingerprint = if version == SEMANTIC_INDEX_VERSION_V2 {
+        // Fingerprint handling:
+        //   - V1: no fingerprint field at all.
+        //   - V2: fingerprint_len + fingerprint bytes; always present (writer
+        //     only emitted V2 when fingerprint was Some).
+        //   - V3: fingerprint_len always present; fingerprint_len==0 ⇒ None.
+        let has_fingerprint_field = version == SEMANTIC_INDEX_VERSION_V2
+            || version == SEMANTIC_INDEX_VERSION_V3
+            || version == SEMANTIC_INDEX_VERSION_V4;
+        let fingerprint = if has_fingerprint_field {
             let fingerprint_len = read_u32(data, &mut pos)? as usize;
             if pos + fingerprint_len > data.len() {
                 return Err("unexpected end of data reading fingerprint".to_string());
             }
-            let raw = String::from_utf8_lossy(&data[pos..pos + fingerprint_len]).to_string();
-            pos += fingerprint_len;
-            Some(
-                serde_json::from_str::<SemanticIndexFingerprint>(&raw)
-                    .map_err(|error| format!("invalid semantic fingerprint: {error}"))?,
-            )
+            if fingerprint_len == 0 {
+                None
+            } else {
+                let raw = String::from_utf8_lossy(&data[pos..pos + fingerprint_len]).to_string();
+                pos += fingerprint_len;
+                Some(
+                    serde_json::from_str::<SemanticIndexFingerprint>(&raw)
+                        .map_err(|error| format!("invalid semantic fingerprint: {error}"))?,
+                )
+            }
         } else {
             None
         };
@@ -1236,7 +1285,38 @@ impl SemanticIndex {
         for _ in 0..mtime_count {
             let path = read_string(data, &mut pos)?;
             let secs = read_u64(data, &mut pos)?;
-            let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            // V3 persists subsec_nanos alongside secs so staleness checks
+            // survive restart round-trips. V1/V2 load with 0 nanos, which
+            // causes one rebuild on upgrade (they never matched live APFS
+            // mtimes anyway — the bug v0.15.2 fixes). After that rebuild,
+            // the cache is persisted as V3 and stabilises.
+            let nanos =
+                if version == SEMANTIC_INDEX_VERSION_V3 || version == SEMANTIC_INDEX_VERSION_V4 {
+                    read_u32(data, &mut pos)?
+                } else {
+                    0
+                };
+            // Hardening against corrupt / maliciously crafted cache files
+            // (v0.15.2). `Duration::new(secs, nanos)` can panic when the
+            // nanosecond carry overflows the second counter, and
+            // `SystemTime + Duration` can panic on carry past the platform's
+            // upper bound. Explicit validation keeps a corrupted semantic.bin
+            // from taking down the whole aft process.
+            if nanos >= 1_000_000_000 {
+                return Err(format!(
+                    "invalid semantic mtime: nanos {} >= 1_000_000_000",
+                    nanos
+                ));
+            }
+            let duration = std::time::Duration::new(secs, nanos);
+            let mtime = SystemTime::UNIX_EPOCH
+                .checked_add(duration)
+                .ok_or_else(|| {
+                    format!(
+                        "invalid semantic mtime: secs={} nanos={} overflows SystemTime",
+                        secs, nanos
+                    )
+                })?;
             file_mtimes.insert(PathBuf::from(path), mtime);
         }
 
@@ -1331,8 +1411,9 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
 
     // Add body snippet (first ~300 chars of symbol body)
     let lines: Vec<&str> = source.lines().collect();
-    let start = (symbol.range.start_line.saturating_sub(1) as usize).min(lines.len()); // 1-based to 0-based
-    let end = (symbol.range.end_line as usize).min(lines.len()); // 1-based inclusive
+    let start = (symbol.range.start_line as usize).min(lines.len());
+    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
+    let end = (symbol.range.end_line as usize + 1).min(lines.len());
     if start < end {
         let body: String = lines[start..end]
             .iter()
@@ -1354,8 +1435,9 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
 /// Build a display snippet from a symbol's source
 fn build_snippet(symbol: &Symbol, source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
-    let start = (symbol.range.start_line.saturating_sub(1) as usize).min(lines.len());
-    let end = (symbol.range.end_line as usize).min(lines.len());
+    let start = (symbol.range.start_line as usize).min(lines.len());
+    // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
+    let end = (symbol.range.end_line as usize + 1).min(lines.len());
     if start < end {
         let snippet_lines: Vec<&str> = lines[start..end].iter().take(5).copied().collect();
         let mut snippet = snippet_lines.join("\n");
@@ -1381,6 +1463,14 @@ fn symbols_to_chunks(
     let mut chunks = Vec::new();
 
     for symbol in symbols {
+        // Skip Markdown / HTML heading chunks: empirically they dominate result
+        // lists even for code-shaped queries because heading prose embeds well.
+        // Agents querying for code lose the actual matches under doc noise.
+        // README/docs queries are still served by grep on the same files.
+        if matches!(symbol.kind, SymbolKind::Heading) {
+            continue;
+        }
+
         // Skip very small symbols (single-line variables, etc.)
         let line_count = symbol
             .range
@@ -1663,6 +1753,29 @@ mod tests {
     }
 
     #[test]
+    fn single_line_symbol_builds_non_empty_snippet() {
+        let symbol = Symbol {
+            name: "answer".to_string(),
+            kind: SymbolKind::Variable,
+            range: crate::symbols::Range {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 24,
+            },
+            signature: Some("const answer = 42".to_string()),
+            scope_chain: Vec::new(),
+            exported: true,
+            parent: None,
+        };
+        let source = "export const answer = 42;\n";
+
+        let snippet = build_snippet(&symbol, source);
+
+        assert_eq!(snippet, "export const answer = 42;");
+    }
+
+    #[test]
     fn rejects_oversized_dimension_during_deserialization() {
         let mut bytes = Vec::new();
         bytes.push(1u8);
@@ -1825,6 +1938,124 @@ mod tests {
         .as_string();
         assert!(
             SemanticIndex::read_from_disk(storage.path(), project_key, Some(&mismatched)).is_none()
+        );
+    }
+
+    #[test]
+    fn read_from_disk_rejects_v3_cache_for_snippet_rebuild() {
+        let storage = tempfile::tempdir().unwrap();
+        let project_key = "proj-v3";
+        let dir = storage.path().join("semantic").join(project_key);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut index = SemanticIndex::new();
+        index.entries.push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: PathBuf::from("/src/main.rs"),
+                name: "handle_request".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 0,
+                exported: true,
+                embed_text: "file:src/main.rs kind:function name:handle_request".to_string(),
+                snippet: "fn handle_request() {}".to_string(),
+            },
+            vector: vec![0.1, 0.2, 0.3],
+        });
+        index.dimension = 3;
+        index
+            .file_mtimes
+            .insert(PathBuf::from("/src/main.rs"), SystemTime::UNIX_EPOCH);
+        let fingerprint = SemanticIndexFingerprint {
+            backend: "fastembed".to_string(),
+            model: "test".to_string(),
+            base_url: FALLBACK_BACKEND.to_string(),
+            dimension: 3,
+        };
+        index.set_fingerprint(fingerprint.clone());
+
+        let mut bytes = index.to_bytes();
+        bytes[0] = SEMANTIC_INDEX_VERSION_V3;
+        fs::write(dir.join("semantic.bin"), bytes).unwrap();
+
+        assert!(SemanticIndex::read_from_disk(
+            storage.path(),
+            project_key,
+            Some(&fingerprint.as_string())
+        )
+        .is_none());
+        assert!(!dir.join("semantic.bin").exists());
+    }
+
+    fn make_symbol(kind: SymbolKind, name: &str, start: u32, end: u32) -> crate::symbols::Symbol {
+        crate::symbols::Symbol {
+            name: name.to_string(),
+            kind,
+            range: crate::symbols::Range {
+                start_line: start,
+                start_col: 0,
+                end_line: end,
+                end_col: 0,
+            },
+            signature: None,
+            scope_chain: Vec::new(),
+            exported: false,
+            parent: None,
+        }
+    }
+
+    /// Heading symbols (Markdown / HTML headings) must NOT be indexed —
+    /// they overwhelmingly dominated semantic results even on code-shaped
+    /// queries because heading prose embeds far more strongly than code
+    /// chunks. Skipping headings keeps aft_search a code-finder.
+    #[test]
+    fn symbols_to_chunks_skips_heading_symbols() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("README.md");
+        let source = "# Title\n\nbody text\n\n## Section\n\nmore text\n";
+
+        let symbols = vec![
+            make_symbol(SymbolKind::Heading, "Title", 0, 2),
+            make_symbol(SymbolKind::Heading, "Section", 4, 6),
+        ];
+
+        let chunks = symbols_to_chunks(&file, &symbols, source, &project_root);
+        assert!(
+            chunks.is_empty(),
+            "Heading symbols must be filtered out before embedding; got {} chunk(s)",
+            chunks.len()
+        );
+    }
+
+    /// Code symbols (functions, classes, methods, structs, etc.) must still
+    /// be indexed alongside the heading skip — otherwise we'd starve the
+    /// index entirely.
+    #[test]
+    fn symbols_to_chunks_keeps_code_symbols_alongside_skipped_headings() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("src/lib.rs");
+        let source = "pub fn handle_request() -> bool {\n    true\n}\n";
+
+        let symbols = vec![
+            // A heading mixed in (e.g. from a doc comment block elsewhere).
+            make_symbol(SymbolKind::Heading, "doc heading", 0, 1),
+            make_symbol(SymbolKind::Function, "handle_request", 0, 2),
+            make_symbol(SymbolKind::Struct, "AuthService", 4, 6),
+        ];
+
+        let chunks = symbols_to_chunks(&file, &symbols, source, &project_root);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "Expected 2 code chunks (Function + Struct), got {}",
+            chunks.len()
+        );
+        let names: Vec<&str> = chunks.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"handle_request"));
+        assert!(names.contains(&"AuthService"));
+        assert!(
+            !names.contains(&"doc heading"),
+            "Heading symbol leaked into chunks: {names:?}"
         );
     }
 }

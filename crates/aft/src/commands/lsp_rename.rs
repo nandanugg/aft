@@ -34,6 +34,12 @@ struct FileChange {
 
 /// Handle the `lsp_rename` command.
 /// Renames a symbol across the workspace via LSP, applying all changes atomically.
+///
+/// Params:
+///   - `file` (string, required) — source file path
+///   - `line` (integer, required, 1-based) — cursor line
+///   - `character` (integer, required, 1-based) — cursor column
+///   - `new_name` (string, required) — replacement symbol name
 pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
     let params = match serde_json::from_value::<LspRenameCommandParams>(req.params.clone()) {
         Ok(params) => params,
@@ -77,7 +83,8 @@ pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let server_keys = {
         let mut lsp = ctx.lsp();
-        match lsp.ensure_file_open(&file_path) {
+        let config = ctx.config();
+        match lsp.ensure_file_open(&file_path, &config) {
             Ok(keys) => keys,
             Err(err) => {
                 return Response::error(
@@ -130,7 +137,8 @@ pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let result = {
         let mut lsp = ctx.lsp();
-        let client = match lsp.client_for_file_mut(&canonical_path) {
+        let config = ctx.config();
+        let client = match lsp.client_for_file_mut(&canonical_path, &config) {
             Some(client) => client,
             None => {
                 return Response::error(
@@ -430,15 +438,9 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
 
 fn rollback_rename(ctx: &AppContext, session: &str, snapshotted: &[PathBuf]) {
     for path in snapshotted.iter().rev() {
-        let backup_entry = {
-            let backup = ctx.backup().borrow();
-            backup.history(session, path).last().cloned()
-        };
-
-        if let Some(entry) = backup_entry {
-            if std::fs::write(path, &entry.content).is_ok() {
-                ctx.lsp_notify_file_changed(path, &entry.content);
-            }
+        let restored = ctx.backup().borrow_mut().restore_latest(session, path);
+        if let Ok((entry, _)) = restored {
+            ctx.lsp_notify_file_changed(path, &entry.content);
         }
     }
 }

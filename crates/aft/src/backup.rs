@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::AftError;
+use sha2::{Digest, Sha256};
 
 const MAX_UNDO_DEPTH: usize = 20;
 
@@ -45,7 +46,7 @@ pub struct BackupStore {
     entries: HashMap<String, HashMap<PathBuf, Vec<BackupEntry>>>,
     /// session -> path -> disk metadata
     disk_index: HashMap<String, HashMap<PathBuf, DiskMeta>>,
-    /// session -> metadata (currently just last_accessed for future TTL GC)
+    /// session -> metadata
     session_meta: HashMap<String, SessionMeta>,
     counter: AtomicU64,
     storage_dir: Option<PathBuf>,
@@ -77,10 +78,12 @@ impl BackupStore {
 
     /// Set storage directory for disk persistence (called during configure).
     ///
-    /// Loads the disk index for all session namespaces and migrates any legacy
-    /// pre-session (flat) layout into the default namespace.
-    pub fn set_storage_dir(&mut self, dir: PathBuf) {
+    /// Loads the disk index for all session namespaces, removes stale session
+    /// directories, and migrates any legacy pre-session (flat) layout into the
+    /// default namespace.
+    pub fn set_storage_dir(&mut self, dir: PathBuf, ttl_hours: u32) {
         self.storage_dir = Some(dir);
+        self.gc_stale_sessions(ttl_hours);
         self.migrate_legacy_layout_if_needed();
         self.load_disk_index();
     }
@@ -230,10 +233,12 @@ impl BackupStore {
     }
 
     fn touch_session(&mut self, session: &str) {
+        let now = current_timestamp();
         self.session_meta
             .entry(session.to_string())
             .or_default()
-            .last_accessed = current_timestamp();
+            .last_accessed = now;
+        self.write_session_marker(session, now);
     }
 
     // ---- Internal helpers ----
@@ -320,17 +325,76 @@ impl BackupStore {
     }
 
     fn session_hash(session: &str) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        session.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        stable_hash_16(session.as_bytes())
     }
 
     fn path_hash(key: &Path) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        // v0.16.0 intentionally switched from DefaultHasher to SHA-256 for
+        // stable on-disk names. Existing DefaultHasher backup directories are
+        // not migrated: backups are short-lived/session-scoped, so one-time
+        // loss of pre-upgrade undo history is acceptable.
+        stable_hash_16(key.to_string_lossy().as_bytes())
+    }
+
+    fn write_session_marker(&self, session: &str, last_accessed: u64) {
+        let Some(session_dir) = self.session_dir(session) else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&session_dir) {
+            log::warn!("[aft] failed to create session dir: {}", e);
+            return;
+        }
+        let marker = session_dir.join("session.json");
+        let json = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session,
+            "last_accessed": last_accessed,
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&json) {
+            let tmp = session_dir.join("session.json.tmp");
+            if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, marker);
+            }
+        }
+    }
+
+    fn gc_stale_sessions(&mut self, ttl_hours: u32) {
+        let backups_dir = match self.backups_dir() {
+            Some(d) if d.exists() => d,
+            _ => return,
+        };
+        let ttl_secs = u64::from(if ttl_hours == 0 { 72 } else { ttl_hours }) * 60 * 60;
+        let cutoff = current_timestamp().saturating_sub(ttl_secs);
+        let entries = match std::fs::read_dir(&backups_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let session_dir = entry.path();
+            if !session_dir.is_dir() || session_dir.join("meta.json").exists() {
+                continue;
+            }
+            let Some(last_accessed) = Self::read_session_last_accessed(&session_dir) else {
+                continue;
+            };
+            if last_accessed >= cutoff {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_dir_all(&session_dir) {
+                log::warn!(
+                    "[aft] failed to remove stale backup session {}: {}",
+                    session_dir.display(),
+                    e
+                );
+            } else {
+                log::warn!(
+                    "[aft] removed stale backup session {} (last_accessed={})",
+                    session_dir.display(),
+                    last_accessed
+                );
+            }
+        }
     }
 
     /// One-time migration: move pre-session flat layout into the default
@@ -410,6 +474,7 @@ impl BackupStore {
             let json = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "session_id": crate::protocol::DEFAULT_SESSION_ID,
+                "last_accessed": current_timestamp(),
             });
             if let Ok(s) = serde_json::to_string_pretty(&json) {
                 let _ = std::fs::write(&marker, s);
@@ -508,6 +573,13 @@ impl BackupStore {
             .map(|s| s.to_string())
     }
 
+    fn read_session_last_accessed(session_dir: &Path) -> Option<u64> {
+        let marker = session_dir.join("session.json");
+        let content = std::fs::read_to_string(&marker).ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+        parsed.get("last_accessed").and_then(|v| v.as_u64())
+    }
+
     fn load_from_disk_if_needed(&mut self, session: &str, key: &Path) -> bool {
         let meta = match self
             .disk_index
@@ -559,6 +631,7 @@ impl BackupStore {
             let json = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "session_id": session,
+                "last_accessed": current_timestamp(),
             });
             if let Ok(s) = serde_json::to_string_pretty(&json) {
                 let _ = std::fs::write(&marker, s);
@@ -642,7 +715,14 @@ impl BackupStore {
 }
 
 fn canonicalize_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path).unwrap_or_else(|err| {
+        log::debug!(
+            "backup canonicalize_key fallback for {}: {}",
+            path.display(),
+            err
+        );
+        path.to_path_buf()
+    })
 }
 
 fn current_timestamp() -> u64 {
@@ -650,6 +730,14 @@ fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn stable_hash_16(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
 }
 
 #[cfg(test)]
@@ -810,7 +898,7 @@ mod tests {
         // Create store with storage, snapshot under default session, drop.
         {
             let mut store = BackupStore::new();
-            store.set_storage_dir(dir.clone());
+            store.set_storage_dir(dir.clone(), 72);
             store
                 .snapshot(DEFAULT_SESSION_ID, &file_path, "before edit")
                 .unwrap();
@@ -821,7 +909,7 @@ mod tests {
 
         // Create new store, load from disk, restore.
         let mut store2 = BackupStore::new();
-        store2.set_storage_dir(dir.clone());
+        store2.set_storage_dir(dir.clone(), 72);
 
         let (entry, warning) = store2
             .restore_latest(DEFAULT_SESSION_ID, &file_path)
@@ -860,7 +948,7 @@ mod tests {
 
         // Run migration.
         let mut store = BackupStore::new();
-        store.set_storage_dir(dir.clone());
+        store.set_storage_dir(dir.clone(), 72);
 
         // After migration, the legacy dir should be gone from the top level,
         // and the entry should now live under the default-session hash dir.
@@ -876,6 +964,33 @@ mod tests {
         assert_eq!(meta["session_id"], DEFAULT_SESSION_ID);
         assert_eq!(meta["schema_version"], SCHEMA_VERSION);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_storage_dir_removes_stale_backup_sessions() {
+        let dir = std::env::temp_dir().join("aft_backup_gc_test");
+        let _ = fs::remove_dir_all(&dir);
+        let backups = dir.join("backups");
+        fs::create_dir_all(&backups).unwrap();
+
+        let stale_session_dir = backups.join("stale-session");
+        fs::create_dir_all(&stale_session_dir).unwrap();
+        let stale_marker = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": "stale",
+            "last_accessed": 1,
+        });
+        fs::write(
+            stale_session_dir.join("session.json"),
+            serde_json::to_string_pretty(&stale_marker).unwrap(),
+        )
+        .unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(dir.clone(), 1);
+
+        assert!(!stale_session_dir.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

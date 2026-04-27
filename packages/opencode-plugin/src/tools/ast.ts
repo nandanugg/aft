@@ -98,6 +98,8 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         total_matches?: number;
         files_with_matches?: number;
         files_searched?: number;
+        no_files_matched_scope?: boolean;
+        scope_warnings?: string[];
       };
 
       const matchCount = data.total_matches ?? data.matches?.length ?? 0;
@@ -105,10 +107,20 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       const filesWithMatches = data.files_with_matches ?? filesSearched;
 
       let output: string;
-      if (matchCount === 0) {
+      if (data.no_files_matched_scope) {
+        // Scope (paths/globs) was syntactically valid but matched zero files — say so
+        // explicitly so agents don't read this as "I searched everywhere and found nothing."
+        output = "No files matched the scope (paths/globs resolved to zero files)";
+        if (data.scope_warnings && data.scope_warnings.length > 0) {
+          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
+        }
+      } else if (matchCount === 0) {
         // Zero-match format is intentionally not documented in the description — it's
         // self-explanatory text and documenting it would bloat the Returns section.
         output = `No matches found (searched ${filesSearched} files)`;
+        if (data.scope_warnings && data.scope_warnings.length > 0) {
+          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
+        }
         // Add hints for common pattern mistakes
         const hint = getEmptyResultHint(args.pattern as string, args.lang as string);
         if (hint) {
@@ -208,6 +220,8 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         total_files?: number;
         files_with_matches?: number;
         files_searched?: number;
+        no_files_matched_scope?: boolean;
+        scope_warnings?: string[];
       };
 
       const matchCount = data.total_replacements ?? data.total_matches ?? data.matches?.length ?? 0;
@@ -215,8 +229,16 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       const filesWithMatches = data.files_with_matches ?? data.total_files ?? filesSearched;
 
       let output: string;
-      if (matchCount === 0) {
+      if (data.no_files_matched_scope) {
+        output = "No files matched the scope (paths/globs resolved to zero files)";
+        if (data.scope_warnings && data.scope_warnings.length > 0) {
+          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
+        }
+      } else if (matchCount === 0) {
         output = `No matches found (searched ${filesSearched} files)`;
+        if (data.scope_warnings && data.scope_warnings.length > 0) {
+          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
+        }
       } else {
         output = isDryRun
           ? `[DRY RUN] Would replace ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`

@@ -73,7 +73,8 @@ pub fn handle_writers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match graph.writers_of(&file_path, symbol) {
+    let max_files = ctx.config().max_callgraph_files;
+    match graph.writers_of(&file_path, symbol, max_files) {
         Ok(result) => {
             let text = result.render_text();
             let mut result_json = serde_json::to_value(&result).unwrap_or_default();

@@ -56,6 +56,36 @@ const SemanticConfigSchema = z.object({
   max_batch_size: z.number().int().positive().optional(),
 });
 
+const LspExtensionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine((value) => value.replace(/^\.+/, "").length > 0, {
+    message: "Extension must include characters other than leading dots",
+  });
+
+const LspServerEntrySchema = z.object({
+  extensions: z.array(LspExtensionSchema).min(1),
+  binary: z.string().trim().min(1),
+  args: z.array(z.string()).optional().default([]),
+  root_markers: z.array(z.string().trim().min(1)).optional().default([".git"]),
+  disabled: z.boolean().optional().default(false),
+  /** Extra environment variables passed to the LSP server child process. */
+  env: z.record(z.string().min(1), z.string()).optional(),
+  /** JSON value passed as `initializationOptions` in the LSP `initialize` request. */
+  initialization_options: z.unknown().optional(),
+});
+
+export const LspServerSchema = LspServerEntrySchema.extend({
+  id: z.string().trim().min(1),
+});
+
+const LspConfigSchema = z.object({
+  servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
+  disabled: z.array(z.string().trim().min(1)).optional(),
+  python: z.enum(["pyright", "ty", "auto"]).optional(),
+});
+
 export const AftConfigSchema = z.object({
   /** Whether to auto-format files after edits. Default: true. */
   format_on_edit: z.boolean().optional(),
@@ -98,11 +128,100 @@ export const AftConfigSchema = z.object({
   experimental_semantic_search: z.boolean().optional(),
   /** Go overlay provider override. `local_helper` uses local helper process, sidecar uses AFT-Go. */
   go_overlay_provider: GoOverlayProviderEnum.optional(),
+  /** Enable experimental ty LSP support. Default: false. */
+  experimental_lsp_ty: z.boolean().optional(),
+  /** User-defined and built-in LSP server configuration. */
+  lsp: LspConfigSchema.optional(),
+  /** Allow URL fetch tools to request private/link-local hosts. Default: false. */
+  url_fetch_allow_private: z.boolean().optional(),
   /** External semantic backend configuration for embedding and retrieval. */
   semantic: SemanticConfigSchema.optional(),
+  /**
+   * Maximum source files allowed for call-graph operations (callers, trace_to,
+   * trace_data, impact). Projects above this size return `project_too_large`
+   * instead of attempting the reverse-index build. Does not affect grep,
+   * glob, read, edit, or any other tool. Default: 20000.
+   */
+  max_callgraph_files: z.number().int().positive().optional(),
 });
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
+
+export type LspServerConfig = z.infer<typeof LspServerSchema>;
+
+export interface ConfigureLspServer {
+  id: string;
+  extensions: string[];
+  binary: string;
+  args: string[];
+  root_markers: string[];
+  disabled: boolean;
+  env?: Record<string, string>;
+  initialization_options?: unknown;
+}
+
+export interface ConfigureLspOverrides {
+  experimental_lsp_ty?: boolean;
+  lsp_servers?: ConfigureLspServer[];
+  disabled_lsp?: string[];
+}
+
+function normalizeLspExtension(extension: string): string {
+  return extension.trim().replace(/^\.+/, "");
+}
+
+export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOverrides {
+  const overrides: ConfigureLspOverrides = {};
+  const disabled = new Set(config.lsp?.disabled ?? []);
+  let experimentalTy = config.experimental_lsp_ty;
+
+  // Server IDs match Rust's `ServerKind::id_str()` — built-in Pyright is
+  // identified as "python", and the experimental Astral checker as "ty".
+  // Custom IDs are case-insensitive.
+  switch (config.lsp?.python ?? "auto") {
+    case "ty":
+      experimentalTy = true;
+      disabled.add("python");
+      break;
+    case "pyright":
+      experimentalTy = false;
+      disabled.add("ty");
+      break;
+    case "auto":
+      break;
+  }
+
+  if (experimentalTy !== undefined) {
+    overrides.experimental_lsp_ty = experimentalTy;
+  }
+
+  const servers = Object.entries(config.lsp?.servers ?? {}).map(([id, server]) => {
+    const entry: ConfigureLspServer = {
+      id,
+      extensions: server.extensions.map(normalizeLspExtension),
+      binary: server.binary,
+      args: server.args,
+      root_markers: server.root_markers,
+      disabled: server.disabled,
+    };
+    if (server.env && Object.keys(server.env).length > 0) {
+      entry.env = server.env;
+    }
+    if (server.initialization_options !== undefined) {
+      entry.initialization_options = server.initialization_options;
+    }
+    return entry;
+  });
+  if (servers.length > 0) {
+    overrides.lsp_servers = servers;
+  }
+
+  if (disabled.size > 0) {
+    overrides.disabled_lsp = [...disabled];
+  }
+
+  return overrides;
+}
 
 // JSONC parsing via comment-json (bundled at build time).
 // Preserves comments during round-trip in tui-config.ts.
@@ -234,6 +353,14 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const lspServers = { ...base.lsp?.servers, ...override.lsp?.servers };
+  const disabledLsp = [...(base.lsp?.disabled ?? []), ...(override.lsp?.disabled ?? [])];
+  const lsp = {
+    ...base.lsp,
+    ...override.lsp,
+    ...(Object.keys(lspServers).length > 0 ? { servers: lspServers } : {}),
+    ...(disabledLsp.length > 0 ? { disabled: [...new Set(disabledLsp)] } : {}),
+  };
 
   // SECURITY: Strip sensitive semantic fields from override before spreading.
   // Without this, if mergeSemanticConfig returns undefined (all safe fields absent),
@@ -246,6 +373,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     // Deep-merge language-scoped maps instead of replacing
     ...(Object.keys(formatter).length > 0 ? { formatter } : {}),
     ...(Object.keys(checker).length > 0 ? { checker } : {}),
+    ...(Object.values(lsp).some((value) => value !== undefined) ? { lsp } : {}),
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through the spread above.
     semantic,

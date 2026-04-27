@@ -929,11 +929,10 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
         // Skip language-specific receivers
         match lang {
             LangId::Rust => {
-                let normalized = trimmed.replace(' ', "");
-                if normalized == "self"
-                    || normalized == "&self"
-                    || normalized == "&mutself"
-                    || normalized == "mutself"
+                if trimmed == "self"
+                    || trimmed == "mut self"
+                    || trimmed.starts_with("&self")
+                    || trimmed.starts_with("&mut self")
                 {
                     continue;
                 }
@@ -1534,6 +1533,34 @@ impl CallGraph {
         self.project_files.as_deref().unwrap_or(&[])
     }
 
+    /// Get the total number of project source files.
+    ///
+    /// Triggers project file discovery on first access and returns the cached
+    /// count thereafter. Prefer [`project_file_count_bounded`] when the caller
+    /// only needs to know whether a threshold is exceeded.
+    pub fn project_file_count(&mut self) -> usize {
+        self.project_files().len()
+    }
+
+    /// Count project source files, stopping after `limit + 1` so huge roots
+    /// do not pay for a full walk or allocate a giant vector.
+    ///
+    /// Returns the real count when ≤ `limit`, or `limit + 1` when exceeded.
+    /// Uses the cached `project_files` vec when it already exists (e.g. a
+    /// previous call-graph op succeeded at this cap), otherwise short-circuits
+    /// the underlying `ignore::Walk` iterator via `.take(limit + 1)`.
+    ///
+    /// CRITICAL: This method must NOT populate `self.project_files`. The whole
+    /// point is to reject oversized roots before the full walk-and-collect runs.
+    pub fn project_file_count_bounded(&self, limit: usize) -> usize {
+        if let Some(files) = self.project_files.as_deref() {
+            return files.len();
+        }
+        walk_project_files(&self.project_root)
+            .take(limit.saturating_add(1))
+            .count()
+    }
+
     /// Build the reverse index by scanning all project files.
     ///
     /// For each file, builds the call data (if not cached), then for each
@@ -1542,8 +1569,28 @@ impl CallGraph {
     ///
     /// After building, flushes the parse-index cache to disk and saves the
     /// merged-graph cache so that subsequent warm runs skip this work entirely.
-    fn build_reverse_index(&mut self) {
+    ///
+    /// Returns `ProjectTooLarge` without doing any work when the project's
+    /// source-file count exceeds `max_files`; the bound check is lazy (early
+    /// short-circuit on the directory walker) so huge roots don't pay the
+    /// full walk cost.
+    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
         let start = std::time::Instant::now();
+
+        // Bounded count first — never populate project_files on oversized roots.
+        // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an
+        // iterator), so this costs at most (max_files + 1) directory entries
+        // worth of work, not a full O(N) walk of the whole tree.
+        let count = self.project_file_count_bounded(max_files);
+        if count > max_files {
+            return Err(AftError::ProjectTooLarge {
+                count,
+                max: max_files,
+            });
+        }
+
+        // TODO(v0.16): rust-side deadline for graceful timeout recovery
+        // (unbounded walks remain a soft cliff for users who raise the cap).
         // Discover all project files first
         let all_files = self.project_files().to_vec();
 
@@ -1863,6 +1910,7 @@ impl CallGraph {
         self.reverse_index = Some(reverse);
         self.dispatch_index = Some(dispatch);
         self.implementation_index = Some(impl_index);
+        Ok(())
     }
 
     /// Try to restore the reverse index from the on-disk merged graph.
@@ -2044,7 +2092,7 @@ impl CallGraph {
     }
 
     /// Ensure the dispatch index is built. Mirrors `build_reverse_index` laziness.
-    fn ensure_dispatch_index(&mut self) {
+    fn ensure_dispatch_index(&mut self, max_files: usize) -> Result<(), AftError> {
         // Warm-load (`try_load_merged_graph`) only populates `reverse_index`,
         // leaving `dispatch_index` None. So gate on `dispatch_index` itself,
         // not `reverse_index`, to force a full build when needed.
@@ -2052,17 +2100,19 @@ impl CallGraph {
             // Discard any warm-loaded reverse_index so build_reverse_index
             // runs end-to-end and populates all three indexes from helper data.
             self.reverse_index = None;
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
+        Ok(())
     }
 
     /// Ensure the implementation index is built.
-    fn ensure_implementation_index(&mut self) {
+    fn ensure_implementation_index(&mut self, max_files: usize) -> Result<(), AftError> {
         // Same rationale as `ensure_dispatch_index` above.
         if self.implementation_index.is_none() {
             self.reverse_index = None;
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
+        Ok(())
     }
 
     /// Look up all concrete types that implement the interface declared in `file`
@@ -2076,9 +2126,10 @@ impl CallGraph {
         file: &Path,
         interface_symbol: &str,
         include_mocks: bool,
+        max_files: usize,
     ) -> Result<ImplementationsResult, AftError> {
         let canon = self.canonicalize(file)?;
-        self.ensure_implementation_index();
+        self.ensure_implementation_index(max_files)?;
 
         let iface_rel = self.relative_path(&canon);
 
@@ -2133,8 +2184,11 @@ impl CallGraph {
 
     /// Exact-match lookup in the dispatch secondary index.
     /// Returns all dispatch entries whose `nearby_string` equals `key`.
-    pub fn find_by_dispatch_key(&mut self, key: &str) -> Vec<DispatchEntry> {
-        self.ensure_dispatch_index();
+    pub fn find_by_dispatch_key(&mut self, key: &str, max_files: usize) -> Vec<DispatchEntry> {
+        if let Err(e) = self.ensure_dispatch_index(max_files) {
+            log::warn!("find_by_dispatch_key: dispatch index unavailable: {}", e);
+            return vec![];
+        }
         self.dispatch_index
             .as_ref()
             .and_then(|di| di.get(key))
@@ -2147,8 +2201,15 @@ impl CallGraph {
     pub fn find_by_dispatch_key_prefix(
         &mut self,
         prefix: &str,
+        max_files: usize,
     ) -> Vec<(String, Vec<DispatchEntry>)> {
-        self.ensure_dispatch_index();
+        if let Err(e) = self.ensure_dispatch_index(max_files) {
+            log::warn!(
+                "find_by_dispatch_key_prefix: dispatch index unavailable: {}",
+                e
+            );
+            return vec![];
+        }
         let Some(di) = self.dispatch_index.as_ref() else {
             return vec![];
         };
@@ -2164,6 +2225,7 @@ impl CallGraph {
         &mut self,
         file: &Path,
         symbol: &str,
+        max_files: usize,
     ) -> Result<DispatchedByResult, AftError> {
         let canon = self.canonicalize(file)?;
         self.build_file(&canon)?;
@@ -2174,7 +2236,7 @@ impl CallGraph {
         // must rebuild to recover dispatch-kind metadata. Route through
         // ensure_dispatch_index, which forces a rebuild when dispatch_index
         // is missing.
-        self.ensure_dispatch_index();
+        self.ensure_dispatch_index(max_files)?;
 
         let target_rel = self.relative_path(&canon);
 
@@ -2206,12 +2268,19 @@ impl CallGraph {
     /// This is the backend for `aft writers <file> <var>`.
     /// Returns only edges with `kind == Writes` — same-package writes are
     /// filtered at the helper side (filter-at-source contract).
-    pub fn writers_of(&mut self, file: &Path, symbol: &str) -> Result<WritersResult, AftError> {
+    pub fn writers_of(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        max_files: usize,
+    ) -> Result<WritersResult, AftError> {
         let canon = self.canonicalize(file)?;
         self.build_file(&canon)?;
 
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            if !self.try_load_merged_graph() {
+                self.build_reverse_index(max_files)?;
+            }
         }
 
         let target_rel = self.relative_path(&canon);
@@ -2245,6 +2314,7 @@ impl CallGraph {
         file: &Path,
         symbol: &str,
         depth: usize,
+        max_files: usize,
     ) -> Result<CallersResult, AftError> {
         let canon = self.canonicalize(file)?;
 
@@ -2255,7 +2325,7 @@ impl CallGraph {
         // First try the warm path: load from the merged-graph disk cache.
         if self.reverse_index.is_none() {
             if !self.try_load_merged_graph() {
-                self.build_reverse_index();
+                self.build_reverse_index(max_files)?;
             }
         }
 
@@ -2332,9 +2402,10 @@ impl CallGraph {
         symbol: &str,
         depth: usize,
         include_mocks: bool,
+        max_files: usize,
     ) -> Result<CallersResult, AftError> {
         // Get regular callers first.
-        let mut result = self.callers_of(file, symbol, depth)?;
+        let mut result = self.callers_of(file, symbol, depth, max_files)?;
 
         // Try to find implementations of the interface named by `symbol`.
         // The symbol in `callers_of` context is the interface *method* name,
@@ -2346,7 +2417,7 @@ impl CallGraph {
         // an interface method. We check the implementation index and append if
         // anything is found.
         let canon = self.canonicalize(file)?;
-        self.ensure_implementation_index();
+        self.ensure_implementation_index(max_files)?;
 
         let impl_data = self
             .implementation_index
@@ -2408,6 +2479,7 @@ impl CallGraph {
         file: &Path,
         symbol: &str,
         max_depth: usize,
+        max_files: usize,
     ) -> Result<TraceToResult, AftError> {
         let canon = self.canonicalize(file)?;
 
@@ -2416,7 +2488,7 @@ impl CallGraph {
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
 
         let target_rel = self.relative_path(&canon);
@@ -2642,6 +2714,7 @@ impl CallGraph {
         file: &Path,
         symbol: &str,
         depth: usize,
+        max_files: usize,
     ) -> Result<ImpactResult, AftError> {
         let canon = self.canonicalize(file)?;
 
@@ -2650,7 +2723,7 @@ impl CallGraph {
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
-            self.build_reverse_index();
+            self.build_reverse_index(max_files)?;
         }
 
         let effective_depth = if depth == 0 { 1 } else { depth };
@@ -2779,6 +2852,7 @@ impl CallGraph {
         symbol: &str,
         expression: &str,
         max_depth: usize,
+        max_files: usize,
     ) -> Result<TraceDataResult, AftError> {
         let canon = self.canonicalize(file)?;
         let rel_file = self.relative_path(&canon);
@@ -2808,6 +2882,17 @@ impl CallGraph {
                     ),
                 });
             }
+        }
+
+        // Bounded count: short-circuits at `max_files + 1` so oversized roots
+        // reject in microseconds instead of paying the full walk/collect cost.
+        // Matches the guard used by build_reverse_index / callers_of / trace_to / impact.
+        let count = self.project_file_count_bounded(max_files);
+        if count > max_files {
+            return Err(AftError::ProjectTooLarge {
+                count,
+                max: max_files,
+            });
         }
 
         let mut hops = Vec::new();
@@ -4796,7 +4881,7 @@ export function funcB() {
 
         // helpers.ts:double is called by utils.ts:helper
         let result = graph
-            .callers_of(&dir.path().join("helpers.ts"), "double", 1)
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
             .unwrap();
 
         assert_eq!(result.symbol, "double");
@@ -4827,7 +4912,7 @@ export function funcB() {
 
         // main.ts:main is the entry point — nothing calls it
         let result = graph
-            .callers_of(&dir.path().join("main.ts"), "main", 1)
+            .callers_of(&dir.path().join("main.ts"), "main", 1, usize::MAX)
             .unwrap();
 
         assert_eq!(result.symbol, "main");
@@ -4844,7 +4929,7 @@ export function funcB() {
         // utils.ts:helper is called by main.ts:main
         // With depth=2, we should see both direct and transitive callers
         let result = graph
-            .callers_of(&dir.path().join("helpers.ts"), "double", 2)
+            .callers_of(&dir.path().join("helpers.ts"), "double", 2, usize::MAX)
             .unwrap();
 
         assert!(
@@ -4869,7 +4954,7 @@ export function funcB() {
 
         // Build callers to populate the reverse index
         let _ = graph
-            .callers_of(&dir.path().join("helpers.ts"), "double", 1)
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
             .unwrap();
         assert!(
             graph.reverse_index.is_some(),
@@ -5151,7 +5236,12 @@ function testValidation() {
         let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
 
         let result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 10)
+            .trace_to(
+                &dir.path().join("helpers.ts"),
+                "checkFormat",
+                10,
+                usize::MAX,
+            )
             .unwrap();
 
         assert_eq!(result.target_symbol, "checkFormat");
@@ -5197,7 +5287,7 @@ function testValidation() {
         // processData is called from main, handleRequest
         // So validate has paths: main→processData→validate, handleRequest→processData→validate, testValidation→validate
         let result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "validate", 10)
+            .trace_to(&dir.path().join("helpers.ts"), "validate", 10, usize::MAX)
             .unwrap();
 
         assert_eq!(result.target_symbol, "validate");
@@ -5215,7 +5305,7 @@ function testValidation() {
 
         // funcA ↔ funcB cycle — should terminate
         let result = graph
-            .trace_to(&dir.path().join("a.ts"), "funcA", 10)
+            .trace_to(&dir.path().join("a.ts"), "funcA", 10, usize::MAX)
             .unwrap();
 
         // Should not hang — the fact we got here means cycle detection works
@@ -5229,7 +5319,7 @@ function testValidation() {
 
         // With max_depth=1, should not be able to reach entry points that are 3+ hops away
         let result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 1)
+            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 1, usize::MAX)
             .unwrap();
 
         // testValidation→validate→checkFormat is 2 hops, which requires depth >= 2
@@ -5239,7 +5329,12 @@ function testValidation() {
 
         // The shallow result should have fewer paths than the deep one
         let deep_result = graph
-            .trace_to(&dir.path().join("helpers.ts"), "checkFormat", 10)
+            .trace_to(
+                &dir.path().join("helpers.ts"),
+                "checkFormat",
+                10,
+                usize::MAX,
+            )
             .unwrap();
 
         assert!(
@@ -5257,7 +5352,7 @@ function testValidation() {
 
         // main is itself an entry point — should return a single trivial path
         let result = graph
-            .trace_to(&dir.path().join("main.ts"), "main", 10)
+            .trace_to(&dir.path().join("main.ts"), "main", 10, usize::MAX)
             .unwrap();
 
         assert_eq!(result.target_symbol, "main");
@@ -5558,7 +5653,7 @@ func interfaceCaller(d Doer, x int) int {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.callers_of(&go_file, "Do", 1).unwrap();
+        let result = cg.callers_of(&go_file, "Do", 1, usize::MAX).unwrap();
 
         // Two helper edges → interfaceCaller:42 (doerA) and interfaceCaller:42 (doerB).
         // After dedup by (file, symbol, line), only 1 caller site should survive.
@@ -5581,7 +5676,7 @@ func interfaceCaller(d Doer, x int) int {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.callers_of(&go_file, "concreteMethod", 1).unwrap();
+        let result = cg.callers_of(&go_file, "concreteMethod", 1, usize::MAX).unwrap();
         assert_eq!(result.total_callers, 1);
         assert_eq!(result.callers[0].callers[0].symbol, "concreteMethodCaller");
         assert_eq!(result.callers[0].callers[0].line, 19);
@@ -5598,7 +5693,7 @@ func interfaceCaller(d Doer, x int) int {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.callers_of(&go_file, "barePkgTarget", 1).unwrap();
+        let result = cg.callers_of(&go_file, "barePkgTarget", 1, usize::MAX).unwrap();
         assert_eq!(result.total_callers, 1);
         assert_eq!(result.callers[0].callers[0].symbol, "barePkgCaller");
         assert_eq!(result.callers[0].callers[0].line, 8);
@@ -5614,7 +5709,7 @@ func interfaceCaller(d Doer, x int) int {
         cg.build_file(&go_file).unwrap();
 
         // First query: no helper data, tree-sitter only.
-        let result_before = cg.callers_of(&go_file, "Do", 1).unwrap();
+        let result_before = cg.callers_of(&go_file, "Do", 1, usize::MAX).unwrap();
         let count_before = result_before.total_callers;
 
         // Now inject helper; should invalidate the reverse index.
@@ -5622,7 +5717,7 @@ func interfaceCaller(d Doer, x int) int {
         cg.set_go_helper(helper_out);
 
         // Second query: reverse index rebuilt, helper edges included then deduped.
-        let result_after = cg.callers_of(&go_file, "Do", 1).unwrap();
+        let result_after = cg.callers_of(&go_file, "Do", 1, usize::MAX).unwrap();
 
         // Regardless of what tree-sitter found, after helper injection and
         // deduplication the count must be exactly 1 (interfaceCaller:42).
@@ -5766,7 +5861,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
         assert_eq!(result.symbol, "HandleMerchantTask");
         assert_eq!(result.dispatched_by.len(), 1);
         assert_eq!(
@@ -5791,7 +5886,7 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         // workerLoop is registered via goroutine (not dispatches), so dispatched_by should be empty.
-        let result = cg.dispatched_by(&go_file, "workerLoop").unwrap();
+        let result = cg.dispatched_by(&go_file, "workerLoop", usize::MAX).unwrap();
         assert_eq!(
             result.dispatched_by.len(),
             0,
@@ -5814,7 +5909,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
         assert_eq!(result.dispatched_by.len(), 1);
         assert_eq!(
             result.dispatched_by[0].dispatched_via,
@@ -5834,7 +5929,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
         let text = result.render_text();
         assert!(
             text.contains("via github.com/hibiken/asynq.(*ServeMux).HandleFunc"),
@@ -5853,7 +5948,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let entries = cg.find_by_dispatch_key("TypeMerchantTask");
+        let entries = cg.find_by_dispatch_key("TypeMerchantTask", usize::MAX);
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].dispatched_via,
@@ -5875,7 +5970,7 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         // HandleGenericTask has dispatched_via = None in make_dispatch_helper_output.
-        let result = cg.dispatched_by(&go_file, "HandleGenericTask").unwrap();
+        let result = cg.dispatched_by(&go_file, "HandleGenericTask", usize::MAX).unwrap();
         assert_eq!(result.dispatched_by.len(), 1);
         assert_eq!(
             result.dispatched_by[0].dispatched_via, None,
@@ -5894,7 +5989,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let entries = cg.find_by_dispatch_key("TypeMerchantTask");
+        let entries = cg.find_by_dispatch_key("TypeMerchantTask", usize::MAX);
         assert_eq!(
             entries.len(),
             1,
@@ -5916,7 +6011,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let results = cg.find_by_dispatch_key_prefix("Type");
+        let results = cg.find_by_dispatch_key_prefix("Type", usize::MAX);
         assert_eq!(
             results.len(),
             1,
@@ -5936,7 +6031,7 @@ func processRequest() {
         cg.build_file(&go_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let entries = cg.find_by_dispatch_key("TypeNonExistent");
+        let entries = cg.find_by_dispatch_key("TypeNonExistent", usize::MAX);
         assert!(entries.is_empty(), "should find nothing for unknown key");
     }
 
@@ -5976,7 +6071,7 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         // Should not panic on special chars.
-        let entries = cg.find_by_dispatch_key("/api/v1?foo=bar&baz=.*+[");
+        let entries = cg.find_by_dispatch_key("/api/v1?foo=bar&baz=.*+[", usize::MAX);
         assert_eq!(entries.len(), 1);
     }
 
@@ -5993,7 +6088,7 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         // No dispatch edges in reverse index.
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask").unwrap();
+        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
         assert_eq!(
             result.dispatched_by.len(),
             0,
@@ -6001,7 +6096,7 @@ func processRequest() {
         );
 
         // Dispatch index should also be empty.
-        let entries = cg.find_by_dispatch_key("TypeMerchantTask");
+        let entries = cg.find_by_dispatch_key("TypeMerchantTask", usize::MAX);
         assert!(
             entries.is_empty(),
             "dispatch index should be empty when flag is false"
@@ -6020,14 +6115,14 @@ func processRequest() {
         cg.set_go_helper(helper_out);
 
         // workerLoop is started via goroutine — should appear in callers_of
-        let callers = cg.callers_of(&go_file, "workerLoop", 1).unwrap();
+        let callers = cg.callers_of(&go_file, "workerLoop", 1, usize::MAX).unwrap();
         assert!(
             callers.total_callers >= 1,
             "workerLoop should have at least one caller (goroutine)"
         );
 
         // cleanup is deferred — should appear in callers_of
-        let callers = cg.callers_of(&go_file, "cleanup", 1).unwrap();
+        let callers = cg.callers_of(&go_file, "cleanup", 1, usize::MAX).unwrap();
         assert!(
             callers.total_callers >= 1,
             "cleanup should have at least one caller (defer)"
@@ -6141,7 +6236,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.implementations_of(&iface_file, "Storer", false).unwrap();
+        let result = cg.implementations_of(&iface_file, "Storer", false, usize::MAX).unwrap();
         assert_eq!(result.interface.symbol, "Storer");
         // storeImpl should be there (mocks excluded by default).
         assert_eq!(
@@ -6174,7 +6269,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.implementations_of(&iface_file, "Storer", true).unwrap();
+        let result = cg.implementations_of(&iface_file, "Storer", true, usize::MAX).unwrap();
         // With include_mocks=true, MockStorer should also appear.
         assert_eq!(
             result.implementations.len(),
@@ -6208,7 +6303,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         cg.set_go_helper(helper_out);
 
         let result = cg
-            .implementations_of(&iface_file, "NonExistentInterface", false)
+            .implementations_of(&iface_file, "NonExistentInterface", false, usize::MAX)
             .unwrap();
         assert!(
             result.implementations.is_empty(),
@@ -6228,7 +6323,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
         cg.build_file(&iface_file).unwrap();
         cg.set_go_helper(helper_out);
 
-        let result = cg.implementations_of(&iface_file, "Storer", true).unwrap();
+        let result = cg.implementations_of(&iface_file, "Storer", true, usize::MAX).unwrap();
         assert!(
             result.implementations.is_empty(),
             "implementation index should be empty when flag is false"
@@ -6249,7 +6344,7 @@ func (s *storeImpl) Delete(id int) error      { return nil }
 
         // Querying callers_of "Create" in iface.go should find no implements edges
         // (those would be wrong — Create is never "called" by the interface declaration).
-        let callers = cg.callers_of(&iface_file, "Storer", 1).unwrap();
+        let callers = cg.callers_of(&iface_file, "Storer", 1, usize::MAX).unwrap();
         for group in &callers.callers {
             for entry in &group.callers {
                 assert!(

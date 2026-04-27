@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::query_support::{filter_callers_result, resolve_symbol_query};
 use crate::context::AppContext;
+use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `callers` request.
@@ -116,10 +117,12 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let max_files = ctx.config().max_callgraph_files;
+
     let result = if via_interface {
-        graph.callers_of_via_interface(&file_path, &symbol, depth, include_mocks)
+        graph.callers_of_via_interface(&file_path, &symbol, depth, include_mocks, max_files)
     } else {
-        graph.callers_of(&file_path, &symbol, depth)
+        graph.callers_of(&file_path, &symbol, depth, max_files)
     };
 
     match result {
@@ -131,6 +134,9 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 obj.insert("text".to_string(), serde_json::Value::String(text));
             }
             Response::success(&req.id, result_json)
+        }
+        Err(err @ AftError::ProjectTooLarge { .. }) => {
+            Response::error(&req.id, "project_too_large", format!("{}", err))
         }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }

@@ -189,8 +189,8 @@ fn test_rename_rollback_on_failure() {
         .borrow()
         .history(aft::protocol::DEFAULT_SESSION_ID, &main_rs);
     assert!(
-        !history.is_empty(),
-        "expected backup history after rollback"
+        history.is_empty(),
+        "rollback should pop consumed backup entries"
     );
 }
 

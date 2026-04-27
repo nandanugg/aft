@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import { error, log } from "./logger.js";
 
@@ -45,6 +46,7 @@ export class BridgePool {
       maxRestarts: options.maxRestarts,
       minVersion: options.minVersion,
       onVersionMismatch: options.onVersionMismatch,
+      onConfigureWarnings: options.onConfigureWarnings,
     };
     this.configOverrides = configOverrides;
     if (Number.isFinite(this.idleTimeoutMs)) {
@@ -54,7 +56,13 @@ export class BridgePool {
   }
 
   /** Get any existing alive bridge, preferring the given directory. */
-  getAnyActiveBridge(_directory: string): BinaryBridge | null {
+  getAnyActiveBridge(directory: string): BinaryBridge | null {
+    const key = canonicalKey(directory);
+    const match = this.bridges.get(key);
+    if (match?.bridge.isAlive()) {
+      match.lastUsed = Date.now();
+      return match.bridge;
+    }
     for (const [, entry] of this.bridges) {
       if (entry.bridge.isAlive()) {
         entry.lastUsed = Date.now();
@@ -66,7 +74,7 @@ export class BridgePool {
 
   /** Get or create a bridge for the given directory. */
   getBridge(directory: string): BinaryBridge {
-    const key = directory.replace(/\/+$/, "");
+    const key = canonicalKey(directory);
     const existing = this.bridges.get(key);
     if (existing) {
       existing.lastUsed = Date.now();
@@ -120,18 +128,23 @@ export class BridgePool {
 
   async replaceBinary(newPath: string): Promise<void> {
     this.binaryPath = newPath;
-    for (const [, entry] of this.bridges) {
-      try {
-        entry.bridge.shutdown();
-      } catch {
-        // best-effort
-      }
-    }
+    const shutdowns = Array.from(this.bridges.values()).map((entry) => entry.bridge.shutdown());
     this.bridges.clear();
+    await Promise.allSettled(shutdowns);
     log(`Binary path updated to ${newPath}. All bridges cleared.`);
   }
 
   get size(): number {
     return this.bridges.size;
+  }
+}
+
+/** Canonicalize bridge keys so symlinked paths and trailing separators collapse to one key. */
+function canonicalKey(directory: string): string {
+  const stripped = directory.replace(/[/\\]+$/, "");
+  try {
+    return realpathSync(stripped);
+  } catch {
+    return stripped;
   }
 }

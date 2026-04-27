@@ -5,15 +5,18 @@ use std::thread;
 
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
-use crate::config::{GoOverlayBackend, SemanticBackend, SemanticBackendConfig};
+use crate::config::{GoOverlayBackend, SemanticBackend, SemanticBackendConfig, UserServerDef};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
 use crate::go_helper;
 use crate::go_overlay::{
     load_available_snapshot, refresh_now, spawn_refresh, GoOverlayRequest, GoOverlayRuntimeConfig,
     DEFAULT_GO_OVERLAY_TIMEOUT,
 };
+use crate::lsp::registry::{servers_for_file, ServerKind};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir, walk_project_files, SearchIndex,
@@ -122,6 +125,197 @@ fn parse_semantic_config(
     Ok(semantic)
 }
 
+fn parse_lsp_servers(value: &Value) -> Result<Vec<UserServerDef>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err("configure: lsp_servers must be an array".to_string());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_lsp_server(entry, index))
+        .collect()
+}
+
+fn parse_lsp_server(value: &Value, index: usize) -> Result<UserServerDef, String> {
+    let Some(obj) = value.as_object() else {
+        return Err(format!("configure: lsp_servers[{index}] must be an object"));
+    };
+
+    let id = required_string(obj.get("id"), index, "id")?;
+    let extensions = required_string_array(obj.get("extensions"), index, "extensions")?;
+    let binary = required_string(obj.get("binary"), index, "binary")?;
+    let args = optional_string_array(obj.get("args"), index, "args")?;
+    let root_markers = optional_string_array(obj.get("root_markers"), index, "root_markers")?;
+    let env = parse_lsp_server_env(obj.get("env"), index)?;
+    let initialization_options = obj.get("initialization_options").cloned();
+    let disabled = obj
+        .get("disabled")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                format!("configure: lsp_servers[{index}].disabled must be a boolean")
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    Ok(UserServerDef {
+        id,
+        extensions,
+        binary,
+        args,
+        root_markers,
+        env,
+        initialization_options,
+        disabled,
+    })
+}
+
+fn parse_lsp_server_env(
+    value: Option<&Value>,
+    index: usize,
+) -> Result<HashMap<String, String>, String> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Some(obj) = value.as_object() else {
+        return Err(format!(
+            "configure: lsp_servers[{index}].env must be an object"
+        ));
+    };
+
+    let mut env = HashMap::with_capacity(obj.len());
+    for (key, value) in obj {
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "configure: lsp_servers[{index}].env.{key} must be a string"
+            ));
+        };
+        env.insert(key.clone(), value.to_string());
+    }
+    Ok(env)
+}
+
+fn required_string(value: Option<&Value>, index: usize, field: &str) -> Result<String, String> {
+    let raw = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("configure: lsp_servers[{index}].{field} must be a string"))?
+        .trim();
+    if raw.is_empty() {
+        return Err(format!(
+            "configure: lsp_servers[{index}].{field} must not be empty"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+fn required_string_array(
+    value: Option<&Value>,
+    index: usize,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let values = optional_string_array(value, index, field)?;
+    if values.is_empty() {
+        return Err(format!(
+            "configure: lsp_servers[{index}].{field} must not be empty"
+        ));
+    }
+    Ok(values)
+}
+
+fn optional_string_array(
+    value: Option<&Value>,
+    index: usize,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(format!(
+            "configure: lsp_servers[{index}].{field} must be an array of strings"
+        ));
+    };
+
+    let mut values = Vec::with_capacity(entries.len());
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(format!(
+                "configure: lsp_servers[{index}].{field}[{entry_index}] must be a string"
+            ));
+        };
+        values.push(raw.trim().trim_start_matches('.').to_string());
+    }
+    Ok(values)
+}
+
+fn parse_disabled_lsp(value: &Value) -> Result<std::collections::HashSet<String>, String> {
+    let Some(entries) = value.as_array() else {
+        return Err("configure: disabled_lsp must be an array of strings".to_string());
+    };
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry
+                .as_str()
+                .map(|value| value.to_ascii_lowercase())
+                .ok_or_else(|| format!("configure: disabled_lsp[{index}] must be a string"))
+        })
+        .collect()
+}
+
+fn is_custom_server(kind: &ServerKind) -> bool {
+    matches!(kind, ServerKind::Custom(_))
+}
+
+fn lsp_missing_hint(binary: &str) -> String {
+    crate::format::install_hint(binary)
+}
+
+fn detect_missing_lsp_binaries(root_path: &Path, config: &crate::config::Config) -> Vec<Value> {
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+
+    for file in crate::callgraph::walk_project_files(root_path) {
+        for server in servers_for_file(&file, config) {
+            if is_custom_server(&server.kind) || which::which(&server.binary).is_ok() {
+                continue;
+            }
+
+            let key = (server.kind.id_str().to_string(), server.binary.clone());
+            if seen.insert(key) {
+                warnings.push(json!({
+                    "kind": "lsp_binary_missing",
+                    "server": server.binary,
+                    "binary": server.binary,
+                    "hint": lsp_missing_hint(&server.binary),
+                }));
+            }
+        }
+    }
+
+    for server in &config.lsp_servers {
+        if server.disabled || which::which(&server.binary).is_ok() {
+            continue;
+        }
+
+        let key = (server.id.clone(), server.binary.clone());
+        if seen.insert(key) {
+            warnings.push(json!({
+                "kind": "lsp_binary_missing",
+                "server": server.id,
+                "binary": server.binary,
+                "hint": lsp_missing_hint(&server.binary),
+            }));
+        }
+    }
+
+    warnings.sort_by_key(|warning| warning.to_string());
+    warnings
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -152,6 +346,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    let previous_project_root = ctx.config().project_root.clone();
+    if previous_project_root.as_ref() != Some(&root_path) {
+        crate::format::clear_tool_cache();
+    }
+
     // Set project root on config
     ctx.config_mut().project_root = Some(root_path.clone());
 
@@ -160,8 +359,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(v) = req.params.get("format_on_edit").and_then(|v| v.as_bool()) {
         ctx.config_mut().format_on_edit = v;
     }
-    if let Some(v) = req.params.get("validate_on_edit").and_then(|v| v.as_str()) {
-        ctx.config_mut().validate_on_edit = Some(v.to_string());
+    if let Some(raw) = req.params.get("validate_on_edit") {
+        if let Some(v) = raw.as_bool() {
+            ctx.config_mut().validate_on_edit = Some(if v { "syntax" } else { "off" }.to_string());
+        } else if let Some(v) = raw.as_str() {
+            let value = match v {
+                "true" => "syntax",
+                "false" => "off",
+                other => other,
+            };
+            ctx.config_mut().validate_on_edit = Some(value.to_string());
+        }
     }
     // Per-language formatter overrides: { "typescript": "biome", "python": "ruff" }
     if let Some(v) = req.params.get("formatter").and_then(|v| v.as_object()) {
@@ -205,6 +413,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
     {
         ctx.config_mut().experimental_semantic_search = v;
+    }
+    if let Some(v) = req
+        .params
+        .get("experimental_lsp_ty")
+        .and_then(|v| v.as_bool())
+    {
+        ctx.config_mut().experimental_lsp_ty = v;
+    }
+    if let Some(v) = req.params.get("lsp_servers") {
+        let servers = match parse_lsp_servers(v) {
+            Ok(servers) => servers,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+        ctx.config_mut().lsp_servers = servers;
+    }
+    if let Some(v) = req.params.get("disabled_lsp") {
+        let disabled_lsp = match parse_disabled_lsp(v) {
+            Ok(disabled_lsp) => disabled_lsp,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
+        ctx.config_mut().disabled_lsp = disabled_lsp;
     }
     if let Some(v) = req
         .params
@@ -281,7 +510,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         };
         ctx.config_mut().storage_dir = Some(storage_dir.clone());
-        ctx.backup().borrow_mut().set_storage_dir(storage_dir);
+        let ttl_hours = ctx.config().checkpoint_ttl_hours;
+        ctx.backup()
+            .borrow_mut()
+            .set_storage_dir(storage_dir, ttl_hours);
     }
     if let Some(v) = req.params.get("semantic") {
         let current = ctx.config().semantic.clone();
@@ -314,6 +546,26 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         };
         ctx.config_mut().go_overlay_backend = backend;
     }
+    if let Some(raw) = req.params.get("max_callgraph_files") {
+        // Reject invalid values explicitly so user typos surface instead of
+        // being silently swallowed (Oracle v0.15.1 review blocker).
+        // Accepts: positive integers (u64).
+        // Rejects: 0, negatives, non-integers, non-numbers.
+        let parsed = raw.as_u64().filter(|v| *v >= 1);
+        match parsed {
+            Some(v) => ctx.config_mut().max_callgraph_files = v as usize,
+            None => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "max_callgraph_files must be a positive integer (>= 1); got {}",
+                        raw
+                    ),
+                );
+            }
+        }
+    }
 
     // [similarity] config section
     if let Some(v) = req.params.get("similarity") {
@@ -327,6 +579,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    // Bounded count — `.take(max + 1)` short-circuits the `ignore::Walk`
+    // iterator so huge roots don't pay full walk cost here. `saturating_add`
+    // guards the pathological case where a user sets `max_callgraph_files`
+    // to `usize::MAX`.
+    let source_file_count = crate::callgraph::walk_project_files(&root_path)
+        .take(ctx.config().max_callgraph_files.saturating_add(1))
+        .count();
+    let exceeds = source_file_count > ctx.config().max_callgraph_files;
+    if exceeds {
+        log::warn!(
+            "[aft] project has >{} source files (max_callgraph_files={}). Call-graph operations (callers, trace_to, trace_data, impact) will be disabled. Open a specific subdirectory for call-graph features.",
+            ctx.config().max_callgraph_files,
+            ctx.config().max_callgraph_files
+        );
+    }
+
     let experimental_search_index = ctx.config().experimental_search_index;
     let experimental_semantic_search = ctx.config().experimental_semantic_search;
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
@@ -334,6 +602,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let similarity_enabled = ctx.config().similarity_enabled;
     let similarity_auto_build = ctx.config().similarity_auto_build_index;
     let _similarity_weights = ctx.config().similarity_weights;
+
+    let search_build_in_progress = ctx.search_index_rx().borrow().is_some();
+    let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
+    // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
+    // JoinHandles to cancel old threads) because:
+    //   1. Old thread results are dropped when ctx.search_index_rx() is reset
+    //   2. Atomic tempfile writes via std::fs::rename are race-safe (last writer wins)
+    //   3. Only CPU is wasted; no correctness issue
+    //   4. Tracking handles would add complexity for negligible benefit
+    // If reconfigure rate becomes a real problem, switch to a single
+    // generation-counter + cancellation-token pattern.
+    if search_build_in_progress {
+        log::warn!(
+            "[aft] configure called while search index build is still in progress; previous build will continue detached"
+        );
+    }
+    if semantic_build_in_progress {
+        log::warn!(
+            "[aft] configure called while semantic index build is still in progress; previous build will continue detached"
+        );
+    }
 
     *ctx.search_index().borrow_mut() = None;
     *ctx.search_index_rx().borrow_mut() = None;
@@ -676,9 +965,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     log::info!("project root set: {}", root_path.display());
 
+    let config_snapshot = ctx.config().clone();
+    let mut warnings = crate::format::detect_missing_tools(&root_path, &config_snapshot)
+        .into_iter()
+        .map(|warning| json!(warning))
+        .collect::<Vec<_>>();
+    warnings.extend(detect_missing_lsp_binaries(&root_path, &config_snapshot));
+
     Response::success(
         &req.id,
-        serde_json::json!({ "project_root": root_path.display().to_string() }),
+        json!({
+            "project_root": root_path.display().to_string(),
+            "source_file_count": source_file_count,
+            "source_file_count_exceeds_max": exceeds,
+            "max_callgraph_files": config_snapshot.max_callgraph_files,
+            "warnings": warnings,
+        }),
     )
 }
 

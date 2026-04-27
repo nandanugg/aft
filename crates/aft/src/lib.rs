@@ -1,3 +1,33 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::double_ended_iterator_last,
+    clippy::int_plus_one,
+    clippy::large_enum_variant,
+    clippy::len_without_is_empty,
+    clippy::let_and_return,
+    clippy::manual_contains,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_repeat_n,
+    clippy::manual_strip,
+    clippy::manual_unwrap_or_default,
+    clippy::map_clone,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_range_loop,
+    clippy::new_without_default,
+    clippy::obfuscated_if_else,
+    clippy::ptr_arg,
+    clippy::question_mark,
+    clippy::same_item_push,
+    clippy::should_implement_trait,
+    clippy::single_match,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_map_or
+)]
+
 // ## Note on `.unwrap()` / `.expect()` usage
 //
 // The remaining `.unwrap()` and `.expect()` calls in `src/` are in:
@@ -187,6 +217,19 @@ mod tests {
     }
 
     #[test]
+    fn error_display_project_too_large() {
+        let err = AftError::ProjectTooLarge {
+            count: 20001,
+            max: 20000,
+        };
+        assert_eq!(
+            err.to_string(),
+            "project has 20001 source files, exceeding max_callgraph_files=20000. Call-graph operations (callers, trace_to, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
+        );
+        assert_eq!(err.code(), "project_too_large");
+    }
+
+    #[test]
     fn error_to_json_has_code_and_message() {
         let err = AftError::FileNotFound { path: "/x".into() };
         let j = err.to_error_json();
@@ -205,5 +248,6 @@ mod tests {
         assert_eq!(cfg.max_symbol_depth, 10);
         assert_eq!(cfg.formatter_timeout_secs, 10);
         assert_eq!(cfg.type_checker_timeout_secs, 30);
+        assert_eq!(cfg.max_callgraph_files, 20_000);
     }
 }

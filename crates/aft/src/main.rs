@@ -218,7 +218,11 @@ fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let path = std::path::Path::new(file);
+    let path = match ctx.validate_path(&req.id, std::path::Path::new(file)) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let path = path.as_path();
     let mut backup = ctx.backup().borrow_mut();
 
     match backup.snapshot(req.session(), path, "manual snapshot") {

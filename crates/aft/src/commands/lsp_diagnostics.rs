@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,9 +7,13 @@ use serde::Deserialize;
 
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+use crate::lsp::manager::{
+    EnsureServerOutcomes, PullFileOutcome, PullFileResult, ServerAttemptResult,
+};
 use crate::protocol::{RawRequest, Response};
 
 const MAX_WAIT_MS: u64 = 10_000;
+const DIRECTORY_FILE_CAP: usize = 200;
 
 #[derive(Debug, Deserialize)]
 struct LspDiagnosticsParams {
@@ -25,13 +29,36 @@ struct LspDiagnosticsParams {
 
 /// Handle an `lsp_diagnostics` request.
 ///
-/// Params:
-///   - `file` (string, optional) — return diagnostics for a single file
-///   - `directory` (string, optional) — return diagnostics for all files under a directory
-///   - `severity` (string, optional) — filter: `error`, `warning`, `information`, `hint`, or `all` (default)
-///   - `wait_ms` (integer, optional) — wait N ms for fresh diagnostics before querying (max 10000)
+/// **Promise:** This is an on-demand LSP file/scope check. It is NOT a
+/// replacement for project-wide type checkers. For "everything in the
+/// project", run `tsc --noEmit`, `cargo check`, `pyright`, etc.
 ///
-/// Returns: `{ diagnostics: [{ file, line, column, end_line, end_column, severity, message, code, source }], total, files_with_errors }`
+/// Behavior summary:
+/// - **File mode** (`file`): ensures the relevant LSP server(s) are running
+///   and the document is in sync, then prefers `textDocument/diagnostic`
+///   (pull) when supported, falling back to `publishDiagnostics` (push) +
+///   `wait_ms`. Reports per-server status so the agent can tell
+///   "checked clean" from "no server registered" from "server crashed".
+///
+/// - **Directory mode** (`directory`): returns whatever the diagnostic cache
+///   already knows for files under the directory plus, for servers that
+///   support `workspace/diagnostic`, an active workspace pull. Files we have
+///   no information for are listed in `unchecked_files`. The response sets
+///   `complete: false` whenever some servers couldn't pull workspace-wide.
+///
+/// - **No-args**: returns all diagnostics in the cache.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "diagnostics": [...],
+///   "total": N,
+///   "files_with_errors": M,
+///   "complete": true|false,
+///   "lsp_servers_used": [{ "server_id", "scope", "status" }],
+///   "unchecked_files": [...]   // directory mode only
+/// }
+/// ```
 pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
     let params = match serde_json::from_value::<LspDiagnosticsParams>(req.params.clone()) {
         Ok(params) => params,
@@ -66,58 +93,348 @@ pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => return Response::error(&req.id, "invalid_request", message),
     };
 
-    if wait_ms > 0 {
-        let deadline = Instant::now() + Duration::from_millis(wait_ms);
-        loop {
-            {
-                let mut lsp = ctx.lsp();
-                lsp.drain_events();
-            }
+    match (&params.file, &params.directory) {
+        (Some(file), None) => handle_file_mode(req, ctx, file, severity_filter, wait_ms),
+        (None, Some(directory)) => {
+            handle_directory_mode(req, ctx, directory, severity_filter, wait_ms)
+        }
+        (None, None) => handle_global_mode(req, ctx, severity_filter, wait_ms),
+        _ => unreachable!("checked above"),
+    }
+}
 
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
+/// File mode: ensure the LSP is running, prefer pull, fall back to push.
+fn handle_file_mode(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+    severity_filter: SeverityFilter,
+    wait_ms: u64,
+) -> Response {
+    let canonical = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => normalize_query_path(&path),
+        Err(resp) => return resp,
+    };
 
-            let remaining = deadline.saturating_duration_since(now);
-            thread::sleep(remaining.min(Duration::from_millis(100)));
+    // Step 1: figure out what servers are registered for this file and try
+    // to spawn them. The structured outcomes let us tell the agent honestly
+    // which servers couldn't be brought up.
+    let outcomes: EnsureServerOutcomes = {
+        let mut lsp = ctx.lsp();
+        lsp.ensure_server_for_file_detailed(&canonical, &ctx.config())
+    };
+
+    let mut server_status: Vec<ServerStatusEntry> = outcomes
+        .attempts
+        .iter()
+        .map(|attempt| ServerStatusEntry::from_attempt(attempt, ServerScope::File))
+        .collect();
+
+    if outcomes.no_server_registered() {
+        // Nothing in the registry handles this extension. This is the
+        // honest "we cannot say anything" case.
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "diagnostics": [],
+                "total": 0,
+                "files_with_errors": 0,
+                "complete": true,
+                "lsp_servers_used": [],
+                "note": format!("no LSP server is registered for '{}'", file),
+            }),
+        );
+    }
+
+    if outcomes.successful.is_empty() {
+        // Servers matched but none could start. Return an empty result with
+        // detailed per-server status so the user can see why.
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "diagnostics": [],
+                "total": 0,
+                "files_with_errors": 0,
+                "complete": false,
+                "lsp_servers_used": server_status,
+            }),
+        );
+    }
+
+    // Step 2: pull diagnostics from every server that supports it. Track
+    // which servers we got a fresh result for.
+    let pull_results = {
+        let mut lsp = ctx.lsp();
+        match lsp.pull_file_diagnostics(&canonical, &ctx.config()) {
+            Ok(results) => results,
+            Err(err) => {
+                log::warn!("[lsp_diagnostics] pull_file_diagnostics failed: {err}");
+                Vec::new()
+            }
+        }
+    };
+    update_status_with_pull(&mut server_status, &pull_results);
+
+    // Step 3: for servers that didn't support pull, drain push events for
+    // the requested wait_ms. Empty publishes are preserved as "checked
+    // clean" so we can read them back.
+    if needs_push_wait(&pull_results) && wait_ms > 0 {
+        wait_for_push(ctx, wait_ms);
+    }
+
+    // Step 4: read the cache and build the response.
+    let diagnostics = collect_file_diagnostics(ctx, &canonical, severity_filter);
+    let response = build_response(&diagnostics, server_status, true, Vec::new(), None);
+    Response::success(&req.id, response)
+}
+
+/// Directory mode: return cached + try workspace-pull for each server.
+/// Files we have NO information about are listed in `unchecked_files`.
+fn handle_directory_mode(
+    req: &RawRequest,
+    ctx: &AppContext,
+    directory: &str,
+    severity_filter: SeverityFilter,
+    _wait_ms: u64,
+) -> Response {
+    let canonical = match ctx.validate_path(&req.id, Path::new(directory)) {
+        Ok(path) => normalize_query_path(&path),
+        Err(resp) => return resp,
+    };
+
+    let mut server_status: Vec<ServerStatusEntry> = Vec::new();
+    let mut all_complete = true;
+
+    // Pull workspace diagnostics from active servers that support it. We
+    // do NOT walk the directory and spawn new servers here — that's the
+    // "open every file" anti-pattern Oracle rejected. Instead we use
+    // whatever servers the agent has already triggered via prior file-mode
+    // calls or post-write hooks. For each active server, attempt
+    // `workspace/diagnostic`. Servers that don't support it return early
+    // with `supports_workspace=false`.
+    let server_keys_to_pull: Vec<crate::lsp::roots::ServerKey> = {
+        let lsp = ctx.lsp();
+        lsp.active_server_keys()
+    };
+
+    for key in &server_keys_to_pull {
+        let pull_result = {
+            let mut lsp = ctx.lsp();
+            lsp.pull_workspace_diagnostics(key, None)
+        };
+        match pull_result {
+            Ok(result) => {
+                let status = if !result.supports_workspace {
+                    "workspace_pull_unsupported"
+                } else if result.cancelled {
+                    all_complete = false;
+                    "workspace_pull_timed_out"
+                } else if result.complete {
+                    "workspace_pull_ok"
+                } else {
+                    all_complete = false;
+                    "workspace_pull_partial"
+                };
+                server_status.push(ServerStatusEntry {
+                    server_id: key.kind.id_str().to_string(),
+                    scope: ServerScope::Workspace,
+                    status: status.to_string(),
+                });
+            }
+            Err(err) => {
+                log::warn!("[lsp_diagnostics] workspace pull failed for {key:?}: {err}");
+                all_complete = false;
+                server_status.push(ServerStatusEntry {
+                    server_id: key.kind.id_str().to_string(),
+                    scope: ServerScope::Workspace,
+                    status: "request_failed".to_string(),
+                });
+            }
         }
     }
 
+    // Now read the cache for the directory.
+    let diagnostics = collect_directory_diagnostics(ctx, &canonical, severity_filter);
+
+    // Compute unchecked_files: walk the directory (capped) and list any
+    // file that has no entry in the diagnostic cache. We cap at
+    // DIRECTORY_FILE_CAP to avoid pathological large-directory walks.
+    let (unchecked_files, walk_truncated) = compute_unchecked_files(ctx, &canonical);
+    if walk_truncated {
+        all_complete = false;
+    }
+
+    let response = build_response(
+        &diagnostics,
+        server_status,
+        all_complete,
+        unchecked_files,
+        Some(walk_truncated),
+    );
+    Response::success(&req.id, response)
+}
+
+/// Global mode: just return everything in the cache.
+fn handle_global_mode(
+    req: &RawRequest,
+    ctx: &AppContext,
+    severity_filter: SeverityFilter,
+    _wait_ms: u64,
+) -> Response {
     let diagnostics: Vec<StoredDiagnostic> = {
         let lsp = ctx.lsp();
-        match (&params.file, &params.directory) {
-            (Some(file), None) => {
-                let path = match ctx.validate_path(&req.id, Path::new(file)) {
-                    Ok(path) => normalize_query_path(&path),
-                    Err(resp) => return resp,
-                };
-                lsp.get_diagnostics_for_file(&path)
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            }
-            (None, Some(directory)) => {
-                let path = match ctx.validate_path(&req.id, Path::new(directory)) {
-                    Ok(path) => normalize_query_path(&path),
-                    Err(resp) => return resp,
-                };
-                lsp.get_diagnostics_for_directory(&path)
-                    .into_iter()
-                    .cloned()
-                    .collect()
-            }
-            (None, None) => lsp.get_all_diagnostics().into_iter().cloned().collect(),
-            _ => Vec::new(),
-        }
+        lsp.get_all_diagnostics()
+            .into_iter()
+            .filter(|diagnostic| severity_filter.matches(diagnostic.severity))
+            .cloned()
+            .collect()
     };
+    let response = build_response(&diagnostics, Vec::new(), true, Vec::new(), None);
+    Response::success(&req.id, response)
+}
 
-    let mut diagnostics: Vec<StoredDiagnostic> = diagnostics
+fn collect_file_diagnostics(
+    ctx: &AppContext,
+    canonical: &Path,
+    severity_filter: SeverityFilter,
+) -> Vec<StoredDiagnostic> {
+    let lsp = ctx.lsp();
+    lsp.get_diagnostics_for_file(canonical)
         .into_iter()
         .filter(|diagnostic| severity_filter.matches(diagnostic.severity))
-        .collect();
+        .cloned()
+        .collect()
+}
 
-    diagnostics.sort_by(|left, right| {
+fn collect_directory_diagnostics(
+    ctx: &AppContext,
+    canonical: &Path,
+    severity_filter: SeverityFilter,
+) -> Vec<StoredDiagnostic> {
+    let lsp = ctx.lsp();
+    lsp.get_diagnostics_for_directory(canonical)
+        .into_iter()
+        .filter(|diagnostic| severity_filter.matches(diagnostic.severity))
+        .cloned()
+        .collect()
+}
+
+fn wait_for_push(ctx: &AppContext, wait_ms: u64) {
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        {
+            let mut lsp = ctx.lsp();
+            lsp.drain_events();
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn needs_push_wait(pull_results: &[PullFileResult]) -> bool {
+    pull_results
+        .iter()
+        .any(|r| matches!(r.outcome, PullFileOutcome::PullNotSupported))
+        || pull_results.is_empty()
+}
+
+fn update_status_with_pull(
+    server_status: &mut [ServerStatusEntry],
+    pull_results: &[PullFileResult],
+) {
+    let mut by_id: HashMap<String, &PullFileResult> = HashMap::new();
+    for result in pull_results {
+        by_id.insert(result.server_key.kind.id_str().to_string(), result);
+    }
+
+    for entry in server_status.iter_mut() {
+        if entry.status != "ok" {
+            continue;
+        }
+        let Some(pull) = by_id.get(&entry.server_id) else {
+            continue;
+        };
+        entry.status = match &pull.outcome {
+            PullFileOutcome::Full { .. } => "pull_ok".to_string(),
+            PullFileOutcome::Unchanged => "pull_unchanged".to_string(),
+            PullFileOutcome::PullNotSupported => "push_only".to_string(),
+            PullFileOutcome::PartialNotSupported => "pull_partial_skipped".to_string(),
+            PullFileOutcome::RequestFailed { reason } => format!("pull_failed: {reason}"),
+        };
+    }
+}
+
+fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) {
+    let mut unchecked = Vec::new();
+    let mut entries_walked = 0usize;
+    let mut truncated = false;
+
+    let known: HashSet<PathBuf> = {
+        let lsp = ctx.lsp();
+        lsp.get_diagnostics_for_directory(dir)
+            .into_iter()
+            .map(|d| d.file.clone())
+            .collect()
+    };
+
+    let walker = ignore::WalkBuilder::new(dir)
+        .standard_filters(true) // honors .gitignore + hidden-file rules
+        .filter_entry(|e| {
+            // Skip noisy directories that explode walk time on real repos.
+            let name = e.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+            )
+        })
+        .build();
+
+    for entry in walker {
+        if entries_walked >= DIRECTORY_FILE_CAP {
+            truncated = true;
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+        if !is_file {
+            continue;
+        }
+        entries_walked += 1;
+        let path = entry.path();
+        if !known.contains(path) {
+            // Only list files that have a registered LSP server for their
+            // extension — listing every random file is noise.
+            let has_server = {
+                let lsp = ctx.lsp();
+                let _ = lsp;
+                let config = ctx.config();
+                !crate::lsp::registry::servers_for_file(path, &config).is_empty()
+            };
+            if has_server {
+                unchecked.push(path.display().to_string());
+            }
+        }
+    }
+
+    (unchecked, truncated)
+}
+
+fn build_response(
+    diagnostics: &[StoredDiagnostic],
+    server_status: Vec<ServerStatusEntry>,
+    complete: bool,
+    unchecked_files: Vec<String>,
+    walk_truncated: Option<bool>,
+) -> serde_json::Value {
+    let mut sorted: Vec<&StoredDiagnostic> = diagnostics.iter().collect();
+    sorted.sort_by(|left, right| {
         left.file
             .cmp(&right.file)
             .then(left.line.cmp(&right.line))
@@ -127,14 +444,14 @@ pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
             .then(left.message.cmp(&right.message))
     });
 
-    let files_with_errors = diagnostics
+    let files_with_errors = sorted
         .iter()
         .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
         .map(|diagnostic| diagnostic.file.clone())
         .collect::<HashSet<PathBuf>>()
         .len();
 
-    let diagnostics_json: Vec<serde_json::Value> = diagnostics
+    let diagnostics_json: Vec<serde_json::Value> = sorted
         .iter()
         .map(|diagnostic| {
             serde_json::json!({
@@ -151,14 +468,65 @@ pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
         })
         .collect();
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "diagnostics": diagnostics_json,
-            "total": diagnostics_json.len(),
-            "files_with_errors": files_with_errors,
-        }),
-    )
+    let mut response = serde_json::json!({
+        "diagnostics": diagnostics_json,
+        "total": diagnostics_json.len(),
+        "files_with_errors": files_with_errors,
+        "complete": complete,
+        "lsp_servers_used": server_status,
+    });
+
+    if !unchecked_files.is_empty() {
+        response["unchecked_files"] = serde_json::Value::Array(
+            unchecked_files
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+    }
+    if let Some(truncated) = walk_truncated {
+        if truncated {
+            response["walk_truncated"] = serde_json::Value::Bool(true);
+        }
+    }
+
+    response
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServerStatusEntry {
+    server_id: String,
+    scope: ServerScope,
+    status: String,
+}
+
+impl ServerStatusEntry {
+    fn from_attempt(attempt: &crate::lsp::manager::ServerAttempt, scope: ServerScope) -> Self {
+        let status = match &attempt.result {
+            ServerAttemptResult::Ok { .. } => "ok".to_string(),
+            ServerAttemptResult::NoRootMarker { looked_for } => {
+                format!("no_root_marker (looked for: {})", looked_for.join(", "))
+            }
+            ServerAttemptResult::BinaryNotInstalled { binary } => {
+                format!("binary_not_installed: {binary}")
+            }
+            ServerAttemptResult::SpawnFailed { binary, reason } => {
+                format!("spawn_failed: {binary} ({reason})")
+            }
+        };
+        Self {
+            server_id: attempt.server_id.clone(),
+            scope,
+            status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ServerScope {
+    File,
+    Workspace,
 }
 
 #[derive(Debug, Clone, Copy)]

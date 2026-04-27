@@ -150,12 +150,14 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             })
             .collect();
 
-        return Response::success(
+        return Response::error_with_data(
             &req.id,
-            serde_json::json!({
-                "code": "ambiguous_symbol",
-                "candidates": candidates,
-            }),
+            "ambiguous_symbol",
+            format!(
+                "multiple symbols match '{}'; use scope to disambiguate",
+                symbol_name
+            ),
+            serde_json::json!({ "candidates": candidates }),
         );
     }
 

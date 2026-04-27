@@ -516,7 +516,8 @@ impl AppContext {
     /// Call this after write_format_validate in command handlers.
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {
         if let Ok(mut lsp) = self.lsp_manager.try_borrow_mut() {
-            if let Err(e) = lsp.notify_file_changed(file_path, content) {
+            let config = self.config();
+            if let Err(e) = lsp.notify_file_changed(file_path, content, &config) {
                 log::warn!("sync error for {}: {}", file_path.display(), e);
             }
         }
@@ -542,13 +543,14 @@ impl AppContext {
         lsp.drain_events();
 
         // Send didChange/didOpen
-        if let Err(e) = lsp.notify_file_changed(file_path, content) {
+        let config = self.config();
+        if let Err(e) = lsp.notify_file_changed(file_path, content, &config) {
             log::warn!("sync error for {}: {}", file_path.display(), e);
             return Vec::new();
         }
 
         // Wait for diagnostics to arrive
-        lsp.wait_for_diagnostics(file_path, timeout)
+        lsp.wait_for_diagnostics(file_path, &config, timeout)
     }
 
     /// Post-write LSP hook: notify server and optionally collect diagnostics.

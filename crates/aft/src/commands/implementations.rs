@@ -91,7 +91,8 @@ pub fn handle_implementations(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(err) => return Response::error(&req.id, err.code(), err.to_string()),
     };
 
-    match graph.implementations_of(&file_path, &symbol, include_mocks) {
+    let max_files = ctx.config().max_callgraph_files;
+    match graph.implementations_of(&file_path, &symbol, include_mocks, max_files) {
         Ok(result) => {
             let text = result.render_text();
             let mut result_json = serde_json::to_value(&result).unwrap_or_default();
