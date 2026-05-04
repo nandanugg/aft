@@ -57,6 +57,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 const ORT_VERSION = "1.24.4";
 const ORT_REPO = "microsoft/onnxruntime";
@@ -121,11 +122,33 @@ const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
   },
 };
 
-/** Get platform info for the current system, or null if unsupported */
+/** Get platform info for the current system, or null if unsupported.
+ *
+ *  Important: ONNX Runtime arch must match the AFT binary's arch, not Node's.
+ *  On Windows ARM64, Node may report `process.arch === "arm64"`, but the AFT
+ *  binary we ship and run is x64 (under Prism emulation — see PLATFORM_ARCH_MAP
+ *  in platform.ts). Loading a native ARM64 onnxruntime.dll from an x64 process
+ *  fails with `LoadLibraryExW failed` and panics ort, so we have to align
+ *  ONNX with the binary, not the host process.
+ *
+ *  We use the same PLATFORM_ARCH_MAP that resolves the AFT binary, then map
+ *  the canonical platform key back to ONNX's arch slot. Today this means
+ *  win32-arm64 → win32-x64 → ORT_PLATFORM_MAP.win32.x64. macOS and Linux are
+ *  already aligned (we ship native arm64 binaries on both). */
 function getPlatformInfo(): OrtPlatformInfo | null {
   const platformMap = ORT_PLATFORM_MAP[process.platform];
   if (!platformMap) return null;
-  return platformMap[process.arch] || null;
+
+  // Map Node's process.arch through PLATFORM_ARCH_MAP so we get the arch slot
+  // that matches our AFT binary, not the host. Falls back to process.arch if
+  // the platform isn't in the map (defensive — shouldn't happen since
+  // resolver would have already failed on this platform).
+  const archMap = PLATFORM_ARCH_MAP[process.platform] ?? {};
+  const platformKey = archMap[process.arch];
+  // platformKey looks like "win32-x64"; the slot under ORT_PLATFORM_MAP.win32
+  // we want is the suffix after the dash.
+  const ortArch = platformKey ? platformKey.split("-")[1] : process.arch;
+  return platformMap[ortArch] || null;
 }
 
 /** Check if this platform can auto-download ONNX Runtime */

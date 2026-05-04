@@ -15,7 +15,7 @@ import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { error, log, warn } from "./active-logger.js";
-import { PLATFORM_ASSET_MAP } from "./platform.js";
+import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 
 const REPO = "cortexkit/aft";
 
@@ -54,11 +54,17 @@ export function getCachedBinaryPath(version?: string): string | null {
  * @returns Absolute path to the downloaded binary, or null on failure.
  */
 export async function downloadBinary(version?: string): Promise<string | null> {
-  const platformKey = `${process.platform}-${process.arch}`;
-  const assetName = PLATFORM_ASSET_MAP[platformKey];
+  // Resolve via the shared platform table rather than concatenating
+  // process.platform + process.arch directly. This matters for Windows
+  // ARM64, which the table maps to win32-x64 (Prism emulation) — a naive
+  // concat would produce "win32-arm64" and miss the x64 asset that
+  // actually runs on those machines.
+  const archMap = PLATFORM_ARCH_MAP[process.platform] ?? {};
+  const platformKey = archMap[process.arch];
+  const assetName = platformKey ? PLATFORM_ASSET_MAP[platformKey] : undefined;
 
-  if (!assetName) {
-    error(`Unsupported platform: ${platformKey}`);
+  if (!platformKey || !assetName) {
+    error(`Unsupported platform: ${process.platform}-${process.arch}`);
     return null;
   }
 
