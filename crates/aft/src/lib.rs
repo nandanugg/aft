@@ -72,6 +72,8 @@ pub mod search_index;
 pub mod semantic_index;
 pub mod symbol_cache_disk;
 pub mod symbols;
+#[cfg(windows)]
+pub mod windows_shell;
 
 #[cfg(test)]
 mod tests {

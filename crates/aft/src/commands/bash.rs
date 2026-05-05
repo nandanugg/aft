@@ -18,6 +18,8 @@ use crate::context::AppContext;
 use crate::protocol::{
     ProgressFrame, ProgressKind, RawRequest, Response, ERROR_PERMISSION_REQUIRED,
 };
+#[cfg(windows)]
+pub(crate) use crate::windows_shell::resolve_windows_shell;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const INLINE_OUTPUT_LIMIT: usize = 30 * 1024;
@@ -301,30 +303,20 @@ fn spawn_command(
 
 #[cfg(windows)]
 fn shell_command(command: &str) -> Command {
-    // -NonInteractive is critical: it tells PowerShell that no human is at
-    // the console, so any cmdlet that would prompt (Read-Host, Get-Credential,
-    // PSGallery trust prompts, Install-Module confirmation, etc.) fails fast
+    // -NonInteractive (PowerShell) / no equivalent in cmd: tells the shell
+    // that no human is at the console, so prompts (Read-Host, Get-Credential,
+    // PSGallery trust prompts, Install-Module confirmation, etc.) fail fast
     // instead of hanging forever waiting for input. This mirrors OpenCode's
     // native bash on Windows (packages/opencode/src/tool/bash.ts:283) and
     // pairs with stdin=null in spawn_command above to fully detach the child
     // from any input source.
     //
-    // -ExecutionPolicy Bypass is intentional and not in OpenCode's flag set:
-    // it lets unsigned .ps1 scripts run, which AFT users routinely need for
-    // local dev scripts. The security tradeoff is acceptable because the
-    // bash command is already an explicit tool invocation chosen by the user
-    // or agent.
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        command,
-    ]);
-    cmd
+    // -ExecutionPolicy Bypass (PowerShell only) is intentional and not in
+    // OpenCode's flag set: it lets unsigned .ps1 scripts run, which AFT users
+    // routinely need for local dev scripts. The security tradeoff is
+    // acceptable because the bash command is already an explicit tool
+    // invocation chosen by the user or agent.
+    resolve_windows_shell().command(command)
 }
 
 #[cfg(not(windows))]
@@ -452,6 +444,8 @@ fn random_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::windows_shell::WindowsShell;
 
     /// Regression: prior reverse `char_indices` logic returned only the LAST
     /// character of `output` because the first reverse-iteration index already
@@ -511,5 +505,53 @@ mod tests {
     fn inline_output_suffix_returns_zero_for_short_input() {
         let output = "small";
         assert_eq!(inline_output_suffix_start(output), 0);
+    }
+
+    /// Issue #27: `WindowsShell::args` must produce shell-appropriate flags.
+    /// PowerShell variants need `-Command <string>`; cmd.exe needs `/D /C
+    /// <string>`. Mixing these up would make the spawned shell ignore the
+    /// command or interpret it as a parameter to the wrong cmdlet.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_args_match_each_shells_invocation_contract() {
+        let cmd = "echo hello";
+        let pwsh_args = WindowsShell::Pwsh.args(cmd);
+        assert!(
+            pwsh_args.contains(&"-Command"),
+            "pwsh args missing -Command: {pwsh_args:?}"
+        );
+        assert!(pwsh_args.contains(&cmd), "pwsh args missing command body");
+        assert!(
+            pwsh_args.contains(&"-NonInteractive"),
+            "pwsh args missing -NonInteractive (would hang on prompts)"
+        );
+
+        let ps_args = WindowsShell::Powershell.args(cmd);
+        assert_eq!(
+            pwsh_args, ps_args,
+            "pwsh and powershell share the same arg set"
+        );
+
+        let cmd_args = WindowsShell::Cmd.args(cmd);
+        assert_eq!(
+            cmd_args,
+            vec!["/D", "/C", cmd],
+            "cmd.exe must use /D /C contract"
+        );
+        assert!(
+            !cmd_args.contains(&"-Command"),
+            "cmd args must not leak PowerShell flags: {cmd_args:?}"
+        );
+    }
+
+    /// Each shell's binary name must match what `Command::new` expects on
+    /// Windows. Bare names rely on PATH lookup; `.exe` suffix is mandatory
+    /// for cross-compatibility with `which::which()` probing.
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_binary_names_have_exe_suffix() {
+        assert_eq!(WindowsShell::Pwsh.binary(), "pwsh.exe");
+        assert_eq!(WindowsShell::Powershell.binary(), "powershell.exe");
+        assert_eq!(WindowsShell::Cmd.binary(), "cmd.exe");
     }
 }
