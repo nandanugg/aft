@@ -641,6 +641,60 @@ fn setup_watcher_fixture() -> (tempfile::TempDir, String) {
     (tmp, root)
 }
 
+/// Poll for a watcher-driven callgraph update with retry.
+///
+/// Watcher tests are timing-sensitive: macOS FSEvents and Linux inotify
+/// can take anywhere from milliseconds to a couple of seconds to deliver
+/// file change notifications, especially under cargo-test parallelism
+/// load. A single sleep(500ms) + ping is flaky on busy runners (~20%
+/// failure rate observed locally on macOS).
+///
+/// This helper sends ping → query in a loop until the predicate matches
+/// or the timeout elapses. The ping forces `drain_watcher_events` to run,
+/// which flushes any pending invalidations into the callgraph.
+///
+/// Args:
+///   - `aft`: live AFT process to query
+///   - `query`: NDJSON request to send (must be a `callers`/`call_tree`/etc.)
+///   - `predicate`: returns true when the response reflects the expected change
+///   - `description`: human-readable for the panic message on timeout
+///
+/// Returns the final response if the predicate matched. Panics on timeout.
+fn poll_watcher_update<F>(
+    aft: &mut AftProcess,
+    query: &str,
+    predicate: F,
+    description: &str,
+) -> serde_json::Value
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    // 5s upper bound — generous enough to absorb FSEvents coalescing latency
+    // on a busy CI runner, short enough that a real regression still fails fast.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let mut last_response = serde_json::Value::Null;
+    let mut ping_id = 1000;
+
+    while std::time::Instant::now() < deadline {
+        // Drain pending watcher events into the callgraph.
+        ping_id += 1;
+        aft.send(&format!(r#"{{"id":"ping-{}","command":"ping"}}"#, ping_id));
+
+        let resp = aft.send(query);
+        if predicate(&resp) {
+            return resp;
+        }
+        last_response = resp;
+        std::thread::sleep(poll_interval);
+    }
+
+    panic!(
+        "watcher update did not propagate within 5s: {}\nlast response: {:?}",
+        description, last_response
+    );
+}
+
 /// File watcher: modify a file to add a new caller, verify it appears.
 ///
 /// configure → callers for validate → add new caller in a new file →
@@ -688,39 +742,36 @@ export function extraCheck(input: string): boolean {
     )
     .expect("write new caller file");
 
-    // Wait for OS file events to be delivered
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Send ping to trigger drain_watcher_events
-    aft.send(r#"{"id":"3","command":"ping"}"#);
-
-    // Query callers again — should include the new caller
-    let resp = aft.send(&format!(
+    // Poll until the watcher delivers the file-create event and the
+    // callgraph picks up the new caller. See poll_watcher_update for why
+    // a single sleep + ping is too flaky on busy runners.
+    let query = format!(
         r#"{{"id":"4","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
         root
-    ));
-    assert_eq!(
-        resp["success"], true,
-        "callers after add should succeed: {:?}",
-        resp
     );
+    let resp = poll_watcher_update(
+        &mut aft,
+        &query,
+        |r| {
+            r["success"] == true
+                && r["total_callers"].as_u64().unwrap_or(0) > initial_total
+                && r["callers"]
+                    .as_array()
+                    .map(|cs| {
+                        cs.iter()
+                            .any(|g| g["file"].as_str().unwrap_or("").contains("extra_caller.ts"))
+                    })
+                    .unwrap_or(false)
+        },
+        "extra_caller.ts should appear as a new caller of validate",
+    );
+
     let new_total = resp["total_callers"].as_u64().unwrap();
     assert!(
         new_total > initial_total,
         "adding a caller should increase total_callers: initial={}, new={}",
         initial_total,
         new_total
-    );
-
-    // Verify the new caller file appears in the results
-    let callers = resp["callers"].as_array().expect("callers array");
-    let extra_group = callers
-        .iter()
-        .find(|g| g["file"].as_str().unwrap_or("").contains("extra_caller.ts"));
-    assert!(
-        extra_group.is_some(),
-        "new caller from extra_caller.ts should appear, callers: {:?}",
-        callers
     );
 
     aft.shutdown();
@@ -778,40 +829,43 @@ fn callgraph_watcher_remove_caller() {
     )
     .expect("rewrite utils.ts");
 
-    // Wait for OS file events to be delivered
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Send ping to trigger drain_watcher_events
-    aft.send(r#"{"id":"3","command":"ping"}"#);
-
-    // Query callers again — utils.ts should no longer appear
-    let resp = aft.send(&format!(
+    // Poll until the watcher delivers the file-modify event and the
+    // callgraph drops the removed caller. See poll_watcher_update for why
+    // a single sleep + ping is too flaky on busy runners.
+    let query = format!(
         r#"{{"id":"4","command":"callers","file":"{}/helpers.ts","symbol":"validate","depth":1}}"#,
         root
-    ));
-    assert_eq!(
-        resp["success"], true,
-        "callers after remove should succeed: {:?}",
-        resp
     );
-
-    let callers = resp["callers"].as_array().expect("callers array");
-    let utils_group = callers
-        .iter()
-        .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
-
-    // utils.ts no longer imports or calls validate, so it should not appear
-    if let Some(group) = utils_group {
-        let entries = group["callers"].as_array().expect("callers entries");
-        let validate_caller = entries
-            .iter()
-            .find(|e| e["callee"].as_str().unwrap_or("") == "validate");
-        assert!(
-            validate_caller.is_none(),
-            "validate call should be removed from utils.ts, entries: {:?}",
-            entries
-        );
-    }
+    poll_watcher_update(
+        &mut aft,
+        &query,
+        |r| {
+            if r["success"] != true {
+                return false;
+            }
+            // The match: utils.ts is either gone from the caller list, or
+            // still listed but no longer has a `validate` callee in it.
+            let callers = match r["callers"].as_array() {
+                Some(cs) => cs,
+                None => return false,
+            };
+            let utils_group = callers
+                .iter()
+                .find(|g| g["file"].as_str().unwrap_or("").contains("utils.ts"));
+            match utils_group {
+                None => true, // utils.ts disappeared — strongest signal
+                Some(group) => group["callers"]
+                    .as_array()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .all(|e| e["callee"].as_str().unwrap_or("") != "validate")
+                    })
+                    .unwrap_or(false),
+            }
+        },
+        "validate call should be removed from utils.ts after rewrite",
+    );
 
     aft.shutdown();
 }
