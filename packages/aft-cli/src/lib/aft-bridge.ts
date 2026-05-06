@@ -14,6 +14,14 @@ export interface AftResponse {
   [key: string]: unknown;
 }
 
+/**
+ * Maximum non-JSON stdout lines we surface in a parse-failure error
+ * message. Higher counts just bloat the error output without adding
+ * diagnostic value — if the binary is producing pages of garbage, the
+ * first 5 lines are enough to tell what kind of binary it is.
+ */
+const MAX_NOISE_LINES_IN_ERROR = 5;
+
 export async function sendAftRequest(
   binaryPath: string,
   request: AftRequest,
@@ -24,6 +32,21 @@ export async function sendAftRequest(
   return response;
 }
 
+/**
+ * Send NDJSON requests to a long-running `aft` binary and collect
+ * matching responses.
+ *
+ * The contract is forgiving by design: any stdout line that isn't valid
+ * JSON is treated as binary noise (panic message, banner from a wrapper
+ * script, log line that escaped to stdout, etc.) and remembered for
+ * diagnostics rather than crashing the caller. We only report failure
+ * when the binary exits without producing the expected number of valid
+ * responses — and when we do, the error message names the specific
+ * binary path, the noise we observed, and the stderr tail so the user
+ * gets actionable context (issue #29 was a raw `SyntaxError` stack from
+ * `JSON.parse` on the first leaked stdout line, with no hint what to
+ * try next).
+ */
 export async function sendAftRequests(
   binaryPath: string,
   requests: AftRequest[],
@@ -33,6 +56,7 @@ export async function sendAftRequests(
       stdio: ["pipe", "pipe", "pipe"],
     });
     const responses: AftResponse[] = [];
+    const noiseLines: string[] = [];
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -46,14 +70,22 @@ export async function sendAftRequests(
 
     const handleLine = (line: string): void => {
       if (!line) return;
-      try {
-        responses.push(JSON.parse(line) as AftResponse);
-      } catch (error) {
-        finish(() => reject(error));
+      // Fast-path the protocol: aft writes `{"id":...}` per response.
+      // Any other content is binary log noise, panic output, or a
+      // wrapper script banner. We swallow it instead of crashing.
+      if (!line.startsWith("{")) {
+        noiseLines.push(line);
         return;
       }
-      if (responses.length === requests.length) {
-        finish(() => resolve(responses));
+      try {
+        const parsed = JSON.parse(line) as AftResponse;
+        responses.push(parsed);
+        if (responses.length === requests.length) {
+          finish(() => resolve(responses));
+        }
+      } catch {
+        // Looked like JSON but wasn't — also noise.
+        noiseLines.push(line);
       }
     };
 
@@ -81,9 +113,7 @@ export async function sendAftRequests(
 
     child.on("exit", (code) => {
       if (settled) return;
-      finish(() =>
-        reject(new Error(`aft exited before responding (code ${code}): ${stderr.trim()}`)),
-      );
+      finish(() => reject(buildBridgeError({ binaryPath, code, stderr, noiseLines, responses })));
     });
 
     for (const request of requests) {
@@ -91,4 +121,47 @@ export async function sendAftRequests(
     }
     child.stdin.end();
   });
+}
+
+interface BridgeErrorContext {
+  binaryPath: string;
+  code: number | null;
+  stderr: string;
+  noiseLines: string[];
+  responses: AftResponse[];
+}
+
+function buildBridgeError(ctx: BridgeErrorContext): Error {
+  const parts: string[] = [];
+  parts.push(
+    `aft exited before responding (binary: ${ctx.binaryPath}, exit code: ${ctx.code ?? "unknown"}).`,
+  );
+
+  if (ctx.responses.length > 0) {
+    parts.push(`Got ${ctx.responses.length} valid response(s) before exit.`);
+  }
+
+  if (ctx.noiseLines.length > 0) {
+    parts.push(
+      `\nThe binary printed ${ctx.noiseLines.length} non-JSON line(s) to stdout — this usually means ` +
+        "the resolved binary isn't an AFT release binary (wrapper script, panic output, or unrelated tool):",
+    );
+    const sample = ctx.noiseLines.slice(0, MAX_NOISE_LINES_IN_ERROR).map((line) => `  | ${line}`);
+    parts.push(sample.join("\n"));
+    if (ctx.noiseLines.length > MAX_NOISE_LINES_IN_ERROR) {
+      parts.push(
+        `  | (… ${ctx.noiseLines.length - MAX_NOISE_LINES_IN_ERROR} more line(s) omitted)`,
+      );
+    }
+    parts.push(
+      "\nTry: bunx --bun @cortexkit/aft doctor (full diagnostics) or check ~/.cache/aft/bin/ for the right binary.",
+    );
+  }
+
+  const stderrTrimmed = ctx.stderr.trim();
+  if (stderrTrimmed) {
+    parts.push(`\nstderr:\n${stderrTrimmed}`);
+  }
+
+  return new Error(parts.join("\n"));
 }
