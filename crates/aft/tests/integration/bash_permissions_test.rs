@@ -54,18 +54,34 @@ fn bash(aft: &mut AftProcess, id: &str, command: &str) -> serde_json::Value {
 }
 
 #[test]
-fn simple_echo_has_no_permission_asks() {
+fn simple_echo_requires_bash_permission() {
+    // Regression: previously AFT silently skipped `echo` from bash
+    // permission asks, which let any command starting with `echo`
+    // bypass the user's `bash: { "*": deny, ... }` rules even though
+    // OpenCode's built-in bash tool always asks for echo.
+    // See packages/opencode/src/tool/bash.ts (which only excludes the
+    // CWD set: cd / push-location / set-location).
     let root = TempDir::new().unwrap();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
-    let frames = aft.send_until(
-        r#"{"id":"echo","method":"bash","params":{"command":"echo hello","permissions_requested":true}}"#,
-        |value| value["id"] == "echo",
+    let response = bash(&mut aft, "echo", "echo hello");
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "permission_required");
+    let asks = response["asks"]
+        .as_array()
+        .expect("asks should be an array");
+    assert!(
+        asks.iter().any(|ask| {
+            ask["kind"] == "bash"
+                && ask["patterns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == "echo hello")
+        }),
+        "expected a bash ask with pattern 'echo hello': {response:?}"
     );
-    let response = frames.last().unwrap();
-    assert_eq!(response["success"], true, "response: {response:?}");
-    assert_eq!(response["output"], "hello\n");
 
     assert!(aft.shutdown().success());
 }

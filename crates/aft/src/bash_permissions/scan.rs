@@ -51,7 +51,13 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
         .set_language(&tree_sitter_bash::LANGUAGE.into())
         .is_err()
     {
-        return Vec::new();
+        // Fail closed: if we can't even load the bash grammar we cannot
+        // verify the command is safe, so require explicit permission via
+        // a wildcard ask rather than silently letting the command run.
+        // This was previously `return Vec::new()` which created a hard
+        // bypass of the user's bash permission rules whenever grammar
+        // loading failed.
+        return vec![parse_failed_ask()];
     }
 
     let Some(tree) = parser.parse(command, None) else {
@@ -107,7 +113,14 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
             }
         }
 
-        if !CWD_COMMANDS.contains(&head) && head != "echo" {
+        // Mirror OpenCode's `packages/opencode/src/tool/bash.ts`: only
+        // skip `cd`/`pushd`/`popd` (they have no externally visible effect
+        // beyond updating scan_cwd, already handled above). Every other
+        // command — including `echo` — must produce a bash ask so the
+        // user's permission rules (`bash: { "*": deny, ... }`) actually
+        // apply. Previous code excluded `echo` here, which let any
+        // command starting with `echo` bypass deny rules.
+        if !CWD_COMMANDS.contains(&head) {
             push_bash_ask(&mut asks, &mut seen, source(command, node), &tokens);
             if head == "xargs" {
                 push_xargs_ask(&mut asks, &mut seen, &tokens);
