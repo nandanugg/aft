@@ -8,6 +8,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import { aftPrefixedTools } from "../tools/hoisted.js";
 import { structureTools } from "../tools/structure.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
@@ -38,7 +39,7 @@ function createMockSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

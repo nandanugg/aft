@@ -10,6 +10,7 @@ import { formatZoomBatchResult, readingTools } from "../tools/reading.js";
 import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
@@ -47,7 +48,7 @@ function createMockSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

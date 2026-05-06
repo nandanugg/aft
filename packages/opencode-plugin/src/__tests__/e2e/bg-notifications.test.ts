@@ -11,6 +11,7 @@ import {
 } from "../../bg-notifications.js";
 import { createBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
+import { noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
   createHarness,
@@ -131,7 +132,7 @@ async function spawnBackground(
     worktree: h.tempDir,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
     callID: `call-${Date.now()}`,
   } as ToolContext);
   // Spawn-line format: "Background task started: <taskId>. <anti-poll reminder>."

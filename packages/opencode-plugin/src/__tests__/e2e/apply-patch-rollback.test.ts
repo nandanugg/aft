@@ -7,6 +7,7 @@ import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
+import { noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
   createHarness,
@@ -44,7 +45,7 @@ function createSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

@@ -6,6 +6,7 @@ import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { consumeToolMetadata } from "../metadata-store.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
+import { mockAsk, noopAsk } from "./test-helpers";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 
@@ -34,7 +35,7 @@ function createMockSdkContext(overrides: Partial<ToolContext> = {}): ToolContext
     worktree: PROJECT_CWD,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
     callID: "test-call",
     ...overrides,
   } as ToolContext;
@@ -101,7 +102,7 @@ describe("OpenCode bash adapter", () => {
   });
 
   test("permission loop asks for each PermissionAsk and retries with permissions_granted", async () => {
-    const ask = mock(async () => {});
+    const ask = mockAsk();
     let sendCount = 0;
     const { calls, tool: bash } = createHarness((_command, _params, _options) => {
       sendCount++;

@@ -970,6 +970,10 @@ fn detached_shell_command_for(
     let wrapper_ext = match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => "ps1",
         WindowsShell::Cmd => "bat",
+        // POSIX shells (git-bash etc.) execute the wrapper through `-c`,
+        // so the file extension is purely cosmetic; `.sh` matches what an
+        // operator would expect when grepping the spill directory.
+        WindowsShell::Posix(_) => "sh",
     };
     let wrapper_path = paths.dir.join(format!(
         "{}.{}",
@@ -983,7 +987,7 @@ fn detached_shell_command_for(
     fs::write(&wrapper_path, wrapper_body)
         .map_err(|e| format!("failed to write background bash wrapper script: {e}"))?;
 
-    let mut cmd = Command::new(shell.binary());
+    let mut cmd = Command::new(shell.binary().as_ref());
     match shell {
         WindowsShell::Pwsh | WindowsShell::Powershell => {
             // -File runs the script with no quoting issues. `-NoLogo`,
@@ -1006,6 +1010,13 @@ fn detached_shell_command_for(
             // "filename syntax incorrect" errors that came from
             // having complex compound commands on the cmd line.
             cmd.args(["/V:ON", "/D", "/C"]);
+            cmd.arg(&wrapper_path);
+        }
+        WindowsShell::Posix(_) => {
+            // git-bash and other POSIX shells run the wrapper script with
+            // `<binary> <wrapper-path>` (the wrapper is just a shell
+            // script). No special flags needed — the `trap` and atomic
+            // exit-marker rename in `wrapper_script` are POSIX-standard.
             cmd.arg(&wrapper_path);
         }
     }
@@ -1076,10 +1087,10 @@ fn spawn_detached_child(
         let raw_candidates = shell_candidates();
         let mut candidates: Vec<WindowsShell> = Vec::with_capacity(raw_candidates.len());
         for shell in &raw_candidates {
-            if *shell == WindowsShell::Cmd {
-                candidates.insert(0, *shell);
+            if matches!(shell, WindowsShell::Cmd) {
+                candidates.insert(0, shell.clone());
             } else {
-                candidates.push(*shell);
+                candidates.push(shell.clone());
             }
         }
         // Win32 process creation flags. We try with CREATE_BREAKAWAY_FROM_JOB
@@ -1108,7 +1119,7 @@ fn spawn_detached_child(
                 let stderr = create_capture_file(&paths.stderr)
                     .map_err(|e| format!("failed to open stderr capture file: {e}"))?;
                 let mut cmd =
-                    detached_shell_command_for(*shell, command, &paths.exit, paths, flags)?;
+                    detached_shell_command_for(shell.clone(), command, &paths.exit, paths, flags)?;
                 cmd.current_dir(workdir)
                     .envs(env)
                     .stdin(Stdio::null())

@@ -4,6 +4,7 @@ import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
@@ -38,7 +39,7 @@ function createMockSdkContext(directory = "/tmp/search-tests"): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

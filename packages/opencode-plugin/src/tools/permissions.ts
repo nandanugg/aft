@@ -3,34 +3,26 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import { Effect } from "effect";
 
 /**
- * Execute a `ctx.ask(...)` result, supporting BOTH the old (Promise-returning)
- * and new (Effect-returning) plugin contracts.
+ * Execute a `ctx.ask(...)` result.
  *
- * Why this exists: OpenCode's plugin TypeScript types declared `ask` as
- * `Promise<void>` in v1.2.x but switched to `Effect.Effect<void>` in
- * v1.14.x (see opencode-source `packages/plugin/src/tool.ts`). When AFT
- * was built against the old typed contract and just used `await`, plain
- * `await effect` resolves silently to the Effect object **without ever
- * executing the effect** — meaning the deny/ask evaluation never ran and
- * the user's `bash: { "*": deny }` (and edit/external_directory) rules
- * were silently ignored.
+ * Why this exists: OpenCode's plugin contract returns `Effect.Effect<void>`
+ * from `ask()` (since v1.14). Plain `await effect` resolves silently to the
+ * Effect object without ever executing it — meaning the deny/ask evaluation
+ * never runs and the user's `bash: { "*": deny }` (and edit/external_directory)
+ * rules are silently ignored. The Effect must be run via `Effect.runPromise`.
  *
- * Promise duck-typing (`.then` is callable) reliably distinguishes the
- * two shapes because Effect objects in @effect/io do not implement the
- * thenable protocol. On deny, `Effect.runPromise` rejects with the
- * underlying defect (DeniedError / RejectedError); on the old contract
- * a rejected Promise has the same shape so callers can still rely on
- * `try/catch` for deny handling.
+ * `effect` is marked external in our bun build and listed as a peerDependency,
+ * so this import resolves at runtime to the same `effect` runtime that
+ * `@opencode-ai/plugin` is using to construct the Effect. Bundling our own
+ * `effect` would create a runtime instance mismatch where
+ * `Effect.runPromise(...)` rejects with "Not a valid effect".
+ *
+ * On deny, `Effect.runPromise` rejects with the underlying defect
+ * (DeniedError / RejectedError) so callers can rely on `try/catch` to
+ * detect denial.
  */
-export async function runAsk(maybe: unknown): Promise<void> {
-  if (maybe && typeof (maybe as { then?: unknown }).then === "function") {
-    // Old contract (1.2.x): Promise<void> — await directly.
-    await (maybe as Promise<void>);
-    return;
-  }
-  // New contract (1.14.x+): Effect.Effect<void> — must run via
-  // Effect.runPromise for the effect to actually execute.
-  await Effect.runPromise(maybe as Effect.Effect<void, unknown, never>);
+export async function runAsk(maybe: Effect.Effect<void>): Promise<void> {
+  await Effect.runPromise(maybe);
 }
 
 export function resolveAbsolutePath(context: ToolContext, target: string): string {

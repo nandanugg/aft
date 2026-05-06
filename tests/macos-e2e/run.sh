@@ -35,6 +35,17 @@ set -euo pipefail
 : "${AFT_BINARY_PATH:?AFT_BINARY_PATH must point at a built aft binary}"
 : "${AFT_PLUGIN_DIST:?AFT_PLUGIN_DIST must point at packages/opencode-plugin/dist/}"
 
+# `RUNNER_TEMP` is only set on GitHub-hosted runners. When running this harness
+# locally (the README documents this as a supported flow), fall back to
+# `$TMPDIR` (macOS standard) and finally `/tmp`. Without this guard, `set -u`
+# trips on the first `$RUNNER_TEMP` reference and the harness aborts with
+# "RUNNER_TEMP: unbound variable" before any setup runs.
+if [ -z "${RUNNER_TEMP:-}" ]; then
+    RUNNER_TEMP="${TMPDIR:-/tmp}/aft-macos-e2e"
+    mkdir -p "$RUNNER_TEMP"
+    export RUNNER_TEMP
+fi
+
 if [ ! -x "$AFT_BINARY_PATH" ]; then
     echo "AFT_BINARY_PATH does not exist or is not executable: $AFT_BINARY_PATH" >&2
     exit 2

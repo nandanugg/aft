@@ -9,6 +9,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import { consumeToolMetadata } from "../metadata-store.js";
 import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 let sdkCtx = createMockSdkContext(PROJECT_CWD);
@@ -46,7 +47,7 @@ function createMockSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

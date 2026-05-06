@@ -5,9 +5,9 @@ import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
-
 import { aftPrefixedTools, hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
+import { noopAsk } from "../test-helpers";
 import {
   BIOME_TS_EXCLUDED_PRESET,
   BIOME_TS_PRESET,
@@ -88,7 +88,7 @@ function createSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

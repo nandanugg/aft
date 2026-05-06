@@ -7,6 +7,7 @@ import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
+import { noopAsk, toolResultText } from "../test-helpers";
 import {
   BIOME_TS_EXCLUDED_PRESET,
   BIOME_TS_PRESET,
@@ -61,7 +62,7 @@ function createSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 
@@ -206,7 +207,9 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     );
     pools.push(pool);
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
-    return await tools.write.execute({ filePath, content }, createSdkContext(h.tempDir));
+    return toolResultText(
+      await tools.write.execute({ filePath, content }, createSdkContext(h.tempDir)),
+    );
   }
 
   async function executeHoistedEdit(
@@ -230,9 +233,8 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     );
     pools.push(pool);
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage-edit")));
-    return await tools.edit.execute(
-      { filePath, oldString, newString },
-      createSdkContext(h.tempDir),
+    return toolResultText(
+      await tools.edit.execute({ filePath, oldString, newString }, createSdkContext(h.tempDir)),
     );
   }
 

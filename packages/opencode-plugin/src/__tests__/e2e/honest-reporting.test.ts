@@ -10,6 +10,7 @@ import { importTools } from "../../tools/imports.js";
 import { lspTools } from "../../tools/lsp.js";
 import { readingTools } from "../../tools/reading.js";
 import type { PluginContext } from "../../types.js";
+import { noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
   createHarness,
@@ -46,7 +47,7 @@ function createSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 

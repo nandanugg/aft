@@ -5,8 +5,10 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { Effect } from "effect";
 import { createBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
+import { mockAsk, noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
   createHarness,
@@ -107,7 +109,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       metadata: (data: Record<string, unknown>) => {
         lastMetadata = data;
       },
-      ask: options.ask ?? (async () => {}),
+      ask: options.ask ?? noopAsk,
       callID: `call-${Date.now()}`,
     } as ToolContext;
     const output = await bash.execute(args, context);
@@ -309,7 +311,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
   test("permission ask round-trip invokes OpenCode ctx.ask", async () => {
     const { h, bash } = await pluginHarness();
-    const ask = mock(async () => {});
+    const ask = mockAsk();
 
     const result = await callPluginBash(bash, h, { command: "git status" }, { ask });
 
@@ -323,6 +325,149 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       patterns: ["git status"],
       always: ["git status *"],
     });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Permission flow regression coverage (Oracle audit v0.19.5..HEAD).
+  //
+  // These tests exercise the FULL stack — Rust permission scan → bridge →
+  // plugin runAsk → real Effect runtime → response — through the OpenCode
+  // adapter exactly as it ships. They sit in the e2e suite (not unit tests)
+  // because the runAsk regression that prompted them was a runtime mismatch
+  // between AFT's bundled effect@3 and OpenCode's effect@4: a unit test that
+  // mocks ctx.ask cannot catch that, but a real Effect from the same `effect`
+  // package the plugin SDK ships with does.
+  //
+  // Coverage matrix:
+  //   1. Effect resolves   → command runs, ask invoked exactly once.
+  //   2. Effect.fail       → bash deny propagates as a thrown Error.
+  //   3. Effect.sync body  → actually executes (was silently `await`-ed pre-fix).
+  //   4. permissions_granted → ask is bypassed entirely (Rust short-circuits).
+  //   5. Multiple asks     → all asks are awaited before bash runs.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  test("Effect-returning ask resolves cleanly and bash runs (allow path)", async () => {
+    const { h, bash } = await pluginHarness();
+
+    let askInvoked = false;
+    // Effect.sync mirrors what OpenCode does for an "allow" decision: it
+    // returns a synchronously-completing Effect with no error channel. If
+    // runAsk reverts to plain `await maybe`, the body of Effect.sync never
+    // runs and `askInvoked` stays false — the assertion below catches that
+    // class of regression even though the bash command itself would still
+    // succeed by accident.
+    const ask = mock((_input: unknown) =>
+      Effect.sync(() => {
+        askInvoked = true;
+      }),
+    ) as ToolContext["ask"];
+
+    const result = await callPluginBash(bash, h, { command: "echo allowed" }, { ask });
+
+    expect(askInvoked).toBe(true);
+    expect(result.output).toBe("allowed\n");
+    expect(result.metadata.exit).toBe(0);
+  });
+
+  test("Effect.fail from ask propagates as a thrown Error (deny path)", async () => {
+    const { h, bash } = await pluginHarness();
+
+    // Effect.fail mirrors what OpenCode does when a permission rule denies
+    // the request. The plugin must surface this back through bash.execute as
+    // a thrown Error so OpenCode's tool runner records it as a deny — NOT
+    // silently let bash run anyway. Pre-fix runAsk used `await` on the
+    // Effect, which never even ran the failure path; the bug report was
+    // exactly "`bash: { '*': deny }` doesn't deny".
+    const ask = mock(
+      (_input: unknown) =>
+        Effect.fail(new Error("Permission denied by user")) as unknown as Effect.Effect<void>,
+    ) as ToolContext["ask"];
+
+    let captured: unknown;
+    try {
+      await callPluginBash(bash, h, { command: "echo should-not-run" }, { ask });
+      throw new Error("expected bash.execute to throw on deny");
+    } catch (err) {
+      captured = err;
+    }
+
+    expect(captured).toBeInstanceOf(Error);
+    expect((captured as Error).message).toContain("Permission denied by user");
+    // The ask must have actually been consulted — a fix that catches the deny
+    // BEFORE consulting ask would also fail this assertion.
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  test("permissions_granted skips ctx.ask entirely", async () => {
+    const { h } = await pluginHarness();
+
+    // Bypass the bash tool's plugin-side permission loop and call the bridge
+    // directly with `permissions_granted` so we can assert that pre-granted
+    // patterns short-circuit the Rust scanner without ever asking the user.
+    // This proves the Rust side of the fail-closed gate (zero-asks → deny)
+    // does NOT trigger when patterns are already trusted.
+    const response = await h.bridge.send("bash", {
+      command: "git status",
+      permissions_requested: true,
+      permissions_granted: ["git status *"],
+    });
+
+    expect(response.success).toBe(true);
+    expect(response.code).not.toBe("permission_required");
+  });
+
+  test("multiple permission asks are all consulted before bash runs", async () => {
+    const { h, bash } = await pluginHarness();
+
+    // `find . | xargs grep foo` produces TWO bash asks (find, grep). Both
+    // must be Effect-resolved before the second bridge call runs the
+    // command. If runAsk silently dropped any of them, the bash deny would
+    // bypass for whichever subcommand the loop forgot to await.
+    let askCount = 0;
+    const ask = mock((_input: unknown) =>
+      Effect.sync(() => {
+        askCount += 1;
+      }),
+    );
+
+    await callPluginBash(
+      bash,
+      h,
+      { command: "find . | xargs grep foo" },
+      { ask: ask as unknown as ToolContext["ask"] },
+    );
+
+    expect(askCount).toBeGreaterThanOrEqual(2);
+    expect(ask.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("Rust scan fail-closed wildcard ask propagates through the plugin layer", async () => {
+    const { h, bash } = await pluginHarness();
+
+    // Inputs like `((i++))` parse cleanly in tree-sitter-bash but produce
+    // ZERO `command` nodes. The Rust scanner's fail-closed branch must emit
+    // a wildcard "*" ask in that case (Oracle audit MEDIUM #2). The plugin
+    // layer must then forward that ask to ctx.ask through the same Effect
+    // path — proving the scanner+plugin chain doesn't silently let
+    // command-less inputs bypass `bash: { "*": deny }`.
+    const ask = mock(() => Effect.sync(() => {}));
+
+    await callPluginBash(
+      bash,
+      h,
+      { command: "((i++))" },
+      { ask: ask as unknown as ToolContext["ask"] },
+    );
+
+    expect(ask).toHaveBeenCalled();
+    const askInput = ask.mock.calls[0][0] as unknown as {
+      patterns: string[];
+      permission: string;
+    };
+    expect(askInput.permission).toBe("bash");
+    // Wildcard or literal echo of the input — either is acceptable as long
+    // as the agent is forced to consult OpenCode's permission rules.
+    expect(askInput.patterns.length).toBeGreaterThan(0);
   });
 });
 

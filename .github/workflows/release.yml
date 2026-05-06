@@ -106,6 +106,48 @@ jobs:
         env:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
 
+  # Bash permission flow on Windows — release-time mirror of the
+  # bun-windows-bash job in tests.yml. Verifies the runAsk + Effect runtime
+  # path through real BinaryBridge spawning aft.exe over stdio NDJSON on
+  # the Windows process model. Scoped to bash.test.ts only because the
+  # full bun suite blocks on integration-harness JSON-path escape issues
+  # (see rust-windows comment in tests.yml). continue-on-error is ON for
+  # now; promote to required once we have stable green runs.
+  test-windows-bash:
+    name: Test (Windows — bash permission e2e)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+        shell: pwsh
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun run --cwd packages/aft-bridge build
+        shell: pwsh
+
+      - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
+        run: cargo build -p agent-file-tools
+        shell: pwsh
+
+      - name: Bun test (bash permission flow — full bridge + plugin + Rust)
+        run: bun test src/__tests__/e2e/bash.test.ts
+        working-directory: packages/opencode-plugin
+        shell: pwsh
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+
   # Run the full E2E matrix (Linux Docker + Windows native + macOS native) at
   # release time. Reuses the same workflow tests.yml runs at PR time — single
   # source of truth, so PR-time and release-time e2e can never drift.

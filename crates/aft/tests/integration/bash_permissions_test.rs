@@ -290,6 +290,17 @@ fn no_command_shape_produces_zero_asks() {
         ": > /tmp/x",
         // variable assignment only
         "FOO=bar",
+        // arithmetic / test-only forms — these parse as their own AST nodes
+        // (arithmetic_command, test_command, declaration_command) and produce
+        // ZERO `command` nodes, so the empty-command-nodes fail-closed branch
+        // is the only thing standing between them and `bash: { "*": deny }`
+        // bypass. Oracle audit (v0.19.5..HEAD MEDIUM #2): make sure each
+        // shape is tracked explicitly so future grammar/scan refactors can't
+        // silently regress them.
+        "((i++))",
+        "[[ -f foo ]]",
+        "readonly FOO=bar",
+        "declare -A map=()",
         // sub-shells and groups
         "(ls)",
         "{ ls; }",
