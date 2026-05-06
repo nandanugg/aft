@@ -262,6 +262,84 @@ fn background_command_requires_permission_before_spawn() {
     assert!(aft.shutdown().success());
 }
 
+/// Probe: figure out which command shapes produce ZERO asks. Any zero-ask
+/// path is an effective bypass of the user's `bash: { "*": deny }` rule
+/// because `bash.rs:110` only blocks the request when asks are non-empty.
+/// This test drives a bunch of command shapes through the live bridge and
+/// asserts they all produce at least one ask. Failures are real bypasses.
+#[test]
+fn no_command_shape_produces_zero_asks() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let cases = [
+        // basic non-whitelisted commands
+        "git status",
+        "ls -la",
+        "find . -name foo",
+        "cat README.md",
+        // bash builtins the agent might reach for
+        "set -e",
+        "shopt -s nullglob",
+        "type git",
+        "alias",
+        // pure redirect (no command word)
+        "> /tmp/x",
+        ":",
+        ": > /tmp/x",
+        // variable assignment only
+        "FOO=bar",
+        // sub-shells and groups
+        "(ls)",
+        "{ ls; }",
+        // backticks / command substitution at top level
+        "$(ls)",
+        "`ls`",
+        // eval and bash -c smuggling
+        "eval ls",
+        "bash -c ls",
+        // pipes
+        "ls | head",
+        // here-doc
+        "cat <<EOF\nhi\nEOF",
+        // unicode / odd whitespace
+        "git\u{00a0}status",
+    ];
+
+    let mut bypasses = Vec::new();
+    let mut zero_ask_failures = Vec::new();
+    for (i, cmd) in cases.iter().enumerate() {
+        let id = format!("probe-{i}");
+        let response = bash(&mut aft, &id, cmd);
+        let asks_len = response["asks"].as_array().map(|a| a.len()).unwrap_or(0);
+        let success = response["success"].as_bool().unwrap_or(true);
+
+        if success && asks_len == 0 {
+            bypasses.push(format!("{cmd:?} -> {response}"));
+        } else if asks_len == 0 && !success {
+            zero_ask_failures.push(format!(
+                "{cmd:?} (code={:?}, message={:?})",
+                response["code"], response["message"]
+            ));
+        }
+    }
+
+    eprintln!("zero-ask but failed for unrelated reasons:");
+    for line in &zero_ask_failures {
+        eprintln!("  - {line}");
+    }
+
+    if !bypasses.is_empty() {
+        let joined = bypasses.join("\n  ");
+        panic!(
+            "BYPASSES: the following commands produced zero asks AND ran successfully:\n  {joined}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn malformed_bash_requires_full_permission_prompt() {
     let root = TempDir::new().unwrap();

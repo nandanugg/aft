@@ -71,6 +71,25 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
     let mut command_nodes = Vec::new();
     collect_commands(root, &mut command_nodes);
 
+    // Fail-closed: tree-sitter parsed successfully but found NO `command`
+    // nodes, yet the input has visible content. This happens for shapes
+    // that have side effects without invoking a command word, e.g.:
+    //   - pure redirects:  `> /tmp/x` (truncate file)
+    //   - variable-only:   `FOO=bar`  (set shell variable)
+    //   - empty subshell:  `()`
+    // Without this fall-back the `bash.rs` guard
+    // `if !permission_asks.is_empty()` skips the permission check
+    // entirely and the user's `bash: { "*": deny }` rule is bypassed.
+    //
+    // Pure `cd` does NOT trigger this branch because tree-sitter still
+    // produces a `command` node for it; the cd handling above just
+    // chooses not to push an ask for that node, which matches OpenCode
+    // and is intentional (cd has no externally visible effect beyond
+    // updating scan_cwd, already handled).
+    if command_nodes.is_empty() && !command.trim().is_empty() {
+        return vec![parse_failed_ask()];
+    }
+
     let mut asks = Vec::new();
     let mut seen = HashSet::new();
     let mut scan_cwd = cwd.clone();
