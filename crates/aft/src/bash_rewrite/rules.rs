@@ -416,8 +416,25 @@ fn ls_request(command: &str) -> Option<Value> {
     let mut path = None;
     for arg in parsed.args.iter().skip(1) {
         if let Some(flags) = arg.strip_prefix('-') {
-            if flags.is_empty() || !flags.chars().all(|flag| matches!(flag, 'l' | 'R' | 'a')) {
+            if flags.is_empty() {
                 return None;
+            }
+            for flag in flags.chars() {
+                match flag {
+                    // -R: recursive listing — `read` of a directory is
+                    // single-level only, but the result is still a useful
+                    // approximation of "what's in this tree".
+                    // -a: show hidden files — `read` of a directory already
+                    // includes hidden files via fs::read_dir(), so this is
+                    // a no-op compared to plain `ls`.
+                    'R' | 'a' => {}
+                    // -l: long format. Shows size, mtime, permissions, owner.
+                    // `read` returns directory entries (no metadata) or file
+                    // contents (not metadata at all). Rewriting drops the
+                    // info the user asked for, so fall through to real bash.
+                    // Reported by user dogfooding the v0.18 bash experimentals.
+                    _ => return None,
+                }
             }
         } else if path.is_none() {
             path = Some(arg.clone());
@@ -426,5 +443,23 @@ fn ls_request(command: &str) -> Option<Value> {
         }
     }
 
-    Some(json!({ "file": path.unwrap_or_else(|| ".".to_string()) }))
+    // Even without -l, `ls FILE` and `read FILE` have entirely different
+    // semantics: `ls FILE` echoes the filename, `read FILE` dumps the file
+    // contents. The rewrite is only safe when the path resolves to a
+    // directory (or is missing/cwd, where `read` of cwd also makes sense).
+    // Stat the path and fall through to bash for files.
+    let target = path.clone().unwrap_or_else(|| ".".to_string());
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        if !metadata.is_dir() {
+            return None;
+        }
+    }
+    // Path doesn't exist (yet)? Let bash handle the error itself — its
+    // wording is well-known to agents and we don't gain anything by
+    // rewriting a guaranteed-failing rewrite call.
+    else if path.is_some() {
+        return None;
+    }
+
+    Some(json!({ "file": target }))
 }

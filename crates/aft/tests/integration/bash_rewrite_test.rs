@@ -259,13 +259,93 @@ fn rewrites_ls_directory_and_rejects_unknown_flags() {
     fs::write(dir.path().join("src/lib.rs"), "fn lib() {}\n").unwrap();
     let ctx = context(dir.path(), true);
 
+    // -a is fine; rewrite to read on the directory.
     let data = assert_rewritten(
-        &format!("ls -la {}", dir.path().join("src").display()),
+        &format!("ls -a {}", dir.path().join("src").display()),
         &ctx,
         "read",
     );
     assert!(output(&data).contains("lib.rs"));
     assert!(rewrite("ls -h src", &ctx).is_none());
+}
+
+/// Regression for a real user report: `ls -l FILENAME` was being rewritten
+/// to `read FILENAME`, swapping metadata (size, mtime, permissions) for
+/// file contents — completely different semantics. The rewrite must
+/// fall through to real bash whenever:
+///   - any -l flag is present (user explicitly wants long-format metadata), OR
+///   - the path resolves to a regular file (`ls FILE` echoes filename;
+///     `read FILE` would dump contents).
+#[test]
+fn rejects_ls_with_l_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn lib() {}\n").unwrap();
+    fs::write(dir.path().join("README.md"), "# project\n").unwrap();
+    let ctx = context(dir.path(), true);
+
+    // -l on a directory: user wants metadata, not entries. Fall through.
+    assert!(
+        rewrite(&format!("ls -l {}", dir.path().join("src").display()), &ctx,).is_none(),
+        "ls -l on a directory must fall through to bash (user wants metadata)"
+    );
+
+    // -l on a file: the original report. Must fall through.
+    assert!(
+        rewrite(
+            &format!("ls -l {}", dir.path().join("README.md").display()),
+            &ctx,
+        )
+        .is_none(),
+        "ls -l on a file must fall through to bash (read would dump contents)"
+    );
+
+    // -la on a file: combined flags including -l. Fall through.
+    assert!(
+        rewrite(
+            &format!("ls -la {}", dir.path().join("README.md").display()),
+            &ctx,
+        )
+        .is_none(),
+        "ls -la on a file must fall through (-l drops metadata, target is file)"
+    );
+}
+
+/// `ls FILE` (no flags) and `read FILE` are NOT semantically equivalent:
+/// `ls FILE` echoes the filename, `read FILE` dumps file contents. The
+/// rewrite must check the path's file type and fall through for files.
+#[test]
+fn rejects_ls_on_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "# project\n").unwrap();
+    let ctx = context(dir.path(), true);
+
+    assert!(
+        rewrite(
+            &format!("ls {}", dir.path().join("README.md").display()),
+            &ctx,
+        )
+        .is_none(),
+        "ls on a regular file must fall through to bash"
+    );
+}
+
+/// `ls NONEXISTENT` should fall through too — bash's "No such file or
+/// directory" wording is well-known to agents, and we don't gain anything
+/// by rewriting a guaranteed-failing call into a different failure shape.
+#[test]
+fn rejects_ls_on_missing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), true);
+
+    assert!(
+        rewrite(
+            &format!("ls {}", dir.path().join("does-not-exist").display()),
+            &ctx,
+        )
+        .is_none(),
+        "ls on a missing path must fall through to bash"
+    );
 }
 
 #[test]
