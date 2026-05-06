@@ -57,6 +57,45 @@ function normalizeGlob(pattern: string): string {
 }
 
 /**
+ * Brace-aware comma split. Allows users to type either of:
+ *
+ *   - "*.ts,*.tsx"            (multiple OpenCode-style includes)
+ *   - "**\/*.{vue,ts,tsx}"    (a single glob with a brace alternation)
+ *   - "*.ts,**\/*.{vue,tsx}"  (mix of both)
+ *
+ * Without brace awareness the naive `String#split(",")` chops the brace
+ * group apart and the resulting `**\/*.{vue` glob fails parsing in
+ * ripgrep / globset with `unclosed alternate group; missing '}'`.
+ */
+export function splitIncludeArg(raw: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let buf = "";
+  for (const ch of raw) {
+    if (ch === "{") {
+      depth++;
+      buf += ch;
+      continue;
+    }
+    if (ch === "}") {
+      if (depth > 0) depth--;
+      buf += ch;
+      continue;
+    }
+    if (ch === "," && depth === 0) {
+      const trimmed = buf.trim();
+      if (trimmed.length > 0) out.push(trimmed);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  const tail = buf.trim();
+  if (tail.length > 0) out.push(tail);
+  return out;
+}
+
+/**
  * Tool definitions for indexed search-backed grep and glob.
  */
 export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> {
@@ -75,10 +114,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         pattern: args.pattern,
         case_sensitive: true,
         include: args.include
-          ? String(args.include)
-              .split(",")
-              .map((s) => normalizeGlob(s.trim()))
-              .filter(Boolean)
+          ? splitIncludeArg(String(args.include)).map(normalizeGlob).filter(Boolean)
           : undefined,
         path: args.path,
         max_results: 100,

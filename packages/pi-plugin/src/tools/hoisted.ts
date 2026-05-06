@@ -549,12 +549,44 @@ async function resolvePathArg(cwd: string, path: string): Promise<string> {
   }
 }
 
-/** Split OpenCode-style include args like `"*.ts,*.tsx"` into a glob array. */
-function splitIncludeGlobs(include: string): string[] {
-  return include
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+/**
+ * Brace-aware split for OpenCode-style include args.
+ *
+ * Accepts:
+ *   - "*.ts,*.tsx"            (comma-separated includes)
+ *   - "**\/*.{vue,ts,tsx}"    (single glob with brace alternation)
+ *   - "*.ts,**\/*.{vue,tsx}"  (mix of both)
+ *
+ * A naive split-by-`,` would chop `*.{vue,ts}` into `*.{vue` + `ts}`,
+ * which then fails downstream globbing with
+ * `unclosed alternate group; missing '}'`.
+ */
+export function splitIncludeGlobs(include: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let buf = "";
+  for (const ch of include) {
+    if (ch === "{") {
+      depth++;
+      buf += ch;
+      continue;
+    }
+    if (ch === "}") {
+      if (depth > 0) depth--;
+      buf += ch;
+      continue;
+    }
+    if (ch === "," && depth === 0) {
+      const trimmed = buf.trim();
+      if (trimmed.length > 0) out.push(trimmed);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  const tail = buf.trim();
+  if (tail.length > 0) out.push(tail);
+  return out;
 }
 
 /**

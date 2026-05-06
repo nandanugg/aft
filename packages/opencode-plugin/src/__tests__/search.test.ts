@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { searchTools } from "../tools/search.js";
+import { searchTools, splitIncludeArg } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
 
@@ -164,5 +164,69 @@ describe("searchTools", () => {
     const output = await tools.glob.execute({ pattern: "src/**/*.ts" }, createMockSdkContext());
 
     expect(output).toBe(["src/one.ts", "src/two.ts"].join("\n"));
+  });
+
+  test("brace-aware include forwards a single glob with a brace alternation intact (regression)", async () => {
+    // Regression: naive String.split(",") used to chop "**/*.{vue,ts}"
+    // into ["**/*.{vue", "ts}"], yielding the user-facing
+    // "unclosed alternate group; missing '}'" globset error.
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute(
+      { pattern: "foo", include: "**/*.{vue,ts,tsx}" },
+      createMockSdkContext(),
+    );
+    expect(sendCalls[0]?.params.include).toEqual(["**/*.{vue,ts,tsx}"]);
+  });
+
+  test("brace-aware include preserves brace groups while still splitting top-level commas", async () => {
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute(
+      { pattern: "foo", include: "*.ts,**/*.{vue,tsx}" },
+      createMockSdkContext(),
+    );
+    expect(sendCalls[0]?.params.include).toEqual(["**/*.ts", "**/*.{vue,tsx}"]);
+  });
+
+  test("backward-compatible: comma-separated includes without braces still split", async () => {
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute({ pattern: "foo", include: "*.tsx,*.ts" }, createMockSdkContext());
+    expect(sendCalls[0]?.params.include).toEqual(["**/*.tsx", "**/*.ts"]);
+  });
+});
+
+describe("splitIncludeArg", () => {
+  test("splits plain comma-separated patterns", () => {
+    expect(splitIncludeArg("*.ts,*.tsx")).toEqual(["*.ts", "*.tsx"]);
+  });
+
+  test("preserves a single brace group as one pattern", () => {
+    expect(splitIncludeArg("**/*.{vue,ts,tsx}")).toEqual(["**/*.{vue,ts,tsx}"]);
+  });
+
+  test("splits top-level commas while preserving nested brace groups", () => {
+    expect(splitIncludeArg("*.ts,**/*.{vue,tsx},*.go")).toEqual(["*.ts", "**/*.{vue,tsx}", "*.go"]);
+  });
+
+  test("handles nested braces correctly", () => {
+    expect(splitIncludeArg("**/*.{a,{b,c},d}")).toEqual(["**/*.{a,{b,c},d}"]);
+  });
+
+  test("trims whitespace and drops empty segments", () => {
+    expect(splitIncludeArg(" *.ts , *.tsx , ")).toEqual(["*.ts", "*.tsx"]);
+  });
+
+  test("tolerates an unclosed brace by treating remaining commas as content (no crash)", () => {
+    // Unmatched '{' shouldn't throw — pattern is forwarded to the backend
+    // as one chunk so globset's own error surfaces, not a JS crash here.
+    expect(splitIncludeArg("**/*.{vue,ts")).toEqual(["**/*.{vue,ts"]);
   });
 });
