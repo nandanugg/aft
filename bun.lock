@@ -18,7 +18,7 @@
     },
     "packages/aft-bridge": {
       "name": "@cortexkit/aft-bridge",
-      "version": "0.19.5",
+      "version": "0.19.6",
       "dependencies": {
         "undici": "^8.2.0",
       },
@@ -29,7 +29,7 @@
     },
     "packages/aft-cli": {
       "name": "@cortexkit/aft",
-      "version": "0.19.5",
+      "version": "0.19.6",
       "bin": {
         "aft": "dist/index.js",
       },
@@ -44,10 +44,10 @@
     },
     "packages/opencode-plugin": {
       "name": "@cortexkit/aft-opencode",
-      "version": "0.19.5",
+      "version": "0.19.6",
       "dependencies": {
         "@clack/prompts": "^1.2.0",
-        "@cortexkit/aft-bridge": "0.19.5",
+        "@cortexkit/aft-bridge": "0.19.6",
         "@opencode-ai/plugin": "^1.14.39",
         "@opencode-ai/sdk": "^1.14.39",
         "comment-json": "^4.6.2",
@@ -59,11 +59,11 @@
         "typescript": "^5.8.0",
       },
       "optionalDependencies": {
-        "@cortexkit/aft-darwin-arm64": "0.19.5",
-        "@cortexkit/aft-darwin-x64": "0.19.5",
-        "@cortexkit/aft-linux-arm64": "0.19.5",
-        "@cortexkit/aft-linux-x64": "0.19.5",
-        "@cortexkit/aft-win32-x64": "0.19.5",
+        "@cortexkit/aft-darwin-arm64": "0.19.6",
+        "@cortexkit/aft-darwin-x64": "0.19.6",
+        "@cortexkit/aft-linux-arm64": "0.19.6",
+        "@cortexkit/aft-linux-x64": "0.19.6",
+        "@cortexkit/aft-win32-x64": "0.19.6",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=1.14.0",
@@ -72,9 +72,9 @@
     },
     "packages/pi-plugin": {
       "name": "@cortexkit/aft-pi",
-      "version": "0.19.5",
+      "version": "0.19.6",
       "dependencies": {
-        "@cortexkit/aft-bridge": "0.19.5",
+        "@cortexkit/aft-bridge": "0.19.6",
         "@sinclair/typebox": "^0.34.33",
         "comment-json": "^5.0.0",
         "diff": "^8.0.4",
@@ -88,11 +88,11 @@
         "typescript": "^5.8.0",
       },
       "optionalDependencies": {
-        "@cortexkit/aft-darwin-arm64": "0.19.5",
-        "@cortexkit/aft-darwin-x64": "0.19.5",
-        "@cortexkit/aft-linux-arm64": "0.19.5",
-        "@cortexkit/aft-linux-x64": "0.19.5",
-        "@cortexkit/aft-win32-x64": "0.19.5",
+        "@cortexkit/aft-darwin-arm64": "0.19.6",
+        "@cortexkit/aft-darwin-x64": "0.19.6",
+        "@cortexkit/aft-linux-arm64": "0.19.6",
+        "@cortexkit/aft-linux-x64": "0.19.6",
+        "@cortexkit/aft-win32-x64": "0.19.6",
       },
       "peerDependencies": {
         "@mariozechner/pi-coding-agent": "*",
@@ -199,19 +199,9 @@
 
     "@cortexkit/aft-bridge": ["@cortexkit/aft-bridge@workspace:packages/aft-bridge"],
 
-    "@cortexkit/aft-darwin-arm64": ["@cortexkit/aft-darwin-arm64@0.19.5", "", { "os": "darwin", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-rVJSWLZg8tnMNQrstulfTA5vp5Z0tjFgE0ySmo21WFYa5chSiF0UCVBqhMKjv8pAvpGi+5+TnS4RlWUT2cPjwg=="],
-
-    "@cortexkit/aft-darwin-x64": ["@cortexkit/aft-darwin-x64@0.19.5", "", { "os": "darwin", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-u+WCUHEI9+b0BOXj4ViUZe6nS2yzAlWfrBEh03ikXBlVU+R8DkNgyc8qWUkpT7QWT2h8oA9pOnUqKSZtwDhhRA=="],
-
-    "@cortexkit/aft-linux-arm64": ["@cortexkit/aft-linux-arm64@0.19.5", "", { "os": "linux", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-1Ui0H0vu7dtRj2VWzh8U4/2RVRCWe++wtTvUYozKep8mKhcgztvfFgnoYOq4W12uv/xv5Fe5J7TMlekV9CR9aQ=="],
-
-    "@cortexkit/aft-linux-x64": ["@cortexkit/aft-linux-x64@0.19.5", "", { "os": "linux", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-kUVEpTi4QY9TW6KDxh/JK1LoEfzL1Uni7JWQbthEKGO3V2Bj17kOO9SJZlTkewfgC/YBpzijosTCTYHrgL/PyA=="],
-
     "@cortexkit/aft-opencode": ["@cortexkit/aft-opencode@workspace:packages/opencode-plugin"],
 
     "@cortexkit/aft-pi": ["@cortexkit/aft-pi@workspace:packages/pi-plugin"],
-
-    "@cortexkit/aft-win32-x64": ["@cortexkit/aft-win32-x64@0.19.5", "", { "os": "win32", "cpu": "x64", "bin": { "aft": "bin/aft.exe" } }, "sha512-cP+87LnURR1RtcBo7TTjxXjzOHe2YG9Sl2VIS4I1oVgzNk6DFzfzy1tgXYuLglzSyBeTw7kyj558YueCRmjouA=="],
 
     "@google/genai": ["@google/genai@1.50.1", "", { "dependencies": { "google-auth-library": "^10.3.0", "p-retry": "^4.6.2", "protobufjs": "^7.5.4", "ws": "^8.18.0" }, "peerDependencies": { "@modelcontextprotocol/sdk": "^1.25.2" }, "optionalPeers": ["@modelcontextprotocol/sdk"] }, "sha512-YbkX7H9+1Pt8wOt7DDREy8XSoiL6fRDzZQRyaVBarFf8MR3zHGqVdvM4cLbDXqPhxqvegZShgfxb8kw9C7YhAQ=="],
 
