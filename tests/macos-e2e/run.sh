@@ -50,6 +50,27 @@ echo "  Repo root:    $REPO_ROOT"
 echo "  AFT binary:   $AFT_BINARY_PATH"
 echo "  Plugin dist:  $AFT_PLUGIN_DIST"
 
+# ---- Install GNU coreutils (for `timeout`) ---------------------------------
+# The shared harness in tests/docker/test-e2e.sh uses
+# `timeout --signal=KILL <secs> opencode run ...` to bound each scenario.
+# `timeout` is GNU coreutils — it ships with Linux but NOT with macOS by
+# default, and a vanilla macOS GH Actions runner without coreutils returns
+# exit 127 ("command not found") the moment the harness tries to invoke it.
+# Install coreutils via Homebrew (pre-installed on macOS-latest images) and
+# put its `gnubin` directory ahead of $PATH so `timeout` resolves to the GNU
+# version. We do NOT use `gtimeout` because the harness is shared with Linux
+# and Linux has no `gtimeout` — keeping the binary name `timeout` on both
+# platforms means the shared script needs zero platform branches.
+echo "── Installing GNU coreutils (for \`timeout\`) ──"
+brew install coreutils >/dev/null
+COREUTILS_GNUBIN="$(brew --prefix coreutils)/libexec/gnubin"
+if [ ! -x "$COREUTILS_GNUBIN/timeout" ]; then
+    echo "Failed to locate GNU timeout under $COREUTILS_GNUBIN" >&2
+    exit 2
+fi
+export PATH="$COREUTILS_GNUBIN:$PATH"
+echo "  GNU timeout: $(command -v timeout)"
+
 # ---- Install OpenCode ------------------------------------------------------
 # Single source of truth: .github/opencode-version.txt. All three E2E
 # harnesses (Linux Docker, macOS native, Windows native) read from this
