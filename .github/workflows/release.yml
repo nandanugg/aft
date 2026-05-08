@@ -78,6 +78,13 @@ jobs:
   test-macos:
     name: Test (macOS)
     runs-on: macos-latest
+    # Mirror tests.yml's rust-macos timeout. Without this the job inherits
+    # GitHub Actions' 6h default, which means a flaky macos-latest runner
+    # that hangs (e.g. stuck network call, frozen test process) keeps the
+    # whole release blocked for 6 hours before failing. 25min is plenty
+    # for the actual workload (~3min on a healthy runner) and gives us
+    # logs instead of a runner timeout.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
