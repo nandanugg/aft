@@ -280,7 +280,7 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
     args: {
       taskId: z
         .string()
-        .describe("Background task ID returned by bash({ background: true }), e.g. bgb-6b454047."),
+        .describe("Background task ID returned by bash({ background: true }), e.g. bash-6b454047."),
     },
     execute: async (args, context) => {
       const data = await callBridge(ctx, context, "bash_status", {
@@ -319,7 +319,7 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
     args: {
       taskId: z
         .string()
-        .describe("Background task ID returned by bash({ background: true }), e.g. bgb-6b454047."),
+        .describe("Background task ID returned by bash({ background: true }), e.g. bash-6b454047."),
     },
     execute: async (args, context) => {
       const data = await callBridge(ctx, context, "bash_kill", {

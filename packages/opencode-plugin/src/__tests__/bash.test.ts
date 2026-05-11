@@ -390,9 +390,9 @@ describe("bash_status tool", () => {
       duration_ms: 3000,
       output_preview: null,
     }));
-    const result = await statusTool.execute({ taskId: "bgb-abc123" }, createMockSdkContext());
+    const result = await statusTool.execute({ taskId: "bash-abc123" }, createMockSdkContext());
     // Header line preserved.
-    expect(result).toContain("Task bgb-abc123: running 3s");
+    expect(result).toContain("Task bash-abc123: running 3s");
     // Anti-polling reminder appended to running tasks. Same wording as the
     // initial spawn line so the agent sees consistent guidance.
     expect(result).toContain("A completion reminder will be delivered automatically; don't poll.");
@@ -407,8 +407,8 @@ describe("bash_status tool", () => {
       duration_ms: 15168,
       output_preview: "test 1: bg starting at 09:19:24\ntest 1: bg done at 09:19:39",
     }));
-    const result = await statusTool.execute({ taskId: "bgb-6b454047" }, createMockSdkContext());
-    expect(result).toContain("Task bgb-6b454047: completed (exit 0) 15s");
+    const result = await statusTool.execute({ taskId: "bash-6b454047" }, createMockSdkContext());
+    expect(result).toContain("Task bash-6b454047: completed (exit 0) 15s");
     expect(result).toContain("test 1: bg starting at");
     expect(result).toContain("test 1: bg done at");
     // Terminal statuses must NOT carry the anti-polling reminder — agent is
@@ -424,7 +424,7 @@ describe("bash_status tool", () => {
         exit_code: status === "killed" ? null : 1,
         duration_ms: 5000,
       }));
-      const result = await statusTool.execute({ taskId: "bgb-end" }, createMockSdkContext());
+      const result = await statusTool.execute({ taskId: "bash-end" }, createMockSdkContext());
       expect(result).not.toContain("don't poll");
     }
   });
@@ -435,20 +435,20 @@ describe("bash_status tool", () => {
       calls.push({ cmd, params });
       return { success: true, status: "running", exit_code: null, duration_ms: 0 };
     });
-    await statusTool.execute({ taskId: "bgb-deadbeef" }, createMockSdkContext());
+    await statusTool.execute({ taskId: "bash-deadbeef" }, createMockSdkContext());
     expect(calls[0].cmd).toBe("bash_status");
-    expect(calls[0].params.task_id).toBe("bgb-deadbeef");
+    expect(calls[0].params.task_id).toBe("bash-deadbeef");
   });
 
   test("throws on bridge error", async () => {
     const { statusTool } = makeCtx(() => ({
       success: false,
       code: "not_found",
-      message: "task bgb-unknown not found",
+      message: "task bash-unknown not found",
     }));
     await expect(
-      statusTool.execute({ taskId: "bgb-unknown" }, createMockSdkContext()),
-    ).rejects.toThrow("task bgb-unknown not found");
+      statusTool.execute({ taskId: "bash-unknown" }, createMockSdkContext()),
+    ).rejects.toThrow("task bash-unknown not found");
   });
 
   test("bash_kill forwards task_id and returns confirmation", async () => {
@@ -457,16 +457,16 @@ describe("bash_status tool", () => {
       calls.push({ cmd, params });
       return { success: true, status: "killed" };
     });
-    const result = await killTool.execute({ taskId: "bgb-deadbeef" }, createMockSdkContext());
-    expect(result).toBe("Task bgb-deadbeef: killed");
+    const result = await killTool.execute({ taskId: "bash-deadbeef" }, createMockSdkContext());
+    expect(result).toBe("Task bash-deadbeef: killed");
     expect(calls[0].cmd).toBe("bash_kill");
-    expect(calls[0].params.task_id).toBe("bgb-deadbeef");
+    expect(calls[0].params.task_id).toBe("bash-deadbeef");
   });
 
   test("bash_kill surfaces already-terminal status from bridge", async () => {
     const { killTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
-    const result = await killTool.execute({ taskId: "bgb-done" }, createMockSdkContext());
-    expect(result).toBe("Task bgb-done: completed");
+    const result = await killTool.execute({ taskId: "bash-done" }, createMockSdkContext());
+    expect(result).toBe("Task bash-done: completed");
   });
 
   test("bash_kill throws on bridge error", async () => {
@@ -475,7 +475,7 @@ describe("bash_status tool", () => {
       code: "not_running",
       message: "task already finished",
     }));
-    await expect(killTool.execute({ taskId: "bgb-done" }, createMockSdkContext())).rejects.toThrow(
+    await expect(killTool.execute({ taskId: "bash-done" }, createMockSdkContext())).rejects.toThrow(
       "task already finished",
     );
   });

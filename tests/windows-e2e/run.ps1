@@ -461,7 +461,7 @@ function Invoke-AftBgBashScenario {
         if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
 
         $taskId = [string]$spawnResponse.task_id
-        if ($taskId -notmatch '^bgb-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
+        if ($taskId -notmatch '^bash-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
 
         Start-Sleep -Seconds $WaitSeconds
 
@@ -585,7 +585,7 @@ function Invoke-AftNdjsonScenario {
         if (-not $spawnResponse.success) { throw "background spawn failed: $($spawnResponse | ConvertTo-Json -Compress)" }
 
         $taskId = [string]$spawnResponse.task_id
-        if ($taskId -notmatch '^bgb-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
+        if ($taskId -notmatch '^bash-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
 
         Start-Sleep -Seconds 2
 
@@ -758,7 +758,7 @@ Check "opencode reached scripted turns (not fallback)" {
 #     loop never blocks on the child process.
 #   - Foreground polling is capped at 5s (FOREGROUND_WAIT_WINDOW_MS);
 #     past that, the plugin promotes the task to background and returns
-#     a "promoted to background: bgb-XXX" string immediately.
+#     a "promoted to background: bash-XXX" string immediately.
 #   - The bg task survives plugin shutdown when experimental.bash.background
 #     is enabled (which this scenario sets in the AFT config).
 #

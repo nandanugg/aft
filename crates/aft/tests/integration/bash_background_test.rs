@@ -691,24 +691,24 @@ fn background_spawn_honors_timeout() {
 
 // ---------------------------------------------------------------------------
 // Slug format regression — task IDs must be compact, agent-friendly slugs of
-// the form `bgb-{8-hex}` (4 OS-entropy bytes, hex-encoded). The earlier
+// the form `bash-{8-hex}` (4 OS-entropy bytes, hex-encoded). The earlier
 // timestamp-XOR format produced predictable IDs; the earlier 16-char version
 // used non-cryptographic mixing. Locked in by direct format assertion.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn background_task_ids_use_short_bgb_slug_format() {
+fn background_task_ids_use_short_bash_slug_format() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
     let task_id = spawn_bg(&mut aft, "slug-format", "true");
 
-    // Format: "bgb-" + exactly 8 lowercase hex characters (4 OS-entropy bytes)
+    // Format: "bash-" + exactly 8 lowercase hex characters (4 OS-entropy bytes)
     assert!(
-        task_id.starts_with("bgb-"),
-        "task_id must start with `bgb-` prefix; got `{task_id}`"
+        task_id.starts_with("bash-"),
+        "task_id must start with `bash-` prefix; got `{task_id}`"
     );
-    let suffix = &task_id["bgb-".len()..];
+    let suffix = &task_id["bash-".len()..];
     assert_eq!(
         suffix.len(),
         8,

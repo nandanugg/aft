@@ -150,7 +150,7 @@ describe("bash tool adapter", () => {
     const api = makeMockApi(tools);
     const { bridge, calls } = makeTrackableMockBridge({
       status: "running",
-      task_id: "bgb-123",
+      task_id: "bash-123",
       duration_ms: 5,
     });
     const ctx = makeMockContext(bridge);
@@ -178,8 +178,8 @@ describe("bash tool adapter", () => {
     // 30s baseline: wait-window (5s) + overhead (5s) is below the floor.
     expect(callArgs[2].transportTimeoutMs).toBe(30_000);
     expect(callArgs[2].keepBridgeOnTimeout).toBe(true);
-    expect(result.content[0].text).toContain("Background task started: bgb-123");
-    expect(result.details.task_id).toBe("bgb-123");
+    expect(result.content[0].text).toContain("Background task started: bash-123");
+    expect(result.details.task_id).toBe("bash-123");
   });
 
   test("foreground running command polls to completion and returns inline output", async () => {
@@ -638,18 +638,18 @@ describe("registerBashTool registers bash + bash_status + bash_kill as a unit", 
 
     await tools
       .get("bash_status")!
-      .execute("status-call", { task_id: "bgb-123" }, undefined, undefined, {
+      .execute("status-call", { task_id: "bash-123" }, undefined, undefined, {
         cwd: "/test",
       });
     await tools
       .get("bash_kill")!
-      .execute("kill-call", { task_id: "bgb-123" }, undefined, undefined, {
+      .execute("kill-call", { task_id: "bash-123" }, undefined, undefined, {
         cwd: "/test",
       });
 
     expect((calls[0] as [string, Record<string, unknown>])[0]).toBe("bash_status");
-    expect((calls[0] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bgb-123" });
+    expect((calls[0] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
     expect((calls[1] as [string, Record<string, unknown>])[0]).toBe("bash_kill");
-    expect((calls[1] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bgb-123" });
+    expect((calls[1] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
   });
 });

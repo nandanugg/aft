@@ -970,7 +970,7 @@ impl BgTaskRegistry {
             .map(|task| task.paths.exit.clone())
     }
 
-    /// Generate a `bgb-{16hex}` slug that is unique against live tasks and queued completions.
+    /// Generate a `bash-{16hex}` slug that is unique against live tasks and queued completions.
     fn generate_unique_task_id(&self) -> Result<String, String> {
         for _ in 0..32 {
             let candidate = random_slug();
@@ -1127,7 +1127,7 @@ fn detached_shell_command_for(
     // parser all interacting with embedded quotes in the wrapper).
     //
     // Path arguments don't need quoting in the same problematic way
-    // because: (1) we use no-space task IDs (bgb-XXXXXXXX) so the path
+    // because: (1) we use no-space task IDs (bash-XXXXXXXX) so the path
     // contains no characters that need shell escaping; (2) the wrapper
     // body's internal quotes never reach the shell command line — the
     // shell reads them from disk by file syntax rules, not command-line
@@ -1359,9 +1359,9 @@ fn random_slug() -> String {
         let p = std::process::id();
         bytes.copy_from_slice(&(t ^ p).to_le_bytes());
     });
-    // `bgb-` + 8 lowercase hex chars — compact, OS-entropy backed.
+    // `bash-` + 8 lowercase hex chars — compact, OS-entropy backed.
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("bgb-{hex}")
+    format!("bash-{hex}")
 }
 
 #[cfg(test)]
@@ -1710,7 +1710,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_shell_cmd_wrapper_writes_exit_marker_with_move() {
-        let exit_path = Path::new(r"C:\Temp\bgb-test.exit");
+        let exit_path = Path::new(r"C:\Temp\bash-test.exit");
         let script =
             crate::windows_shell::WindowsShell::Cmd.wrapper_script("cmd /c exit 42", exit_path);
 
@@ -1732,8 +1732,8 @@ mod tests {
             script.contains("> nul"),
             "wrapper must redirect move output to nul: {script}"
         );
-        assert!(script.contains(r#""C:\Temp\bgb-test.exit.tmp""#));
-        assert!(script.contains(r#""C:\Temp\bgb-test.exit""#));
+        assert!(script.contains(r#""C:\Temp\bash-test.exit.tmp""#));
+        assert!(script.contains(r#""C:\Temp\bash-test.exit""#));
     }
 
     /// Issue #27 Oracle review P1: `bg_command()` for Cmd MUST prepend

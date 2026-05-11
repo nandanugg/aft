@@ -736,14 +736,14 @@ mod tests {
     fn posix_wrapper_writes_exit_marker_atomically() {
         let bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
         let shell = WindowsShell::Posix(bash);
-        let script = shell.wrapper_script("echo hi", Path::new(r"C:\Temp\bgb.exit"));
+        let script = shell.wrapper_script("echo hi", Path::new(r"C:\Temp\bash.exit"));
         // Must use sh -c with single-quoted command, then printf $? to a
         // tmp file, then mv it atomically into place.
         assert!(script.contains("sh -c 'echo hi'"), "{script}");
         assert!(script.contains("printf '%s' \"$?\""), "{script}");
         assert!(script.contains("mv "), "{script}");
-        assert!(script.contains(r"C:\Temp\bgb.exit"), "{script}");
-        assert!(script.contains(r"C:\Temp\bgb.exit.tmp"), "{script}");
+        assert!(script.contains(r"C:\Temp\bash.exit"), "{script}");
+        assert!(script.contains(r"C:\Temp\bash.exit.tmp"), "{script}");
     }
 
     #[test]
@@ -752,7 +752,7 @@ mod tests {
         // standard `'\''` close-and-reopen idiom.
         let bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
         let shell = WindowsShell::Posix(bash);
-        let script = shell.wrapper_script("echo 'hi'", Path::new(r"C:\Temp\bgb.exit"));
+        let script = shell.wrapper_script("echo 'hi'", Path::new(r"C:\Temp\bash.exit"));
         assert!(
             script.contains(r"'echo '\''hi'\'''"),
             "embedded single quote must be escaped: got {script}"

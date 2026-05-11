@@ -166,7 +166,7 @@ fn exit_file_atomicity_many_short_tasks() {
 #[test]
 fn pre_spawn_metadata_starting_replays_as_failed() {
     let storage = tempfile::tempdir().unwrap();
-    let task_id = "bgb-starting";
+    let task_id = "bash-starting";
     let metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
@@ -394,7 +394,7 @@ fn session_isolation_on_replay() {
 #[test]
 fn replay_stale_running_task_marks_killed_orphaned() {
     let storage = tempfile::tempdir().unwrap();
-    let task_id = "bgb-stale";
+    let task_id = "bash-stale";
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
         SESSION.to_string(),
