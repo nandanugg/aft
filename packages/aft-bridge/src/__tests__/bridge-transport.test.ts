@@ -46,7 +46,10 @@ process.stdin.on("data", (chunk) => {
 });
 `,
     );
-    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 500, maxRestarts: 0 });
+    // Generous transport budget: node spawn alone can take ~300ms on a cold
+    // cache, and we have a 5ms intentional delay inside the fixture before
+    // the second chunk arrives. Anything under 1s is flaky on shared runners.
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
 
     try {
       const response = await bridge.send("version");
