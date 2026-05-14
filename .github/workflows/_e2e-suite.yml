@@ -136,14 +136,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Distinct cache namespace from the `Test (macOS)` job that runs in
-      # parallel — without a unique prefix, both jobs race on the same cache
-      # key. We have seen the loser restore a corrupted state that breaks
-      # the rustup `cargo` shim (it sees `cargo build` as `rustup-init build`
-      # and rejects it). Tagging the prefix isolates the cache stores.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v0-rust-e2e-macos"
+      # Intentionally NO Swatinem/rust-cache on macOS.
+      # rust-cache restore on macos-latest overwrites the just-installed
+      # ~/.cargo/bin/cargo shim with stale cached bytes — the shim then
+      # misreads its own argv as if it were `rustup-init`:
+      #   error: unexpected argument 'build' found
+      #   Usage: rustup-init[EXE] [OPTIONS]
+      # Cold cargo build on macos-latest is ~3min — acceptable cost for
+      # release reliability. See release.yml test-macos for the same fix.
 
       - uses: oven-sh/setup-bun@v2
         with:

@@ -117,7 +117,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      # Intentionally NO Swatinem/rust-cache on macOS — rust-cache restore
+      # on macos-latest overwrites the just-installed ~/.cargo/bin/cargo
+      # shim with stale cached bytes, producing:
+      #   error: unexpected argument 'test' found
+      #   Usage: rustup-init[EXE] [OPTIONS]
+      # Observed in release runs 25839773442 and 25840332625. Cold cargo
+      # build is ~3min — acceptable. See release.yml test-macos.
 
       - uses: oven-sh/setup-bun@v2
         with:
