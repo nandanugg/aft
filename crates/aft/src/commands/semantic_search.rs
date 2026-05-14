@@ -194,12 +194,13 @@ fn format_semantic_text(results: &[SemanticResult], project_root: &Path) -> Stri
 
             for result in file_results {
                 section.push_str(&format!(
-                    "\n{} [{}] lines {}-{} score {:.3}",
+                    "\n{} [{}] lines {}-{} score {:.3} source {}",
                     result.name,
                     symbol_kind_label(&result.kind),
                     display_line_number(result.start_line),
                     display_line_number(result.end_line),
-                    result.score
+                    result.score,
+                    result.source
                 ));
 
                 if !result.snippet.trim().is_empty() {
@@ -229,6 +230,7 @@ fn result_to_json(result: &SemanticResult) -> serde_json::Value {
         "start_line": display_line_number(result.start_line),
         "end_line": display_line_number(result.end_line),
         "score": result.score,
+        "source": result.source,
         "snippet": result.snippet,
     })
 }

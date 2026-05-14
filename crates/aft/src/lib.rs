@@ -69,6 +69,7 @@ pub mod lsp;
 pub mod lsp_hints;
 pub mod parser;
 pub mod protocol;
+pub mod query_shape;
 pub mod search_index;
 pub mod semantic_index;
 pub mod symbol_cache_disk;

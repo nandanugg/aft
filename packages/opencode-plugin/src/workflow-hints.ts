@@ -61,14 +61,11 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 
   // Code exploration — needs at least aft_outline + aft_zoom + (grep or aft_search).
   if (hasOutline && hasZoom && (hasGrep || hasSearch)) {
-    const locator =
-      hasGrep && hasSearch
-        ? `\`${grepName}\` or \`aft_search\``
-        : hasGrep
-          ? `\`${grepName}\``
-          : "`aft_search`";
+    const locator = hasGrep ? `\`${grepName}\`` : "`aft_search`";
     sections.push(
-      `**Code exploration**: ${locator} to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
+      hasGrep && hasSearch
+        ? `**Code exploration**: For exact identifiers (\`useState\`, function names, env vars), error messages, or path-shaped queries → \`${grepName}\` first. For broad concepts ('where is X handled', 'how does Y work') → \`aft_search\`. Then use \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`
+        : `**Code exploration**: ${locator} to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`,
     );
   }
 

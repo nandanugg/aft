@@ -16,7 +16,10 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("## Prefer AFT tools for token efficiency");
     expect(out).toContain("**Web/URL access**");
     expect(out).toContain("**Code exploration**");
-    expect(out).toContain("`grep` or `aft_search`");
+    expect(out).toContain("For exact identifiers (`useState`, function names, env vars)");
+    expect(out).toContain(
+      "For broad concepts ('where is X handled', 'how does Y work') → `aft_search`",
+    );
     expect(out).toContain("Use `aft_navigate`");
     expect(out).toContain("- `callers`");
     expect(out).toContain("- `impact`");

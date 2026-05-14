@@ -258,6 +258,7 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
         model: "all-MiniLM-L6-v2".to_string(),
         base_url: "none".to_string(),
         dimension: 3,
+        chunking_version: 1,
     }
     .as_string();
 
@@ -343,6 +344,7 @@ fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
         model: "all-MiniLM-L6-v2".to_string(),
         base_url: "none".to_string(),
         dimension: 4,
+        chunking_version: 1,
     };
     let fp_str = fingerprint.as_string();
     let fp_bytes = fp_str.as_bytes();
@@ -412,6 +414,7 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
             model: "all-MiniLM-L6-v2".to_string(),
             base_url: "none".to_string(),
             dimension: 4,
+            chunking_version: 1,
         };
         let fp_bytes = fingerprint.as_string().into_bytes();
         let mut bytes = Vec::new();

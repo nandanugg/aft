@@ -123,6 +123,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       "When NOT to use:",
       "- You have a specific symbol name → use grep",
       "- You have an error message or stack trace → use grep",
+      "- Exact identifiers, error messages, and path-shaped queries should start with grep",
       "- You want the file/module structure → use aft_outline",
       "- You're following a call chain → use aft_navigate",
       "",

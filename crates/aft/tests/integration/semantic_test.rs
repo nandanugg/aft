@@ -189,6 +189,7 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
         "expected at least one semantic result"
     );
     assert_eq!(first_results[0]["name"], "handle_request");
+    assert_eq!(first_results[0]["source"], "semantic");
 
     let status = first.shutdown();
     assert!(status.success());

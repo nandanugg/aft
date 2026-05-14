@@ -55,6 +55,12 @@ pub struct SemanticIndexFingerprint {
     #[serde(default)]
     pub base_url: String,
     pub dimension: usize,
+    #[serde(default = "default_chunking_version")]
+    pub chunking_version: u32,
+}
+
+fn default_chunking_version() -> u32 {
+    1
 }
 
 impl SemanticIndexFingerprint {
@@ -71,6 +77,7 @@ impl SemanticIndexFingerprint {
             model: config.model.clone(),
             base_url,
             dimension,
+            chunking_version: default_chunking_version(),
         }
     }
 
@@ -913,6 +920,7 @@ pub struct SemanticResult {
     pub exported: bool,
     pub snippet: String,
     pub score: f32,
+    pub source: &'static str,
 }
 
 impl SemanticIndex {
@@ -1331,7 +1339,13 @@ impl SemanticIndex {
             .entries
             .iter()
             .enumerate()
-            .map(|(i, entry)| (cosine_similarity(query_vector, &entry.vector), i))
+            .map(|(i, entry)| {
+                let mut score = cosine_similarity(query_vector, &entry.vector);
+                if entry.chunk.exported {
+                    score *= 1.1;
+                }
+                (score, i)
+            })
             .collect();
 
         // Sort descending by score
@@ -1340,7 +1354,9 @@ impl SemanticIndex {
         scored
             .into_iter()
             .take(top_k)
-            .filter(|(score, _)| *score > 0.0)
+            // Keep the sort → take → map ordering explicit: removing the old
+            // `> 0.0` floor cannot evict positive hits because top_k has already
+            // been selected, but it can surface zero-score noise in the tail.
             .map(|(score, idx)| {
                 let entry = &self.entries[idx];
                 SemanticResult {
@@ -1352,6 +1368,7 @@ impl SemanticIndex {
                     exported: entry.chunk.exported,
                     snippet: entry.chunk.snippet.clone(),
                     score,
+                    source: "semantic",
                 }
             })
             .collect()
@@ -2208,6 +2225,7 @@ mod tests {
             model: "all-MiniLM-L6-v2".to_string(),
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 4,
+            chunking_version: default_chunking_version(),
         });
 
         let bytes = index.to_bytes();
@@ -2756,6 +2774,7 @@ mod tests {
             model: "test-embedding".to_string(),
             base_url: "http://127.0.0.1:1234/v1".to_string(),
             dimension: 3,
+            chunking_version: default_chunking_version(),
         });
         index.write_to_disk(storage.path(), project_key);
 
@@ -2769,6 +2788,7 @@ mod tests {
             model: "embeddinggemma".to_string(),
             base_url: "http://127.0.0.1:11434".to_string(),
             dimension: 3,
+            chunking_version: default_chunking_version(),
         }
         .as_string();
         assert!(
@@ -2807,6 +2827,7 @@ mod tests {
             model: "test".to_string(),
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 3,
+            chunking_version: default_chunking_version(),
         };
         index.set_fingerprint(fingerprint.clone());
 
