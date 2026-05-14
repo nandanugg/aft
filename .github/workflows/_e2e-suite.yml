@@ -136,7 +136,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Distinct cache namespace from the `Test (macOS)` job that runs in
+      # parallel — without a unique prefix, both jobs race on the same cache
+      # key. We have seen the loser restore a corrupted state that breaks
+      # the rustup `cargo` shim (it sees `cargo build` as `rustup-init build`
+      # and rejects it). Tagging the prefix isolates the cache stores.
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v0-rust-e2e-macos"
 
       - uses: oven-sh/setup-bun@v2
         with:
