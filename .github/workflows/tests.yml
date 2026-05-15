@@ -74,6 +74,10 @@ jobs:
         with:
           bun-version: latest
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
@@ -134,6 +138,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -226,6 +234,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
