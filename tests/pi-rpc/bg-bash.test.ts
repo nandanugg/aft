@@ -107,15 +107,17 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       expect(
         (await client.sendCommand({ type: "prompt", message: "Start a background echo." })).success,
       ).toBe(true);
+      // 60s budgets: Pi cold start + ONNX init + first LLM call + bg-bash
+      // spawn can exceed 30s on shared macOS CI runners under load.
       const bashEnd = await client.waitForEvent(
         (event) => event.type === "tool_execution_end" && event.toolName === "bash",
-        30_000,
+        60_000,
       );
       expect(bashEnd.isError).toBe(false);
       const taskId = resultDetails(bashEnd).task_id;
       expect(taskId).toEqual(expect.stringMatching(BASH_TASK_ID));
       expect(resultText(bashEnd)).toContain(`Background task started: ${taskId}`);
-      await client.waitForEvent((event) => event.type === "agent_end", 30_000);
+      await client.waitForEvent((event) => event.type === "agent_end", 60_000);
 
       aimock.registerToolCallFixture({
         predicate: (request) =>
