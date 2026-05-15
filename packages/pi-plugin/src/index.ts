@@ -488,26 +488,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         pluginVersion: PLUGIN_VERSION,
       });
     },
-    onBashCompletion: (completion, bridge) => {
+    onBashCompletion: (completion) => {
       void handlePushedBgCompletion(
         {
           ctx,
           directory: process.cwd(),
           sessionID: completion.session_id,
           runtime: pi,
-          isActive: () => bridge.hasPendingRequests(),
         },
         completion,
       );
     },
-    onBashLongRunning: (reminder, bridge) => {
+    onBashLongRunning: (reminder) => {
       void handlePushedBgLongRunning(
         {
           ctx,
           directory: process.cwd(),
           sessionID: reminder.session_id,
           runtime: pi,
-          isActive: () => bridge.hasPendingRequests(),
         },
         reminder,
       );

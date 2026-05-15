@@ -202,7 +202,10 @@ describe("Pi background notifications", () => {
     expect(sessionBgStates.get("__default__")?.outstandingTaskIds.has("task-1")).toBe(false);
   });
 
-  test("push completion lands in pending without wake when active", async () => {
+  test("push completion still wakes even when bridge is busy with non-agent RPC", async () => {
+    // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
+    // which returned true for the TUI status poll, orphaning the completion when
+    // no other trigger fired. The wake must always be scheduled.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const sendUserMessage = mock(() => {});
@@ -213,14 +216,15 @@ describe("Pi background notifications", () => {
         directory: "/tmp/project",
         sessionID: "s1",
         runtime: { sendUserMessage },
-        isActive: () => true,
       },
       completion("task-1", "npm test"),
     );
     await sleep(260);
 
-    expect(sendUserMessage).toHaveBeenCalledTimes(0);
-    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(sendUserMessage.mock.calls[0][0]).toContain("task-1");
+    expect(sendUserMessage.mock.calls[0][1]).toEqual({ deliverAs: "steer" });
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
   test("coalesces three idle completions into one notification", async () => {

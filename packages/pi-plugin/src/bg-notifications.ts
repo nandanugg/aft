@@ -57,7 +57,6 @@ interface DrainContext {
   ctx: PluginContext;
   directory: string;
   sessionID?: string;
-  isActive?: () => boolean;
 }
 
 export function trackBgTask(sessionID: string | undefined, taskId: string): void {
@@ -163,8 +162,14 @@ async function triggerWakeIfPending(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   skipDrain: boolean,
 ): Promise<void> {
+  // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
+  // to defer wakes until the bridge was idle. That was wrong: the bridge
+  // is busy for any non-agent traffic (status polls, configure work),
+  // which orphaned completions when no other trigger fired. Pi's
+  // `sendUserMessage` with `deliverAs: "steer"` already handles mid-turn
+  // delivery cleanly, so suppressing the wake provides no benefit and
+  // creates a hang. Mirrors the OpenCode fix.
   const state = stateFor(drainContext.sessionID);
-  if (drainContext.isActive?.()) return;
 
   if (!skipDrain && state.outstandingTaskIds.size > 0) {
     await drainCompletions(drainContext);

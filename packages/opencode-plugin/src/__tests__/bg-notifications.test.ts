@@ -327,7 +327,10 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
   });
 
-  test("push completion lands in pending without wake when active", async () => {
+  test("push completion still wakes even when bridge is busy with non-agent RPC", async () => {
+    // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
+    // which returned true for the TUI status poll, orphaning the completion when
+    // no other trigger fired. The wake must always be scheduled.
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
@@ -338,14 +341,16 @@ describe("OpenCode background notifications", () => {
         directory: "/tmp/project",
         sessionID: "s1",
         client: { session: { promptAsync } },
-        isActive: () => true,
       },
       completion("task-1", "npm test"),
     );
     await sleep(260);
 
-    expect(promptAsync).toHaveBeenCalledTimes(0);
-    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
+      .parts[0].text;
+    expect(text).toContain("task-1");
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
   test("coalesces three idle completions into one notification", async () => {

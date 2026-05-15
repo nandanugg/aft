@@ -51,7 +51,6 @@ interface DrainContext {
   ctx: PluginContext;
   directory: string;
   sessionID: string;
-  isActive?: () => boolean;
 }
 
 interface OpenCodeClient {
@@ -167,8 +166,17 @@ async function triggerWakeIfPending(
   drainContext: DrainContext & { client: unknown },
   skipDrain: boolean,
 ): Promise<void> {
+  // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
+  // to defer wakes until the bridge was idle. That was wrong:
+  // bridge.hasPendingRequests() returns true for the TUI status RPC poll
+  // and any other non-agent traffic. When a bash_completed push arrived
+  // during such a window, we'd skip scheduling the wake — and the only
+  // recovery paths (session.idle and appendInTurnBgCompletions) can
+  // legitimately not fire in time, leaving the agent waiting forever.
+  // The downstream debounce (200-1000ms), appendInTurnBgCompletions's
+  // timer cancellation, and the send-failure retry-with-backoff already
+  // handle the original concern (avoiding mid-turn wake races) correctly.
   const state = stateFor(drainContext.sessionID);
-  if (drainContext.isActive?.()) return;
 
   if (!skipDrain && state.outstandingTaskIds.size > 0) {
     await drainCompletions(drainContext);

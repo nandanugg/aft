@@ -436,7 +436,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         pluginVersion: PLUGIN_VERSION,
       });
     },
-    onBashCompletion: (completion, bridge) => {
+    onBashCompletion: (completion) => {
       // Prefer the cached session directory; fall back to plugin-init cwd
       // when we haven't seen this session yet (e.g. completion arriving
       // before any tool call has populated the cache).
@@ -447,12 +447,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           directory: sessionDir,
           sessionID: completion.session_id,
           client: input.client,
-          isActive: () => bridge.hasPendingRequests(),
         },
         completion,
       );
     },
-    onBashLongRunning: (reminder, bridge) => {
+    onBashLongRunning: (reminder) => {
       const sessionDir = getSessionDirectoryCached(reminder.session_id) ?? input.directory;
       void handlePushedBgLongRunning(
         {
@@ -460,7 +459,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           directory: sessionDir,
           sessionID: reminder.session_id,
           client: input.client,
-          isActive: () => bridge.hasPendingRequests(),
         },
         reminder,
       );
