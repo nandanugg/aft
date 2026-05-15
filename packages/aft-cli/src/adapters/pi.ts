@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -16,16 +16,52 @@ const PLUGIN_NAME = "@cortexkit/aft-pi";
 const PLUGIN_ENTRY = `npm:${PLUGIN_NAME}`;
 
 function getPiAgentDir(): string {
-  return join(homedir(), ".pi", "agent");
+  // Prefer $HOME / %USERPROFILE% so tests can override. Falls back to
+  // os.homedir() which reads from getpwuid()/SHGetKnownFolderPath. Matches
+  // the convention OpenCode and Pi themselves use (settings-manager.js
+  // reads $HOME via getAgentDir()).
+  const envHome = process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME;
+  const home = envHome && envHome.length > 0 ? envHome : homedir();
+  return join(home, ".pi", "agent");
 }
 
 /**
- * Pi extensions are installed via `pi install npm:<package>` and managed by
- * Pi itself — there's no user-editable registration file equivalent to
- * OpenCode's `plugin` array. We detect installation by looking at Pi's
- * extension index (if it exists) and fall back to probing the host.
+ * Pi extensions are installed via `pi install npm:<package>` (or `file:<path>`)
+ * and managed by Pi itself — there's no user-editable registration file
+ * equivalent to OpenCode's `plugin` array.
+ *
+ * As of Pi v0.74.0, installed package sources are recorded in
+ * `~/.pi/agent/settings.json` under the `packages` array. Each entry is a
+ * string in one of these forms (Pi's package-manager.js → parseSource):
+ *
+ *   - `npm:<spec>`         e.g. `npm:@cortexkit/aft-pi` or `npm:@cortexkit/aft-pi@1.2.3`
+ *   - `file:<path>`        local file: URL
+ *   - `<rel-path>`         path relative to `~/.pi/agent/` (normalized via
+ *                          `relative(baseDir, resolved)` in normalizePackageSourceForSettings)
+ *   - `<abs-path>`         absolute path to a local package directory
+ *
+ * Pre-v0.74 versions used `extensions.json` / `extensions.jsonc` / `config.json`
+ * with an `extensions` or `plugins` array. We still check those for back-compat,
+ * but the primary path is settings.json now.
  */
 function readPiExtensionIndex(): { installed: string[]; path: string | null } {
+  // Pi v0.74+: settings.json `packages` array (primary)
+  const settingsPath = join(getPiAgentDir(), "settings.json");
+  if (existsSync(settingsPath)) {
+    try {
+      const raw = readFileSync(settingsPath, "utf-8");
+      const trimmed = raw.replace(/^\uFEFF/, "");
+      const value = JSON.parse(trimmed) as Record<string, unknown>;
+      const packages = value.packages;
+      if (Array.isArray(packages)) {
+        const installed = packages.filter((p): p is string => typeof p === "string");
+        return { installed, path: settingsPath };
+      }
+    } catch {
+      // fall through to legacy files
+    }
+  }
+  // Pre-v0.74: extensions.json / extensions.jsonc / config.json (legacy)
   const candidates = [
     join(getPiAgentDir(), "extensions.json"),
     join(getPiAgentDir(), "extensions.jsonc"),
@@ -58,11 +94,53 @@ function readPiExtensionIndex(): { installed: string[]; path: string | null } {
   return { installed: [], path: null };
 }
 
+/**
+ * Match a Pi `packages` entry against AFT's package. Handles all four
+ * source-string forms documented in `readPiExtensionIndex`. For local
+ * paths we verify the package.json name field — symmetric with OpenCode's
+ * `pathPointsToOurPlugin` heuristic.
+ */
+function piEntryMatchesAft(entry: string): boolean {
+  // npm:<spec> — e.g. `npm:@cortexkit/aft-pi`, `npm:@cortexkit/aft-pi@1.2.3`
+  if (entry.startsWith("npm:")) {
+    const spec = entry.slice("npm:".length).trim();
+    if (spec === PLUGIN_NAME) return true;
+    if (spec.startsWith(`${PLUGIN_NAME}@`)) return true;
+    return false;
+  }
+  // file:<path> — file URL
+  let resolved: string | null = null;
+  if (entry.startsWith("file:")) {
+    try {
+      // Strip `file:` prefix manually — fileURLToPath would require `file://`.
+      const stripped = entry.slice("file:".length);
+      resolved = stripped.startsWith("//") ? stripped.slice(2) : stripped;
+    } catch {
+      return false;
+    }
+  } else if (entry.startsWith("/")) {
+    resolved = entry;
+  } else if (entry.length > 0) {
+    // Relative path — resolve against the Pi agent dir (matches Pi's
+    // `normalizePackageSourceForSettings` `relative(baseDir, ...)` behavior).
+    resolved = join(getPiAgentDir(), entry);
+  }
+  if (!resolved) return false;
+  try {
+    if (!existsSync(resolved)) return false;
+    // Look for package.json in resolved or its parent directories.
+    const pkgPath = join(resolved, "package.json");
+    if (!existsSync(pkgPath)) return false;
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as { name?: unknown };
+    return pkg.name === PLUGIN_NAME;
+  } catch {
+    return false;
+  }
+}
+
 function piHasOurExtension(): boolean {
   const { installed } = readPiExtensionIndex();
-  return installed.some(
-    (entry) => entry === PLUGIN_NAME || entry === PLUGIN_ENTRY || entry.includes("aft-pi"),
-  );
+  return installed.some(piEntryMatchesAft);
 }
 
 export class PiAdapter implements HarnessAdapter {
@@ -81,8 +159,23 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   getHostVersion(): string | null {
+    // Pi v0.74.0+ writes `--version` output through its `takeOverStdout()`
+    // redirector, which sends everything stdout-bound to stderr. Pre-v0.74
+    // writes the version to stdout. Capture both so we work either way.
     try {
-      return execSync("pi --version", { encoding: "utf-8", stdio: "pipe" }).trim();
+      const result = spawnSync("pi", ["--version"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+      });
+      if (result.status !== 0) return null;
+      const stdout = (result.stdout ?? "").trim();
+      const stderr = (result.stderr ?? "").trim();
+      const text = stdout || stderr;
+      // Some Pi versions print a leading banner before the version; the version
+      // itself is always the last semver-looking token. Take the first line that
+      // looks like a version.
+      const semverLine = text.split(/\r?\n/).find((l) => /^\d+\.\d+\.\d+/.test(l.trim()));
+      return semverLine?.trim() ?? text ?? null;
     } catch {
       return null;
     }

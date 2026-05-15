@@ -1,11 +1,12 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getAdapter, getAllAdapters } from "../adapters/index.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
+import { PiAdapter } from "../adapters/pi.js";
 
 describe("registry", () => {
   test("getAllAdapters returns known adapters", () => {
@@ -162,5 +163,167 @@ describe("OpenCodeAdapter configuration", () => {
     const parsed = JSON.parse(readFileSync(result.configPath, "utf-8").replace(/\/\/.*$/gm, ""));
     expect(parsed.plugin).toContain("some-other-plugin");
     expect(parsed.plugin).toContain("@cortexkit/aft-opencode@latest");
+  });
+});
+
+// PiAdapter reads ~/.pi/agent/settings.json — covered by faking HOME to a
+// tmp dir per test. The adapter calls `homedir()` directly, which respects
+// the HOME env on Unix and USERPROFILE on Windows.
+describe("PiAdapter configuration", () => {
+  let tmpHome: string;
+  let agentDir: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), "aft-cli-pi-test-"));
+    agentDir = join(tmpHome, ".pi", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    process.env.HOME = tmpHome;
+    if (process.platform === "win32") process.env.USERPROFILE = tmpHome;
+  });
+
+  afterEach(() => {
+    if (originalHome === undefined) {
+      process.env.HOME = undefined;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    if (originalUserProfile === undefined) {
+      process.env.USERPROFILE = undefined;
+    } else {
+      process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  test("hasPluginEntry returns false when no settings.json", () => {
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(false);
+  });
+
+  test("hasPluginEntry returns false when settings.json has no packages", () => {
+    writeFileSync(join(agentDir, "settings.json"), '{\n  "theme": "dark"\n}\n');
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(false);
+  });
+
+  // Pi v0.74+ writes `npm:<spec>` for npm-installed packages
+  // (package-manager.js → parseSource branch).
+  test("hasPluginEntry returns true for `npm:@cortexkit/aft-pi`", () => {
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["npm:@cortexkit/aft-pi"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("hasPluginEntry returns true for pinned `npm:@cortexkit/aft-pi@1.2.3`", () => {
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["npm:@cortexkit/aft-pi@1.2.3"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
+  // Local dev mode: `pi install file:/path` writes a relative path to
+  // the agentDir under `packages` (see Pi's normalizePackageSourceForSettings).
+  test("hasPluginEntry returns true for relative path to local plugin checkout", () => {
+    const pluginDir = join(agentDir, "extensions", "aft-pi");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(
+      join(pluginDir, "package.json"),
+      JSON.stringify({ name: "@cortexkit/aft-pi", version: "0.0.0-dev" }),
+    );
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["extensions/aft-pi"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("hasPluginEntry returns true for absolute path to local plugin checkout", () => {
+    const pluginDir = join(tmpHome, "work", "aft-pi");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(
+      join(pluginDir, "package.json"),
+      JSON.stringify({ name: "@cortexkit/aft-pi", version: "0.0.0-dev" }),
+    );
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [pluginDir] }));
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("hasPluginEntry returns true for `file:` URL pointing at our plugin", () => {
+    const pluginDir = join(tmpHome, "work", "aft-pi-file");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, "package.json"), JSON.stringify({ name: "@cortexkit/aft-pi" }));
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: [`file:${pluginDir}`] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("hasPluginEntry returns false for unrelated `npm:other-pkg` entry", () => {
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["npm:some-other-extension"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(false);
+  });
+
+  // Regression: previously `includes("aft-pi")` would match any package whose
+  // name contained "aft-pi" — e.g. a hostile package named `awesome-aft-pi-thief`.
+  test("hasPluginEntry returns false for unrelated package whose name contains 'aft-pi'", () => {
+    const pluginDir = join(tmpHome, "work", "aft-pi-thief");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(
+      join(pluginDir, "package.json"),
+      JSON.stringify({ name: "some-unrelated-aft-pi-thief" }),
+    );
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [pluginDir] }));
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(false);
+  });
+
+  test("hasPluginEntry returns false for path that does not exist on disk", () => {
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["/nonexistent/path/to/aft-pi"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(false);
+  });
+
+  // Back-compat: pre-v0.74 used extensions.json
+  test("hasPluginEntry falls back to legacy extensions.json `extensions` array", () => {
+    writeFileSync(
+      join(agentDir, "extensions.json"),
+      JSON.stringify({ extensions: ["npm:@cortexkit/aft-pi"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("settings.json `packages` takes priority over legacy extensions.json", () => {
+    // settings.json has no AFT, legacy has AFT — should report false because
+    // settings.json is the authoritative source on v0.74+.
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: ["npm:some-other"] }),
+    );
+    writeFileSync(
+      join(agentDir, "extensions.json"),
+      JSON.stringify({ extensions: ["npm:@cortexkit/aft-pi"] }),
+    );
+    const adapter = new PiAdapter();
+    expect(adapter.hasPluginEntry()).toBe(false);
   });
 });

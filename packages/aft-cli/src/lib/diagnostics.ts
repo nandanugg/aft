@@ -153,15 +153,23 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
 export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
   const lines: string[] = [];
   lines.push(`- Timestamp: ${report.timestamp}`);
-  lines.push(`- CLI: v${report.cliVersion}`);
-  lines.push(`- Binary: ${report.binaryVersion ?? "unknown"}`);
+  // Use explicit `AFT CLI` / `AFT binary` labels so users with multiple
+  // harnesses (Pi v0.74.0, OpenCode v0.x.y) can tell at a glance that
+  // these are AFT's own versions, not the host's.
+  lines.push(`- AFT CLI: v${report.cliVersion}`);
+  lines.push(`- AFT binary: ${report.binaryVersion ?? "unknown"}`);
   lines.push(`- OS: ${report.platform} ${report.arch}`);
   lines.push(`- Node: ${report.nodeVersion}`);
 
   for (const h of report.harnesses) {
     lines.push("");
     lines.push(`### ${h.displayName}`);
-    lines.push(`- Host installed: ${h.hostInstalled}${h.hostVersion ? ` (${h.hostVersion})` : ""}`);
+    // Always render host version on its own line so its absence is explicit
+    // ("unknown" rather than silently omitted). Triage tip: if hostInstalled
+    // is true but hostVersion is unknown, the host's `--version` flag failed
+    // — file an issue with the harness logs, not aft logs.
+    lines.push(`- Host installed: ${h.hostInstalled}`);
+    lines.push(`- Host version: ${h.hostVersion ?? "unknown"}`);
     lines.push(`- Plugin registered: ${h.pluginRegistered}`);
     lines.push(`- AFT config parse error: ${h.aftConfig.parseError ?? "none"}`);
     lines.push("");

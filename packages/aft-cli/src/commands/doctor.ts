@@ -85,7 +85,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
-  log.info(`CLI v${report.cliVersion}, binary ${report.binaryVersion ?? "unknown"}`);
+  log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   log.info(
     `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}`,
   );
@@ -453,8 +453,8 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     description,
     "",
     "## Environment",
-    `- CLI: v${report.cliVersion}`,
-    `- Binary: ${report.binaryVersion ?? "unknown"}`,
+    `- AFT CLI: v${report.cliVersion}`,
+    `- AFT binary: ${report.binaryVersion ?? "unknown"}`,
     `- OS: ${report.platform} ${report.arch}`,
     `- Node: ${report.nodeVersion}`,
     "",
