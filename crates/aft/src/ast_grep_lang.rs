@@ -27,6 +27,7 @@ pub enum AstGrepLang {
     CSharp,
     Solidity,
     Vue,
+    Json,
 }
 
 impl AstGrepLang {
@@ -45,6 +46,8 @@ impl AstGrepLang {
             LangId::CSharp => Some(Self::CSharp),
             LangId::Solidity => Some(Self::Solidity),
             LangId::Vue => Some(Self::Vue),
+            LangId::Json => Some(Self::Json),
+            LangId::Scala => None,
             LangId::Bash => None, // ast-grep doesn't support Bash
             // Markdown, CSS, HTML etc. don't have meaningful AST patterns
             _ => None,
@@ -66,6 +69,7 @@ impl AstGrepLang {
             "csharp" | "c#" | "cs" => Some(Self::CSharp),
             "solidity" | "sol" => Some(Self::Solidity),
             "vue" => Some(Self::Vue),
+            "json" | "jsonc" => Some(Self::Json),
             _ => None,
         }
     }
@@ -85,6 +89,7 @@ impl AstGrepLang {
             Self::CSharp => &["cs"],
             Self::Solidity => &["sol"],
             Self::Vue => &["vue"],
+            Self::Json => &["json", "jsonc"],
         }
     }
 
@@ -182,6 +187,7 @@ impl LanguageExt for AstGrepLang {
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Solidity => tree_sitter_solidity::LANGUAGE.into(),
             Self::Vue => tree_sitter_vue::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
         }
     }
 }
@@ -215,6 +221,7 @@ mod tests {
         );
         assert_eq!(AstGrepLang::from_str("sol"), Some(AstGrepLang::Solidity));
         assert_eq!(AstGrepLang::from_str("vue"), Some(AstGrepLang::Vue));
+        assert_eq!(AstGrepLang::from_str("json"), Some(AstGrepLang::Json));
         assert_eq!(AstGrepLang::from_str("markdown"), None);
     }
 

@@ -357,6 +357,28 @@ const SOL_QUERY: &str = r#"
   name: (identifier) @var.name) @var.def
 "#;
 
+const SCALA_QUERY: &str = r#"
+;; classes / objects / traits
+(class_definition
+  name: (identifier) @class.name) @class.def
+(object_definition
+  name: (identifier) @object.name) @object.def
+(trait_definition
+  name: (identifier) @trait.name) @trait.def
+;; methods (def)
+(function_definition
+  name: (identifier) @fn.name) @fn.def
+(function_declaration
+  name: (identifier) @fn.name) @fn.def
+;; vals / vars / type aliases
+(val_definition
+  pattern: (identifier) @val.name) @val.def
+(var_definition
+  pattern: (identifier) @var.name) @var.def
+(type_definition
+  name: (type_identifier) @type.name) @type.def
+"#;
+
 /// Supported language identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LangId {
@@ -375,6 +397,8 @@ pub enum LangId {
     Markdown,
     Solidity,
     Vue,
+    Json,
+    Scala,
 }
 
 /// Maps file extension to language identifier.
@@ -396,6 +420,8 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "md" | "markdown" | "mdx" => Some(LangId::Markdown),
         "sol" => Some(LangId::Solidity),
         "vue" => Some(LangId::Vue),
+        "json" | "jsonc" => Some(LangId::Json),
+        "scala" | "sc" => Some(LangId::Scala),
         _ => None,
     }
 }
@@ -418,6 +444,8 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Markdown => tree_sitter_md::LANGUAGE.into(),
         LangId::Solidity => tree_sitter_solidity::LANGUAGE.into(),
         LangId::Vue => tree_sitter_vue::LANGUAGE.into(),
+        LangId::Json => tree_sitter_json::LANGUAGE.into(),
+        LangId::Scala => tree_sitter_scala::LANGUAGE.into(),
     }
 }
 
@@ -438,6 +466,8 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Markdown => None,
         LangId::Solidity => Some(SOL_QUERY),
         LangId::Vue => None,
+        LangId::Json => None,
+        LangId::Scala => Some(SCALA_QUERY),
     }
 }
 
@@ -464,6 +494,8 @@ static BASH_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Bash));
 static SOL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Solidity));
+static SCALA_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Scala));
 
 fn compile_query(lang: LangId) -> Result<Query, String> {
     let query_src = query_for(lang).ok_or_else(|| format!("missing query for {lang:?}"))?;
@@ -486,7 +518,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
         LangId::Solidity => Some(&*SOL_QUERY_CACHE),
-        LangId::Html | LangId::Markdown | LangId::Vue => None,
+        LangId::Scala => Some(&*SCALA_QUERY_CACHE),
+        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => None,
     };
 
     query
@@ -928,6 +961,9 @@ pub fn extract_symbols_from_tree(
     if lang == LangId::Vue {
         return extract_vue_symbols(source, &root);
     }
+    if lang == LangId::Json {
+        return extract_json_symbols(source, &root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -945,7 +981,8 @@ pub fn extract_symbols_from_tree(
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
         LangId::Solidity => extract_solidity_symbols(source, &root, query),
-        LangId::Html | LangId::Markdown | LangId::Vue => {
+        LangId::Scala => extract_scala_symbols(source, &root, query),
+        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => {
             unreachable!("handled before query lookup")
         }
     }
@@ -1026,8 +1063,8 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Include doc comments only if immediately above (no blank line gap)
                 kind == "comment" && is_adjacent_line(&prev, &current, source)
             }
-            LangId::Solidity => {
-                // Include `///` doc comments and `/** */` NatSpec blocks if immediately above
+            LangId::Solidity | LangId::Scala => {
+                // Include `///` doc comments and `/** */` doc blocks if immediately above
                 let text = node_text(source, &prev);
                 kind == "comment"
                     && (text.starts_with("///") || text.starts_with("/**"))
@@ -1037,7 +1074,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Decorators are handled by decorated_definition capture
                 false
             }
-            LangId::Html | LangId::Markdown | LangId::Vue => false,
+            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => false,
         };
 
         if should_include {
@@ -3119,6 +3156,214 @@ fn extract_solidity_symbols(
     Ok(symbols)
 }
 
+fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let Some(value) = root.named_child(0) else {
+        return Ok(Vec::new());
+    };
+
+    if value.kind() != "object" {
+        return Ok(Vec::new());
+    }
+
+    let mut symbols = Vec::new();
+    let mut cursor = value.walk();
+    for child in value.named_children(&mut cursor) {
+        if child.kind() != "pair" {
+            continue;
+        }
+        let Some(key_node) = child.child_by_field_name("key") else {
+            continue;
+        };
+        let name = node_text(source, &key_node).trim_matches('"').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(Symbol {
+            name,
+            kind: SymbolKind::Variable,
+            range: node_range_with_decorators(&child, source, LangId::Json),
+            signature: None,
+            scope_chain: vec![],
+            exported: false,
+            parent: None,
+        });
+    }
+
+    Ok(symbols)
+}
+
+fn scala_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        match parent.kind() {
+            "class_definition" | "object_definition" | "trait_definition" => {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    chain.push(node_text(source, &name_node).to_string());
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn extract_scala_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Scala;
+    let capture_names = query.capture_names();
+
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut object_name_node = None;
+        let mut object_def_node = None;
+        let mut trait_name_node = None;
+        let mut trait_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut val_name_node = None;
+        let mut val_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut type_name_node = None;
+        let mut type_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "object.name" => object_name_node = Some(cap.node),
+                "object.def" => object_def_node = Some(cap.node),
+                "trait.name" => trait_name_node = Some(cap.node),
+                "trait.def" => trait_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "val.name" => val_name_node = Some(cap.node),
+                "val.def" => val_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "type.name" => type_name_node = Some(cap.node),
+                "type.def" => type_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Class,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: scala_scope_chain(&def_node, source),
+                exported: true,
+                parent: scala_scope_chain(&def_node, source).last().cloned(),
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (object_name_node, object_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Class,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: scala_scope_chain(&def_node, source),
+                exported: true,
+                parent: scala_scope_chain(&def_node, source).last().cloned(),
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (trait_name_node, trait_def_node) {
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Interface,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                scope_chain: scala_scope_chain(&def_node, source),
+                exported: true,
+                parent: scala_scope_chain(&def_node, source).last().cloned(),
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = scala_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (val_name_node, val_def_node) {
+            let scope_chain = scala_scope_chain(&def_node, source);
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Variable,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            let scope_chain = scala_scope_chain(&def_node, source);
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::Variable,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+
+        if let (Some(name_node), Some(def_node)) = (type_name_node, type_def_node) {
+            let scope_chain = scala_scope_chain(&def_node, source);
+            symbols.push(Symbol {
+                name: node_text(source, &name_node).to_string(),
+                kind: SymbolKind::TypeAlias,
+                range: node_range_with_decorators(&def_node, source, lang),
+                signature: Some(extract_signature(source, &def_node)),
+                parent: scope_chain.last().cloned(),
+                scope_chain,
+                exported: true,
+            });
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
 fn extract_vue_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let mut symbols = Vec::new();
     collect_vue_sections(source, root, &mut symbols, true);
@@ -5102,5 +5347,87 @@ mod tests {
         // Re-extract should return same results from cache
         let rs_syms2 = parser.extract_symbols(&rs_file).unwrap();
         assert_eq!(rs_syms.len(), rs_syms2.len());
+    }
+
+    #[test]
+    fn extract_json_symbols_top_level_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("package.json");
+        std::fs::write(&file, r#"{"name": "x", "version": "1"}"#).unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 2);
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "name" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "version" && s.kind == SymbolKind::Variable));
+    }
+
+    #[test]
+    fn extract_json_symbols_root_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("array.json");
+        std::fs::write(&file, "[1,2,3]").unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 0);
+    }
+
+    #[test]
+    fn extract_json_symbols_no_recursion_into_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("nested.json");
+        std::fs::write(&file, r#"{"scripts": {"build": "tsc"}}"#).unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "scripts");
+        assert!(!symbols.iter().any(|s| s.name == "build"));
+    }
+
+    #[test]
+    fn extract_scala_symbols_object_and_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Greeter.scala");
+        std::fs::write(
+            &file,
+            "object Greeter {\n  def hello(name: String): String = s\"hi $name\"\n}",
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Greeter" && s.kind == SymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "hello"
+            && s.kind == SymbolKind::Method
+            && s.scope_chain == vec!["Greeter".to_string()]));
+    }
+
+    #[test]
+    fn extract_scala_symbols_class_and_trait() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Types.scala");
+        std::fs::write(&file, "class Foo\ntrait Bar").unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Bar" && s.kind == SymbolKind::Interface));
     }
 }

@@ -430,6 +430,8 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Bash => "bash",
         LangId::Solidity => "solidity",
         LangId::Vue => "vue",
+        LangId::Json => "json",
+        LangId::Scala => "scala",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
     }
@@ -570,7 +572,9 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
-        | LangId::Vue => Vec::new(),
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
     }
@@ -671,7 +675,9 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
-        | LangId::Vue => Vec::new(),
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
     }
@@ -882,6 +888,8 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Bash => "aft_tool_detection.sh",
         LangId::Solidity => "aft_tool_detection.sol",
         LangId::Vue => "aft-tool-detection.vue",
+        LangId::Json => "aft-tool-detection.json",
+        LangId::Scala => "aft-tool-detection.scala",
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",
     };

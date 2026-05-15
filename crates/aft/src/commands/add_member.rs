@@ -451,6 +451,8 @@ fn find_scope_container(
         | LangId::Bash
         | LangId::Solidity
         | LangId::Vue
+        | LangId::Json
+        | LangId::Scala
         | LangId::Html
         | LangId::Markdown => {}
     }

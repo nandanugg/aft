@@ -180,7 +180,9 @@ pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
-        | LangId::Vue => ImportBlock::empty(),
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala => ImportBlock::empty(),
         LangId::Html | LangId::Markdown => ImportBlock::empty(),
     }
 }
@@ -407,7 +409,9 @@ pub fn generate_import_line(
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
-        | LangId::Vue => String::new(),
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala => String::new(),
         LangId::Html | LangId::Markdown => String::new(),
     }
 }
@@ -447,7 +451,9 @@ pub fn classify_group(lang: LangId, module_path: &str) -> ImportGroup {
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
-        | LangId::Vue => ImportGroup::External,
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala => ImportGroup::External,
         LangId::Html | LangId::Markdown => ImportGroup::External,
     }
 }

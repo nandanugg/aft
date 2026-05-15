@@ -14,7 +14,7 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         }
         LangId::Python => vec!["call"],
         LangId::Rust => vec!["call_expression", "macro_invocation"],
-        LangId::Solidity => vec!["call_expression"],
+        LangId::Solidity | LangId::Scala => vec!["call_expression"],
         LangId::C
         | LangId::Cpp
         | LangId::Zig
@@ -22,7 +22,8 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         | LangId::Bash
         | LangId::Vue
         | LangId::Html
-        | LangId::Markdown => vec![],
+        | LangId::Markdown
+        | LangId::Json => vec![],
     }
 }
 

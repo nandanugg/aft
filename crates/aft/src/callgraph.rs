@@ -209,6 +209,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Bash
         | LangId::Solidity
         | LangId::Vue
+        | LangId::Json
+        | LangId::Scala
         | LangId::Html
         | LangId::Markdown => false,
     }
@@ -2862,8 +2864,8 @@ export function funcB() {
             "Markdown is now a supported source language"
         );
         assert!(
-            !file_names.contains(&"data.json".to_string()),
-            "Should not include non-source files"
+            file_names.contains(&"data.json".to_string()),
+            "JSON is now a supported source language"
         );
     }
 
