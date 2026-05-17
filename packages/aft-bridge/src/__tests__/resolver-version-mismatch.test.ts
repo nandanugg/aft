@@ -17,7 +17,7 @@
  * present, so this test focuses on the version-check helper directly.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findBinarySync, readBinaryVersion } from "../resolver.js";
@@ -129,11 +129,25 @@ describe("findBinarySync versioned cache validation", () => {
   test("returns exact-version cached binary after probing --version", () => {
     const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
 
+    // Precondition: the cached binary actually exists at the expected path.
+    // If this fails, the test environment is broken before findBinarySync is
+    // even called — separates fs/env setup bugs from resolver behavior bugs.
+    expect(existsSync(binaryPath)).toBe(true);
+    expect(process.env.XDG_CACHE_HOME).toBe(tmpDir);
+
+    // Precondition: the fake binary actually reports the expected version
+    // when invoked. If this fails, the shebang interpreter or PATH-stripping
+    // breaks `--version` probing on this platform.
+    expect(readBinaryVersion(binaryPath)).toBe("1.2.3");
+
     expect(findBinarySync("1.2.3")).toBe(binaryPath);
   });
 
   test("skips mislabeled newer cached binary instead of accepting directory name", () => {
-    writeCachedVersion("v1.2.3", "9.9.9");
+    const binaryPath = writeCachedVersion("v1.2.3", "9.9.9");
+
+    expect(existsSync(binaryPath)).toBe(true);
+    expect(process.env.XDG_CACHE_HOME).toBe(tmpDir);
 
     expect(findBinarySync("1.2.3")).toBeNull();
   });

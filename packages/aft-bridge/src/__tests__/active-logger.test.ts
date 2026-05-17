@@ -1,10 +1,26 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { getActiveLogger, log, setActiveLogger } from "../active-logger.js";
 import type { Logger } from "../logger.js";
 
+// Active logger lives on a process-global Symbol slot. Tests that install a
+// custom logger MUST restore the previous logger in afterEach, otherwise the
+// no-op or throwing logger leaks into sibling test files via bun's shared
+// process. Earlier this leaked into resolver-version-mismatch.test.ts on
+// Linux CI, silently swallowing diagnostic `warn(...)` calls and changing
+// the resolver's apparent behavior.
 describe("active logger", () => {
+  let prevLogger: Logger | undefined;
+
+  beforeEach(() => {
+    prevLogger = getActiveLogger();
+  });
+
+  afterEach(() => {
+    if (prevLogger) setActiveLogger(prevLogger);
+  });
+
   test("stores logger on Symbol.for global slot", () => {
     const logger: Logger = {
       log: () => undefined,
