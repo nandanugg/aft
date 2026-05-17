@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
 import { BinaryBridge } from "../bridge.js";
 import type { Logger, LogMeta } from "../logger.js";
+import { BridgePool } from "../pool.js";
 
 let workDir: string;
 
@@ -194,6 +195,87 @@ process.stdin.on("data", (chunk) => {
     } finally {
       await bridge.shutdown();
     }
+  });
+
+  test("pool replaceBinary does not mark the current mismatch bridge as shutting down", async () => {
+    const compatible = writeExecutable(
+      "pool-compatible.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    } else if (req.command === "version") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, version: "2.0.0" }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, source: "compatible", command: req.command }) + "\\n");
+    }
+  }
+});
+`,
+    );
+    const stale = writeExecutable(
+      "pool-stale.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    } else if (req.command === "version") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, version: "0.1.0" }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, source: "stale", command: req.command }) + "\\n");
+    }
+  }
+});
+`,
+    );
+
+    let pool: BridgePool;
+    pool = new BridgePool(stale, {
+      timeoutMs: 5_000,
+      maxRestarts: 0,
+      minVersion: "1.0.0",
+      onVersionMismatch: async () => pool.replaceBinary(compatible),
+    });
+
+    try {
+      const bridge = pool.getBridge(workDir);
+      const response = await bridge.send("ping");
+      expect(response).toMatchObject({ success: true, source: "compatible", command: "ping" });
+    } finally {
+      await pool.shutdown();
+    }
+  });
+
+  test("stderr tail buffers split chunks as logical lines", () => {
+    const bridge = new BinaryBridge("/fake/aft", workDir, { maxRestarts: 0 });
+    const testBridge = bridge as unknown as {
+      onStderrData(data: string): void;
+      flushStderrBuffer(): void;
+      stderrTail: string[];
+    };
+
+    testBridge.onStderrData("first half");
+    expect(testBridge.stderrTail).toEqual([]);
+    testBridge.onStderrData(" second half\nnext");
+    expect(testBridge.stderrTail).toEqual(["[aft] first half second half"]);
+    testBridge.flushStderrBuffer();
+    expect(testBridge.stderrTail).toEqual(["[aft] first half second half", "[aft] next"]);
   });
 
   test("configureWarningClients evicts entries after delivery and clears on shutdown", async () => {

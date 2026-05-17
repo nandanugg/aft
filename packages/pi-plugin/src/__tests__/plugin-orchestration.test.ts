@@ -79,6 +79,7 @@ describe("Pi Lane G plugin orchestration regressions", () => {
       () => ({
         replaceBinary: async (path: string) => {
           replaceCalls.push(path);
+          return path;
         },
       }),
       async (version?: string) => {
@@ -87,28 +88,42 @@ describe("Pi Lane G plugin orchestration regressions", () => {
       },
     );
 
-    handler("1.0.0", "1.2.3");
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(handler("1.0.0", "1.2.3")).resolves.toBe("/cache/aft/v1.2.3/aft");
 
     expect(ensureCalls).toEqual(["v1.2.3"]);
     expect(replaceCalls).toEqual(["/cache/aft/v1.2.3/aft"]);
   });
 
-  test("version mismatch handler only attempts one hot-swap per stale binary version", async () => {
+  test("version mismatch handler shares one in-flight hot-swap per target version", async () => {
     const ensureCalls: string[] = [];
+    const replaceCalls: string[] = [];
+    let resolveEnsure: (path: string) => void = () => undefined;
+    const pendingEnsure = new Promise<string>((resolve) => {
+      resolveEnsure = resolve;
+    });
     const handler = __test__.createVersionMismatchHandler(
-      () => ({ replaceBinary: async () => {} }),
+      () => ({
+        replaceBinary: async (path: string) => {
+          replaceCalls.push(path);
+          return path;
+        },
+      }),
       async (version?: string) => {
         ensureCalls.push(version ?? "");
-        return null;
+        return pendingEnsure;
       },
     );
 
-    handler("1.0.0", "1.2.3");
-    handler("1.0.0", "1.2.3");
+    const first = handler("1.0.0", "1.2.3");
+    const second = handler("1.0.1", "1.2.3");
     await new Promise((resolve) => setTimeout(resolve, 0));
+    resolveEnsure("/cache/aft/v1.2.3/aft");
 
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "/cache/aft/v1.2.3/aft",
+      "/cache/aft/v1.2.3/aft",
+    ]);
     expect(ensureCalls).toEqual(["v1.2.3"]);
+    expect(replaceCalls).toEqual(["/cache/aft/v1.2.3/aft"]);
   });
 });

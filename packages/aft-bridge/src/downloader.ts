@@ -11,13 +11,32 @@
  * Cache dir respects XDG_CACHE_HOME on Linux/macOS and LOCALAPPDATA on Windows.
  */
 
-import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 
 const REPO = "cortexkit/aft";
+const DOWNLOAD_TIMEOUT_MS = 300_000;
+const LATEST_TAG_TIMEOUT_MS = 30_000;
+const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+const DOWNLOAD_LOCK_TIMEOUT_MS = 120_000;
+const DOWNLOAD_LOCK_STALE_MS = 10 * 60_000;
 
 /** Get the cache directory, respecting XDG_CACHE_HOME / LOCALAPPDATA. */
 export function getCacheDir(): string {
@@ -96,16 +115,37 @@ export async function downloadBinary(version?: string): Promise<string | null> {
 
   log(`Downloading AFT binary (${tag}) for ${platformKey}...`);
 
+  const lockPath = join(versionedCacheDir, ".download.lock");
+  let releaseLock: (() => void) | null = null;
+  let binaryController: AbortController | null = null;
+  let checksumController: AbortController | null = null;
+  let binaryTimeout: ReturnType<typeof setTimeout> | null = null;
+  let checksumTimeout: ReturnType<typeof setTimeout> | null = null;
+  const tmpPath = `${binaryPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+
   try {
-    // Ensure versioned cache directory exists
+    // Ensure versioned cache directory exists before taking the per-version lock.
     if (!existsSync(versionedCacheDir)) {
       mkdirSync(versionedCacheDir, { recursive: true });
     }
 
+    releaseLock = await acquireDownloadLock(lockPath);
+
+    // Another process may have completed the same version while we waited.
+    if (existsSync(binaryPath)) {
+      return binaryPath;
+    }
+
     // Download binary and checksum file in parallel
+    binaryController = new AbortController();
+    checksumController = new AbortController();
+    const activeBinaryController = binaryController;
+    const activeChecksumController = checksumController;
+    binaryTimeout = setTimeout(() => activeBinaryController.abort(), DOWNLOAD_TIMEOUT_MS);
+    checksumTimeout = setTimeout(() => activeChecksumController.abort(), DOWNLOAD_TIMEOUT_MS);
     const [binaryResponse, checksumResponse] = await Promise.all([
-      fetch(downloadUrl, { redirect: "follow" }),
-      fetch(checksumUrl, { redirect: "follow" }),
+      fetch(downloadUrl, { redirect: "follow", signal: activeBinaryController.signal }),
+      fetch(checksumUrl, { redirect: "follow", signal: activeChecksumController.signal }),
     ]);
 
     if (!binaryResponse.ok) {
@@ -113,8 +153,14 @@ export async function downloadBinary(version?: string): Promise<string | null> {
         `HTTP ${binaryResponse.status}: ${binaryResponse.statusText} (${downloadUrl})`,
       );
     }
+    if (!binaryResponse.body) {
+      throw new Error(`Download response for ${assetName} had no body`);
+    }
 
-    const arrayBuffer = await binaryResponse.arrayBuffer();
+    const advertised = Number.parseInt(binaryResponse.headers.get("content-length") ?? "", 10);
+    if (Number.isFinite(advertised) && advertised > MAX_DOWNLOAD_BYTES) {
+      throw new Error(`Content-Length ${advertised} exceeds max ${MAX_DOWNLOAD_BYTES}`);
+    }
 
     // Verify checksum - MANDATORY for security
     if (!checksumResponse.ok) {
@@ -126,6 +172,8 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
 
     const checksumText = await checksumResponse.text();
+    clearTimeout(checksumTimeout);
+    checksumTimeout = null;
     const expectedHash = parseChecksumForAsset(checksumText, assetName);
     if (!expectedHash) {
       warn(
@@ -135,8 +183,32 @@ export async function downloadBinary(version?: string): Promise<string | null> {
       return null;
     }
 
-    const { createHash } = await import("node:crypto");
-    const actualHash = createHash("sha256").update(Buffer.from(arrayBuffer)).digest("hex");
+    const hash = createHash("sha256");
+    let bytesWritten = 0;
+    const guard = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        bytesWritten += chunk.byteLength;
+        if (bytesWritten > MAX_DOWNLOAD_BYTES) {
+          controller.error(
+            new Error(
+              `download exceeded ${MAX_DOWNLOAD_BYTES} bytes after streaming (server lied about size or sent unbounded body)`,
+            ),
+          );
+          return;
+        }
+        hash.update(chunk);
+        controller.enqueue(chunk);
+      },
+    });
+
+    const guarded = binaryResponse.body.pipeThrough(guard);
+    // biome-ignore lint/suspicious/noExplicitAny: ReadableStream→Node stream conversion
+    const nodeStream = Readable.fromWeb(guarded as any);
+    await pipeline(nodeStream, createWriteStream(tmpPath), { signal: binaryController.signal });
+    clearTimeout(binaryTimeout);
+    binaryTimeout = null;
+
+    const actualHash = hash.digest("hex");
     if (actualHash !== expectedHash) {
       throw new Error(
         `Checksum mismatch for ${assetName}: expected ${expectedHash}, got ${actualHash}. ` +
@@ -145,18 +217,12 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
     log(`Checksum verified (SHA-256: ${actualHash.slice(0, 16)}...)`);
 
-    // Write to a temp file first, then rename (atomic-ish)
-    const tmpPath = `${binaryPath}.tmp`;
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(tmpPath, Buffer.from(arrayBuffer));
-
     // Make executable
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
     }
 
     // Atomic rename
-    const { renameSync } = await import("node:fs");
     renameSync(tmpPath, binaryPath);
 
     log(`AFT binary ready at ${binaryPath}`);
@@ -166,7 +232,6 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     error(`Failed to download AFT binary: ${msg}`);
 
     // Clean up partial download
-    const tmpPath = `${binaryPath}.tmp`;
     if (existsSync(tmpPath)) {
       try {
         unlinkSync(tmpPath);
@@ -176,6 +241,16 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
 
     return null;
+  } finally {
+    if (binaryTimeout) {
+      binaryController?.abort();
+      clearTimeout(binaryTimeout);
+    }
+    if (checksumTimeout) {
+      checksumController?.abort();
+      clearTimeout(checksumTimeout);
+    }
+    releaseLock?.();
   }
 }
 
@@ -210,6 +285,45 @@ export async function ensureBinary(version?: string): Promise<string | null> {
   return downloadBinary();
 }
 
+async function acquireDownloadLock(lockPath: string): Promise<() => void> {
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      return () => {
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed — ignore
+        }
+        try {
+          rmSync(lockPath, { force: true });
+        } catch {
+          // best-effort lock cleanup
+        }
+      };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw err;
+
+      try {
+        const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+        if (ageMs > DOWNLOAD_LOCK_STALE_MS) {
+          rmSync(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      if (Date.now() - startedAt > DOWNLOAD_LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for download lock: ${lockPath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 /**
  * Parse a checksums.sha256 file (GNU coreutils format) and return the hash
  * for the given asset name, or null if not found.
@@ -231,14 +345,19 @@ function parseChecksumForAsset(checksumText: string, assetName: string): string 
 
 /** Fetch the latest release tag from GitHub API. */
 async function fetchLatestTag(): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LATEST_TAG_TIMEOUT_MS);
   try {
     const response = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
       headers: { Accept: "application/vnd.github.v3+json" },
+      signal: controller.signal,
     });
     if (!response.ok) return null;
     const data = (await response.json()) as { tag_name?: string };
     return data.tag_name ?? null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }

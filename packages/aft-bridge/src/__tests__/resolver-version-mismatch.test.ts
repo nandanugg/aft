@@ -17,10 +17,10 @@
  * present, so this test focuses on the version-check helper directly.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readBinaryVersion } from "../resolver.js";
+import { findBinarySync, readBinaryVersion } from "../resolver.js";
 
 describe("readBinaryVersion", () => {
   let tmpDir: string;
@@ -83,5 +83,58 @@ describe("readBinaryVersion", () => {
     writeFileSync(fakeBin, '#!/bin/sh\necho "aft 0.22.1"\n');
     chmodSync(fakeBin, 0o755);
     expect(readBinaryVersion(fakeBin)).toBe("0.22.1"); // not "v0.22.1"
+  });
+});
+
+describe("findBinarySync versioned cache validation", () => {
+  let tmpDir: string;
+  let prevXdgCacheHome: string | undefined;
+  let prevPath: string | undefined;
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "aft-cache-version-test-"));
+    prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    prevPath = process.env.PATH;
+    prevHome = process.env.HOME;
+    process.env.XDG_CACHE_HOME = tmpDir;
+    process.env.PATH = "";
+    process.env.HOME = tmpDir;
+  });
+
+  afterEach(() => {
+    if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeCachedVersion(dirVersion: string, reportedVersion: string): string {
+    const binaryPath = join(
+      tmpDir,
+      "aft",
+      "bin",
+      dirVersion,
+      process.platform === "win32" ? "aft.exe" : "aft",
+    );
+    mkdirSync(join(tmpDir, "aft", "bin", dirVersion), { recursive: true });
+    writeFileSync(binaryPath, `#!/bin/sh\necho "aft ${reportedVersion}"\n`);
+    chmodSync(binaryPath, 0o755);
+    return binaryPath;
+  }
+
+  test("returns exact-version cached binary after probing --version", () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+
+    expect(findBinarySync("1.2.3")).toBe(binaryPath);
+  });
+
+  test("skips mislabeled newer cached binary instead of accepting directory name", () => {
+    writeCachedVersion("v1.2.3", "9.9.9");
+
+    expect(findBinarySync("1.2.3")).toBeNull();
   });
 });

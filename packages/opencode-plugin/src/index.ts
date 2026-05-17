@@ -378,10 +378,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Track which binary version we already attempted to upgrade from.
-  // Prevents the loop: mismatch → fire-and-forget download → replaceBinary kills bridge →
-  // respawn with same binary → mismatch fires again → kills again → 3-attempt limit.
-  let versionUpgradeAttempted: string | null = null;
+  // Coordinate concurrent version mismatches so followers wait for the first
+  // download/hot-swap for the target plugin version instead of failing with
+  // "already attempted" while the compatible binary is still in flight.
+  const versionUpgradePromises = new Map<string, Promise<string | null>>();
 
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
@@ -389,35 +389,42 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     errorPrefix: "[aft-plugin]",
     minVersion: PLUGIN_VERSION,
     onVersionMismatch: async (binaryVersion, minVersion) => {
-      if (versionUpgradeAttempted === binaryVersion) {
-        log(`Version ${binaryVersion} < ${minVersion} but upgrade already attempted — continuing`);
-        return null;
-      }
-      versionUpgradeAttempted = binaryVersion;
-      warn(
-        `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
-          "Some features may not work. Attempting to download a compatible binary...",
-      );
-      try {
-        const path = await ensureBinary(`v${minVersion}`);
-        if (!path) {
-          warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
-          return null;
-        }
-        log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
-        const replaced = await pool.replaceBinary(path);
-        // Don't reset versionUpgradeAttempted — the new binary might also be
-        // outdated. The tracker resets naturally when a new plugin version loads.
-        log("Binary replaced successfully. New bridges will use the updated binary.");
-        // Returning the new path triggers aft-bridge's coordinated retry of the
-        // in-flight request against the replacement binary.
-        return replaced;
-      } catch (err) {
-        error(
-          `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
+      const existing = versionUpgradePromises.get(minVersion);
+      if (existing) {
+        log(
+          `Version ${binaryVersion} < ${minVersion}; awaiting in-flight compatible binary upgrade`,
         );
-        return null;
+        return existing;
       }
+
+      const upgradePromise = (async () => {
+        warn(
+          `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
+            "Some features may not work. Attempting to download a compatible binary...",
+        );
+        try {
+          const path = await ensureBinary(`v${minVersion}`);
+          if (!path) {
+            warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
+            return null;
+          }
+          log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
+          const replaced = await pool.replaceBinary(path);
+          log("Binary replaced successfully. New bridges will use the updated binary.");
+          // Returning the new path triggers aft-bridge's coordinated retry of the
+          // in-flight request against the replacement binary.
+          return replaced;
+        } catch (err) {
+          error(
+            `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
+          );
+          return null;
+        } finally {
+          versionUpgradePromises.delete(minVersion);
+        }
+      })();
+      versionUpgradePromises.set(minVersion, upgradePromise);
+      return upgradePromise;
     },
     onConfigureWarnings: async ({ projectRoot, sessionId, client, warnings }) => {
       const pendingWarnings = sessionId ? drainPendingEagerWarnings(projectRoot) : [];

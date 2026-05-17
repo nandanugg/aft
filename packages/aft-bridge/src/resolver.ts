@@ -52,12 +52,19 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     const ext = process.platform === "win32" ? ".exe" : "";
     const cachedPath = join(versionedDir, `aft${ext}`);
 
-    // Already cached
-    if (existsSync(cachedPath)) return cachedPath;
+    // Already cached. Probe before trusting the directory label; stale or
+    // corrupted cache entries must not shadow PATH/cargo fallback forever.
+    if (existsSync(cachedPath)) {
+      const cachedVersion = readBinaryVersion(cachedPath);
+      if (cachedVersion === version) return cachedPath;
+      warn(
+        `Cached binary at ${cachedPath} reports ${cachedVersion ?? "no version"}, expected ${version}; refreshing from npm package`,
+      );
+    }
 
     // Copy to versioned cache
     mkdirSync(versionedDir, { recursive: true });
-    const tmpPath = `${cachedPath}.tmp`;
+    const tmpPath = `${cachedPath}.${process.pid}.${Date.now()}.tmp`;
     copyFileSync(npmBinaryPath, tmpPath);
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
@@ -69,6 +76,20 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     warn(`Failed to copy binary to cache: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
+}
+
+function normalizeBareVersion(version: string): string {
+  return version.startsWith("v") ? version.slice(1) : version;
+}
+
+function isExpectedCachedBinary(binaryPath: string, expectedVersion: string): boolean {
+  const expected = normalizeBareVersion(expectedVersion);
+  const actual = readBinaryVersion(binaryPath);
+  if (actual === expected) return true;
+  warn(
+    `Cached binary at ${binaryPath} reports ${actual ?? "no version"}, expected ${expected}; skipping cache candidate`,
+  );
+  return false;
 }
 
 /**
@@ -134,7 +155,7 @@ export function findBinarySync(expectedVersion?: string): string | null {
   if (pluginVersion) {
     const tag = pluginVersion.startsWith("v") ? pluginVersion : `v${pluginVersion}`;
     const versionCached = getCachedBinaryPath(tag);
-    if (versionCached) return versionCached;
+    if (versionCached && isExpectedCachedBinary(versionCached, pluginVersion)) return versionCached;
   }
 
   // 2. Check npm platform package — copy to versioned cache to avoid
@@ -153,12 +174,16 @@ export function findBinarySync(expectedVersion?: string): string | null {
     const resolved = req.resolve(packageBin);
     if (existsSync(resolved)) {
       const npmVersion = readBinaryVersion(resolved);
-      if (pluginVersion && npmVersion && npmVersion !== pluginVersion) {
+      if (npmVersion === null) {
+        warn(
+          `npm platform package binary at ${resolved} did not report a version; skipping (continuing to PATH lookup)`,
+        );
+      } else if (pluginVersion && npmVersion !== normalizeBareVersion(pluginVersion)) {
         warn(
           `npm platform package binary v${npmVersion} does not match plugin v${pluginVersion}; skipping (continuing to PATH lookup)`,
         );
       } else {
-        const copied = copyToVersionedCache(resolved, npmVersion ?? undefined);
+        const copied = copyToVersionedCache(resolved, npmVersion);
         return copied ?? resolved;
       }
     }

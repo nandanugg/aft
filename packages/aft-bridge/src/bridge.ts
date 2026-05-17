@@ -3,16 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
-import {
-  error,
-  getActiveLogger,
-  getLogFilePath,
-  log,
-  sessionError,
-  sessionLog,
-  sessionWarn,
-  warn,
-} from "./active-logger.js";
+import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion } from "./protocol.js";
 
@@ -274,6 +265,7 @@ export class BinaryBridge {
   private pending = new Map<string, PendingRequest>();
   private nextId = 1;
   private stdoutBuffer = "";
+  private stderrBuffer = "";
   /** Ring buffer of the last N stderr lines, cleared on every spawn. */
   private stderrTail: string[] = [];
   private _restartCount = 0;
@@ -322,40 +314,78 @@ export class BinaryBridge {
     this.logger = options?.logger;
   }
 
-  /**
-   * Internal log helpers that prefer the constructor-provided logger over the
-   * active-logger singleton. Mirrors the same pattern used by `BridgePool`
-   * (Oracle F9 — D2 deferral for BinaryBridge). These are intentionally
-   * unused at the call sites today: migrating every existing `log()`/`warn()`/
-   * `error()`/`sessionLog()` call site in this file to `this.logVia()` etc. is
-   * a separate mechanical refactor we defer until we have a concrete use case
-   * for per-bridge log routing. Until then, the existing module-level helpers
-   * fall through to the singleton, which is the same default behavior the
-   * `this.logVia` helpers provide when `this.logger` is `undefined`.
-   *
-   * The constructor `logger` option + the test in `bridge-transport.test.ts`
-   * are what verify the F9 wiring. Once a future change starts using these
-   * helpers for any new logging, the biome unused-private warnings disappear.
-   */
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: F9 plumbing kept for future call-site migration
   private logVia(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
-    if (logger) logger.log(message, meta);
-    else log(message, meta);
+    if (logger) {
+      try {
+        logger.log(message, meta);
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: logger log threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(`[aft-bridge] ${message}`);
+      }
+    } else {
+      log(message, meta);
+    }
   }
 
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: F9 plumbing kept for future call-site migration
   private warnVia(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
-    if (logger) logger.warn(message, meta);
-    else warn(message, meta);
+    if (logger) {
+      try {
+        logger.warn(message, meta);
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: logger warn threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(`[aft-bridge] WARN: ${message}`);
+      }
+    } else {
+      warn(message, meta);
+    }
   }
 
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: F9 plumbing kept for future call-site migration
   private errorVia(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
-    if (logger) logger.error(message, meta);
-    else error(message, meta);
+    if (logger) {
+      try {
+        logger.error(message, meta);
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: logger error threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(`[aft-bridge] ERROR: ${message}`);
+      }
+    } else {
+      error(message, meta);
+    }
+  }
+
+  private getLogFilePathVia(): string | undefined {
+    if (this.logger?.getLogFilePath) {
+      try {
+        return this.logger.getLogFilePath();
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: logger getLogFilePath threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return undefined;
+      }
+    }
+    return getLogFilePath();
+  }
+
+  private sessionLogVia(sessionId: string | undefined, message: string): void {
+    this.logVia(message, sessionId ? { sessionId } : undefined);
+  }
+
+  private sessionWarnVia(sessionId: string | undefined, message: string): void {
+    this.warnVia(message, sessionId ? { sessionId } : undefined);
+  }
+
+  private sessionErrorVia(sessionId: string | undefined, message: string): void {
+    this.errorVia(message, sessionId ? { sessionId } : undefined);
   }
 
   /** Number of times the binary has been restarted after a crash. */
@@ -481,7 +511,7 @@ export class BinaryBridge {
                 // errors as best-effort, so the bridge may have died without throwing.
                 if (!this.isAlive()) {
                   throw new Error(
-                    `${this.errorPrefix} Bridge died during version check. Check logs: ${getLogFilePath()}`,
+                    `${this.errorPrefix} Bridge died during version check. Check logs: ${this.getLogFilePathVia()}`,
                   );
                 }
                 this.configured = true;
@@ -535,9 +565,9 @@ export class BinaryBridge {
           const restartSuffix = keepBridgeOnTimeout ? "" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {
-            sessionWarn(requestSessionId, timeoutMsg);
+            this.sessionWarnVia(requestSessionId, timeoutMsg);
           } else {
-            warn(timeoutMsg);
+            this.warnVia(timeoutMsg);
           }
           reject(
             new Error(
@@ -582,7 +612,7 @@ export class BinaryBridge {
         command !== "configure" &&
         command !== "version"
       ) {
-        log(
+        this.logVia(
           `Retrying request "${command}" once after coordinated binary replacement: ${err.newBinaryPath}`,
         );
         return this.sendWithVersionMismatchRetry(command, params, options, false);
@@ -610,7 +640,7 @@ export class BinaryBridge {
         warnings: configResult.warnings,
       });
     } catch (err) {
-      warn(
+      this.warnVia(
         `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
@@ -653,7 +683,7 @@ export class BinaryBridge {
     const snapshot = frame.snapshot;
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
     this.cachedStatus = snapshot as StatusSnapshot;
-    log("Received status_changed push frame; cached AFT status snapshot");
+    this.logVia("Received status_changed push frame; cached AFT status snapshot");
     for (const listener of this.statusListeners) {
       this.deliverStatusSnapshot(listener, this.cachedStatus);
     }
@@ -666,7 +696,7 @@ export class BinaryBridge {
     try {
       listener(snapshot);
     } catch (err) {
-      warn(`status listener threw: ${err instanceof Error ? err.message : String(err)}`);
+      this.warnVia(`status listener threw: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -689,7 +719,7 @@ export class BinaryBridge {
 
         proc.once("exit", () => {
           clearTimeout(forceKillTimer);
-          log("Process exited during shutdown");
+          this.logVia("Process exited during shutdown");
           resolve();
         });
 
@@ -716,9 +746,9 @@ export class BinaryBridge {
           `Binary did not report a version — likely too old (minVersion: ${this.minVersion})`,
         );
       }
-      log(`Binary version: ${binaryVersion}`);
+      this.logVia(`Binary version: ${binaryVersion}`);
       if (compareSemver(binaryVersion, this.minVersion) < 0) {
-        warn(`Binary version ${binaryVersion} is older than required ${this.minVersion}`);
+        this.warnVia(`Binary version ${binaryVersion} is older than required ${this.minVersion}`);
         const replacementPath = await this.onVersionMismatch?.(binaryVersion, this.minVersion);
         if (replacementPath === undefined) {
           // Backwards compatibility: legacy callbacks returned void and usually kicked off a
@@ -735,7 +765,7 @@ export class BinaryBridge {
         throw new BridgeReplacedDuringVersionCheck(replacementPath);
       }
     } catch (err) {
-      warn(`Version check failed: ${(err as Error).message}`);
+      this.warnVia(`Version check failed: ${(err as Error).message}`);
       throw err;
     }
   }
@@ -761,7 +791,7 @@ export class BinaryBridge {
 
       proc.once("exit", () => {
         clearTimeout(forceKillTimer);
-        log("Process exited during coordinated binary replacement");
+        this.logVia("Process exited during coordinated binary replacement");
         resolve();
       });
 
@@ -776,9 +806,12 @@ export class BinaryBridge {
 
   private spawnProcess(triggeringSessionId?: string): void {
     if (triggeringSessionId) {
-      sessionLog(triggeringSessionId, `Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
+      this.sessionLogVia(
+        triggeringSessionId,
+        `Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`,
+      );
     } else {
-      log(`Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
+      this.logVia(`Spawning binary: ${this.binaryPath} (cwd: ${this.cwd})`);
     }
     const semantic = this.configOverrides.semantic;
     const semanticBackend = (() => {
@@ -854,18 +887,19 @@ export class BinaryBridge {
     child.stderr?.on("end", () => {
       const remaining = stderrDecoder.end();
       if (remaining) this.onStderrData(remaining);
+      this.flushStderrBuffer();
     });
 
     child.on("error", (err) => {
       if (this.process !== currentChild) return;
-      error(`Process error: ${err.message}${this.formatStderrTail()}`);
+      this.errorVia(`Process error: ${err.message}${this.formatStderrTail()}`);
       this.handleCrash();
     });
 
     child.on("exit", (code, signal) => {
       if (this.process !== currentChild) return;
       if (this._shuttingDown) return;
-      log(`Process exited: code=${code}, signal=${signal}`);
+      this.logVia(`Process exited: code=${code}, signal=${signal}`);
       // External termination signals (SIGTERM/SIGKILL/SIGHUP/SIGINT) are almost
       // always intentional kills — from our own shutdown path, OpenCode tearing
       // down, OS shutdown, or the user killing the host. Auto-restarting here
@@ -890,6 +924,7 @@ export class BinaryBridge {
 
     this.process = child;
     this.stdoutBuffer = "";
+    this.stderrBuffer = "";
     // Fresh spawn — clear the stderr ring so crash diagnostics only reflect
     // the current child's output, not output from prior restart cycles.
     this.stderrTail = [];
@@ -903,13 +938,25 @@ export class BinaryBridge {
   }
 
   private onStderrData(data: string): void {
-    const lines = data.trimEnd().split("\n");
-    for (const line of lines) {
+    this.stderrBuffer += data;
+    let newlineIdx: number;
+    while ((newlineIdx = this.stderrBuffer.indexOf("\n")) !== -1) {
+      const line = this.stderrBuffer.slice(0, newlineIdx).replace(/\r$/, "");
+      this.stderrBuffer = this.stderrBuffer.slice(newlineIdx + 1);
       if (!line) continue;
       const tagged = tagStderrLine(line);
-      log(tagged);
+      this.logVia(tagged);
       this.pushStderrLine(tagged);
     }
+  }
+
+  private flushStderrBuffer(): void {
+    const line = this.stderrBuffer.replace(/\r$/, "");
+    this.stderrBuffer = "";
+    if (!line) return;
+    const tagged = tagStderrLine(line);
+    this.logVia(tagged);
+    this.pushStderrLine(tagged);
   }
 
   /**
@@ -975,7 +1022,7 @@ export class BinaryBridge {
         }
         if (response.type === "configure_warnings") {
           this.handleConfigureWarningsFrame(response).catch((err) => {
-            warn(
+            this.warnVia(
               `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
             );
           });
@@ -994,10 +1041,10 @@ export class BinaryBridge {
           this.scheduleRestartCountReset();
           entry.resolve(response);
         } else if (typeof response.type === "string") {
-          log(`Ignoring unknown stdout push frame type: ${response.type}`);
+          this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
         }
       } catch (_err) {
-        warn(`Failed to parse stdout line: ${line}`);
+        this.warnVia(`Failed to parse stdout line: ${line}`);
       }
     }
   }
@@ -1024,17 +1071,17 @@ export class BinaryBridge {
     this.stderrTail = [];
     const killedMsg = tail
       ? `Bridge killed after timeout.${tail}`
-      : `Bridge killed after timeout (see ${getLogFilePath()})`;
+      : `Bridge killed after timeout (see ${this.getLogFilePathVia()})`;
     if (tail) {
       if (triggeringSessionId) {
-        sessionError(triggeringSessionId, killedMsg);
+        this.sessionErrorVia(triggeringSessionId, killedMsg);
       } else {
-        error(killedMsg);
+        this.errorVia(killedMsg);
       }
     } else if (triggeringSessionId) {
-      sessionWarn(triggeringSessionId, killedMsg);
+      this.sessionWarnVia(triggeringSessionId, killedMsg);
     } else {
-      warn(killedMsg);
+      this.warnVia(killedMsg);
     }
   }
 
@@ -1053,14 +1100,14 @@ export class BinaryBridge {
     // rejection only carries a pointer to the log.
     const tail = this.formatStderrTail();
     if (tail) {
-      error(
+      this.errorVia(
         `Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""}.${tail}`,
       );
     }
 
     this.rejectAllPending(
       new Error(
-        `${this.errorPrefix} Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""} (see ${getLogFilePath()})`,
+        `${this.errorPrefix} Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""} (see ${this.getLogFilePathVia()})`,
       ),
     );
 
@@ -1068,14 +1115,14 @@ export class BinaryBridge {
     if (this._restartCount < this.maxRestarts) {
       const delay = 100 * 2 ** this._restartCount; // 100ms, 200ms, 400ms
       this._restartCount++;
-      log(`Auto-restart #${this._restartCount} in ${delay}ms`);
+      this.logVia(`Auto-restart #${this._restartCount} in ${delay}ms`);
 
       setTimeout(() => {
         if (!this._shuttingDown && !this.isAlive()) {
           try {
             this.spawnProcess();
           } catch (err) {
-            error(`Failed to restart: ${(err as Error).message}`);
+            this.errorVia(`Failed to restart: ${(err as Error).message}`);
           }
         }
       }, delay);
@@ -1083,8 +1130,8 @@ export class BinaryBridge {
       // successful response don't permanently wedge the bridge.
       this.scheduleRestartCountReset();
     } else {
-      error(
-        `Max restarts (${this.maxRestarts}) reached, giving up. Logs: ${getLogFilePath()}${tail}`,
+      this.errorVia(
+        `Max restarts (${this.maxRestarts}) reached, giving up. Logs: ${this.getLogFilePathVia()}${tail}`,
       );
       this.scheduleRestartCountReset();
     }

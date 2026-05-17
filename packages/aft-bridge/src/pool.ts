@@ -115,6 +115,8 @@ export class BridgePool {
       onConfigureWarnings: options.onConfigureWarnings,
       onBashCompletion: options.onBashCompletion,
       onBashLongRunning: options.onBashLongRunning,
+      errorPrefix: options.errorPrefix,
+      logger: options.logger,
     };
     this.configOverrides = configOverrides;
     // Skip cleanup timer when idle timeout is Infinity (no-op) to avoid wasted cycles
@@ -229,12 +231,13 @@ export class BridgePool {
   async replaceBinary(newPath: string): Promise<string> {
     this.binaryPath = newPath;
     // Clear the pool so next getBridge() creates fresh bridges with the new binary.
-    // Old bridge processes are NOT killed — they continue running from the old
-    // binary (safe on all platforms since the binary is loaded in memory) and will
-    // exit naturally when their stdin/stdout are garbage collected.
-    const shutdowns = Array.from(this.bridges.values()).map((entry) => entry.bridge.shutdown());
+    // Do NOT call shutdown() here: when replaceBinary() is invoked from a bridge's
+    // onVersionMismatch callback, shutdown() marks that in-flight bridge as
+    // shutting down before BinaryBridge.replaceCurrentBinary() can restart it,
+    // breaking the transparent retry path. Existing bridge processes are left to
+    // finish their current calls; the current bridge owns its coordinated restart
+    // after the callback returns.
     this.bridges.clear();
-    await Promise.allSettled(shutdowns);
     this.log(
       `Binary path updated to ${newPath}. All bridges cleared — next calls will use the new binary.`,
     );
@@ -243,14 +246,30 @@ export class BridgePool {
 
   private log(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
-    if (logger) logger.log(message, meta);
-    else log(message, meta);
+    if (logger) {
+      try {
+        logger.log(message, meta);
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: pool logger log threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(`[aft-bridge] ${message}`);
+      }
+    } else log(message, meta);
   }
 
   private error(message: string, meta?: LogMeta): void {
     const logger = this.logger ?? getActiveLogger();
-    if (logger) logger.error(message, meta);
-    else error(message, meta);
+    if (logger) {
+      try {
+        logger.error(message, meta);
+      } catch (err) {
+        console.error(
+          `[aft-bridge] ERROR: pool logger error threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        console.error(`[aft-bridge] ERROR: ${message}`);
+      }
+    } else error(message, meta);
   }
 
   /**

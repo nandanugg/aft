@@ -30,13 +30,27 @@ export function getActiveLogger(): Logger | undefined {
 }
 
 export function getLogFilePath(): string | undefined {
-  return getActiveLogger()?.getLogFilePath?.();
+  try {
+    return getActiveLogger()?.getLogFilePath?.();
+  } catch (err) {
+    console.error(
+      `[aft-bridge] ERROR: active logger getLogFilePath threw: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
 }
 
 export function log(message: string, meta?: LogMeta): void {
   const active = getActiveLogger();
   if (active) {
-    active.log(message, meta);
+    try {
+      active.log(message, meta);
+    } catch (err) {
+      console.error(
+        `[aft-bridge] ERROR: active logger log threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(`[aft-bridge] ${message}`);
+    }
   } else {
     console.error(`[aft-bridge] ${message}`);
   }
@@ -45,7 +59,14 @@ export function log(message: string, meta?: LogMeta): void {
 export function warn(message: string, meta?: LogMeta): void {
   const active = getActiveLogger();
   if (active) {
-    active.warn(message, meta);
+    try {
+      active.warn(message, meta);
+    } catch (err) {
+      console.error(
+        `[aft-bridge] ERROR: active logger warn threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(`[aft-bridge] WARN: ${message}`);
+    }
   } else {
     console.error(`[aft-bridge] WARN: ${message}`);
   }
@@ -54,7 +75,14 @@ export function warn(message: string, meta?: LogMeta): void {
 export function error(message: string, meta?: LogMeta): void {
   const active = getActiveLogger();
   if (active) {
-    active.error(message, meta);
+    try {
+      active.error(message, meta);
+    } catch (err) {
+      console.error(
+        `[aft-bridge] ERROR: active logger error threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(`[aft-bridge] ERROR: ${message}`);
+    }
   } else {
     console.error(`[aft-bridge] ERROR: ${message}`);
   }
