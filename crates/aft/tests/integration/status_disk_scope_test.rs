@@ -75,6 +75,7 @@ fn status_disk_bytes_only_count_current_project() {
     let configure = json!({
         "id": "1",
         "command": "configure",
+            "harness": "opencode",
         "project_root": project_a.to_str().expect("project a utf-8"),
         "storage_dir": storage_root.to_str().expect("storage utf-8"),
     });
@@ -135,6 +136,7 @@ fn status_disk_bytes_zero_when_no_cache_for_project() {
     let configure = json!({
         "id": "1",
         "command": "configure",
+            "harness": "opencode",
         "project_root": project_root.to_str().expect("utf-8"),
         "storage_dir": storage_root.to_str().expect("utf-8"),
     });

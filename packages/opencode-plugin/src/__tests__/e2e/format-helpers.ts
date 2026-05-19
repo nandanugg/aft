@@ -252,6 +252,7 @@ export async function createFormatHarness(
   // Step 3: Configure the bridge with format_on_edit on and explicit
   //         formatter/checker maps if the preset specifies them.
   const configureParams: Record<string, unknown> = {
+    harness: "opencode",
     project_root: harness.tempDir,
     format_on_edit: true,
     validate_on_edit: "syntax",

@@ -835,7 +835,7 @@ fn test_lsp_diagnostics_command_response_format() {
     ]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root.display()
     ));
     assert_eq!(configure["success"], true);

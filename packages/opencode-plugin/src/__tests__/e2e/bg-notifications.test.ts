@@ -51,6 +51,7 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
         bash_permissions: false,
         experimental_bash_background: true,
         storage_dir: h.path(".aft-storage"),
+        harness: "opencode",
       },
     );
     const ctx: PluginContext = {

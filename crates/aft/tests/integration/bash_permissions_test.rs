@@ -8,6 +8,7 @@ fn configure(aft: &mut AftProcess, root: &TempDir) {
         &serde_json::to_string(&json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.path(),
             "bash_permissions": true,
         }))
@@ -21,6 +22,7 @@ fn configure_path(aft: &mut AftProcess, root: &std::path::Path) {
         &serde_json::to_string(&json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root,
             "bash_permissions": true,
         }))

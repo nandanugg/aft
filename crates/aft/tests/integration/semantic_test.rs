@@ -55,6 +55,7 @@ fn configure_semantic(
         json!({
             "id": "cfg-semantic",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "semantic_search": enabled,
             "storage_dir": storage_dir.display().to_string(),
@@ -230,6 +231,7 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
             json!({
                 "id": "cfg-ollama",
                 "command": "configure",
+            "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
                 "semantic_search": true,
@@ -267,6 +269,7 @@ fn configure_rejects_non_loopback_private_base_url() {
             json!({
                 "id": "cfg-private",
                 "command": "configure",
+            "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
                 "semantic_search": true,

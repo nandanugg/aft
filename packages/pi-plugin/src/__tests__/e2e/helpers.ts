@@ -162,7 +162,7 @@ export async function createHarness(
     preparedBinary.binaryPath,
     { timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
     // Forward the full config to configure so indexing/restrict/etc. match prod.
-    { ...config, storage_dir: join(tempDir, ".aft-storage") },
+    { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
   );
 
   const bridge = pool.getBridge(tempDir);

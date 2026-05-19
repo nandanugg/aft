@@ -41,6 +41,7 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
         &serde_json::to_string(&serde_json::json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "restrict_to_project_root": true,
         }))

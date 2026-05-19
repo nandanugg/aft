@@ -121,10 +121,15 @@ export async function createHarness(
   process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
   await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
-  const bridge = new BinaryBridge(preparedBinary.binaryPath, tempDir, {
-    timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    ...(options?.bridgeOptions ?? {}),
-  });
+  const bridge = new BinaryBridge(
+    preparedBinary.binaryPath,
+    tempDir,
+    {
+      timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      ...(options?.bridgeOptions ?? {}),
+    },
+    { harness: "opencode" },
+  );
 
   return {
     binaryPath: preparedBinary.binaryPath,

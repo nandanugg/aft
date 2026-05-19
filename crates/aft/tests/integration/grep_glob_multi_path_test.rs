@@ -29,6 +29,7 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
         json!({
             "id": "cfg-restricted",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "restrict_to_project_root": true,
         }),

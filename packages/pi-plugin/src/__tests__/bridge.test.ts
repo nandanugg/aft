@@ -27,12 +27,17 @@ describe("Pi BinaryBridge", () => {
 
   test("parses pushed bash_completed frames without request correlation", async () => {
     const completions: unknown[] = [];
-    bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", PROJECT_CWD, {
-      timeoutMs: 5_000,
-      onBashCompletion: (completion) => {
-        completions.push(completion);
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        onBashCompletion: (completion) => {
+          completions.push(completion);
+        },
       },
-    });
+      { harness: "pi" },
+    );
 
     (bridge as any).onStdoutData(
       `${JSON.stringify({
@@ -59,12 +64,17 @@ describe("Pi BinaryBridge", () => {
 
   test("routes pushed configure_warnings frames with session_id to the warning handler", async () => {
     const deliveries: unknown[] = [];
-    bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", PROJECT_CWD, {
-      timeoutMs: 5_000,
-      onConfigureWarnings: (context) => {
-        deliveries.push(context);
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
       },
-    });
+      { harness: "pi" },
+    );
 
     (bridge as any).onStdoutData(
       `${JSON.stringify({
@@ -103,12 +113,17 @@ describe("Pi BinaryBridge", () => {
 
   test("handles pushed configure_warnings frames with missing session_id gracefully", async () => {
     const deliveries: unknown[] = [];
-    bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", PROJECT_CWD, {
-      timeoutMs: 5_000,
-      onConfigureWarnings: (context) => {
-        deliveries.push(context);
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
       },
-    });
+      { harness: "pi" },
+    );
 
     expect(() => {
       (bridge as any).onStdoutData(
@@ -150,12 +165,17 @@ describe("Pi BinaryBridge", () => {
     const deliveries: unknown[] = [];
     const clientA = { name: "client-a" };
     const clientB = { name: "client-b" };
-    bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", PROJECT_CWD, {
-      timeoutMs: 5_000,
-      onConfigureWarnings: (context) => {
-        deliveries.push(context);
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
       },
-    });
+      { harness: "pi" },
+    );
     (bridge as any).configureWarningClients.set("session-a", clientA);
     (bridge as any).configureWarningClients.set("session-b", clientB);
 
@@ -191,10 +211,15 @@ describe("Pi BinaryBridge", () => {
     await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000, // bridge-wide default
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000, // bridge-wide default
+          maxRestarts: 0,
+        },
+        { harness: "pi" },
+      );
 
       const start = Date.now();
       // Use "version" to skip the auto-configure path (configure/version are
@@ -215,10 +240,15 @@ describe("Pi BinaryBridge", () => {
   });
 
   test("restart counter decays even after max restarts is reached", async () => {
-    bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", PROJECT_CWD, {
-      timeoutMs: 5_000,
-      maxRestarts: 1,
-    });
+    bridge = new BinaryBridge(
+      "/tmp/aft-does-not-need-to-exist",
+      PROJECT_CWD,
+      {
+        timeoutMs: 5_000,
+        maxRestarts: 1,
+      },
+      { harness: "pi" },
+    );
     const originalResetMs = (BinaryBridge as any).RESTART_RESET_MS;
 
     try {
@@ -241,10 +271,15 @@ describe("Pi BinaryBridge", () => {
 
     let staleChild: ChildProcess | null = null;
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000,
+          maxRestarts: 0,
+        },
+        { harness: "pi" },
+      );
 
       (bridge as any).spawnProcess();
       staleChild = (bridge as any).process as ChildProcessWithoutNullStreams;
@@ -267,10 +302,15 @@ describe("Pi BinaryBridge", () => {
     await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000,
+          maxRestarts: 0,
+        },
+        { harness: "pi" },
+      );
 
       await expect(bridge.send("read", { id: "caller-id", filePath: "x.ts" })).rejects.toThrow(
         "params cannot contain reserved key 'id'",

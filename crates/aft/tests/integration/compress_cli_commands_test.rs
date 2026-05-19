@@ -10,6 +10,7 @@ fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::pat
         &json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
             "experimental_bash_compress": true,

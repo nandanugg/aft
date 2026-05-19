@@ -69,7 +69,14 @@ maybeDescribe("e2e honest reporting surfaces", () => {
     const h = await createHarness(preparedBinary, { fixtureNames: [], timeoutMs: 20_000 });
     harnesses.push(h);
     const storageDir = join(h.tempDir, ".storage");
-    const pool = new BridgePool(h.binaryPath, { timeoutMs: 20_000 }, { storage_dir: storageDir });
+    const pool = new BridgePool(
+      h.binaryPath,
+      { timeoutMs: 20_000 },
+      {
+        storage_dir: storageDir,
+        harness: "opencode",
+      },
+    );
     pools.push(pool);
     const pluginContext = createPluginContext(pool, storageDir);
     return {

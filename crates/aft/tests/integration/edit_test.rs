@@ -516,7 +516,7 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg-inline","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root.display()
     ));
     assert_eq!(
@@ -581,7 +581,7 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline-fast","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg-inline-fast","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root.display()
     ));
     assert_eq!(
@@ -1334,6 +1334,7 @@ fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
         &serde_json::json!({
             "id": "cfg-glob-excluded",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "format_on_edit": true,
             "formatter": { "typescript": "biome" }
@@ -1384,6 +1385,7 @@ fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
         &serde_json::json!({
             "id": "cfg-glob-disabled",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "format_on_edit": false
         })
@@ -1450,6 +1452,7 @@ exit 0
         &serde_json::json!({
             "id": "cfg-glob-mixed",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "format_on_edit": true,
             "formatter": { "typescript": "biome", "python": "biome" }

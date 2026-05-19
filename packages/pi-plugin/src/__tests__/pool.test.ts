@@ -8,7 +8,7 @@ import { BridgePool } from "@cortexkit/aft-bridge";
 
 describe("Pi BridgePool", () => {
   test("getActiveBridgeForRoot returns the bridge when it is alive for the requested root", () => {
-    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 });
+    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 }, { harness: "pi" });
     try {
       const projectA = pool.getBridge("/tmp/project-a");
       const projectB = pool.getBridge("/tmp/project-b");
@@ -24,7 +24,7 @@ describe("Pi BridgePool", () => {
   });
 
   test("getActiveBridgeForRoot returns null when bridge for root is not alive", () => {
-    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 });
+    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 }, { harness: "pi" });
     try {
       const projectA = pool.getBridge("/tmp/project-a");
       const projectB = pool.getBridge("/tmp/project-b");
@@ -40,7 +40,7 @@ describe("Pi BridgePool", () => {
   });
 
   test("root-scoped active lookup does not fall back to another project", () => {
-    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 });
+    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 }, { harness: "pi" });
     try {
       const projectA = pool.getBridge("/tmp/project-a");
       const projectB = pool.getBridge("/tmp/project-b");
@@ -54,7 +54,7 @@ describe("Pi BridgePool", () => {
   });
 
   test("trailing slash and backslash normalize to the same key", () => {
-    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 });
+    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 }, { harness: "pi" });
     try {
       const a = pool.getBridge("C:\\repo\\");
       const b = pool.getBridge("C:\\repo");
@@ -75,7 +75,7 @@ describe("Pi BridgePool", () => {
     const link = join(linkDir, "link");
     symlinkSync(real, link);
 
-    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 });
+    const pool = new BridgePool("/tmp/aft", { timeoutMs: 1_000 }, { harness: "pi" });
     try {
       const a = pool.getBridge(link);
       const b = pool.getBridge(`${link}/`);

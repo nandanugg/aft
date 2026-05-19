@@ -52,6 +52,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     if (Object.keys(configOverrides).length > 0) {
       await created.bridge.send("configure", {
         project_root: created.tempDir,
+        harness: "opencode",
         restrict_to_project_root: true,
         bash_permissions: false,
         storage_dir: join(created.tempDir, ".aft-storage"),
@@ -71,6 +72,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
         restrict_to_project_root: true,
         bash_permissions: true,
         storage_dir: join(h.tempDir, ".aft-storage"),
+        harness: "opencode",
         ...configOverrides,
       },
     );

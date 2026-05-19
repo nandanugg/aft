@@ -34,6 +34,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
         &json!({
             "id": "cfg-bg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "experimental_bash_background": true,
         })
@@ -402,6 +403,7 @@ fn background_feature_flag_disabled_rejects_spawn() {
         &json!({
             "id": "cfg-disabled",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path()
         })
         .to_string(),

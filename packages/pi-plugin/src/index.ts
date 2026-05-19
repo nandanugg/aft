@@ -571,6 +571,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
   };
   pool = new BridgePool(binaryPath, poolOptions, configOverrides);
+  pool.setConfigureOverride("harness", "pi");
   const ctx: PluginContext = { pool, config, storageDir };
 
   // Settle the ONNX runtime download promise (started above) and patch the

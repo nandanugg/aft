@@ -10,6 +10,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
         &json!({
             "id": "cfg-drain-bg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "experimental_bash_background": true,
         })

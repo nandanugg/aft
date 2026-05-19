@@ -123,6 +123,7 @@ async function executeRustGlobEdit(
   if (overrides) {
     const configured = await h.bridge.send("configure", {
       project_root: h.tempDir,
+      harness: "opencode",
       validate_on_edit: "syntax",
       ...overrides,
     });
@@ -202,6 +203,7 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       {
         project_root: h.tempDir,
         storage_dir: h.path(".storage"),
+        harness: "opencode",
         ...poolOverrides,
       },
     );
@@ -228,6 +230,7 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       {
         project_root: h.tempDir,
         storage_dir: h.path(".storage-edit"),
+        harness: "opencode",
         ...poolOverrides,
       },
     );
@@ -281,6 +284,7 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
       {
         project_root: h.tempDir,
         storage_dir: h.path(".storage-rust"),
+        harness: "opencode",
         ...overrides,
       },
     );

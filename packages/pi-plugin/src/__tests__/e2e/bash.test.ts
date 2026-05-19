@@ -75,6 +75,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
         project_root: h.tempDir,
         restrict_to_project_root: false,
         storage_dir: join(h.tempDir, ".aft-storage"),
+        harness: "pi",
         ...configOverrides,
       },
     );

@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
 
+use crate::backup::hash_session;
 use crate::backup::BackupStore;
 use crate::bash_background::{BgCompletion, BgTaskRegistry};
 use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
+use crate::harness::Harness;
 use crate::language::LanguageProvider;
 use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
@@ -281,6 +283,7 @@ pub struct AppContext {
     backup: RefCell<BackupStore>,
     checkpoint: RefCell<CheckpointStore>,
     config: RefCell<Config>,
+    pub harness: RefCell<Option<Harness>>,
     canonical_cache_root: RefCell<Option<PathBuf>>,
     is_worktree_bridge: RefCell<bool>,
     git_common_dir: RefCell<Option<PathBuf>>,
@@ -354,6 +357,7 @@ impl AppContext {
             backup: RefCell::new(BackupStore::new()),
             checkpoint: RefCell::new(CheckpointStore::new()),
             config: RefCell::new(config),
+            harness: RefCell::new(None),
             canonical_cache_root: RefCell::new(None),
             is_worktree_bridge: RefCell::new(false),
             git_common_dir: RefCell::new(None),
@@ -645,6 +649,46 @@ impl AppContext {
     /// Access the configuration (mutable borrow).
     pub fn config_mut(&self) -> RefMut<'_, Config> {
         self.config.borrow_mut()
+    }
+
+    pub fn set_harness(&self, harness: Harness) {
+        *self.harness.borrow_mut() = Some(harness);
+    }
+
+    pub fn harness(&self) -> Harness {
+        self.harness
+            .borrow()
+            .expect("harness set by configure before any tool call")
+    }
+
+    pub fn storage_dir(&self) -> PathBuf {
+        crate::bash_background::storage_dir(self.config().storage_dir.as_deref())
+    }
+
+    pub fn harness_dir(&self) -> PathBuf {
+        self.storage_dir().join(self.harness().as_str())
+    }
+
+    pub fn bash_tasks_dir(&self, session_id: &str) -> PathBuf {
+        self.harness_dir()
+            .join("bash-tasks")
+            .join(hash_session(session_id))
+    }
+
+    pub fn backups_dir(&self, session_id: &str, path_hash: &str) -> PathBuf {
+        self.harness_dir()
+            .join("backups")
+            .join(hash_session(session_id))
+            .join(path_hash)
+    }
+
+    pub fn filters_dir(&self) -> PathBuf {
+        self.harness_dir().join("filters")
+    }
+
+    /// HOST-GLOBAL — NOT under harness_dir. Read by trust.rs across both harnesses.
+    pub fn trust_file(&self) -> PathBuf {
+        self.storage_dir().join("trusted-filter-projects.json")
     }
 
     pub fn set_canonical_cache_root(&self, root: PathBuf) {
@@ -1200,6 +1244,88 @@ mod status_emitter_tests {
         let (ctx, rx) = ctx_with_frame_rx();
         drop(ctx);
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod harness_path_tests {
+    use super::*;
+    use crate::harness::Harness;
+    use crate::parser::TreeSitterProvider;
+
+    fn ctx_with_storage_and_harness(storage_dir: PathBuf, harness: Harness) -> AppContext {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.config_mut().storage_dir = Some(storage_dir);
+        ctx.set_harness(harness);
+        ctx
+    }
+
+    #[test]
+    fn harness_dir_resolves_correctly() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Pi);
+
+        assert_eq!(ctx.harness_dir(), storage.join("pi"));
+    }
+
+    #[test]
+    fn bash_tasks_dir_uses_hash_session() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Opencode);
+
+        assert_eq!(
+            ctx.bash_tasks_dir("ses_abc"),
+            storage
+                .join("opencode")
+                .join("bash-tasks")
+                .join(hash_session("ses_abc"))
+        );
+    }
+
+    #[test]
+    fn backups_dir_includes_path_hash() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Pi);
+
+        assert_eq!(
+            ctx.backups_dir("ses_abc", "pathhash"),
+            storage
+                .join("pi")
+                .join("backups")
+                .join(hash_session("ses_abc"))
+                .join("pathhash")
+        );
+    }
+
+    #[test]
+    fn filters_dir_under_harness() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Opencode);
+
+        assert_eq!(ctx.filters_dir(), storage.join("opencode").join("filters"));
+    }
+
+    #[test]
+    fn trust_file_is_host_global() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Pi);
+
+        assert_eq!(
+            ctx.trust_file(),
+            storage.join("trusted-filter-projects.json")
+        );
+    }
+
+    #[test]
+    fn same_session_different_harness_resolve_different_paths() {
+        let storage = PathBuf::from("/tmp/cortexkit/aft");
+        let opencode = ctx_with_storage_and_harness(storage.clone(), Harness::Opencode);
+        let pi = ctx_with_storage_and_harness(storage, Harness::Pi);
+
+        assert_ne!(
+            opencode.bash_tasks_dir("ses_same"),
+            pi.bash_tasks_dir("ses_same")
+        );
     }
 }
 

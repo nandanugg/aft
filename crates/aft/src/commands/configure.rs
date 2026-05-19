@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
 use crate::parser::{detect_language, LangId};
@@ -936,6 +937,25 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let params = req.params.get("params").unwrap_or(&req.params);
+    let harness = match params.get("harness") {
+        Some(raw) => match serde_json::from_value::<Harness>(raw.clone()) {
+            Ok(harness) => harness,
+            Err(_) => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "configure payload invalid field 'harness'; expected 'opencode' or 'pi'",
+                );
+            }
+        },
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "configure payload missing required field 'harness'; expected 'opencode' or 'pi'",
+            );
+        }
+    };
     let root = match params.get("project_root").and_then(|v| v.as_str()) {
         Some(r) => r,
         None => {
@@ -974,6 +994,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Set project root on config
     ctx.config_mut().project_root = Some(root_path.clone());
+    ctx.config_mut().harness = Some(harness);
+    ctx.set_harness(harness);
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
 
@@ -1884,8 +1906,65 @@ mod tests {
             command: "configure".to_string(),
             lsp_hints: None,
             session_id: None,
-            params: json!({ "project_root": project_root }),
+            params: json!({ "project_root": project_root, "harness": "opencode" }),
         }
+    }
+
+    fn configure_request_with_params(params: serde_json::Value) -> RawRequest {
+        RawRequest {
+            id: "cfg".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params,
+        }
+    }
+
+    #[test]
+    fn configure_without_harness_returns_invalid_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({ "project_root": temp.path() }));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "invalid_request");
+        assert_eq!(
+            response.data["message"],
+            "configure payload missing required field 'harness'; expected 'opencode' or 'pi'"
+        );
+    }
+
+    #[test]
+    fn configure_with_invalid_harness_returns_invalid_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "claude_code"
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "invalid_request");
+    }
+
+    #[test]
+    fn harness_set_on_appcontext_after_configure() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "pi"
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+
+        assert!(response.success);
+        assert_eq!(ctx.harness(), crate::harness::Harness::Pi);
+        assert_eq!(ctx.config().harness, Some(crate::harness::Harness::Pi));
     }
 
     #[test]

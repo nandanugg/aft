@@ -315,6 +315,7 @@ fn symlink_file_delete_is_rejected_with_project_restriction() {
     let configure = serde_json::json!({
         "id": "cfg-delete-single-symlink",
         "command": "configure",
+            "harness": "opencode",
         "project_root": dir.display().to_string(),
         "restrict_to_project_root": true,
     });

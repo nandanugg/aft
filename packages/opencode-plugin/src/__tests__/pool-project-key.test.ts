@@ -19,7 +19,7 @@ const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
  */
 describe("BridgePool project-key sharing", () => {
   test("same canonical project root collapses to one bridge entry", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       // Two different "session IDs" used to key the pool; with the new design
       // only the project root matters, so both calls must hit the same entry.
@@ -33,7 +33,7 @@ describe("BridgePool project-key sharing", () => {
   });
 
   test("different project roots get separate bridges", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       pool.getBridge("/tmp/project-one");
       pool.getBridge("/tmp/project-two");
@@ -44,7 +44,7 @@ describe("BridgePool project-key sharing", () => {
   });
 
   test("trailing separators normalize to the same key", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       const a = pool.getBridge("/tmp/project-trail");
       const b = pool.getBridge("/tmp/project-trail/");
@@ -63,7 +63,7 @@ describe("BridgePool project-key sharing", () => {
     const link = join(linkDir, "link");
     symlinkSync(real, link);
 
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       const viaLink = pool.getBridge(link);
       const viaReal = pool.getBridge(real);
@@ -76,7 +76,7 @@ describe("BridgePool project-key sharing", () => {
   });
 
   test("root-scoped active lookup does not fall back to another project", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       const projectA = pool.getBridge("/tmp/project-a");
       const projectB = pool.getBridge("/tmp/project-b");

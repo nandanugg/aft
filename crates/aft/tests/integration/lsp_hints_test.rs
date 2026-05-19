@@ -15,7 +15,7 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
     std::fs::copy(&fixture, &target).unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         dir.display()
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
@@ -46,7 +46,7 @@ fn edit_symbol_without_lsp_hints_returns_candidates() {
     let fixture = fixture_path("ambiguous.ts");
     let dir = fixture.parent().unwrap().parent().unwrap();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         dir.display()
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
@@ -83,7 +83,7 @@ fn edit_symbol_with_malformed_lsp_hints_falls_back() {
     let fixture = fixture_path("ambiguous.ts");
     let dir = fixture.parent().unwrap().parent().unwrap();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         dir.display()
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);
@@ -118,7 +118,7 @@ fn zoom_with_lsp_hints_disambiguates() {
     let fixture = fixture_path("ambiguous.ts");
     let dir = fixture.parent().unwrap().parent().unwrap();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         dir.display()
     ));
     assert_eq!(resp["success"], true, "configure failed: {:?}", resp);

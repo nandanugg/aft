@@ -73,7 +73,7 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 20_000 },
-      { storage_dir: join(h.tempDir, ".storage") },
+      { storage_dir: join(h.tempDir, ".storage"), harness: "opencode" },
     );
     pools.push(pool);
     return {

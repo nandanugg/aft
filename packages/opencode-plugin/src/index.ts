@@ -466,6 +466,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     },
   };
   const pool = new BridgePool(binaryPath, poolOptions, configOverrides);
+  pool.setConfigureOverride("harness", "opencode");
   const ctx: PluginContext = {
     pool,
     client: input.client,

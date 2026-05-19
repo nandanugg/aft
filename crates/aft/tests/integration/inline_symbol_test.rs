@@ -28,7 +28,7 @@ fn setup_inline_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(

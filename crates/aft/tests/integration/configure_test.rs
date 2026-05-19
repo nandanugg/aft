@@ -31,6 +31,7 @@ fn configure_accepts_boolean_validate_on_edit() {
         &json!({
             "id": "cfg-validate-bool",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "validate_on_edit": true,
         })
@@ -64,6 +65,7 @@ fn configure_warnings_frame_after_main_response() {
         &json!({
             "id": "cfg-warning-order",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["typescript-language-server"]
         })
@@ -92,6 +94,7 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
         &json!({
             "id": "cfg-missing-format-check",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path()
         })
         .to_string(),
@@ -132,6 +135,7 @@ fn configure_only_warns_for_languages_present() {
         &json!({
             "id": "cfg-language-present",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path()
         })
         .to_string(),
@@ -162,6 +166,7 @@ fn configure_warns_for_missing_builtin_and_custom_lsp_binaries() {
         &json!({
             "id": "cfg-missing-lsp",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["bash-language-server"],
             "lsp_servers": [{
@@ -213,6 +218,7 @@ fn configure_does_not_warn_for_file_discovered_non_auto_installable_lsp() {
         &json!({
             "id": "cfg-no-roslyn-warning",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["typescript-language-server"]
         })
@@ -250,6 +256,7 @@ fn configure_warns_for_file_discovered_auto_installable_lsp() {
         &json!({
             "id": "cfg-typescript-lsp-warning",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["typescript-language-server"]
         })
@@ -285,6 +292,7 @@ fn configure_warns_for_custom_lsp_regardless_of_auto_install_set() {
         &json!({
             "id": "cfg-custom-lsp-warning",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": [],
             "lsp_servers": [{
@@ -374,6 +382,7 @@ fn configure_suppresses_missing_lsp_warning_for_inflight_install() {
         &json!({
             "id": "cfg-typescript-lsp-inflight",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["typescript-language-server"],
             "lsp_inflight_installs": ["typescript-language-server"]
@@ -409,6 +418,7 @@ fn configure_accepts_custom_lsp_servers() {
         &json!({
             "id": "cfg-lsp-custom",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "experimental_lsp_ty": true,
             "lsp_servers": [{
@@ -448,6 +458,7 @@ fn configure_rejects_lsp_server_env_with_non_string_values() {
         &json!({
             "id": "cfg-lsp-bad-env",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_servers": [{
                 "id": "tinymist",
@@ -481,6 +492,7 @@ fn configure_rejects_malformed_lsp_servers() {
         &json!({
             "id": "cfg-lsp-bad",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_servers": [{
                 "id": "tinymist",
@@ -522,6 +534,7 @@ fn configure_accepts_lsp_paths_extra() {
         &json!({
             "id": "cfg-lsp-paths-extra",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_paths_extra": [
                 existing_bin,
@@ -551,6 +564,7 @@ fn configure_rejects_existing_file_lsp_paths_extra() {
         &json!({
             "id": "cfg-lsp-paths-file",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_paths_extra": [file],
         })
@@ -582,6 +596,7 @@ fn configure_rejects_malformed_lsp_paths_extra() {
         &json!({
             "id": "cfg-lsp-paths-not-array",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_paths_extra": "not-an-array",
         })
@@ -598,6 +613,7 @@ fn configure_rejects_malformed_lsp_paths_extra() {
         &json!({
             "id": "cfg-lsp-paths-empty",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_paths_extra": [""],
         })
@@ -614,6 +630,7 @@ fn configure_rejects_malformed_lsp_paths_extra() {
         &json!({
             "id": "cfg-lsp-paths-relative",
             "command": "configure",
+            "harness": "opencode",
             "project_root": dir.path(),
             "lsp_paths_extra": ["relative/path"],
         })

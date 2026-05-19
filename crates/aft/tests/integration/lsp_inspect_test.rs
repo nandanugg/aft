@@ -125,6 +125,7 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
         &json!({
             "id": "cfg-custom-lsp",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root,
             "lsp_paths_extra": [fake_bin_dir],
             "lsp_servers": [{

@@ -44,7 +44,7 @@ fn setup_move_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(
@@ -654,7 +654,7 @@ fn move_symbol_project_too_large() {
     // Configure with an artificially low cap so the 7+ file fixture trips the
     // guard. This asserts the guard fires BEFORE the move writes anything.
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -702,7 +702,7 @@ fn move_symbol_does_not_leak_export_keyword() {
     let mut aft = AftProcess::spawn();
     let root = tmp.path().display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -770,7 +770,7 @@ fn extract_function_preserves_enclosing_export_keyword() {
     let mut aft = AftProcess::spawn();
     let root = tmp.path().display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(resp["success"], true);

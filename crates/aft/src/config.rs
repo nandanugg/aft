@@ -1,13 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+use crate::harness::Harness;
+
 /// Runtime configuration for the aft process.
 ///
 /// Holds project-scoped settings and tuning knobs. Values are set at startup
 /// and remain immutable for the lifetime of the process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SemanticBackend {
     Fastembed,
+    #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     Ollama,
 }
@@ -31,7 +37,7 @@ impl SemanticBackend {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticBackendConfig {
     pub backend: SemanticBackend,
     pub model: String,
@@ -41,7 +47,7 @@ pub struct SemanticBackendConfig {
     pub max_batch_size: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserServerDef {
     pub id: String,
     pub extensions: Vec<String>,
@@ -76,7 +82,8 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
@@ -162,6 +169,9 @@ pub struct Config {
     /// Set by the plugin to the XDG-compliant path (e.g. ~/.local/share/opencode/storage/plugin/aft/).
     /// Falls back to ~/.cache/aft/ if not set.
     pub storage_dir: Option<PathBuf>,
+    /// Hosting harness identity supplied by configure.
+    #[serde(default)]
+    pub harness: Option<Harness>,
     /// Maximum number of (server, file) entries kept in the in-memory
     /// diagnostic cache. Older entries are evicted in LRU order when the
     /// cap is exceeded. Set to 0 to disable the cap entirely.
@@ -222,6 +232,7 @@ impl Default for Config {
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),
             storage_dir: None,
+            harness: None,
             diagnostic_cache_size: 5000,
         }
     }

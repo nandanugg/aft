@@ -116,9 +116,13 @@ describe("Structure tool round-trips", () => {
   let tmpDir: string | null = null;
 
   const createBridge = () => {
-    pool = new BridgePool(BINARY_PATH, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    pool = new BridgePool(
+      BINARY_PATH,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
     return pool;
   };
 

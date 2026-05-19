@@ -425,7 +425,7 @@ fn validate_on_edit_full_from_config_runs_checker() {
 
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-full","command":"configure","project_root":"{}","validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
+        r#"{{"id":"cfg-val-full","command":"configure","harness":"opencode","project_root":"{}","validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
         dir.display()
     ));
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
@@ -461,7 +461,7 @@ fn validate_on_edit_off_from_config_skips_checker() {
 
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-off","command":"configure","project_root":"{}","validate_on_edit":"off"}}"#,
+        r#"{{"id":"cfg-val-off","command":"configure","harness":"opencode","project_root":"{}","validate_on_edit":"off"}}"#,
         dir.display()
     ));
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);

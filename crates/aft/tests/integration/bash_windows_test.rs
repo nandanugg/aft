@@ -180,6 +180,7 @@ fn windows_cmd_background_wrapper_allows_bang_in_path() {
         &json!({
             "id":"cfg-win-bang",
             "command":"configure",
+            "harness":"opencode",
             "project_root": project,
             "storage_dir": storage,
             "experimental_bash_background": true,

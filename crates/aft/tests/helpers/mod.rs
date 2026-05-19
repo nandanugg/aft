@@ -248,6 +248,7 @@ impl AftProcess {
         let request = serde_json::json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": project_root.to_string_lossy(),
         });
         self.send(&request.to_string())

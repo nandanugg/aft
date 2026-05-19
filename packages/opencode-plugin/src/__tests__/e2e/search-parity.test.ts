@@ -285,6 +285,7 @@ async function configureBridge(
 ): Promise<void> {
   const response = await harness.bridge.send("configure", {
     project_root: harness.tempDir,
+    harness: "opencode",
     search_index: options.experimentalSearchIndex,
   });
 

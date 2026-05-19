@@ -77,6 +77,7 @@ fn write_rejects_paths_outside_the_configured_project_root() {
         &serde_json::to_string(&serde_json::json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "restrict_to_project_root": true,
         }))
@@ -249,6 +250,7 @@ fn delete_file_rejects_paths_outside_the_configured_project_root() {
         &serde_json::to_string(&serde_json::json!({
             "id": "cfg",
             "command": "configure",
+            "harness": "opencode",
             "project_root": root.display().to_string(),
             "restrict_to_project_root": true,
         }))

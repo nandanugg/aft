@@ -10,7 +10,7 @@ use tempfile::tempdir;
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
     let resp = aft.send(&format!(
-        r#"{{"id":"configure","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"configure","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root.display()
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
@@ -24,7 +24,7 @@ fn callgraph_configure_sets_project_root() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -47,7 +47,7 @@ fn callgraph_configure_sets_project_root() {
 fn callgraph_configure_missing_param() {
     let mut aft = AftProcess::spawn();
 
-    let resp = aft.send(r#"{"id":"1","command":"configure"}"#);
+    let resp = aft.send(r#"{"id":"1","command":"configure","harness":"opencode"}"#);
 
     assert_eq!(resp["success"], false);
     assert_eq!(resp["code"], "invalid_request");
@@ -79,7 +79,7 @@ fn callgraph_cross_file_tree() {
 
     // Configure first
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -171,7 +171,7 @@ fn callgraph_depth_limit_truncates() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -207,7 +207,7 @@ fn callgraph_unknown_symbol_error() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -234,7 +234,7 @@ fn callgraph_aliased_import_resolution() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -296,7 +296,7 @@ fn callgraph_callers_cross_file() {
 
     // Configure first
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -356,7 +356,7 @@ fn callgraph_callers_empty_result() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -385,7 +385,7 @@ fn callgraph_callers_recursive() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -462,7 +462,7 @@ export function runWorkspaceImport(): string {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root_display
     ));
     assert_eq!(
@@ -604,7 +604,7 @@ export function registerPiReadingTools(): string {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root_display
     ));
     assert_eq!(
@@ -703,7 +703,7 @@ export function runWorkspaceImport(): string {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root_display
     ));
     assert_eq!(
@@ -799,7 +799,7 @@ test("calls target", () => {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root_display
     ));
     assert_eq!(
@@ -867,7 +867,7 @@ export function render(): unknown {
     let mut aft = AftProcess::spawn();
     let root_display = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root_display
     ));
     assert_eq!(
@@ -1381,7 +1381,7 @@ fn callgraph_trace_to_symbol_not_found() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -1411,7 +1411,7 @@ fn callgraph_trace_to_single_path() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -1471,7 +1471,7 @@ fn callgraph_trace_to_multi_path() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -1539,7 +1539,7 @@ fn callgraph_trace_to_no_entry_points() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -1595,7 +1595,7 @@ fn callgraph_default_import_targets_real_default_export_name() {
     let mut aft = AftProcess::spawn();
     let root_str = root.display().to_string();
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root_str
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
@@ -1713,7 +1713,7 @@ fn callgraph_watcher_add_caller() {
 
     // Configure with temp dir
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(
@@ -1800,7 +1800,7 @@ fn callgraph_watcher_remove_caller() {
 
     // Configure with temp dir
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(
@@ -1906,7 +1906,7 @@ fn callgraph_impact_symbol_not_found() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -1939,7 +1939,7 @@ fn callgraph_impact_multi_caller() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -2062,7 +2062,7 @@ fn callgraph_trace_data_symbol_not_found() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -2096,7 +2096,7 @@ fn callgraph_trace_data_assignment_tracking() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -2154,7 +2154,7 @@ fn callgraph_trace_data_cross_file() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -2224,7 +2224,7 @@ fn callgraph_trace_data_approximation() {
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -2276,7 +2276,7 @@ fn callgraph_navigation_rejects_paths_outside_project_root() {
     let outside_path = outside_file.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
@@ -2333,7 +2333,7 @@ fn callgraph_configure_small_repo_does_not_flag_exceeds() {
 
     // Default cap is 20_000; the 9-file fixture is nowhere near it.
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root
     ));
 
@@ -2366,7 +2366,7 @@ fn callgraph_configure_reports_source_file_count_exceeds_max() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
         root
     ));
 
@@ -2393,7 +2393,7 @@ fn callgraph_callers_project_too_large() {
 
     // Configure with cap=1 so the 9-file fixture trips the guard.
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -2424,7 +2424,7 @@ fn callgraph_trace_to_project_too_large() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -2448,7 +2448,7 @@ fn callgraph_impact_project_too_large() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -2472,7 +2472,7 @@ fn callgraph_trace_data_project_too_large() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":1}}"#,
         root
     ));
     assert_eq!(resp["success"], true);
@@ -2498,7 +2498,7 @@ fn callgraph_configure_rejects_zero_max_callgraph_files() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":0}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":0}}"#,
         root
     ));
 
@@ -2522,7 +2522,7 @@ fn callgraph_configure_rejects_negative_max_callgraph_files() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":-5}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":-5}}"#,
         root
     ));
 
@@ -2541,7 +2541,7 @@ fn callgraph_configure_accepts_positive_max_callgraph_files() {
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":42}}"#,
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":42}}"#,
         root
     ));
 
@@ -2580,7 +2580,7 @@ fn callgraph_configure_rejects_non_integer_max_callgraph_files_payloads() {
     for (label, payload) in rejected_payloads {
         let mut aft = AftProcess::spawn();
         let resp = aft.send(&format!(
-            r#"{{"id":"1","command":"configure","project_root":"{}","max_callgraph_files":{}}}"#,
+            r#"{{"id":"1","command":"configure","harness":"opencode","project_root":"{}","max_callgraph_files":{}}}"#,
             root, payload
         ));
 

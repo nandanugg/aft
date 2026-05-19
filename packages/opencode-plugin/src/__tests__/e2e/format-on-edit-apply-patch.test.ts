@@ -83,7 +83,7 @@ async function createToolHarness(
   const pool = new BridgePool(
     h.binaryPath,
     { timeoutMs: 20_000 },
-    { storage_dir: join(h.tempDir, ".storage"), ...configOverrides },
+    { storage_dir: join(h.tempDir, ".storage"), harness: "opencode", ...configOverrides },
   );
   return {
     h,

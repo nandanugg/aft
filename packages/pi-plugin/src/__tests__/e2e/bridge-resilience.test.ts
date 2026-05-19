@@ -160,7 +160,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
     const pool = new BridgePool(
       preparedBinary.binaryPath,
       { timeoutMs: 10_000, maxRestarts: 0 },
-      { search_index: false },
+      { search_index: false, harness: "pi" },
     );
     extraPools.push(pool);
 

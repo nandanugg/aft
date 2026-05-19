@@ -508,7 +508,7 @@ fn transaction_returns_inline_lsp_diagnostics_when_requested() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-txn-inline","command":"configure","project_root":"{}"}}"#,
+        r#"{{"id":"cfg-txn-inline","command":"configure","harness":"opencode","project_root":"{}"}}"#,
         root.display()
     ));
     assert_eq!(

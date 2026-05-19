@@ -64,6 +64,7 @@ pub mod extract;
 pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;
+pub mod harness;
 pub mod imports;
 pub mod indent;
 pub mod language;

@@ -23,9 +23,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("spawns binary and ping returns pong", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     const response = await bridge.send("ping");
 
@@ -36,12 +41,17 @@ describe("BinaryBridge lifecycle", () => {
 
   test("parses pushed bash_completed frames without request correlation", async () => {
     const completions: unknown[] = [];
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      onBashCompletion: (completion) => {
-        completions.push(completion);
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onBashCompletion: (completion) => {
+          completions.push(completion);
+        },
       },
-    });
+      { harness: "opencode" },
+    );
 
     (bridge as any).onStdoutData(
       `${JSON.stringify({
@@ -68,12 +78,17 @@ describe("BinaryBridge lifecycle", () => {
 
   test("routes pushed configure_warnings frames with session_id to the warning handler", async () => {
     const deliveries: unknown[] = [];
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      onConfigureWarnings: (context) => {
-        deliveries.push(context);
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
       },
-    });
+      { harness: "opencode" },
+    );
 
     (bridge as any).onStdoutData(
       `${JSON.stringify({
@@ -112,12 +127,17 @@ describe("BinaryBridge lifecycle", () => {
 
   test("handles pushed configure_warnings frames with missing session_id gracefully", async () => {
     const deliveries: unknown[] = [];
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      onConfigureWarnings: (context) => {
-        deliveries.push(context);
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
       },
-    });
+      { harness: "opencode" },
+    );
 
     expect(() => {
       (bridge as any).onStdoutData(
@@ -159,12 +179,17 @@ describe("BinaryBridge lifecycle", () => {
     const deliveries: unknown[] = [];
     const clientA = { name: "client-a" };
     const clientB = { name: "client-b" };
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      onConfigureWarnings: (context) => {
-        deliveries.push(context);
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
       },
-    });
+      { harness: "opencode" },
+    );
     (bridge as any).configureWarningClients.set("session-a", clientA);
     (bridge as any).configureWarningClients.set("session-b", clientB);
 
@@ -192,9 +217,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("multiple sequential requests return correct responses (ID correlation)", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     // Send multiple requests sequentially — each gets a unique ID internally
     const r1 = await bridge.send("ping");
@@ -218,10 +248,15 @@ describe("BinaryBridge lifecycle", () => {
     // Issue #14: SIGKILL/SIGTERM are external kills, not crashes — we explicitly
     // do NOT auto-restart to avoid process avalanches when many bridges receive
     // SIGTERM together. Recovery still works: the next send() lazy-spawns.
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      maxRestarts: 3,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        maxRestarts: 3,
+      },
+      { harness: "opencode" },
+    );
 
     // First request to ensure the process is running
     const r1 = await bridge.send("ping");
@@ -243,9 +278,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("shutdown cleans up child process (no orphans)", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     // Ensure process is alive
     const r = await bridge.send("ping");
@@ -264,10 +304,15 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("request to dead bridge after max retries rejects with error", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      maxRestarts: 0, // no restarts allowed
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        maxRestarts: 0, // no restarts allowed
+      },
+      { harness: "opencode" },
+    );
 
     // Start the process
     const r = await bridge.send("ping");
@@ -296,9 +341,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("multiple parallel first calls share one configure (no race)", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     // Fire 5 requests in parallel — all arrive before configure completes.
     // Before the shared-promise fix, the 4th+ call would hit the depth limit.
@@ -322,13 +372,18 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("bridge death during version check prevents configured=true", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      // Set a minVersion so checkVersion actually sends a "version" command
-      minVersion: "0.0.1",
-      // Disable auto-restart so the killed process stays dead
-      maxRestarts: 0,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        // Set a minVersion so checkVersion actually sends a "version" command
+        minVersion: "0.0.1",
+        // Disable auto-restart so the killed process stays dead
+        maxRestarts: 0,
+      },
+      { harness: "opencode" },
+    );
 
     // Intercept checkVersion to kill the process mid-flight.
     // We monkey-patch the private checkVersion method to simulate a crash
@@ -379,10 +434,15 @@ describe("BinaryBridge lifecycle", () => {
     );
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000, // must exceed the fake binary's sleep
-        maxRestarts: 0, // force straight to the "giving up" path
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000, // must exceed the fake binary's sleep
+          maxRestarts: 0, // force straight to the "giving up" path
+        },
+        { harness: "opencode" },
+      );
 
       let caught: Error | null = null;
       try {
@@ -415,10 +475,15 @@ describe("BinaryBridge lifecycle", () => {
     await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000, // bridge-wide default
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000, // bridge-wide default
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       const start = Date.now();
       // Use "version" to skip the auto-configure path (configure/version are
@@ -448,10 +513,15 @@ describe("BinaryBridge lifecycle", () => {
     await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       // First request: timeout with keepBridgeOnTimeout — should reject without
       // killing the bridge.
@@ -495,9 +565,14 @@ describe("BinaryBridge lifecycle", () => {
     );
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       await expect(bridge.send("foo", { id: "evil" })).rejects.toThrow(
         "params cannot contain reserved key 'id'",
@@ -525,10 +600,15 @@ describe("BinaryBridge lifecycle", () => {
     }) as typeof setTimeout;
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 30_000,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 30_000,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       const err = await bridge.send("version", {}, { transportTimeoutMs: 60_000 }).catch((e) => e);
 
@@ -542,10 +622,15 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("restart counter decays even after max restarts is reached", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      maxRestarts: 1,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        maxRestarts: 1,
+      },
+      { harness: "opencode" },
+    );
     const originalResetMs = (BinaryBridge as any).RESTART_RESET_MS;
 
     try {
@@ -568,10 +653,15 @@ describe("BinaryBridge lifecycle", () => {
 
     let staleChild: ChildProcess | null = null;
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: TEST_TIMEOUT_MS,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       (bridge as any).spawnProcess();
       staleChild = (bridge as any).process as ChildProcessWithoutNullStreams;
@@ -614,10 +704,15 @@ describe("BinaryBridge lifecycle", () => {
     );
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       // Spawn the process so stderr starts streaming. We don't wait on a
       // response — the fake binary doesn't speak NDJSON.

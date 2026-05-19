@@ -154,6 +154,7 @@ maybeDescribe("e2e format_on_edit write tools", () => {
   ): Promise<Record<string, unknown>> {
     return await h.bridge.send("configure", {
       project_root: h.tempDir,
+      harness: "opencode",
       validate_on_edit: "syntax",
       ...overrides,
     });

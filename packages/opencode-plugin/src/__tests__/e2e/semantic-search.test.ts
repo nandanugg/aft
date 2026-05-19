@@ -82,6 +82,7 @@ maybeDescribe("e2e semantic search tool", () => {
       {
         semantic_search: options?.experimentalSemanticSearch ?? false,
         storage_dir: join(harness.tempDir, ".storage"),
+        harness: "opencode",
       },
     );
     pools.push(pool);

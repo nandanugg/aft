@@ -58,9 +58,13 @@ describe("Tool round-trips", () => {
 
   // Fresh pool per test — each test is independent
   const createBridge = () => {
-    pool = new BridgePool(BINARY_PATH, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    pool = new BridgePool(
+      BINARY_PATH,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
     return pool;
   };
 
@@ -404,9 +408,13 @@ describe("move_symbol round-trip", () => {
   test(
     "aft_move_symbol moves a function and rewires consumer import",
     async () => {
-      pool = new BridgePool(BINARY_PATH, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      pool = new BridgePool(
+        BINARY_PATH,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       // Create temp project with source, consumer, and destination
       tmpDir = await mkdtemp(resolve(tmpdir(), "aft-move-"));
@@ -492,9 +500,13 @@ describe("extract_function round-trip", () => {
   test(
     "aft_extract_function extracts code range into a new function with parameters",
     async () => {
-      pool = new BridgePool(BINARY_PATH, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      pool = new BridgePool(
+        BINARY_PATH,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       tmpDir = await mkdtemp(resolve(tmpdir(), "aft-extract-"));
       sdkCtx = createMockSdkContext(tmpDir);
@@ -553,9 +565,13 @@ describe("inline_symbol round-trip", () => {
   test(
     "aft_inline_symbol inlines a function call and returns substitution info",
     async () => {
-      pool = new BridgePool(BINARY_PATH, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      pool = new BridgePool(
+        BINARY_PATH,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       tmpDir = await mkdtemp(resolve(tmpdir(), "aft-inline-"));
       sdkCtx = createMockSdkContext(tmpDir);

@@ -126,6 +126,7 @@ async function installPreset(h: Harness, preset: FormatPreset, shims: FakeFormat
   }
   const configureParams: Record<string, unknown> = {
     project_root: h.tempDir,
+    harness: "pi",
     format_on_edit: true,
     validate_on_edit: "syntax",
   };

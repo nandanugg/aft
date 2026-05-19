@@ -263,6 +263,7 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     const h = await formatHarness(formatterPreset("biome"), [countingTsShim(), rustFormatShim()]);
     await h.bridge.send("configure", {
       project_root: h.tempDir,
+      harness: "opencode",
       format_on_edit: true,
       formatter: { typescript: "biome", rust: "rustfmt" },
     });
