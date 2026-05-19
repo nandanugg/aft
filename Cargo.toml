@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/aft"]
+members = ["crates/aft", "crates/aft-tokenizer"]
 
 [profile.release]
 lto = true
