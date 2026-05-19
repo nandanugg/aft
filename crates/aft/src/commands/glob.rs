@@ -46,9 +46,12 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
     let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
-        Some(path) => match resolve_path_or_multi(path, &project_root, |candidate| {
-            ctx.validate_path(&req.id, candidate)
-        }) {
+        Some(path) => match resolve_path_or_multi(
+            path,
+            &project_root,
+            |candidate| ctx.validate_path(&req.id, candidate),
+            &req.id,
+        ) {
             Ok(SearchPathResolution::Single(root)) => vec![root],
             Ok(SearchPathResolution::Multi(roots)) => roots,
             Err(resp) => return resp,

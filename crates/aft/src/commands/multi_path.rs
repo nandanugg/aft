@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::protocol::Response;
 use crate::search_index::resolve_search_scope;
 
+#[derive(Debug)]
 pub(crate) enum SearchPathResolution {
     Single(PathBuf),
     Multi(Vec<PathBuf>),
@@ -12,6 +13,7 @@ pub(crate) fn resolve_path_or_multi<F>(
     raw: &str,
     project_root: &Path,
     validate: F,
+    req_id: &str,
 ) -> Result<SearchPathResolution, Response>
 where
     F: Fn(&Path) -> Result<PathBuf, Response>,
@@ -28,11 +30,20 @@ where
     }
 
     let mut roots = Vec::with_capacity(fragments.len());
-    for fragment in fragments {
+    for fragment in &fragments {
         let validated = validate(Path::new(fragment))?;
         let root = search_root(project_root, &validated);
         if !root.exists() {
-            return Ok(SearchPathResolution::Single(single_root));
+            return Err(Response::error(
+                req_id,
+                "path_not_found",
+                format!(
+                    "path does not exist: {} (interpreted as one of {} space-separated paths; \
+                     if this was meant as a single path containing a space, quote it)",
+                    root.display(),
+                    fragments.len(),
+                ),
+            ));
         }
         roots.push(root);
     }
@@ -76,4 +87,29 @@ pub(crate) fn canonical_key(path: &Path) -> PathBuf {
 fn search_root(project_root: &Path, validated: &Path) -> PathBuf {
     let path = validated.to_string_lossy();
     resolve_search_scope(project_root, Some(path.as_ref())).root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_path_reports_missing_fragment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = temp.path().to_path_buf();
+        std::fs::create_dir(project_root.join("src")).expect("create src");
+        assert!(!project_root.join("does-not-exist").exists());
+
+        let result = resolve_path_or_multi(
+            "src does-not-exist",
+            &project_root,
+            |candidate| Ok(candidate.to_path_buf()),
+            "test-id",
+        );
+
+        let err = result.expect_err("missing fragment should return an error");
+        let body = serde_json::to_value(err).expect("serialize response");
+        assert!(body.to_string().contains("path_not_found"));
+        assert!(body.to_string().contains("does-not-exist"));
+    }
 }

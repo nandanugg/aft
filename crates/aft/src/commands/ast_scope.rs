@@ -69,9 +69,12 @@ fn resolve_roots(
 
     let mut roots = Vec::new();
     for path in paths {
-        match resolve_path_or_multi(path, project_root, |candidate| {
-            ctx.validate_path(req_id, candidate)
-        })? {
+        match resolve_path_or_multi(
+            path,
+            project_root,
+            |candidate| ctx.validate_path(req_id, candidate),
+            req_id,
+        )? {
             SearchPathResolution::Single(root) => roots.push(SearchRoot {
                 path: root,
                 label: Some(path.clone()),
