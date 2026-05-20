@@ -42,7 +42,7 @@ send_commands() {
     # Build configure params
     local configure_params
     configure_params=$(cat <<CONF
-{"project_root":"${PROJECT_DIR}","experimental_semantic_search":true${extra_configure_params:+,$extra_configure_params}}
+{"harness":"opencode","project_root":"${PROJECT_DIR}","experimental_semantic_search":true${extra_configure_params:+,$extra_configure_params}}
 CONF
     )
 
@@ -188,7 +188,7 @@ local_outline_cmd='{"id":"2","command":"outline","params":{"file":"main.py"}}'
 exit_code=0
 timeout 10 bash -c "
     printf '%s\n%s\n' \
-        '{\"id\":\"1\",\"command\":\"configure\",\"params\":{\"project_root\":\"${PROJECT_DIR}\"}}' \
+        '{\"id\":\"1\",\"command\":\"configure\",\"params\":{\"harness\":\"opencode\",\"project_root\":\"${PROJECT_DIR}\"}}' \
         '${local_outline_cmd}' \
     | /usr/local/bin/aft
 " 2>/dev/null || exit_code=$?

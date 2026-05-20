@@ -431,6 +431,7 @@ function Invoke-AftBgBashScenario {
         $configure = @{
             id = "bg-configure"
             command = "configure"
+            harness = "opencode"
             project_root = $ProjectDir
             experimental_bash_background = $true
         } | ConvertTo-Json -Compress
@@ -552,6 +553,7 @@ function Invoke-AftNdjsonScenario {
         $configure = @{
             id = "bg-configure"
             command = "configure"
+            harness = "opencode"
             project_root = $ProjectDir
             experimental_bash_background = $true
         } | ConvertTo-Json -Compress
