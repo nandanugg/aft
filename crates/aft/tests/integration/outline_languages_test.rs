@@ -31,6 +31,14 @@ fn outline_text(aft: &mut AftProcess, file: &Path) -> String {
     resp["text"].as_str().expect("outline text").to_string()
 }
 
+fn assert_symbol_kind(text: &str, kind: &str, name: &str) {
+    assert!(
+        text.lines()
+            .any(|line| { line.split_whitespace().nth(1) == Some(kind) && line.contains(name) }),
+        "missing {kind} symbol {name} in outline: {text}"
+    );
+}
+
 #[test]
 fn outline_c_header_symbols_include_macros_types_and_prototypes() {
     let dir = TempDir::new().unwrap();
@@ -222,6 +230,290 @@ object Module {
         !text.contains("Ordering[Int]"),
         "anonymous given should be skipped: {text}"
     );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_java_symbols_include_types_members_and_fields() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "src/main/java/demo/Greeter.java",
+        r#"package demo;
+
+public class Greeter {
+    private String name;
+
+    public Greeter(String name) {
+        this.name = name;
+    }
+
+    public String greet(String who) {
+        return "Hi " + who;
+    }
+}
+
+interface Named {
+    String name();
+}
+
+enum Color { RED, GREEN }
+
+record Point(int x, int y) {}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "cls", "Greeter");
+    assert_symbol_kind(&text, "var", "name");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "ifc", "Named");
+    assert_symbol_kind(&text, "enum", "Color");
+    assert_symbol_kind(&text, "st", "Point");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_ruby_symbols_include_modules_classes_methods_and_constants() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "lib/demo/greeter.rb",
+        r#"module Demo
+  class Greeter
+    DEFAULT_NAME = "world"
+
+    def initialize(name)
+      @name = name
+    end
+
+    def greet(who)
+      "Hi #{who}"
+    end
+
+    def self.build
+      new(DEFAULT_NAME)
+    end
+  end
+end
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "cls", "Demo");
+    assert_symbol_kind(&text, "cls", "Greeter");
+    assert_symbol_kind(&text, "var", "DEFAULT_NAME");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "mth", "build");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_kotlin_symbols_include_classes_functions_properties_and_typealiases() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "src/main/kotlin/demo/Greeter.kt",
+        r#"package demo
+
+class Greeter(val name: String) {
+    fun greet(who: String): String = "Hi $who"
+    val label: String = name
+}
+
+fun helper(): Greeter = Greeter("world")
+
+typealias Name = String
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "cls", "Greeter");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "var", "label");
+    assert_symbol_kind(&text, "fn", "helper");
+    assert_symbol_kind(&text, "type", "Name");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_swift_symbols_include_types_protocols_functions_and_properties() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "Sources/Demo/Greeter.swift",
+        r#"struct Greeter {
+    let name: String
+
+    func greet(_ who: String) -> String {
+        return "Hi \(who)"
+    }
+}
+
+class Service {
+    func run() {}
+}
+
+protocol Named {
+    func name() -> String
+}
+
+enum Color { case red, green }
+
+typealias Name = String
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "st", "Greeter");
+    assert_symbol_kind(&text, "var", "name");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "cls", "Service");
+    assert_symbol_kind(&text, "ifc", "Named");
+    assert_symbol_kind(&text, "enum", "Color");
+    assert_symbol_kind(&text, "type", "Name");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_php_symbols_include_namespaces_types_functions_methods_and_properties() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "src/Greeter.php",
+        r#"<?php
+namespace Demo;
+
+interface Named {
+    public function name(): string;
+}
+
+trait Logs {
+    public function log(string $msg): void {}
+}
+
+class Greeter {
+    private string $name;
+
+    public function greet(string $who): string {
+        return "Hi $who";
+    }
+}
+
+function helper(): void {}
+
+enum Color { case Red; case Green; }
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "cls", "Demo");
+    assert_symbol_kind(&text, "ifc", "Named");
+    assert_symbol_kind(&text, "ifc", "Logs");
+    assert_symbol_kind(&text, "cls", "Greeter");
+    assert_symbol_kind(&text, "var", "name");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "fn", "helper");
+    assert_symbol_kind(&text, "enum", "Color");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_lua_symbols_include_module_tables_functions_and_methods() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "lua/demo/greeter.lua",
+        r#"local M = {}
+
+function M.greet(name)
+  return "Hi " .. name
+end
+
+function M:run()
+end
+
+local function helper()
+end
+
+return M
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "var", "M");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "mth", "run");
+    assert_symbol_kind(&text, "fn", "helper");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn outline_perl_symbols_include_packages_subroutines_constants_and_variables() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "lib/Demo/Greeter.pm",
+        r#"package Demo::Greeter;
+
+use constant DEFAULT_NAME => 'world';
+
+sub new {
+    my ($class, $name) = @_;
+    bless { name => $name }, $class;
+}
+
+sub greet {
+    my ($self, $who) = @_;
+    return "Hi $who";
+}
+
+my $counter = 0;
+1;
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &file);
+
+    assert_symbol_kind(&text, "cls", "Demo::Greeter");
+    assert_symbol_kind(&text, "var", "DEFAULT_NAME");
+    assert_symbol_kind(&text, "mth", "new");
+    assert_symbol_kind(&text, "mth", "greet");
+    assert_symbol_kind(&text, "var", "$counter");
 
     let status = aft.shutdown();
     assert!(status.success());

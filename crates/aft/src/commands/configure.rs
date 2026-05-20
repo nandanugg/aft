@@ -483,6 +483,13 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Vue => "vue",
         LangId::Json => "json",
         LangId::Scala => "scala",
+        LangId::Java => "java",
+        LangId::Ruby => "ruby",
+        LangId::Kotlin => "kotlin",
+        LangId::Swift => "swift",
+        LangId::Php => "php",
+        LangId::Lua => "lua",
+        LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
     }
@@ -619,7 +626,14 @@ fn formatter_candidates(
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => Vec::new(),
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => Vec::new(),
         LangId::Html | LangId::Markdown => Vec::new(),
     }
 }
@@ -678,7 +692,14 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => Vec::new(),
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => Vec::new(),
         LangId::Html | LangId::Markdown => Vec::new(),
     }
 }

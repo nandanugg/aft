@@ -39,13 +39,20 @@ impl IndentStyle {
             | LangId::JavaScript
             | LangId::Vue
             | LangId::Json
-            | LangId::Scala => IndentStyle::Spaces(2),
+            | LangId::Scala
+            | LangId::Ruby
+            | LangId::Lua => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {
                 IndentStyle::Spaces(4)
             }
-            LangId::Solidity => IndentStyle::Spaces(4),
+            LangId::Solidity
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Swift
+            | LangId::Php
+            | LangId::Perl => IndentStyle::Spaces(4),
             LangId::Html => IndentStyle::Spaces(2),
             LangId::Markdown => IndentStyle::Spaces(4),
         }

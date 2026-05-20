@@ -432,6 +432,13 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Vue => "vue",
         LangId::Json => "json",
         LangId::Scala => "scala",
+        LangId::Java => "java",
+        LangId::Ruby => "ruby",
+        LangId::Kotlin => "kotlin",
+        LangId::Swift => "swift",
+        LangId::Php => "php",
+        LangId::Lua => "lua",
+        LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
     }
@@ -574,7 +581,14 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => Vec::new(),
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
     }
@@ -677,7 +691,14 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => Vec::new(),
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
     }
@@ -890,6 +911,13 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Vue => "aft-tool-detection.vue",
         LangId::Json => "aft-tool-detection.json",
         LangId::Scala => "aft-tool-detection.scala",
+        LangId::Java => "aft-tool-detection.java",
+        LangId::Ruby => "aft-tool-detection.rb",
+        LangId::Kotlin => "aft-tool-detection.kt",
+        LangId::Swift => "aft-tool-detection.swift",
+        LangId::Php => "aft-tool-detection.php",
+        LangId::Lua => "aft-tool-detection.lua",
+        LangId::Perl => "aft-tool-detection.pl",
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",
     };

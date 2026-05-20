@@ -1,5 +1,6 @@
 #![allow(
     clippy::collapsible_if,
+    clippy::collapsible_match,
     clippy::double_ended_iterator_last,
     clippy::int_plus_one,
     clippy::large_enum_variant,
@@ -11,6 +12,7 @@
     clippy::manual_strip,
     clippy::manual_unwrap_or_default,
     clippy::map_clone,
+    clippy::iter_kv_map,
     clippy::needless_borrow,
     clippy::needless_borrows_for_generic_args,
     clippy::needless_range_loop,
@@ -23,6 +25,7 @@
     clippy::single_match,
     clippy::too_many_arguments,
     clippy::type_complexity,
+    clippy::unnecessary_sort_by,
     clippy::unnecessary_cast,
     clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_map_or

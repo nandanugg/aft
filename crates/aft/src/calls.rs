@@ -20,6 +20,25 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         LangId::Python => vec!["call"],
         LangId::Rust => vec!["call_expression", "macro_invocation"],
         LangId::Solidity | LangId::Scala => vec!["call_expression"],
+        LangId::Java => vec!["method_invocation"],
+        LangId::Ruby => vec!["call"],
+        LangId::Kotlin | LangId::Swift => vec!["call_expression"],
+        LangId::Php => vec![
+            "function_call_expression",
+            "member_call_expression",
+            "nullsafe_member_call_expression",
+            "scoped_call_expression",
+        ],
+        LangId::Perl => vec![
+            "call_expression_recursive",
+            "call_expression_with_args_with_brackets",
+            "call_expression_with_bareword",
+            "call_expression_with_spaced_args",
+            "call_expression_with_sub",
+            "call_expression_with_variable",
+            "method_invocation",
+        ],
+        LangId::Lua => vec!["function_call"],
         LangId::C
         | LangId::Cpp
         | LangId::Zig

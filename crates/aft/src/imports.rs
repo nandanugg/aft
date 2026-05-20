@@ -182,7 +182,14 @@ pub fn parse_imports(source: &str, tree: &Tree, lang: LangId) -> ImportBlock {
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => ImportBlock::empty(),
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => ImportBlock::empty(),
         LangId::Html | LangId::Markdown => ImportBlock::empty(),
     }
 }
@@ -428,7 +435,14 @@ pub fn generate_import_line_with_namespace(
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => String::new(),
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => String::new(),
         LangId::Html | LangId::Markdown => String::new(),
     }
 }
@@ -470,7 +484,14 @@ pub fn classify_group(lang: LangId, module_path: &str) -> ImportGroup {
         | LangId::Solidity
         | LangId::Vue
         | LangId::Json
-        | LangId::Scala => ImportGroup::External,
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl => ImportGroup::External,
         LangId::Html | LangId::Markdown => ImportGroup::External,
     }
 }

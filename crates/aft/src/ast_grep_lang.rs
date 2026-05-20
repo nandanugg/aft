@@ -28,6 +28,13 @@ pub enum AstGrepLang {
     Solidity,
     Vue,
     Json,
+    Java,
+    Ruby,
+    Kotlin,
+    Swift,
+    Php,
+    Lua,
+    Perl,
 }
 
 impl AstGrepLang {
@@ -47,6 +54,13 @@ impl AstGrepLang {
             LangId::Solidity => Some(Self::Solidity),
             LangId::Vue => Some(Self::Vue),
             LangId::Json => Some(Self::Json),
+            LangId::Java => Some(Self::Java),
+            LangId::Ruby => Some(Self::Ruby),
+            LangId::Kotlin => Some(Self::Kotlin),
+            LangId::Swift => Some(Self::Swift),
+            LangId::Php => Some(Self::Php),
+            LangId::Lua => Some(Self::Lua),
+            LangId::Perl => Some(Self::Perl),
             LangId::Scala => None,
             LangId::Bash => None, // ast-grep doesn't support Bash
             // Markdown, CSS, HTML etc. don't have meaningful AST patterns
@@ -70,6 +84,13 @@ impl AstGrepLang {
             "solidity" | "sol" => Some(Self::Solidity),
             "vue" => Some(Self::Vue),
             "json" | "jsonc" => Some(Self::Json),
+            "java" => Some(Self::Java),
+            "ruby" | "rb" => Some(Self::Ruby),
+            "kotlin" | "kt" | "kts" => Some(Self::Kotlin),
+            "swift" => Some(Self::Swift),
+            "php" => Some(Self::Php),
+            "lua" => Some(Self::Lua),
+            "perl" | "pl" | "pm" => Some(Self::Perl),
             _ => None,
         }
     }
@@ -90,6 +111,13 @@ impl AstGrepLang {
             Self::Solidity => &["sol"],
             Self::Vue => &["vue"],
             Self::Json => &["json", "jsonc"],
+            Self::Java => &["java"],
+            Self::Ruby => &["rb"],
+            Self::Kotlin => &["kt", "kts"],
+            Self::Swift => &["swift"],
+            Self::Php => &["php"],
+            Self::Lua => &["lua"],
+            Self::Perl => &["pl", "pm", "t"],
         }
     }
 
@@ -163,9 +191,19 @@ impl Language for AstGrepLang {
             // breaks pattern parsing (µ is not in the Solidity identifier
             // character set, so `µNAME` is rejected by the grammar and
             // meta-vars never bind).
-            Self::Python | Self::Rust | Self::C | Self::Cpp | Self::Zig | Self::CSharp => {
-                '\u{00B5}' // µ
-            }
+            Self::Python
+            | Self::Rust
+            | Self::C
+            | Self::Cpp
+            | Self::Zig
+            | Self::CSharp
+            | Self::Java
+            | Self::Ruby
+            | Self::Kotlin
+            | Self::Swift
+            | Self::Php
+            | Self::Lua
+            | Self::Perl => '\u{00B5}', // µ
             // $ is valid in TS, JS, Go, Solidity, and Vue template identifiers
             _ => '$',
         }
@@ -188,6 +226,13 @@ impl LanguageExt for AstGrepLang {
             Self::Solidity => tree_sitter_solidity::LANGUAGE.into(),
             Self::Vue => tree_sitter_vue::LANGUAGE.into(),
             Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP_ONLY.into(),
+            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Self::Perl => tree_sitter_perl::LANGUAGE.into(),
         }
     }
 }
@@ -222,6 +267,13 @@ mod tests {
         assert_eq!(AstGrepLang::from_str("sol"), Some(AstGrepLang::Solidity));
         assert_eq!(AstGrepLang::from_str("vue"), Some(AstGrepLang::Vue));
         assert_eq!(AstGrepLang::from_str("json"), Some(AstGrepLang::Json));
+        assert_eq!(AstGrepLang::from_str("java"), Some(AstGrepLang::Java));
+        assert_eq!(AstGrepLang::from_str("ruby"), Some(AstGrepLang::Ruby));
+        assert_eq!(AstGrepLang::from_str("kotlin"), Some(AstGrepLang::Kotlin));
+        assert_eq!(AstGrepLang::from_str("swift"), Some(AstGrepLang::Swift));
+        assert_eq!(AstGrepLang::from_str("php"), Some(AstGrepLang::Php));
+        assert_eq!(AstGrepLang::from_str("lua"), Some(AstGrepLang::Lua));
+        assert_eq!(AstGrepLang::from_str("perl"), Some(AstGrepLang::Perl));
         assert_eq!(AstGrepLang::from_str("markdown"), None);
     }
 
@@ -267,6 +319,56 @@ mod tests {
     }
 
     #[test]
+    fn test_new_language_ast_grep_pattern_probes() {
+        let probes = [
+            (
+                AstGrepLang::Java,
+                "class Greeter { String greet(String who) { return who; } }",
+                "class $NAME { $$$ }",
+            ),
+            (
+                AstGrepLang::Ruby,
+                "class Greeter\n  def greet(who)\n    who\n  end\nend\n",
+                "def $METHOD($$$)\n  $$$\nend",
+            ),
+            (
+                AstGrepLang::Kotlin,
+                "class Greeter { fun greet(who: String): String = who }",
+                "fun $NAME($$$): $RET = $BODY",
+            ),
+            (
+                AstGrepLang::Swift,
+                "func greet(_ who: String) -> String { return who }",
+                "func greet(_ who: String) -> String { return who }",
+            ),
+            (
+                AstGrepLang::Php,
+                "<?php\nfunction helper(): void {}\nhelper();\n",
+                "function $NAME(): void {}",
+            ),
+            (
+                AstGrepLang::Lua,
+                "function greet(name)\n  return name\nend\n",
+                "function $NAME($$$)\n  $$$\nend",
+            ),
+            (
+                AstGrepLang::Perl,
+                "sub greet { return 1; }\ngreet();\n",
+                "sub greet { return 1; }",
+            ),
+        ];
+
+        for (lang, source, pattern) in probes {
+            let grep = lang.ast_grep(source);
+            let root = grep.root();
+            assert!(
+                root.find(pattern).is_some(),
+                "{lang:?} pattern should match: {pattern}"
+            );
+        }
+    }
+
+    #[test]
     fn test_expando_char() {
         assert_eq!(AstGrepLang::Python.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Rust.expando_char(), '\u{00B5}');
@@ -274,6 +376,13 @@ mod tests {
         assert_eq!(AstGrepLang::Cpp.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Zig.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::CSharp.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Java.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Ruby.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Kotlin.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Swift.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Php.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Lua.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::Perl.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::TypeScript.expando_char(), '$');
         assert_eq!(AstGrepLang::JavaScript.expando_char(), '$');
         assert_eq!(AstGrepLang::Go.expando_char(), '$');

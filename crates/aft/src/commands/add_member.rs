@@ -459,6 +459,13 @@ fn find_scope_container(
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl
         | LangId::Html
         | LangId::Markdown => {}
     }

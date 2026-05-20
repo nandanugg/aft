@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_match)]
+
 use std::io::{self, BufReader, Write};
 
 use aft::lsp::jsonrpc::{Notification, RequestId, ServerMessage};

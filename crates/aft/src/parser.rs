@@ -383,6 +383,138 @@ const SCALA_QUERY: &str = r#"
   name: (type_identifier) @type.name) @type.def
 "#;
 
+const JAVA_QUERY: &str = r#"
+;; types
+(class_declaration
+  name: (identifier) @class.name) @class.def
+(interface_declaration
+  name: (identifier) @interface.name) @interface.def
+(annotation_type_declaration
+  name: (identifier) @interface.name) @interface.def
+(enum_declaration
+  name: (identifier) @enum.name) @enum.def
+(record_declaration
+  name: (identifier) @struct.name) @struct.def
+
+;; members
+(method_declaration
+  name: (identifier) @fn.name) @fn.def
+(constructor_declaration
+  name: (identifier) @fn.name) @fn.def
+(field_declaration
+  declarator: (variable_declarator
+    name: (identifier) @var.name)) @var.def
+"#;
+
+const RUBY_QUERY: &str = r#"
+;; modules / classes
+(module
+  name: (constant) @module.name) @module.def
+(class
+  name: (constant) @class.name) @class.def
+
+;; methods
+(method
+  name: (_) @fn.name) @fn.def
+(singleton_method
+  name: (_) @fn.name) @fn.def
+
+;; constants
+(assignment
+  left: (constant) @var.name) @var.def
+"#;
+
+const KOTLIN_QUERY: &str = r#"
+;; declarations
+(class_declaration
+  (type_identifier) @class.name) @class.def
+(object_declaration
+  (type_identifier) @object.name) @object.def
+(function_declaration
+  (simple_identifier) @fn.name) @fn.def
+(property_declaration
+  (variable_declaration
+    (simple_identifier) @var.name)) @var.def
+(type_alias
+  (type_identifier) @type.name) @type.def
+"#;
+
+const SWIFT_QUERY: &str = r#"
+;; types
+(class_declaration
+  name: (type_identifier) @class.name) @class.def
+(protocol_declaration
+  name: (type_identifier) @interface.name) @interface.def
+
+;; functions and members
+(function_declaration
+  name: (simple_identifier) @fn.name) @fn.def
+(protocol_function_declaration
+  name: (simple_identifier) @fn.name) @fn.def
+(property_declaration
+  name: (pattern
+    bound_identifier: (simple_identifier) @var.name)) @var.def
+(typealias_declaration
+  name: (type_identifier) @type.name) @type.def
+"#;
+
+const PHP_QUERY: &str = r#"
+;; namespaces and types
+(namespace_definition
+  name: (namespace_name) @namespace.name) @namespace.def
+(class_declaration
+  name: (name) @class.name) @class.def
+(interface_declaration
+  name: (name) @interface.name) @interface.def
+(trait_declaration
+  name: (name) @trait.name) @trait.def
+(enum_declaration
+  name: (name) @enum.name) @enum.def
+
+;; functions and members
+(function_definition
+  name: (name) @fn.name) @fn.def
+(method_declaration
+  name: (name) @fn.name) @fn.def
+(property_declaration
+  (property_element
+    name: (variable_name (name) @var.name))) @var.def
+"#;
+
+const LUA_QUERY: &str = r#"
+;; functions
+(function_declaration
+  name: (identifier) @fn.name) @fn.def
+(function_declaration
+  name: (dot_index_expression
+    field: (identifier) @fn.name)) @fn.def
+(function_declaration
+  name: (method_index_expression
+    method: (identifier) @fn.name)) @fn.def
+
+;; locals / module tables
+(variable_declaration
+  (assignment_statement
+    (variable_list
+      name: (identifier) @var.name))) @var.def
+"#;
+
+const PERL_QUERY: &str = r#"
+;; packages and subroutines
+(package_statement
+  (package_name) @package.name) @package.def
+(function_definition
+  name: (identifier) @fn.name) @fn.def
+(function_definition_without_sub
+  name: (identifier) @fn.name) @fn.def
+
+;; constants / lexical variables
+(use_constant_statement
+  constant: (identifier) @var.name) @var.def
+(variable_declaration
+  variable_name: (_) @var.name) @var.def
+"#;
+
 /// Supported language identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LangId {
@@ -403,6 +535,13 @@ pub enum LangId {
     Vue,
     Json,
     Scala,
+    Java,
+    Ruby,
+    Kotlin,
+    Swift,
+    Php,
+    Lua,
+    Perl,
 }
 
 /// Maps file extension to language identifier.
@@ -426,6 +565,13 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "vue" => Some(LangId::Vue),
         "json" | "jsonc" => Some(LangId::Json),
         "scala" | "sc" => Some(LangId::Scala),
+        "java" => Some(LangId::Java),
+        "rb" => Some(LangId::Ruby),
+        "kt" | "kts" => Some(LangId::Kotlin),
+        "swift" => Some(LangId::Swift),
+        "php" => Some(LangId::Php),
+        "lua" => Some(LangId::Lua),
+        "pl" | "pm" | "t" => Some(LangId::Perl),
         _ => None,
     }
 }
@@ -450,6 +596,13 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Vue => tree_sitter_vue::LANGUAGE.into(),
         LangId::Json => tree_sitter_json::LANGUAGE.into(),
         LangId::Scala => tree_sitter_scala::LANGUAGE.into(),
+        LangId::Java => tree_sitter_java::LANGUAGE.into(),
+        LangId::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        LangId::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
+        LangId::Swift => tree_sitter_swift::LANGUAGE.into(),
+        LangId::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        LangId::Lua => tree_sitter_lua::LANGUAGE.into(),
+        LangId::Perl => tree_sitter_perl::LANGUAGE.into(),
     }
 }
 
@@ -472,6 +625,13 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Vue => None,
         LangId::Json => None,
         LangId::Scala => Some(SCALA_QUERY),
+        LangId::Java => Some(JAVA_QUERY),
+        LangId::Ruby => Some(RUBY_QUERY),
+        LangId::Kotlin => Some(KOTLIN_QUERY),
+        LangId::Swift => Some(SWIFT_QUERY),
+        LangId::Php => Some(PHP_QUERY),
+        LangId::Lua => Some(LUA_QUERY),
+        LangId::Perl => Some(PERL_QUERY),
     }
 }
 
@@ -500,6 +660,20 @@ static SOL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Solidity));
 static SCALA_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Scala));
+static JAVA_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Java));
+static RUBY_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Ruby));
+static KOTLIN_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Kotlin));
+static SWIFT_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Swift));
+static PHP_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Php));
+static LUA_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Lua));
+static PERL_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Perl));
 
 fn compile_query(lang: LangId) -> Result<Query, String> {
     let query_src = query_for(lang).ok_or_else(|| format!("missing query for {lang:?}"))?;
@@ -523,6 +697,13 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
         LangId::Solidity => Some(&*SOL_QUERY_CACHE),
         LangId::Scala => Some(&*SCALA_QUERY_CACHE),
+        LangId::Java => Some(&*JAVA_QUERY_CACHE),
+        LangId::Ruby => Some(&*RUBY_QUERY_CACHE),
+        LangId::Kotlin => Some(&*KOTLIN_QUERY_CACHE),
+        LangId::Swift => Some(&*SWIFT_QUERY_CACHE),
+        LangId::Php => Some(&*PHP_QUERY_CACHE),
+        LangId::Lua => Some(&*LUA_QUERY_CACHE),
+        LangId::Perl => Some(&*PERL_QUERY_CACHE),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => None,
     };
 
@@ -1037,6 +1218,13 @@ pub fn extract_symbols_from_tree(
         LangId::Bash => extract_bash_symbols(source, &root, query),
         LangId::Solidity => extract_solidity_symbols(source, &root, query),
         LangId::Scala => extract_scala_symbols(source, &root, query),
+        LangId::Java => extract_java_symbols(source, &root, query),
+        LangId::Ruby => extract_ruby_symbols(source, &root, query),
+        LangId::Kotlin => extract_kotlin_symbols(source, &root, query),
+        LangId::Swift => extract_swift_symbols(source, &root, query),
+        LangId::Php => extract_php_symbols(source, &root, query),
+        LangId::Lua => extract_lua_symbols(source, &root, query),
+        LangId::Perl => extract_perl_symbols(source, &root, query),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => {
             unreachable!("handled before query lookup")
         }
@@ -1118,13 +1306,26 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Include doc comments only if immediately above (no blank line gap)
                 kind == "comment" && is_adjacent_line(&prev, &current, source)
             }
-            LangId::Solidity | LangId::Scala => {
+            LangId::Solidity
+            | LangId::Scala
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Swift
+            | LangId::Php => {
                 // Include `///` doc comments and `/** */` doc blocks if immediately above
                 let text = node_text(source, &prev);
-                kind == "comment"
+                (kind == "comment" || kind == "line_comment" || kind == "block_comment")
                     && (text.starts_with("///") || text.starts_with("/**"))
                     && is_adjacent_line(&prev, &current, source)
             }
+            LangId::Ruby | LangId::Lua => {
+                // Include adjacent `#`/`---` style comments used as documentation.
+                let text = node_text(source, &prev);
+                kind == "comment"
+                    && (text.starts_with('#') || text.starts_with("---"))
+                    && is_adjacent_line(&prev, &current, source)
+            }
+            LangId::Perl => false,
             LangId::Python => {
                 // Decorators are handled by decorated_definition capture
                 false
@@ -3539,6 +3740,987 @@ fn extract_scala_symbols(
                 scope_chain,
                 exported: true,
             });
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn child_text_by_field_or_kind(
+    node: &Node,
+    source: &str,
+    field_name: &str,
+    kinds: &[&str],
+) -> Option<String> {
+    if let Some(name_node) = node.child_by_field_name(field_name) {
+        return Some(node_text(source, &name_node).to_string());
+    }
+
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let child = cursor.node();
+        if kinds.contains(&child.kind()) {
+            return Some(node_text(source, &child).to_string());
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn push_captured_symbol(
+    symbols: &mut Vec<Symbol>,
+    source: &str,
+    lang: LangId,
+    name_node: Node,
+    def_node: Node,
+    kind: SymbolKind,
+    scope_chain: Vec<String>,
+    exported: bool,
+) {
+    symbols.push(Symbol {
+        name: node_text(source, &name_node).to_string(),
+        kind,
+        range: node_range_with_decorators(&def_node, source, lang),
+        signature: Some(extract_signature(source, &def_node)),
+        parent: scope_chain.last().cloned(),
+        scope_chain,
+        exported,
+    });
+}
+
+fn java_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "annotation_type_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                chain.push(node_text(source, &name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn extract_java_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Java;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut interface_name_node = None;
+        let mut interface_def_node = None;
+        let mut enum_name_node = None;
+        let mut enum_def_node = None;
+        let mut struct_name_node = None;
+        let mut struct_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "interface.name" => interface_name_node = Some(cap.node),
+                "interface.def" => interface_def_node = Some(cap.node),
+                "enum.name" => enum_name_node = Some(cap.node),
+                "enum.def" => enum_def_node = Some(cap.node),
+                "struct.name" => struct_name_node = Some(cap.node),
+                "struct.def" => struct_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                java_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Interface,
+                java_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Enum,
+                java_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (struct_name_node, struct_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Struct,
+                java_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = java_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                java_scope_chain(&def_node, source),
+                true,
+            );
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn ruby_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "class" | "module") {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                chain.push(node_text(source, &name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn extract_ruby_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Ruby;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut module_name_node = None;
+        let mut module_def_node = None;
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "module.name" => module_name_node = Some(cap.node),
+                "module.def" => module_def_node = Some(cap.node),
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (module_name_node, module_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                ruby_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                ruby_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = ruby_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                ruby_scope_chain(&def_node, source),
+                true,
+            );
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn kotlin_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "class_declaration" | "object_declaration") {
+            if let Some(name) =
+                child_text_by_field_or_kind(&parent, source, "name", &["type_identifier"])
+            {
+                chain.push(name);
+            }
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn extract_kotlin_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Kotlin;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut object_name_node = None;
+        let mut object_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut type_name_node = None;
+        let mut type_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "object.name" => object_name_node = Some(cap.node),
+                "object.def" => object_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "type.name" => type_name_node = Some(cap.node),
+                "type.def" => type_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                kotlin_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (object_name_node, object_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                kotlin_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = kotlin_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                kotlin_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (type_name_node, type_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::TypeAlias,
+                kotlin_scope_chain(&def_node, source),
+                true,
+            );
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn swift_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "class_declaration" | "protocol_declaration") {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                chain.push(node_text(source, &name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn swift_type_kind(source: &str, node: &Node) -> SymbolKind {
+    let signature = extract_signature(source, node);
+    if signature.starts_with("struct ") {
+        SymbolKind::Struct
+    } else if signature.starts_with("enum ") {
+        SymbolKind::Enum
+    } else {
+        SymbolKind::Class
+    }
+}
+
+fn extract_swift_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Swift;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut interface_name_node = None;
+        let mut interface_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut type_name_node = None;
+        let mut type_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "interface.name" => interface_name_node = Some(cap.node),
+                "interface.def" => interface_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "type.name" => type_name_node = Some(cap.node),
+                "type.def" => type_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            let kind = swift_type_kind(source, &def_node);
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                swift_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Interface,
+                swift_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = swift_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                swift_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (type_name_node, type_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::TypeAlias,
+                swift_scope_chain(&def_node, source),
+                true,
+            );
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn php_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        match parent.kind() {
+            "namespace_definition"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    chain.push(node_text(source, &name_node).to_string());
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn extract_php_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Php;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut namespace_name_node = None;
+        let mut namespace_def_node = None;
+        let mut class_name_node = None;
+        let mut class_def_node = None;
+        let mut interface_name_node = None;
+        let mut interface_def_node = None;
+        let mut trait_name_node = None;
+        let mut trait_def_node = None;
+        let mut enum_name_node = None;
+        let mut enum_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "namespace.name" => namespace_name_node = Some(cap.node),
+                "namespace.def" => namespace_def_node = Some(cap.node),
+                "class.name" => class_name_node = Some(cap.node),
+                "class.def" => class_def_node = Some(cap.node),
+                "interface.name" => interface_name_node = Some(cap.node),
+                "interface.def" => interface_def_node = Some(cap.node),
+                "trait.name" => trait_name_node = Some(cap.node),
+                "trait.def" => trait_def_node = Some(cap.node),
+                "enum.name" => enum_name_node = Some(cap.node),
+                "enum.def" => enum_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (namespace_name_node, namespace_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                php_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                php_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Interface,
+                php_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (trait_name_node, trait_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Interface,
+                php_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (enum_name_node, enum_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Enum,
+                php_scope_chain(&def_node, source),
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = php_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() || def_node.kind() == "function_definition" {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                php_scope_chain(&def_node, source),
+                true,
+            );
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn lua_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+
+    if node.kind() == "function_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            match name_node.kind() {
+                "dot_index_expression" | "method_index_expression" => {
+                    if let Some(table_node) = name_node.child_by_field_name("table") {
+                        chain.push(node_text(source, &table_node).to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    chain
+}
+
+fn extract_lua_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Lua;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = lua_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                vec![],
+                true,
+            );
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn perl_package_name(source: &str, node: &Node) -> Option<String> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let child = cursor.node();
+        if child.kind() == "package_name" {
+            return Some(node_text(source, &child).to_string());
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn perl_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if parent.kind() == "package_statement" {
+            if let Some(name) = perl_package_name(source, &parent) {
+                chain.push(name);
+            }
+        }
+        current = parent.parent();
+    }
+
+    if chain.is_empty() && node.kind() != "package_statement" {
+        let mut sibling = node.prev_sibling();
+        while let Some(prev) = sibling {
+            if prev.kind() == "package_statement" {
+                if let Some(name) = perl_package_name(source, &prev) {
+                    chain.push(name);
+                }
+                break;
+            }
+            sibling = prev.prev_sibling();
+        }
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn extract_perl_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Perl;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut package_name_node = None;
+        let mut package_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "package.name" => package_name_node = Some(cap.node),
+                "package.def" => package_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (package_name_node, package_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            let scope_chain = perl_scope_chain(&def_node, source);
+            let kind = if scope_chain.is_empty() {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Method
+            };
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                kind,
+                scope_chain,
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                perl_scope_chain(&def_node, source),
+                true,
+            );
         }
     }
 
