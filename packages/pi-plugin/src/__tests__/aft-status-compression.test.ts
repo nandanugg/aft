@@ -51,10 +51,20 @@ describe("Pi aft-status compression rendering", () => {
       null,
       theme,
       80,
-    ).join("\n");
+    );
 
+    // Tabular format: scope header line ("Session"/"Project") followed by
+    // two stat lines with Tokens Saved and Compression Ratio. Use array
+    // `some` predicates so we tolerate any incidental ANSI/theme escapes
+    // wrapped around the visible text. 333,000 / 567,000 ≈ 59%.
     expect(lines).toContain("Compression");
-    expect(lines).toContain("Project: 1.2k events");
+    expect(lines).toContain("Project");
+    expect(lines.some((line) => line.includes("Tokens Saved") && line.includes("333,000"))).toBe(
+      true,
+    );
+    expect(lines.some((line) => line.includes("Compression Ratio") && line.includes("59%"))).toBe(
+      true,
+    );
   });
 
   test("pi_status_hides_compression_when_zero_events", () => {
@@ -66,21 +76,27 @@ describe("Pi aft-status compression rendering", () => {
     expect(rows).toEqual([]);
   });
 
-  test("pi_status_renders_savings_percent_when_original_nonzero", () => {
+  test("pi_status_renders_savings_delta_when_original_nonzero", () => {
+    // 40 saved / 100 original = 40% reduction. Locale grouping omitted for
+    // values < 1000 — "40" is the right formatting for a small count.
     const rows = formatCompressionStatusRows({
       project: { events: 1, original_tokens: 100, compressed_tokens: 60, savings_tokens: 40 },
       session: { events: 0, original_tokens: 0, compressed_tokens: 0, savings_tokens: 0 },
     });
 
-    expect(rows[0]).toBe("Project: 1 events · 100 → 60 (40 saved, 40%)");
+    // Tabular format: scope header + two stat rows.
+    expect(rows).toEqual(["Project", "  Tokens Saved        40", "  Compression Ratio   40%"]);
   });
 
-  test("pi_status_omits_percent_when_original_zero", () => {
+  test("pi_status_renders_zero_savings_cleanly", () => {
+    // A scope where no commands matched any compressor (savings_tokens === 0)
+    // must render as "0 tokens, 0% reduction" rather than "-0 tokens, …" so
+    // users don't read a noop as a regression.
     const rows = formatCompressionStatusRows({
       project: { events: 1, original_tokens: 0, compressed_tokens: 0, savings_tokens: 0 },
       session: { events: 0, original_tokens: 0, compressed_tokens: 0, savings_tokens: 0 },
     });
 
-    expect(rows[0]).toBe("Project: 1 events · 0 → 0 (0 saved)");
+    expect(rows).toEqual(["Project", "  Tokens Saved        0", "  Compression Ratio   0%"]);
   });
 });

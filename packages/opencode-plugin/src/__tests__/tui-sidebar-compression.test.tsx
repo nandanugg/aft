@@ -37,9 +37,16 @@ describe("sidebar compression rows", () => {
   test("sidebar_renders_compression_when_project_events_present", () => {
     const rows = formatCompressionSidebarRows(compression());
 
-    expect(rows.join("\n")).toContain("Session");
-    expect(rows.join("\n")).toContain("Project");
-    expect(rows.join("\n")).toContain("333k saved");
+    // Each scope expands to: scope-header + Tokens Saved + Compression
+    // Ratio. With both Session and Project, six rows total. 333,000
+    // savings / 567,000 original ≈ 59% reduction.
+    expect(rows).toHaveLength(6);
+    expect(rows[0]).toEqual({ kind: "scope", label: "Session" });
+    expect(rows[1]).toEqual({ kind: "stat", label: "Tokens Saved", value: "3,300" });
+    expect(rows[2]).toEqual({ kind: "stat", label: "Compression Ratio", value: "59%" });
+    expect(rows[3]).toEqual({ kind: "scope", label: "Project" });
+    expect(rows[4]).toEqual({ kind: "stat", label: "Tokens Saved", value: "333,000" });
+    expect(rows[5]).toEqual({ kind: "stat", label: "Compression Ratio", value: "59%" });
   });
 
   test("sidebar_hides_compression_when_undefined", () => {
@@ -56,15 +63,16 @@ describe("sidebar compression rows", () => {
     ).toEqual([]);
   });
 
-  test("sidebar_hides_session_row_when_session_events_zero", () => {
+  test("sidebar_hides_session_scope_when_session_events_zero", () => {
     const rows = formatCompressionSidebarRows(
       compression({
         session: { events: 0, original_tokens: 0, compressed_tokens: 0, savings_tokens: 0 },
       }),
     );
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toContain("Project");
-    expect(rows.join("\n")).not.toContain("Session");
+    // Only the Project scope (header + 2 stats) when session.events === 0.
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toEqual({ kind: "scope", label: "Project" });
+    expect(rows.some((row) => row.kind === "scope" && row.label === "Session")).toBe(false);
   });
 });

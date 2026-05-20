@@ -14,7 +14,7 @@
  * the user needing to close and re-open it.
  */
 
-import { compressionSavingsPercent, formatTokenCount } from "@cortexkit/aft-bridge";
+import { compressionSavingsPercent } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
@@ -245,7 +245,9 @@ function renderInner(
   if (compressionRows.length > 0) {
     lines.push("");
     lines.push(theme.fg("muted", "Compression"));
-    for (const row of compressionRows) lines.push(`  ${row}`);
+    // Each row already contains its own indentation (scope headers are
+    // flush-left, stat rows are indented by 2). Don't double-prefix.
+    for (const row of compressionRows) lines.push(row);
   }
 
   // Optional semantic build progress
@@ -291,13 +293,20 @@ export function renderStatusDialogInnerForTest(
   return renderInner(s, error, theme, innerWidth);
 }
 
-function formatCompressionRow(label: string, aggregate: StatusCompressionAggregate): string {
+function appendCompressionScope(
+  rows: string[],
+  label: string,
+  aggregate: StatusCompressionAggregate,
+): void {
   const pct = compressionSavingsPercent(aggregate.original_tokens, aggregate.compressed_tokens);
-  return (
-    `${label}: ${formatTokenCount(aggregate.events)} events · ` +
-    `${formatTokenCount(aggregate.original_tokens)} → ${formatTokenCount(aggregate.compressed_tokens)} ` +
-    `(${formatTokenCount(aggregate.savings_tokens)} saved${pct !== null ? `, ${pct}%` : ""})`
-  );
+  const savings = aggregate.savings_tokens;
+  // Tabular layout matching OpenCode's sidebar/dialog: scope header line
+  // followed by two stat lines (Tokens Saved + Compression Ratio). Pi's TUI
+  // is monospace, so the kv() helper provides column alignment via the
+  // outer renderInner pipeline.
+  rows.push(label);
+  rows.push(`  Tokens Saved        ${savings.toLocaleString("en-US")}`);
+  rows.push(`  Compression Ratio   ${pct ?? 0}%`);
 }
 
 export function formatCompressionStatusRows(compression: StatusCompression | undefined): string[] {
@@ -305,9 +314,9 @@ export function formatCompressionStatusRows(compression: StatusCompression | und
 
   const rows: string[] = [];
   if (compression.session.events > 0) {
-    rows.push(formatCompressionRow("Session", compression.session));
+    appendCompressionScope(rows, "Session", compression.session);
   }
-  rows.push(formatCompressionRow("Project", compression.project));
+  appendCompressionScope(rows, "Project", compression.project);
   return rows;
 }
 

@@ -575,8 +575,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         message: "Waiting for first tool call to populate",
       };
     }
+    // The cached snapshot is session-aware: Rust computes
+    // `compression.session`, `session.checkpoints`, and `session.tracked_files`
+    // for the *one* session_id passed at the time the cache was populated.
+    // Serving that cached snapshot to a caller with a different sessionID
+    // would mis-attribute another session's per-session slice — most visibly
+    // showing `Session: 0 events` in the sidebar even when this session has
+    // many compression events. Only serve the cache when its session matches.
     const cached = bridge.getCachedStatus();
-    if (cached !== null) {
+    const cachedSessionId = (cached as Record<string, unknown> | null)?.session as
+      | Record<string, unknown>
+      | undefined;
+    const cachedId = cachedSessionId?.id as string | undefined;
+    if (cached !== null && cachedId === sessionID) {
       return { success: true, ...cached };
     }
     const response = await bridge.send("status", { session_id: sessionID });
@@ -854,11 +865,20 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         input.directory;
       // Prefer an existing active bridge to get warm index status
       const bridge = ctx.pool.getActiveBridgeForRoot(sessionDir) ?? ctx.pool.getBridge(sessionDir);
+      // Cache is session-aware (Rust computes `session` / `compression.session`
+      // for one specific session_id). Only serve it when its session matches
+      // the caller's — otherwise we'd render another session's per-session
+      // slice in this session's `/aft-status` dialog.
       const cached = bridge.getCachedStatus();
-      const response = cached
+      const cachedSessionId = (cached as Record<string, unknown> | null)?.session as
+        | Record<string, unknown>
+        | undefined;
+      const cachedId = cachedSessionId?.id as string | undefined;
+      const cacheUsable = cached !== null && cachedId === commandInput.sessionID;
+      const response = cacheUsable
         ? { success: true, ...cached }
         : await bridge.send("status", { session_id: commandInput.sessionID });
-      if (!cached && response.success !== false) {
+      if (!cacheUsable && response.success !== false) {
         bridge.cacheStatusSnapshot(response);
       }
       if (response.success === false) {

@@ -1,20 +1,13 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
 
-import { compressionSavingsPercent, formatTokenCount } from "@cortexkit/aft-bridge";
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 
 import packageJson from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
-import {
-  type AftStatusSnapshot,
-  coerceAftStatus,
-  formatBytes,
-  type StatusCompression,
-  type StatusCompressionAggregate,
-} from "../shared/status";
-import { createAftSidebarSlot } from "./sidebar";
+import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
+import { createAftSidebarSlot, formatCompressionSidebarRows } from "./sidebar";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
 // JSON port file written by AftRpcServer ({ port, token }) and includes that
@@ -30,9 +23,14 @@ function getRpcClient(directory: string): AftRpcClient {
   let client = rpcClients.get(directory);
   if (client) return client;
 
+  // v0.27 moved AFT storage to the CortexKit root. The TUI plugin must use
+  // the same path as the server plugin (`resolveCortexKitStorageRoot()`),
+  // otherwise it polls stale legacy port files written by older versions
+  // and never picks up the live RPC server, leaving the sidebar/dialog
+  // stuck on the "AFT is starting up" placeholder forever.
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const dataHome = process.env.XDG_DATA_HOME || `${home}/.local/share`;
-  const storageDir = `${dataHome}/opencode/storage/plugin/aft`;
+  const storageDir = `${dataHome}/cortexkit/aft`;
 
   client = new AftRpcClient(storageDir, directory);
   rpcClients.set(directory, client);
@@ -70,28 +68,6 @@ function formatCountShort(value: number | null | undefined): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
   return String(value);
-}
-
-function formatCompressionDetailRow(label: string, aggregate: StatusCompressionAggregate): string {
-  const pct = compressionSavingsPercent(aggregate.original_tokens, aggregate.compressed_tokens);
-  return (
-    `${label}: ${formatTokenCount(aggregate.events)} events · ` +
-    `${formatTokenCount(aggregate.original_tokens)} → ${formatTokenCount(
-      aggregate.compressed_tokens,
-    )} tokens ` +
-    `(${formatTokenCount(aggregate.savings_tokens)} saved${pct !== null ? `, ${pct}%` : ""})`
-  );
-}
-
-export function formatCompressionDialogRows(compression: StatusCompression | undefined): string[] {
-  if (!compression || compression.project.events <= 0) return [];
-
-  const rows: string[] = [];
-  if (compression.session.events > 0) {
-    rows.push(formatCompressionDetailRow("Session", compression.session));
-  }
-  rows.push(formatCompressionDetailRow("Project", compression.project));
-  return rows;
 }
 
 function statusTone(status: string): "ok" | "warn" | "err" | "muted" {
@@ -183,7 +159,11 @@ const StatusDialog = (props: StatusDialogProps) => {
   // not_initialized is muted. Matches the sidebar convention.
   const cacheRoleTone = (role: string): "accent" | "warn" | "muted" =>
     role === "main" ? "accent" : role === "worktree" ? "warn" : "muted";
-  const compressionRows = () => formatCompressionDialogRows(status()?.compression);
+  // Reuse the sidebar's label/value formatter so the dialog and sidebar
+  // render identical text (e.g. "Session" / "-174,489 tokens, 59% reduction").
+  // The earlier `formatCompressionDialogRows` returned padded strings that
+  // looked offset against neighboring sections.
+  const compressionAggregateRows = () => formatCompressionSidebarRows(status()?.compression);
 
   return (
     <box
@@ -405,15 +385,25 @@ const StatusDialog = (props: StatusDialogProps) => {
         </box>
       ) : null}
 
-      {/* Compression aggregates — hidden until project-level events exist. */}
-      {compressionRows().length > 0 ? (
+      {/* Compression aggregates — tabular layout matching Search/Semantic
+          Index. Each scope ("Session", "Project") renders as a subheader
+          followed by two <R> rows (Tokens Saved, Compression Ratio) so the
+          numbers stay right-aligned under the value column instead of
+          crowding the label. */}
+      {compressionAggregateRows().length > 0 ? (
         <box flexDirection="column" width="100%" marginTop={1}>
           <text fg={t().text}>
             <b>Compression</b>
           </text>
-          {compressionRows().map((row) => (
-            <text fg={t().textMuted}>{`  ${row}`}</text>
-          ))}
+          {compressionAggregateRows().map((row) =>
+            row.kind === "scope" ? (
+              <box width="100%">
+                <text fg={t().text}>{row.label}</text>
+              </box>
+            ) : (
+              <R theme={t()} label={row.label} value={row.value} tone="muted" />
+            ),
+          )}
         </box>
       ) : null}
 
