@@ -1,11 +1,19 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
 
+import { compressionSavingsPercent, formatTokenCount } from "@cortexkit/aft-bridge";
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createMemo, createSignal, onCleanup } from "solid-js";
+
 import packageJson from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
-import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
+import {
+  type AftStatusSnapshot,
+  coerceAftStatus,
+  formatBytes,
+  type StatusCompression,
+  type StatusCompressionAggregate,
+} from "../shared/status";
 import { createAftSidebarSlot } from "./sidebar";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
@@ -62,6 +70,28 @@ function formatCountShort(value: number | null | undefined): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
   return String(value);
+}
+
+function formatCompressionDetailRow(label: string, aggregate: StatusCompressionAggregate): string {
+  const pct = compressionSavingsPercent(aggregate.original_tokens, aggregate.compressed_tokens);
+  return (
+    `${label}: ${formatTokenCount(aggregate.events)} events · ` +
+    `${formatTokenCount(aggregate.original_tokens)} → ${formatTokenCount(
+      aggregate.compressed_tokens,
+    )} tokens ` +
+    `(${formatTokenCount(aggregate.savings_tokens)} saved${pct !== null ? `, ${pct}%` : ""})`
+  );
+}
+
+export function formatCompressionDialogRows(compression: StatusCompression | undefined): string[] {
+  if (!compression || compression.project.events <= 0) return [];
+
+  const rows: string[] = [];
+  if (compression.session.events > 0) {
+    rows.push(formatCompressionDetailRow("Session", compression.session));
+  }
+  rows.push(formatCompressionDetailRow("Project", compression.project));
+  return rows;
 }
 
 function statusTone(status: string): "ok" | "warn" | "err" | "muted" {
@@ -153,6 +183,7 @@ const StatusDialog = (props: StatusDialogProps) => {
   // not_initialized is muted. Matches the sidebar convention.
   const cacheRoleTone = (role: string): "accent" | "warn" | "muted" =>
     role === "main" ? "accent" : role === "worktree" ? "warn" : "muted";
+  const compressionRows = () => formatCompressionDialogRows(status()?.compression);
 
   return (
     <box
@@ -371,6 +402,18 @@ const StatusDialog = (props: StatusDialogProps) => {
       {status()?.semantic_index.error ? (
         <box marginTop={1} width="100%">
           <text fg={t().error}>⚠ {status()!.semantic_index.error}</text>
+        </box>
+      ) : null}
+
+      {/* Compression aggregates — hidden until project-level events exist. */}
+      {compressionRows().length > 0 ? (
+        <box flexDirection="column" width="100%" marginTop={1}>
+          <text fg={t().text}>
+            <b>Compression</b>
+          </text>
+          {compressionRows().map((row) => (
+            <text fg={t().textMuted}>{`  ${row}`}</text>
+          ))}
         </box>
       ) : null}
 

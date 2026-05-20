@@ -14,6 +14,7 @@
  * the user needing to close and re-open it.
  */
 
+import { compressionSavingsPercent, formatTokenCount } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
@@ -22,8 +23,15 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+
 import packageJson from "../../package.json";
-import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status.js";
+import {
+  type AftStatusSnapshot,
+  coerceAftStatus,
+  formatBytes,
+  type StatusCompression,
+  type StatusCompressionAggregate,
+} from "../shared/status.js";
 import { bridgeFor, callBridge } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
@@ -233,6 +241,13 @@ function renderInner(
     `  ${featureBadge("format_on_edit", s.features.format_on_edit, theme)}  ${featureBadge("search_index", s.features.search_index, theme)}  ${featureBadge("semantic_search", s.features.semantic_search, theme)}`,
   );
 
+  const compressionRows = formatCompressionStatusRows(s.compression);
+  if (compressionRows.length > 0) {
+    lines.push("");
+    lines.push(theme.fg("muted", "Compression"));
+    for (const row of compressionRows) lines.push(`  ${row}`);
+  }
+
   // Optional semantic build progress
   if (s.semantic_index.stage) {
     lines.push("");
@@ -265,6 +280,35 @@ function renderInner(
   lines.push("");
   lines.push(theme.fg("muted", "Press Escape to close"));
   return lines;
+}
+
+export function renderStatusDialogInnerForTest(
+  s: AftStatusSnapshot | null,
+  error: string | null,
+  theme: Theme,
+  innerWidth: number,
+): string[] {
+  return renderInner(s, error, theme, innerWidth);
+}
+
+function formatCompressionRow(label: string, aggregate: StatusCompressionAggregate): string {
+  const pct = compressionSavingsPercent(aggregate.original_tokens, aggregate.compressed_tokens);
+  return (
+    `${label}: ${formatTokenCount(aggregate.events)} events · ` +
+    `${formatTokenCount(aggregate.original_tokens)} → ${formatTokenCount(aggregate.compressed_tokens)} ` +
+    `(${formatTokenCount(aggregate.savings_tokens)} saved${pct !== null ? `, ${pct}%` : ""})`
+  );
+}
+
+export function formatCompressionStatusRows(compression: StatusCompression | undefined): string[] {
+  if (!compression || compression.project.events <= 0) return [];
+
+  const rows: string[] = [];
+  if (compression.session.events > 0) {
+    rows.push(formatCompressionRow("Session", compression.session));
+  }
+  rows.push(formatCompressionRow("Project", compression.project));
+  return rows;
 }
 
 type ToneColor = "accent" | "warning" | "error" | "muted" | "success";

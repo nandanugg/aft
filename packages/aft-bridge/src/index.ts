@@ -28,6 +28,8 @@ export {
   getCacheDir,
   getCachedBinaryPath,
 } from "./downloader.js";
+// --- compact UI formatting ---
+export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 export type { Logger, LogMeta } from "./logger.js";
 export type { MigrationHarness, MigrationOptions } from "./migration.js";
 // --- storage migration ---

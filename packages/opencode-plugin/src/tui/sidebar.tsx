@@ -7,11 +7,12 @@
 // session.updated/message.updated events with a small debounce, same as
 // magic-context, so the panel stays current without polling.
 
+import { formatTokenCount } from "@cortexkit/aft-bridge";
 import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 
 import { AftRpcClient } from "../shared/rpc-client";
-import { type AftStatusSnapshot, coerceAftStatus } from "../shared/status";
+import { type AftStatusSnapshot, coerceAftStatus, type StatusCompression } from "../shared/status";
 
 const SINGLE_BORDER = { type: "single" } as any;
 const REFRESH_DEBOUNCE_MS = 200;
@@ -33,6 +34,26 @@ function formatCount(n: number | null | undefined): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
   return String(n);
+}
+
+export function formatCompressionSidebarRows(compression: StatusCompression | undefined): string[] {
+  if (!compression || compression.project.events <= 0) return [];
+
+  const rows: string[] = [];
+  if (compression.session.events > 0) {
+    rows.push(
+      `Session  ${formatTokenCount(compression.session.events)} events · ${formatTokenCount(
+        compression.session.savings_tokens,
+      )} saved`,
+    );
+  }
+  rows.push(
+    `Project  ${formatTokenCount(compression.project.events)} events · ${formatTokenCount(
+      compression.project.savings_tokens,
+    )} saved`,
+  );
+
+  return rows;
 }
 
 // Map index status → (label, theme color name). The label is what we want
@@ -225,6 +246,7 @@ const SidebarContent = (props: {
   const semanticStatus = () => statusDisplay(s()?.semantic_index?.status ?? "disabled");
   const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
   const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
+  const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
 
   // Degraded-mode reason → human-readable hint. Distinct strings per reason
   // because the UX direction is different: "home_root" tells the user to
@@ -356,6 +378,18 @@ const SidebarContent = (props: {
         />
       )}
       <StatRow theme={props.theme} label="Disk" value={formatBytes(semanticBytes())} tone="muted" />
+
+      {/* Compression aggregates */}
+      {compressionRows().length > 0 && (
+        <>
+          <SectionHeader theme={props.theme} title="Compression" />
+          {compressionRows().map((row) => (
+            <box width="100%">
+              <text fg={props.theme.textMuted}>{`  ${row}`}</text>
+            </box>
+          ))}
+        </>
+      )}
 
       {/* Surface failures clearly so users know to act (install ONNX,
           fix config, etc.) rather than silently leaving the panel "off". */}
