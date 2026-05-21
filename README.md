@@ -80,7 +80,8 @@ The unified `@cortexkit/aft` CLI works across every supported harness:
 | Command | What it does |
 |---|---|
 | `npx @cortexkit/aft setup` | Interactive first-time setup — auto-detects installed harnesses and registers AFT with each |
-| `npx @cortexkit/aft doctor` | Check configuration and auto-fix common issues across all detected harnesses |
+| `npx @cortexkit/aft doctor` | Read-only health check across all detected harnesses (host install, plugin registration, binary cache, ONNX, config) |
+| `npx @cortexkit/aft doctor --fix` | Auto-fix what doctor can: register missing plugin entries, download a missing `aft` binary, repair ONNX Runtime |
 | `npx @cortexkit/aft doctor lsp <file>` | Show exactly which LSP servers AFT would spawn for a file, where each binary resolves, and why a server failed to start |
 | `npx @cortexkit/aft doctor --clear` | Interactive cache cleanup — pick which caches to clear (plugin packages, binary, LSP, semantic) |
 | `npx @cortexkit/aft doctor --issue` | Collect diagnostics and open a GitHub issue with sanitized logs |
@@ -91,10 +92,18 @@ Add `--harness opencode` or `--harness pi` to any command to target one harness 
 the AFT plugin). When multiple harnesses are detected, prompts you to pick which ones to
 configure.
 
-**`doctor`** — Checks everything that can go wrong per harness: host install, plugin
-registration, plugin cache version, binary cache, config parse errors, ONNX Runtime
-availability (for semantic search), storage directory sizes, log file status. Auto-fixes
-missing plugin entries and outdated caches.
+**`doctor`** — Read-only health check. Reports host install state, plugin registration,
+plugin cache version, binary cache, config parse errors, ONNX Runtime availability (for
+semantic search), storage directory sizes, and log file status. Exits non-zero when
+something needs attention so it can be wired into CI scripts. Pure inspection — nothing
+is modified.
+
+**`doctor --fix`** — Applies the fixes doctor would otherwise just report. Registers
+missing plugin entries in your harness config, downloads the matching `aft` binary if
+`~/.cache/aft/bin` is empty (run this after `--clear` or after wiping the cache to recover
+without opening a session), and repairs ONNX Runtime version mismatches by clearing AFT's
+managed ONNX cache so the next bridge launch redownloads. Each step asks confirmation
+before mutating state.
 
 **`doctor lsp <file>`** — Per-file LSP triage. Shows which servers AFT registered for the
 file's extension, where each binary resolves (project `node_modules/.bin` → `lsp_paths_extra`
