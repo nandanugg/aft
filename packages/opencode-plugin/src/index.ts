@@ -164,11 +164,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.18.0";
+const ANNOUNCEMENT_VERSION = "0.27.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "New experimental features — AFT now optionally hoists bash:\n    - Run bash scripts in the background.\n    - Initial output compression for git, cargo, npm, bun, pnpm, pytest, tsc (more in 0.19).\n    - Rewrite cat/grep/find/sed/ls into AFT counterparts for faster, formatted output.\n  Check GitHub for how to enable.",
-  "Trigram grep/glob and semantic search (aft_search) graduated out of experimental.",
-  "Lots of bugfixes and new end-to-end test coverage.",
+  "Storage moved to ~/.local/share/cortexkit/aft (~/Library/Application Support/cortexkit/aft on macOS, %APPDATA%/cortexkit/aft on Windows). Your existing data migrated automatically on first launch.",
+  "Bash output compression now reports token savings — visible in /aft-status and the TUI sidebar (Session + Project totals).",
+  "Seven new languages supported by aft_outline / aft_zoom / aft_search / ast_grep: Java, Ruby, Kotlin, Swift, PHP, Lua, Perl.",
+  "Join us on Discord: https://discord.gg/F2uWxjGnU",
 ];
 
 /**
