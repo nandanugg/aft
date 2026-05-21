@@ -262,6 +262,15 @@ const SidebarContent = (props: {
 
   const s = createMemo(() => status());
 
+  // Lazy-bridge: while AFT has no live bridge yet, the RPC server returns a
+  // synthetic snapshot with `cache_role === "not_initialized"`. In that state
+  // every metric is unknown by design — not "disabled" — so we hide the
+  // version line and the entire Search Index / Semantic Index / Compression
+  // grid until a first tool call warms the bridge. Users were reading the
+  // pre-init `vunknown` + `Status: unknown` rows as broken state instead of
+  // "AFT has not been used yet for this project".
+  const notInitialized = () => s()?.cache_role === "not_initialized";
+
   // Pre-compute display values so the JSX stays readable. createMemo for
   // each derived field would be overkill — these are cheap derivations.
   const searchStatus = () => statusDisplay(s()?.search_index?.status ?? "disabled");
@@ -324,7 +333,9 @@ const SidebarContent = (props: {
             </box>
           )}
         </box>
-        <text fg={props.theme.textMuted}>v{s()?.version ?? props.pluginVersion}</text>
+        {!notInitialized() && (
+          <text fg={props.theme.textMuted}>v{s()?.version ?? props.pluginVersion}</text>
+        )}
       </box>
 
       {/* Degraded reason — explains why heavy tools (aft_search, aft_navigate)
@@ -343,90 +354,105 @@ const SidebarContent = (props: {
           until the first tool call routes through `callBridge()` and warms
           the bridge. Show the explanatory message instead of empty status
           rows so users understand why metrics are blank. */}
-      {s()?.cache_role === "not_initialized" && (
+      {notInitialized() && (
         <box marginTop={1} width="100%">
           <text fg={props.theme.textMuted}>
-            {s()!.message || "Waiting for first tool call to populate"}
+            {s()!.message ||
+              "AFT bridge is now spawned lazily, information here will be populated after first tool call."}
           </text>
         </box>
       )}
 
       {/* Search index */}
-      <SectionHeader theme={props.theme} title="Search Index" />
-      <StatRow
-        theme={props.theme}
-        label="Status"
-        value={searchStatus().label}
-        tone={searchStatus().tone}
-      />
-      {(s()?.search_index?.files ?? null) != null && (
-        <StatRow
-          theme={props.theme}
-          label="Files"
-          value={formatCount(s()!.search_index.files)}
-          tone="muted"
-        />
-      )}
-      <StatRow theme={props.theme} label="Disk" value={formatBytes(trigramBytes())} tone="muted" />
-
-      {/* Semantic index */}
-      <SectionHeader theme={props.theme} title="Semantic Index" />
-      <StatRow
-        theme={props.theme}
-        label="Status"
-        value={semanticStatus().label}
-        tone={semanticStatus().tone}
-      />
-      {/* When loading, magic-context-style progress hint helps users see
-          background work is making progress instead of stuck. */}
-      {s()?.semantic_index?.status === "loading" &&
-        s()?.semantic_index?.entries_total != null &&
-        s()!.semantic_index.entries_total! > 0 && (
+      {!notInitialized() && (
+        <>
+          <SectionHeader theme={props.theme} title="Search Index" />
           <StatRow
             theme={props.theme}
-            label="Progress"
-            value={`${formatCount(s()!.semantic_index.entries_done)} / ${formatCount(
-              s()!.semantic_index.entries_total,
-            )}`}
-            tone="warn"
+            label="Status"
+            value={searchStatus().label}
+            tone={searchStatus().tone}
           />
-        )}
-      {(s()?.semantic_index?.entries ?? null) != null && (
-        <StatRow
-          theme={props.theme}
-          label="Entries"
-          value={formatCount(s()!.semantic_index.entries)}
-          tone="muted"
-        />
-      )}
-      <StatRow theme={props.theme} label="Disk" value={formatBytes(semanticBytes())} tone="muted" />
+          {(s()?.search_index?.files ?? null) != null && (
+            <StatRow
+              theme={props.theme}
+              label="Files"
+              value={formatCount(s()!.search_index.files)}
+              tone="muted"
+            />
+          )}
+          <StatRow
+            theme={props.theme}
+            label="Disk"
+            value={formatBytes(trigramBytes())}
+            tone="muted"
+          />
 
-      {/* Compression aggregates. Tabular layout matching Search/Semantic
+          {/* Semantic index */}
+          <SectionHeader theme={props.theme} title="Semantic Index" />
+          <StatRow
+            theme={props.theme}
+            label="Status"
+            value={semanticStatus().label}
+            tone={semanticStatus().tone}
+          />
+          {/* When loading, magic-context-style progress hint helps users see
+          background work is making progress instead of stuck. */}
+          {s()?.semantic_index?.status === "loading" &&
+            s()?.semantic_index?.entries_total != null &&
+            s()!.semantic_index.entries_total! > 0 && (
+              <StatRow
+                theme={props.theme}
+                label="Progress"
+                value={`${formatCount(s()!.semantic_index.entries_done)} / ${formatCount(
+                  s()!.semantic_index.entries_total,
+                )}`}
+                tone="warn"
+              />
+            )}
+          {(s()?.semantic_index?.entries ?? null) != null && (
+            <StatRow
+              theme={props.theme}
+              label="Entries"
+              value={formatCount(s()!.semantic_index.entries)}
+              tone="muted"
+            />
+          )}
+          <StatRow
+            theme={props.theme}
+            label="Disk"
+            value={formatBytes(semanticBytes())}
+            tone="muted"
+          />
+
+          {/* Compression aggregates. Tabular layout matching Search/Semantic
           Index above: each scope ("Session", "Project") renders as a
           subheader followed by two StatRows (Tokens Saved, Compression
           Ratio). Keeps numbers right-aligned in the value column instead
           of jamming them after the label on the same line. */}
-      {compressionRows().length > 0 && (
-        <>
-          <SectionHeader theme={props.theme} title="Compression" />
-          {compressionRows().map((row) =>
-            row.kind === "scope" ? (
-              <box width="100%">
-                <text fg={props.theme.text}>{row.label}</text>
-              </box>
-            ) : (
-              <StatRow theme={props.theme} label={row.label} value={row.value} tone="muted" />
-            ),
+          {compressionRows().length > 0 && (
+            <>
+              <SectionHeader theme={props.theme} title="Compression" />
+              {compressionRows().map((row) =>
+                row.kind === "scope" ? (
+                  <box width="100%">
+                    <text fg={props.theme.text}>{row.label}</text>
+                  </box>
+                ) : (
+                  <StatRow theme={props.theme} label={row.label} value={row.value} tone="muted" />
+                ),
+              )}
+            </>
+          )}
+
+          {/* Surface failures clearly so users know to act (install ONNX,
+          fix config, etc.) rather than silently leaving the panel "off". */}
+          {s()?.semantic_index?.status === "failed" && s()?.semantic_index?.error && (
+            <box marginTop={1} width="100%">
+              <text fg={props.theme.error}>⚠ {s()!.semantic_index.error}</text>
+            </box>
           )}
         </>
-      )}
-
-      {/* Surface failures clearly so users know to act (install ONNX,
-          fix config, etc.) rather than silently leaving the panel "off". */}
-      {s()?.semantic_index?.status === "failed" && s()?.semantic_index?.error && (
-        <box marginTop={1} width="100%">
-          <text fg={props.theme.error}>⚠ {s()!.semantic_index.error}</text>
-        </box>
       )}
     </box>
   );

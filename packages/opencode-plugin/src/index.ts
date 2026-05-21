@@ -582,7 +582,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       return {
         success: true,
         status: "not_initialized",
-        message: "Waiting for first tool call to populate",
+        message:
+          "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
       };
     }
     // The cached snapshot is session-aware: Rust computes

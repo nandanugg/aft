@@ -60,6 +60,11 @@ export interface AftStatusSnapshot {
   };
   /** Compression aggregate passthrough; rendering is added separately. */
   compression?: StatusCompression;
+  /**
+   * Set on synthetic "not_initialized" snapshots when no bridge has spawned
+   * yet. Renderers display this in place of empty status rows.
+   */
+  message?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -145,6 +150,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     project_root: readNullableString(response.project_root),
     canonical_root: readNullableString(response.canonical_root),
     cache_role: readString(response.cache_role, "not_initialized"),
+    message: typeof response.message === "string" ? response.message : undefined,
     features: {
       format_on_edit: readBoolean(features.format_on_edit),
       validate_on_edit: readString(features.validate_on_edit, "off"),

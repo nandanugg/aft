@@ -174,12 +174,16 @@ const StatusDialog = (props: StatusDialogProps) => {
       paddingTop={1}
       paddingBottom={1}
     >
-      {/* Title */}
+      {/* Title. Hide version while the lazy-spawn placeholder is showing — users
+          read `vunknown` next to "AFT Status" as broken state instead of "AFT
+          has not been used yet for this project". */}
       <box justifyContent="center" width="100%" marginBottom={1} flexDirection="row" gap={2}>
         <text fg={t().accent}>
           <b>⚡ AFT Status</b>
         </text>
-        <text fg={t().textMuted}>v{status()?.version ?? packageJson.version}</text>
+        {status()?.cache_role !== "not_initialized" && (
+          <text fg={t().textMuted}>v{status()?.version ?? packageJson.version}</text>
+        )}
       </box>
 
       {/* Error / not-yet-ready state */}
@@ -197,7 +201,8 @@ const StatusDialog = (props: StatusDialogProps) => {
       {status()?.cache_role === "not_initialized" ? (
         <box width="100%" marginTop={1} justifyContent="center">
           <text fg={t().textMuted}>
-            {status()!.message || "Waiting for first tool call to populate"}
+            {status()!.message ||
+              "AFT bridge is now spawned lazily, information here will be populated after first tool call."}
           </text>
         </box>
       ) : null}
@@ -224,8 +229,10 @@ const StatusDialog = (props: StatusDialogProps) => {
         </box>
       ) : null}
 
-      {/* 2-column body */}
-      {status() ? (
+      {/* 2-column body. Gate on cache_role too so a synthetic not_initialized
+          snapshot doesn't render an empty grid of "unknown" / "—" rows
+          alongside the lazy-spawn placeholder message above. */}
+      {status() && status()!.cache_role !== "not_initialized" ? (
         <box flexDirection="row" width="100%" gap={4}>
           {/* Left column */}
           <box flexDirection="column" flexGrow={1} flexBasis={0}>
