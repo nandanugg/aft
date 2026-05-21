@@ -1615,7 +1615,10 @@ impl BgTaskRegistry {
         };
         match crate::db::compression_events::insert_compression_event(&conn, &row) {
             Ok(_) => {
-                crate::slog_info!(
+                // DEBUG-level: each foreground bash call records one of these,
+                // which clutters info-level logs without adding diagnostic value.
+                // Aggregate totals are visible via the status RPC / TUI sidebar.
+                crate::slog_debug!(
                     "compression event recorded for {} (project={}, session={}, {} → {} tokens)",
                     metadata.task_id,
                     project_key,

@@ -105,6 +105,19 @@ macro_rules! slog_error {
     };
 }
 
+/// Log at DEBUG level with the optional `[ses_xxx]` session tag.
+///
+/// Use for verbose-but-useful diagnostics that should be silent by default and
+/// only surface when `RUST_LOG=aft=debug` (or similar) is set.
+///
+/// See [`slog_info!`] for format details.
+#[macro_export]
+macro_rules! slog_debug {
+    ($($arg:tt)*) => {
+        log::debug!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
