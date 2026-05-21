@@ -91,6 +91,11 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   const report = await collectDiagnostics(adapters);
 
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
+  if (!report.binaryVersion) {
+    log.warn(
+      "  no aft binary detected — run `aft doctor --fix` to download, or it will install automatically when an AFT-enabled session makes its first tool call",
+    );
+  }
   log.info(
     `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}`,
   );
@@ -163,7 +168,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
 
   if (hadProblems) {
     note(
-      "Run `aft setup` or `aft doctor --fix` to register AFT with any harness showing `plugin registered: no`. Run `aft doctor --fix` for ONNX Runtime issues.",
+      "Run `aft setup` or `aft doctor --fix` to register AFT with any harness showing `plugin registered: no`. Run `aft doctor --fix` for ONNX Runtime issues or to download a missing aft binary.",
       "Tips",
     );
     outro("Done — some issues found.");
@@ -174,6 +179,12 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
 }
 
 export function hasDoctorProblems(report: DiagnosticReport): boolean {
+  // GitHub #46 follow-up: an absent aft binary is a real problem the user
+  // should see flagged, not buried under a misleading "Everything looks
+  // good." outro. Reproducer: `rm -rf ~/.cache/aft/bin && bunx --bun
+  // @cortexkit/aft doctor` previously printed "AFT binary unknown" + "Binary
+  // cache: 0 versions" and then "Everything looks good." at the bottom.
+  if (!report.binaryVersion) return true;
   return report.harnesses.some((h) => {
     if (!h.hostInstalled) return true;
     if (!h.pluginRegistered) return true;
@@ -342,8 +353,8 @@ export function clearOldBinaries(): BinaryCacheClearResult {
 
 /**
  * `aft doctor --fix` flow — detect and apply auto-fixable issues with
- * user consent. Currently covers ONNX Runtime version mismatches by
- * clearing AFT's managed cache; future fixes can plug in here.
+ * user consent. Currently covers plugin registration, missing aft binary
+ * (GitHub #46 follow-up), and ONNX Runtime version mismatches.
  */
 async function runFixFlow(argv: string[]): Promise<number> {
   const adapters = await resolveAdaptersForCommand(argv, {
@@ -356,10 +367,43 @@ async function runFixFlow(argv: string[]): Promise<number> {
 
   await fixPluginEntries(adapters);
 
-  // ONNX Runtime fix is the only supported auto-fix today.
+  // GitHub #46 follow-up: download the binary if it's missing. Without this,
+  // doctor would silently say "everything looks good" while the user
+  // explicitly tried to recover from a wiped cache. ensureBinary first checks
+  // the cache (so it's idempotent if the binary was downloaded concurrently
+  // by another OpenCode session) and only hits the network when needed.
+  let binaryDownloaded = false;
+  let binaryDownloadError: string | null = null;
+  if (!report.binaryVersion) {
+    log.info("AFT binary not found. Downloading…");
+    try {
+      const { ensureBinary } = await import("@cortexkit/aft-bridge");
+      const path = await ensureBinary(`v${report.cliVersion}`);
+      if (path) {
+        log.success(`AFT binary installed at ${path}`);
+        binaryDownloaded = true;
+      } else {
+        log.error(
+          "AFT binary download failed — no matching release asset on GitHub. " +
+            "Try opening any AFT-enabled session to trigger plugin-side download instead.",
+        );
+        binaryDownloadError = "no matching release asset";
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(`AFT binary download failed: ${message}`);
+      binaryDownloadError = message;
+    }
+  }
+
+  // ONNX Runtime fix is the other supported auto-fix today.
   const onnxResult = await runOnnxFix(adapters, report);
 
-  if (onnxResult === null) {
+  // Decide outro state based on combined results. We can have any
+  // combination of: ONNX fix attempted/skipped/failed, binary
+  // downloaded/skipped/failed, plus pre-existing harness issues left over
+  // that this --fix run can't remediate (plugin entry, host install, etc).
+  if (onnxResult === null && !binaryDownloaded && !binaryDownloadError) {
     log.info("No auto-fixable issues detected.");
     note(
       "If you're still seeing 'Semantic Index: failed' in the TUI sidebar, run " +
@@ -372,7 +416,7 @@ async function runFixFlow(argv: string[]): Promise<number> {
     return stillHasProblems ? 1 : 0;
   }
 
-  const hadErrors = onnxResult.errors.length > 0;
+  const hadErrors = (onnxResult?.errors.length ?? 0) > 0 || binaryDownloadError !== null;
   const afterReport = await collectDiagnostics(adapters);
   const stillHasProblems = hasDoctorProblems(afterReport);
   outro(

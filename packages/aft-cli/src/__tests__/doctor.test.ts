@@ -256,4 +256,26 @@ describe("doctor problem assessment", () => {
     expect(adapter.hasPluginEntry()).toBe(false);
     expect(ensureCalls).toBe(0);
   });
+
+  // GitHub #46 follow-up regression. Before v0.27.2 the user could `rm -rf
+  // ~/.cache/aft/bin && bunx --bun @cortexkit/aft doctor` and watch doctor
+  // report `AFT binary unknown` + `Binary cache: 0 versions` and then close
+  // with "Everything looks good." because `hasDoctorProblems` only checked
+  // the harness rows. The whole reason a user runs `doctor` after wiping
+  // the cache is to confirm AFT can recover — a missing binary must be
+  // surfaced as a real problem so the user knows to run `doctor --fix`.
+  test("missing binary is treated as a problem (GitHub #46 follow-up)", () => {
+    const report = {
+      ...makeReport(makeHarness({ pluginRegistered: true })),
+      binaryVersion: null,
+    };
+    expect(hasDoctorProblems(report)).toBe(true);
+  });
+
+  test("present binary alongside a clean harness is not a problem", () => {
+    const report = makeReport(makeHarness({ pluginRegistered: true }));
+    // baseline: binaryVersion is "0.0.0-test", everything else green
+    expect(report.binaryVersion).toBe("0.0.0-test");
+    expect(hasDoctorProblems(report)).toBe(false);
+  });
 });
