@@ -81,15 +81,21 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME wants $TAG_VERSION but Cargo.toml has $CARGO_VERSION after version-sync. version-sync.mjs broken?"
             exit 1
           fi
+          # CRITICAL: use `true` (not `exit 0`) in the success branch of the
+          # || fallback. `exit 0` in `||` terminates the WHOLE script, so the
+          # second `cargo publish` is skipped silently when the first crate
+          # is already published — which is exactly the retag-recovery case
+          # this fallback exists for. (Repro: v0.28.1 retag — aft-tokenizer
+          # already existed, agent-file-tools never published.)
           cargo publish --package aft-tokenizer \
-            || { ec=$?; cargo publish --package aft-tokenizer --dry-run 2>&1 | grep -q "already exists" && exit 0 || exit $ec; }
+            || { ec=$?; cargo publish --package aft-tokenizer --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
           # Wait briefly for the new tokenizer version to become visible on
           # crates.io's sparse index before publishing `agent-file-tools` —
           # otherwise the verify step in the second publish can race against
           # index propagation and fail with "no matching package found".
           sleep 30
           cargo publish --package agent-file-tools \
-            || { ec=$?; cargo publish --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && exit 0 || exit $ec; }
+            || { ec=$?; cargo publish --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -543,7 +549,13 @@ jobs:
   discord-announce:
     name: Announce on Discord
     runs-on: ubuntu-latest
-    needs: github-release
+    # MUST wait for BOTH github-release AND publish-npm. Without `publish-npm`
+    # the announcement can fire while npm packages are still uploading,
+    # leaving users who click the release link unable to install the
+    # versions Discord just announced.
+    needs:
+      - github-release
+      - publish-npm
     if: success()
     continue-on-error: true
     steps:
