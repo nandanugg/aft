@@ -73,8 +73,13 @@ fi
 echo "→ Running pre-release checks..."
 echo ""
 
-echo "  cargo test..."
-cargo test --quiet 2>&1 || { echo "Error: Rust tests failed"; exit 1; }
+if [ "${SKIP_RUST_TESTS:-}" = "1" ]; then
+  echo "  (skipping local cargo tests — SKIP_RUST_TESTS=1)"
+  echo "  ↳ CI still runs the full suite on its own runners before publishing."
+else
+  echo "  cargo test..."
+  cargo test --quiet 2>&1 || { echo "Error: Rust tests failed"; exit 1; }
+fi
 
 echo "  bun lint..."
 bun run lint 2>&1 || { echo "Error: Lint failed"; exit 1; }
