@@ -14,7 +14,15 @@
  */
 const { LLMock } = require("@copilotkit/aimock");
 
-const port = parseInt(process.env.AIMOCK_PORT || "4010", 10);
+function parsePort(value) {
+  const port = Number.parseInt(value || "0", 10);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`invalid AIMOCK_PORT: ${value}`);
+  }
+  return port;
+}
+
+const port = parsePort(process.env.AIMOCK_PORT);
 
 async function main() {
   const mock = new LLMock({ port });

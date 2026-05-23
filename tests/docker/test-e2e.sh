@@ -34,8 +34,11 @@ NC='\033[0m'
 
 PASS=0
 FAIL=0
-PLUGIN_LOG="${AFT_E2E_PLUGIN_LOG:-/tmp/aft-plugin.log}"
 PLATFORM="${AFT_E2E_PLATFORM:-linux}"
+AIMOCK_RUN_DIR="${AFT_E2E_TEMP_ROOT:-${TMPDIR:-/tmp}/aimock-$$}"
+mkdir -p "$AIMOCK_RUN_DIR"
+export TMPDIR="$AIMOCK_RUN_DIR"
+PLUGIN_LOG="${AFT_E2E_PLUGIN_LOG:-$AIMOCK_RUN_DIR/aft-plugin.log}"
 
 # Platform-specific paths for the broken-ONNX scenario.
 case "$PLATFORM" in
@@ -82,16 +85,66 @@ warn_check() {
     fi
 }
 
+choose_aimock_port() {
+    node <<'NODE'
+const net = require("node:net");
+
+let attempts = 0;
+function probe() {
+  if (++attempts > 100) {
+    console.error("failed to find a free aimock port in 4000-9999");
+    process.exit(1);
+  }
+
+  const port = 4000 + Math.floor(Math.random() * 6000);
+  const server = net.createServer();
+  server.unref();
+  server.on("error", probe);
+  server.listen(port, "127.0.0.1", () => {
+    const selected = server.address().port;
+    server.close(() => console.log(selected));
+  });
+}
+
+probe();
+NODE
+}
+
+configure_opencode_mock_port() {
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+    local config_file="$config_dir/opencode.json"
+    if [ ! -f "$config_file" ]; then
+        echo "OpenCode config not found: $config_file" >&2
+        exit 2
+    fi
+
+    OPENCODE_CONFIG="$config_file" MOCK_BASE_URL="$AIMOCK_BASE_URL/v1" node <<'NODE'
+const fs = require("node:fs");
+const configPath = process.env.OPENCODE_CONFIG;
+const baseURL = process.env.MOCK_BASE_URL;
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+config.provider = config.provider || {};
+config.provider.mock = config.provider.mock || {};
+config.provider.mock.options = config.provider.mock.options || {};
+config.provider.mock.options.baseURL = baseURL;
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+NODE
+}
+
 # AFT_E2E_MOCK_SERVER points to the mock-server.js entry. The Docker setup
 # places it at /test/mock-server.js; the macOS runner places it relative to
 # the repo checkout. Both wire this through env so we don't hardcode paths.
 MOCK_SERVER="${AFT_E2E_MOCK_SERVER:-/test/mock-server.js}"
+AIMOCK_PORT="${AFT_E2E_AIMOCK_PORT:-$(choose_aimock_port)}"
+AIMOCK_BASE_URL="http://127.0.0.1:${AIMOCK_PORT}"
+AIMOCK_LOG="$AIMOCK_RUN_DIR/aimock.log"
+configure_opencode_mock_port
 
 start_aimock() {
-    node "$MOCK_SERVER" > /tmp/aimock.log 2>&1 &
+    AIMOCK_PORT="$AIMOCK_PORT" node "$MOCK_SERVER" > "$AIMOCK_LOG" 2>&1 &
     AIMOCK_PID=$!
     for i in $(seq 1 15); do
-        if curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1; then
+        if curl -s "$AIMOCK_BASE_URL/v1/models" > /dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -113,6 +166,7 @@ run_opencode_session() {
 
     set +e
     # OPENAI_API_KEY required for OpenCode's openai adapter to make requests
+    TMPDIR="$AIMOCK_RUN_DIR" \
     OPENAI_API_KEY=sk-mock-e2e-test \
     timeout --signal=KILL "$timeout_secs" opencode run \
         --model "mock/mock-model" \
@@ -140,6 +194,8 @@ opencode --version 2>&1 | head -1
 echo -n "Node: "
 node --version
 
+echo "Run temp: $AIMOCK_RUN_DIR"
+echo "aimock URL: $AIMOCK_BASE_URL/v1"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════
@@ -155,10 +211,10 @@ rm -f "$PLUGIN_LOG"
 
 echo "Starting aimock..."
 start_aimock
-check "aimock started" "curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1"
+check "aimock started" "curl -s '$AIMOCK_BASE_URL/v1/models' > /dev/null 2>&1"
 
 echo "Running 8-turn OpenCode session..."
-RESULT_FILE="/tmp/result-scenario1.txt"
+RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario1.txt"
 # 90s timeout (was default 30s — too tight): on a cold-cache run under
 # QEMU emulation, ONNX Runtime download (~30MB) plus first-time npm
 # install of 3 LSP servers (typescript-language-server, pyright,
@@ -214,7 +270,7 @@ tail -30 "$PLUGIN_LOG" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
 
 echo ""
 echo "  aimock log:"
-cat /tmp/aimock.log 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+cat "$AIMOCK_LOG" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
 
 stop_aimock
 
@@ -239,10 +295,10 @@ echo "  Installed fake $(basename "$FAKE_ORT_PATH") at $FAKE_ORT_PATH"
 rm -f "$PLUGIN_LOG"
 
 start_aimock
-check "aimock started (s2)" "curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1"
+check "aimock started (s2)" "curl -s '$AIMOCK_BASE_URL/v1/models' > /dev/null 2>&1"
 
 echo "Running session with broken library..."
-RESULT_FILE="/tmp/result-scenario2.txt"
+RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario2.txt"
 # On macOS, the AFT plugin probes a fixed list of system paths
 # (/usr/local/lib, /opt/homebrew/lib) for libonnxruntime.dylib. Since
 # we cannot write into /usr/local/lib on a vanilla GH Actions runner
@@ -262,7 +318,7 @@ fi
 EXIT_CODE=$?
 
 check "session completed (broken lib)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
-warn_check "no crash (broken lib)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
+check "no crash (broken lib)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
 check "no plugin crash (broken lib)" "! grep -qi 'SIGABRT\|thread.*panicked' '$PLUGIN_LOG' 2>/dev/null"
 
 # Verify the plugin detected the system library
@@ -287,16 +343,16 @@ echo ""
 rm -f "$PLUGIN_LOG"
 
 start_aimock
-check "aimock started (s3)" "curl -s http://127.0.0.1:4010/v1/models > /dev/null 2>&1"
+check "aimock started (s3)" "curl -s '$AIMOCK_BASE_URL/v1/models' > /dev/null 2>&1"
 
-RESULT_FILE="/tmp/result-scenario3.txt"
+RESULT_FILE="$AIMOCK_RUN_DIR/result-scenario3.txt"
 run_opencode_session \
     "Read src/main.py" \
     "$RESULT_FILE"
 EXIT_CODE=$?
 
-warn_check "session completed (missing ORT)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
-warn_check "no crash (missing ORT)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
+check "session completed (missing ORT)" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
+check "no crash (missing ORT)" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
 
 stop_aimock
 

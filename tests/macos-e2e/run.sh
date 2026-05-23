@@ -217,6 +217,8 @@ fi
 cd "$TEST_PROJECT"
 
 export AFT_E2E_PLATFORM=macos
-export AFT_E2E_PLUGIN_LOG="${TMPDIR:-/tmp}/aft-plugin.log"
+# The shared harness creates a per-run TMPDIR/aimock-$$ root and points the
+# plugin log there so concurrent macOS/Linux E2E jobs do not collide.
+unset AFT_E2E_PLUGIN_LOG
 
 bash "$REPO_ROOT/tests/docker/test-e2e.sh"

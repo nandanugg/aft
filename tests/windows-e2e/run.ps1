@@ -103,14 +103,81 @@ function Read-NdjsonReply {
         [int]$TimeoutSec = 30
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        $line = $Process.StandardOutput.ReadLine()
-        if (-not $line) { throw "aft stdout closed before reply with id=$ExpectedId" }
+    while ($true) {
+        $remainingMs = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalMilliseconds)
+        if ($remainingMs -le 0) { throw "timed out waiting for reply with id=$ExpectedId" }
+
+        # StandardOutput.ReadLine() blocks indefinitely, so use the async form
+        # and wait only for the remaining budget. If this times out, the caller's
+        # finally block closes/kills the process; we do not issue another async
+        # read against the same StreamReader.
+        $readTask = $Process.StandardOutput.ReadLineAsync()
+        if (-not $readTask.Wait($remainingMs)) {
+            throw "timed out waiting for reply with id=$ExpectedId"
+        }
+
+        $line = $readTask.Result
+        if ($null -eq $line) { throw "aft stdout closed before reply with id=$ExpectedId" }
         $parsed = $line | ConvertFrom-Json
         if ($parsed.id -eq $ExpectedId) { return $parsed }
         # else: unsolicited push frame, keep reading
     }
-    throw "timed out waiting for reply with id=$ExpectedId"
+}
+
+function Get-FreeAimockPort {
+    for ($i = 0; $i -lt 100; $i++) {
+        $candidate = Get-Random -Minimum 4000 -Maximum 10000
+        $listener = $null
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $candidate)
+            $listener.Start()
+            return $candidate
+        } catch {
+            # Try another random high port.
+        } finally {
+            if ($listener) { $listener.Stop() }
+        }
+    }
+    throw "failed to find a free aimock port in 4000-9999"
+}
+
+function Get-TaskStatus {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$TaskId,
+        [string]$RequestId = "bg-status"
+    )
+
+    $status = @{
+        id = $RequestId
+        command = "bash_status"
+        params = @{ task_id = $TaskId }
+    } | ConvertTo-Json -Compress -Depth 5
+    $Process.StandardInput.WriteLine($status)
+    $Process.StandardInput.Flush()
+
+    $statusResponse = Read-NdjsonReply -Process $Process -ExpectedId $RequestId -TimeoutSec 10
+    if (-not $statusResponse.success) { throw "bash_status failed: $($statusResponse | ConvertTo-Json -Compress)" }
+    return $statusResponse
+}
+
+function Wait-ForTerminalStatus {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$TaskId,
+        [int]$TimeoutSec
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $terminalStatuses = @("completed", "failed", "killed", "timed_out")
+    $attempt = 0
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        $statusResponse = Get-TaskStatus -Process $Process -TaskId $TaskId -RequestId "bg-status-$attempt"
+        if ($terminalStatuses -contains [string]$statusResponse.status) { return $statusResponse }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Task $TaskId did not reach terminal state within $TimeoutSec seconds"
 }
 
 # ---------------------------------------------------------------------------
@@ -127,12 +194,25 @@ if (-not $env:AFT_PLUGIN_DIST -or -not (Test-Path $env:AFT_PLUGIN_DIST)) {
     exit 2
 }
 
+# Per-run temp root avoids collisions between concurrent Windows E2E jobs.
+$TempBase = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
+$RunTempRoot = Join-Path $TempBase "aimock-$PID"
+New-Item -ItemType Directory -Force -Path $RunTempRoot | Out-Null
+$env:TEMP = $RunTempRoot
+$env:TMP = $RunTempRoot
+
+$AimockPort = Get-FreeAimockPort
+$env:AIMOCK_PORT = [string]$AimockPort
+$AimockBaseUrl = "http://127.0.0.1:${AimockPort}"
+
 Write-Host "============================================"
 Write-Host "  AFT E2E Test - Windows native"
 Write-Host "============================================"
 Write-Host ""
 Write-Host "AFT binary:   $env:AFT_BINARY_PATH"
 Write-Host "Plugin dist:  $env:AFT_PLUGIN_DIST"
+Write-Host "Run temp:     $RunTempRoot"
+Write-Host "aimock URL:   $AimockBaseUrl/v1"
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -262,7 +342,7 @@ $OpencodeConfig = @"
     "mock": {
       "api": "openai",
       "name": "aimock",
-      "options": { "baseURL": "http://127.0.0.1:4010/v1" },
+      "options": { "baseURL": "$AimockBaseUrl/v1" },
       "models": {
         "mock-model": { "name": "Mock Model" }
       }
@@ -324,27 +404,29 @@ $NpmGlobalRoot = (& npm root -g).Trim()
 $env:NODE_PATH = $NpmGlobalRoot
 
 Write-Host "-- Starting aimock mock LLM --"
+$AimockLog = Join-Path $RunTempRoot "aimock.log"
+$AimockErrLog = Join-Path $RunTempRoot "aimock.err.log"
 $MockProc = Start-Process -FilePath "node" `
     -ArgumentList @($MockServer) `
-    -RedirectStandardOutput (Join-Path $env:TEMP "aimock.log") `
-    -RedirectStandardError  (Join-Path $env:TEMP "aimock.err.log") `
+    -RedirectStandardOutput $AimockLog `
+    -RedirectStandardError  $AimockErrLog `
     -PassThru -NoNewWindow
 
-# Wait for aimock to bind port 4010.
+# Wait for aimock to bind the per-run port.
 $Ready = $false
 for ($i = 0; $i -lt 15; $i++) {
     try {
-        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:4010/v1/models" -TimeoutSec 2 -UseBasicParsing 2>$null
+        $resp = Invoke-WebRequest -Uri "$AimockBaseUrl/v1/models" -TimeoutSec 2 -UseBasicParsing 2>$null
         if ($resp.StatusCode -eq 200) { $Ready = $true; break }
     } catch { }
     Start-Sleep -Seconds 1
 }
 
 if (-not $Ready) {
-    Write-Host "aimock did not become ready" -ForegroundColor Red
-    if (Test-Path (Join-Path $env:TEMP "aimock.err.log")) {
+    Write-Host "aimock did not become ready on $AimockBaseUrl" -ForegroundColor Red
+    if (Test-Path $AimockErrLog) {
         Write-Host "--- aimock stderr ---"
-        Get-Content (Join-Path $env:TEMP "aimock.err.log")
+        Get-Content $AimockErrLog
     }
     exit 2
 }
@@ -429,7 +511,7 @@ function Invoke-AftBgBashScenario {
         [string]$ProjectDir,
         [string]$Command,
         [int]$ExpectedExitCode = 0,
-        [int]$WaitSeconds = 2,
+        [int]$WaitSeconds = 10,
         [hashtable]$ExtraEnv = @{}
     )
 
@@ -478,18 +560,7 @@ function Invoke-AftBgBashScenario {
         $taskId = [string]$spawnResponse.task_id
         if ($taskId -notmatch '^bash-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
 
-        Start-Sleep -Seconds $WaitSeconds
-
-        $status = @{
-            id = "bg-status"
-            command = "bash_status"
-            params = @{ task_id = $taskId }
-        } | ConvertTo-Json -Compress -Depth 5
-        $proc.StandardInput.WriteLine($status)
-        $proc.StandardInput.Flush()
-
-        $statusResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-status" -TimeoutSec 10
-        if (-not $statusResponse.success) { throw "bash_status failed: $($statusResponse | ConvertTo-Json -Compress)" }
+        $statusResponse = Wait-ForTerminalStatus -Process $proc -TaskId $taskId -TimeoutSec $WaitSeconds
 
         # Status check: completed for exit==0, failed for non-zero.
         $expectedStatus = if ($ExpectedExitCode -eq 0) { "completed" } else { "failed" }
@@ -586,18 +657,7 @@ function Invoke-AftNdjsonScenario {
         $taskId = [string]$spawnResponse.task_id
         if ($taskId -notmatch '^bash-[0-9a-f]{8}$') { throw "bad task id format: $taskId" }
 
-        Start-Sleep -Seconds 2
-
-        $status = @{
-            id = "bg-status"
-            command = "bash_status"
-            params = @{ task_id = $taskId }
-        } | ConvertTo-Json -Compress -Depth 5
-        $proc.StandardInput.WriteLine($status)
-        $proc.StandardInput.Flush()
-
-        $statusResponse = Read-NdjsonReply -Process $proc -ExpectedId "bg-status" -TimeoutSec 10
-        if (-not $statusResponse.success) { throw "bash_status failed: $($statusResponse | ConvertTo-Json -Compress)" }
+        $statusResponse = Wait-ForTerminalStatus -Process $proc -TaskId $taskId -TimeoutSec 10
         if ($statusResponse.status -ne "completed") { throw "expected completed status, got: $($statusResponse | ConvertTo-Json -Compress)" }
 
         return $true
@@ -676,8 +736,8 @@ if (-not $logExists) {
 
     Show-LogTail "opencode stdout" $Result1
     Show-LogTail "opencode stderr" ($Result1 + ".err")
-    Show-LogTail "aimock stdout" (Join-Path $env:TEMP "aimock.log")
-    Show-LogTail "aimock stderr" (Join-Path $env:TEMP "aimock.err.log")
+    Show-LogTail "aimock stdout" $AimockLog
+    Show-LogTail "aimock stderr" $AimockErrLog
 
     # Also probe the alternative log paths in case the plugin is using one we
     # didn't expect. Node's os.tmpdir() on Windows resolves to %TEMP% but
@@ -728,7 +788,6 @@ WarnCheck "search index started" { LogContains $PluginLog "watcher started|searc
 # writes a per-request journal sidecar every 1s containing the cumulative
 # request count and per-request paths/timestamps. Used here as bus-level
 # proof opencode talked to the mock.
-$AimockLog = Join-Path $env:TEMP "aimock.log"
 $AimockJournal = Join-Path $env:TEMP "aimock-journal.txt"
 Check "aimock received chat-completion requests" {
     if (-not (Test-Path $AimockJournal)) { return $false }
@@ -1021,7 +1080,7 @@ Check "bg bash records non-zero exit code (cmd /c exit 42)" {
         -ProjectDir $ProjectDir `
         -Command "cmd /c exit 42" `
         -ExpectedExitCode 42 `
-        -WaitSeconds 2 | Out-Null
+        -WaitSeconds 10 | Out-Null
     return $true
 }
 
@@ -1030,7 +1089,7 @@ Check "bg bash records zero exit code (cmd /c exit 0)" {
         -ProjectDir $ProjectDir `
         -Command "cmd /c exit 0" `
         -ExpectedExitCode 0 `
-        -WaitSeconds 2 | Out-Null
+        -WaitSeconds 10 | Out-Null
     return $true
 }
 
@@ -1107,7 +1166,7 @@ if (-not $CmdResolved) {
             -ProjectDir $ProjectDir `
             -Command "cmd /c echo cmd-fallback-ok" `
             -ExpectedExitCode 0 `
-            -WaitSeconds 2 `
+            -WaitSeconds 10 `
             -ExtraEnv @{ PATH = $NoShellPath } | Out-Null
         return $true
     }
@@ -1120,7 +1179,7 @@ if (-not $CmdResolved) {
             -ProjectDir $ProjectDir `
             -Command "cmd /c exit 42" `
             -ExpectedExitCode 42 `
-            -WaitSeconds 2 `
+            -WaitSeconds 10 `
             -ExtraEnv @{ PATH = $NoShellPath } | Out-Null
         return $true
     }
