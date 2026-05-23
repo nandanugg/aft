@@ -110,9 +110,33 @@ const BashWriteParams = Type.Object({
   task_id: Type.String({
     description: "Background PTY task id returned by bash({ pty: true, background: true }).",
   }),
-  input: Type.String({
-    description: 'Input bytes to write to the PTY, e.g. "print(1)\n" or "\u001b[A".',
-  }),
+  // input accepts either a plain string (verbatim bytes) or a sequence array
+  // mixing strings (text) with { key: "<name>" } objects (named control keys).
+  // Rust validates each item; unknown key names return invalid_request.
+  input: Type.Union(
+    [
+      Type.String(),
+      Type.Array(
+        Type.Union([
+          Type.String(),
+          Type.Object({
+            key: Type.String({
+              description:
+                "Named control key, e.g. 'esc', 'enter', 'up', 'ctrl-c'. Case-insensitive.",
+            }),
+          }),
+        ]),
+      ),
+    ],
+    {
+      description:
+        "Either a string of verbatim bytes (e.g. 'print(1)\\n') OR an array mixing strings " +
+        "and { key: '<name>' } objects for atomic text+key sequences. " +
+        "Example: [ 'iHello', { key: 'esc' }, ':wq', { key: 'enter' } ]. " +
+        "Allowed key names: enter, return, tab, space, backspace, esc, escape, up, down, " +
+        "left, right, home, end, page-up, page-down, delete, insert, f1..f12, ctrl-a..ctrl-z.",
+    },
+  ),
 });
 
 interface BashDetails {
@@ -270,7 +294,9 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       if (response.status === "running" && taskId) {
         if (params.background === true) {
           trackBgTask(resolveSessionId(extCtx), taskId);
-          return bashResult(formatBackgroundLaunch(taskId), { task_id: taskId });
+          return bashResult(formatBackgroundLaunch(taskId, params.pty === true), {
+            task_id: taskId,
+          });
         }
 
         // Wait-window decoupled from params.timeout. Always cap polling at
@@ -342,7 +368,13 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
 }
 
-function formatBackgroundLaunch(taskId: string): string {
+function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
+  if (isPty) {
+    // PTY tasks are inherently interactive — the agent MUST poll bash_status
+    // to see the screen and bash_write to drive the program. The piped-task
+    // "don't poll" copy is wrong for this mode.
+    return `PTY task started: ${taskId}. Use bash_status({ task_id: "${taskId}", output_mode: "screen" }) to see the visible terminal, bash_write({ task_id: "${taskId}", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.`;
+  }
   return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
 }
 
@@ -419,7 +451,11 @@ export function createBashWriteTool(ctx: PluginContext) {
     name: "bash_write",
     label: "bash_write",
     description:
-      'Write input bytes to a running PTY bash task. PTY-only; use JSON escapes such as "\u001b[A" for arrow-up. Maximum 1 MiB per call. Check bash_status reports mode: "pty" before writing.',
+      'Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: "pty" first. ' +
+      'Input is either a string (verbatim bytes) or an array mixing strings and { key: "esc" | "enter" | "up" | "ctrl-c" | ... } objects ' +
+      'for atomic text+key sequences such as [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ]. ' +
+      "Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. " +
+      "Maximum 1 MiB per call (post-expansion).",
     promptSnippet: "Write keystrokes/input to a PTY bash task",
     parameters: BashWriteParams,
     async execute(

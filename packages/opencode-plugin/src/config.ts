@@ -138,6 +138,17 @@ const BashFeaturesSchema = z.object({
   rewrite: z.boolean().optional(),
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
+  /**
+   * Allow OpenCode subagents to use real background bash (`background: true`
+   * and auto-promotion). Default: false — subagents fall back to synchronous
+   * foreground polling because they can't survive turn-end to receive the
+   * wake-up reminder. When true, subagents get the same bg semantics as
+   * primary sessions and MUST explicitly wait for their bg tasks with
+   * `bash_status({ taskId, exit: true, ... })` before returning to parent.
+   * Setting this is essentially a contract with your subagent prompts that
+   * they know how to use bash_status's wait mode.
+   */
+  subagent_background: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
 });
@@ -382,6 +393,8 @@ export interface ResolvedBashConfig {
   rewrite: boolean;
   compress: boolean;
   background: boolean;
+  /** See BashFeaturesSchema.subagent_background. Default false. */
+  subagent_background: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
 }
@@ -421,11 +434,18 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
     legacy?.long_running_reminder_interval_ms;
 
+  // subagent_background defaults FALSE everywhere (object form, legacy form,
+  // surface default). It's an explicit opt-in even when bash: true. Top-level
+  // wins; only the object form can set it.
+  const topSubagentBg =
+    typeof top === "object" && top !== null ? top.subagent_background === true : false;
+
   const base: ResolvedBashConfig = {
     enabled: false,
     rewrite: false,
     compress: false,
     background: false,
+    subagent_background: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
   };
@@ -444,6 +464,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       rewrite: top.rewrite ?? true,
       compress: top.compress ?? true,
       background: top.background ?? true,
+      subagent_background: topSubagentBg,
     };
   }
 

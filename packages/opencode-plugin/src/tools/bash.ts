@@ -130,7 +130,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         .boolean()
         .optional()
         .describe(
-          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Requires background: true and is unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and send input with bash_write.',
+          'When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Requires background: true and is unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: "screen" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ] for atomic text+key sequences.',
         ),
     },
     execute: async (args, context) => {
@@ -215,7 +215,7 @@ export function createBashTool(ctx: PluginContext): ToolDefinition {
         const taskId = data.task_id;
         if (effectiveBackground) {
           trackBgTask(context.sessionID, taskId);
-          const startedLine = formatBackgroundLaunch(taskId);
+          const startedLine = formatBackgroundLaunch(taskId, requestedPty);
           const metadataPayload = { description, output: startedLine, status: "running", taskId };
           metadata?.(metadataPayload);
           if (callID) {
@@ -451,7 +451,13 @@ function isTerminalStatus(status: unknown): boolean {
   );
 }
 
-function formatBackgroundLaunch(taskId: string): string {
+function formatBackgroundLaunch(taskId: string, isPty: boolean): string {
+  if (isPty) {
+    // PTY tasks are inherently interactive — the agent MUST poll bash_status
+    // to see the screen and bash_write to drive the program. The piped-task
+    // "don't poll" copy is wrong for this mode.
+    return `PTY task started: ${taskId}. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "${taskId}", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.`;
+  }
   return `Background task started: ${taskId}. A completion reminder will be delivered automatically; don't poll bash_status.`;
 }
 
