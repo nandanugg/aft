@@ -428,23 +428,32 @@ fn cap_lines(lines: &[String], max_lines: usize, keep: KeepMode) -> String {
         return lines.join("\n");
     }
 
-    let omitted = lines.len() - max_lines;
-    let marker = format!("… ({omitted} more lines)");
+    if max_lines == 0 {
+        return String::new();
+    }
+
+    let content_slots = max_lines - 1;
 
     match keep {
         KeepMode::Head => {
-            let mut out: Vec<String> = lines.iter().take(max_lines).cloned().collect();
+            let omitted = lines.len() - content_slots;
+            let marker = format!("… ({omitted} more lines)");
+            let mut out: Vec<String> = lines.iter().take(content_slots).cloned().collect();
             out.push(marker);
             out.join("\n")
         }
         KeepMode::Tail => {
+            let omitted = lines.len() - content_slots;
+            let marker = format!("… ({omitted} more lines)");
             let mut out = vec![marker];
             out.extend(lines.iter().skip(omitted).cloned());
             out.join("\n")
         }
         KeepMode::Middle => {
-            let head_count = max_lines / 2;
-            let tail_count = max_lines - head_count;
+            let head_count = content_slots / 2;
+            let tail_count = content_slots - head_count;
+            let omitted = lines.len() - head_count - tail_count;
+            let marker = format!("… ({omitted} more lines)");
             let mut out: Vec<String> = lines.iter().take(head_count).cloned().collect();
             out.push(marker);
             out.extend(lines.iter().skip(lines.len() - tail_count).cloned());
@@ -622,7 +631,8 @@ keep = "tail"
         );
         let input = "1\n2\n3\n4\n5";
         let out = apply_filter(&filter, input);
-        assert_eq!(out, "… (2 more lines)\n3\n4\n5");
+        assert_eq!(out, "… (3 more lines)\n4\n5");
+        assert_eq!(out.lines().count(), 3);
     }
 
     #[test]
@@ -639,7 +649,8 @@ keep = "head"
         );
         let input = "1\n2\n3\n4";
         let out = apply_filter(&filter, input);
-        assert_eq!(out, "1\n2\n… (2 more lines)");
+        assert_eq!(out, "1\n… (3 more lines)");
+        assert_eq!(out.lines().count(), 2);
     }
 
     #[test]
@@ -656,8 +667,59 @@ keep = "middle"
         );
         let input = "1\n2\n3\n4\n5\n6\n7\n8";
         let out = apply_filter(&filter, input);
-        // 4/2=2 head, 4-2=2 tail → keep 1,2 then 7,8
-        assert_eq!(out, "1\n2\n… (4 more lines)\n7\n8");
+        // max_lines includes the marker: 1 head + marker + 2 tail = 4 total lines.
+        assert_eq!(out, "1\n… (5 more lines)\n7\n8");
+        assert_eq!(out.lines().count(), 4);
+    }
+
+    #[test]
+    fn cap_zero_keeps_no_lines() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[cap]
+max_lines = 0
+keep = "head"
+"#,
+        );
+        let out = apply_filter(&filter, "1\n2\n3");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn cap_one_keeps_only_marker_when_truncated() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[cap]
+max_lines = 1
+keep = "tail"
+"#,
+        );
+        let out = apply_filter(&filter, "1\n2\n3");
+        assert_eq!(out, "… (3 more lines)");
+        assert_eq!(out.lines().count(), 1);
+    }
+
+    #[test]
+    fn cap_two_reserves_one_line_for_marker() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[cap]
+max_lines = 2
+keep = "tail"
+"#,
+        );
+        let out = apply_filter(&filter, "1\n2\n3\n4");
+        assert_eq!(out, "… (3 more lines)\n4");
+        assert_eq!(out.lines().count(), 2);
     }
 
     #[test]

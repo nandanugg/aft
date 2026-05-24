@@ -66,6 +66,17 @@ fn bun_install_drops_resolver_noise_but_keeps_errors_and_summary() {
 }
 
 #[test]
+fn bun_i_alias_uses_install_compressor() {
+    let output = "Resolving dependencies 1/30\nDownloaded dep-1\nDownloaded dep-2\n42 packages installed [1234.00ms]\nSaved lockfile\n";
+
+    let compressed = BunCompressor.compress("bun i", output);
+    assert!(!compressed.contains("Resolving dependencies"));
+    assert!(!compressed.contains("Downloaded dep-"));
+    assert!(compressed.contains("42 packages installed"));
+    assert!(compressed.contains("Saved lockfile"));
+}
+
+#[test]
 fn pnpm_install_limits_progress_and_keeps_auth_warning_error_summary() {
     let mut output =
         String::from("Lockfile is up to date\nAlready up-to-date\nAlready up-to-date\n");

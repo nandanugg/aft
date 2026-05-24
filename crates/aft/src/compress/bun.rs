@@ -22,7 +22,7 @@ impl Compressor for BunCompressor {
 
     fn compress(&self, command: &str, output: &str) -> String {
         match bun_subcommand(command).as_deref() {
-            Some("install" | "add" | "remove") => compress_package(output),
+            Some("install" | "i" | "add" | "remove") => compress_package(output),
             Some("test") => compress_test(output),
             Some("run") => GenericCompressor::compress_output(output),
             Some("build") => compress_build(output),

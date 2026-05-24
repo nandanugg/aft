@@ -225,6 +225,7 @@ pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
 ///   - `cd /path && cmd ...`            → `cmd ...`
 ///   - `cd /path; cmd ...`              → `cmd ...`
 ///   - `env FOO=bar [BAR=baz ...] cmd`  → `cmd ...`
+///   - `FOO=bar [BAR=baz ...] cmd`      → `cmd ...`
 ///   - `timeout 30 cmd ...`             → `cmd ...`
 ///   - `nohup cmd ...`                  → `cmd ...`
 ///   - `(cd /path && cmd ...)`          → `cmd ...`   (trailing `)` is kept; harmless for matchers)
@@ -256,6 +257,15 @@ pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
 
     // Step 2: iteratively peel known shell prefixes.
     loop {
+        // `VAR=value cmd ...` (possibly multiple assignment words). This must
+        // run before head-token matching so package-manager/Rust compressors
+        // still see the real command for `NODE_ENV=production npm install`.
+        if let Some(stripped) = strip_leading_assignment_prefix(&current) {
+            current = stripped;
+            changed = true;
+            continue;
+        }
+
         let head: String = current.split_whitespace().next().unwrap_or("").to_string();
 
         // `cd <path> && ...` or `cd <path>; ...`
@@ -348,42 +358,96 @@ fn strip_cd_prefix(command: &str) -> Option<String> {
 
 fn strip_env_prefix(command: &str) -> Option<String> {
     // env <ASSIGN>... <cmd> ...
-    // ASSIGN looks like VAR=value (no leading dash).
     let rest = command.strip_prefix("env")?.trim_start();
-    let mut tokens = rest.split_whitespace().peekable();
-    let mut consumed = 0usize;
-    while let Some(&token) = tokens.peek() {
-        if !is_env_assignment(token) {
+    strip_leading_assignment_prefix(rest)
+}
+
+fn strip_leading_assignment_prefix(command: &str) -> Option<String> {
+    let mut index = 0usize;
+    let mut consumed_assignment = false;
+
+    loop {
+        index = skip_whitespace(command, index);
+        if index >= command.len() {
             break;
         }
-        consumed += token.len();
-        // count whitespace between this and next
-        tokens.next();
+
+        let word_end = shell_word_end(command, index)?;
+        if word_end == index {
+            break;
+        }
+
+        let word = &command[index..word_end];
+        if !is_env_assignment(word) {
+            break;
+        }
+
+        consumed_assignment = true;
+        index = word_end;
     }
-    if consumed == 0 {
+
+    if !consumed_assignment {
         return None;
     }
-    // Re-walk rest to find the byte offset after the last assignment.
-    let mut idx = 0usize;
-    let mut consumed_now = 0usize;
-    let bytes = rest.as_bytes();
-    while consumed_now < consumed && idx < bytes.len() {
-        // skip whitespace
-        while idx < bytes.len() && (bytes[idx] as char).is_whitespace() {
-            idx += 1;
-        }
-        // consume token
-        let token_start = idx;
-        while idx < bytes.len() && !(bytes[idx] as char).is_whitespace() {
-            idx += 1;
-        }
-        consumed_now += idx - token_start;
-    }
-    let after = rest[idx..].trim_start();
+
+    let after = command[index..].trim_start();
     if after.is_empty() {
         None
     } else {
         Some(after.to_string())
+    }
+}
+
+fn skip_whitespace(input: &str, mut index: usize) -> usize {
+    while index < input.len() {
+        let Some(ch) = input[index..].chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn shell_word_end(command: &str, start: usize) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for (offset, ch) in command[start..].char_indices() {
+        let index = start + offset;
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+
+        if !in_single && !in_double && (ch.is_whitespace() || matches!(ch, ';' | '&' | '|')) {
+            return Some(index);
+        }
+    }
+
+    if in_single || in_double || escaped {
+        None
+    } else {
+        Some(command.len())
     }
 }
 
@@ -394,10 +458,12 @@ fn is_env_assignment(token: &str) -> bool {
     let Some((name, _value)) = token.split_once('=') else {
         return false;
     };
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn strip_timeout_prefix(command: &str) -> Option<String> {
@@ -658,6 +724,27 @@ mod normalize_command_tests {
     }
 
     #[test]
+    fn strips_bare_assignment_prefixes() {
+        assert_eq!(
+            normalize_command_for_dispatch("NODE_ENV=production npm install").as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(
+            normalize_command_for_dispatch("FOO=1 BAR=2 cargo test").as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            normalize_command_for_dispatch("RUSTFLAGS='-C debug' cargo build").as_deref(),
+            Some("cargo build")
+        );
+    }
+
+    #[test]
+    fn does_not_strip_later_assignment_arguments() {
+        assert_eq!(normalize_command_for_dispatch("npm install foo=bar"), None);
+    }
+
+    #[test]
     fn env_without_assignments_returns_none() {
         // `env` alone is the env-listing command, not a prefix.
         assert_eq!(
@@ -743,6 +830,38 @@ mod normalize_command_tests {
         );
         // NpmCompressor's install path keeps "added N packages" / "audited" markers.
         assert!(compressed.contains("added") || compressed.contains("audited"));
+    }
+
+    #[test]
+    fn bare_assignment_prefix_npm_install_routes_to_npm() {
+        let output = "npm http fetch GET 200 https://registry.npmjs.org/foo 123ms\nnpm WARN deprecated old-pkg@1.0.0: use new-pkg instead\n\nadded 42 packages in 2s\n\naudited 100 packages in 2s\n\nfound 0 vulnerabilities\n";
+        let compressed =
+            compress_with_registry("NODE_ENV=production npm install", output, &empty_registry());
+        assert!(!compressed.contains("npm http fetch"));
+        assert!(compressed.contains("audited 100 packages"));
+    }
+
+    #[test]
+    fn bare_assignment_prefix_cargo_test_routes_to_cargo() {
+        let output = "running 1 test\ntest foo ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let compressed =
+            compress_with_registry("FOO=1 BAR=2 cargo test", output, &empty_registry());
+        assert!(compressed.contains("running 1 test"));
+        assert!(compressed.contains("test result: ok"));
+        assert!(!compressed.contains("test foo ... ok"));
+    }
+
+    #[test]
+    fn quoted_assignment_prefix_cargo_build_routes_to_cargo() {
+        let output = "   Compiling foo v0.1.0\nwarning: unused variable: `x`\n --> src/lib.rs:1:9\n  |\n1 |     let x = 1;\n  |         ^ help: if this is intentional, prefix it with an underscore: `_x`\n\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s\n";
+        let compressed = compress_with_registry(
+            "RUSTFLAGS='-C debug' cargo build",
+            output,
+            &empty_registry(),
+        );
+        assert!(!compressed.contains("Compiling foo"));
+        assert!(compressed.contains("warning: unused variable"));
+        assert!(compressed.contains("Finished `dev` profile"));
     }
 
     #[test]

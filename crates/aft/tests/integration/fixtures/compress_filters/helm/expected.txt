@@ -1,5 +1,4 @@
-… (72 more lines)
-kind: ConfigMap
+… (73 more lines)
 metadata:
   name: config-15
 # Source: app/templates/deployment.yaml line 16
