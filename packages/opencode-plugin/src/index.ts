@@ -175,11 +175,13 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.28.0";
+const ANNOUNCEMENT_VERSION = "0.30.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Bash hoisting is now default-on. Configure with top-level `bash: { rewrite, compress, background }` instead of `experimental.bash.*` — old config migrates automatically on first launch.",
-  "Vue, Astro, and Svelte language servers now auto-install when the framework appears in your package.json (fixes #48).",
-  "Native Windows ARM64 binary — ARM64 hosts no longer fall back to x64 under emulation.",
+  'PTY support for interactive bash. `bash({pty: true, background: true})` spawns commands inside a real terminal — runs Python/Node REPLs, vim, htop, less, and nested TUIs. Use `ptyRows`/`ptyCols` (up to 60×140) to size the terminal, `bash_status({outputMode: "screen"})` for the rendered view, and `bash_write` to send keystrokes.',
+  "New `bash_watch` tool unifies pattern notifications and sync waits. `bash_watch({taskId, pattern?, timeoutMs?})` blocks inline; `bash_watch({taskId, pattern, background: true})` registers an async watcher that fires `[BG BASH NOTIFY]` on match or task exit and suppresses the default completion reminder.",
+  "`bash_status` is now a pure snapshot tool — wait and watch semantics moved to `bash_watch`.",
+  "URL fetches in `aft_outline` and `aft_zoom` no longer hang indefinitely on slow servers — body reads abort with a clear stall error after 15 seconds without data.",
+  "Post-restart bg-bash replay is fixed: previously-delivered task completions no longer fire fresh reminders after OpenCode restarts.",
 ];
 
 /**
