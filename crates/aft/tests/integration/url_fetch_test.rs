@@ -472,3 +472,88 @@ fn concurrent_fetches_do_not_collide() {
         "one content file and one meta file should remain: {entries:?}"
     );
 }
+
+#[test]
+fn transient_connect_failure_retries_then_succeeds() {
+    // First connect: TCP listener accepts the connection but drops it without
+    // writing any response. reqwest surfaces that as `is_request()` (the body
+    // never read a status line), which is_transient_reqwest_error classifies
+    // as transient. Second connect: write a real 200 response. Without the
+    // retry the outer call would fail; with it the second attempt wins.
+    let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempt_for_handler = Arc::clone(&attempt);
+    let server = spawn_mock_server(2, move |_path, stream| {
+        let n = attempt_for_handler.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // Drop without writing anything — peer closed during request.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        } else {
+            write_response(stream, "200 OK", "text/markdown", b"# Retried OK\n");
+        }
+    });
+    let url = server.url("/doc.md");
+    let storage = TempDir::new().unwrap();
+
+    let start = Instant::now();
+    let result = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    );
+    let elapsed = start.elapsed();
+
+    let path = result.expect("retry should make the fetch succeed");
+    let body = fs::read_to_string(path).unwrap();
+    assert!(body.contains("Retried OK"));
+    assert_eq!(
+        attempt.load(Ordering::SeqCst),
+        2,
+        "server should see exactly two connect attempts"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "first retry should sleep at least one short backoff before reconnecting (elapsed = {elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "retry budget shouldn't blow up foreground latency (elapsed = {elapsed:?})"
+    );
+}
+
+#[test]
+fn http_error_status_is_not_retried() {
+    // The server *answers* with HTTP 404 on the first request. reqwest treats
+    // that as a successful response (status() carries 404), so the caller
+    // surfaces "HTTP 404" without re-hammering the server. If the retry loop
+    // wrongly retried, the mock would be reached more than once.
+    let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempt_for_handler = Arc::clone(&attempt);
+    let server = spawn_mock_server(3, move |_path, stream| {
+        attempt_for_handler.fetch_add(1, Ordering::SeqCst);
+        write_response(stream, "404 Not Found", "text/plain", b"nope\n");
+    });
+    let url = server.url("/missing.md");
+    let storage = TempDir::new().unwrap();
+
+    let result = fetch_url_to_cache(
+        &url,
+        storage.path(),
+        UrlFetchOptions {
+            allow_private: true,
+            ..UrlFetchOptions::default()
+        },
+    );
+    let err = result.expect_err("404 must surface as error");
+    assert!(
+        err.to_string().contains("HTTP 404"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        attempt.load(Ordering::SeqCst),
+        1,
+        "HTTP error status must NOT trigger a retry"
+    );
+}

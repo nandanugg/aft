@@ -20,6 +20,19 @@ const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(30_000);
 const BODY_CHUNK_TIMEOUT: Duration = Duration::from_millis(15_000);
 const MAX_REDIRECTS: usize = 5;
+
+/// Retry budget for transient connect/transport failures only. Agents
+/// shouldn't have to retry manually for a single TCP/TLS hiccup. We cap
+/// at 2 retries (= 3 total attempts) with short jittered backoff so a
+/// genuinely-broken host fails fast instead of dragging the foreground
+/// fetch out to many seconds.
+///
+/// We deliberately do NOT retry on:
+///   - HTTP error status (4xx/5xx) — the server actually answered
+///   - Redirect errors / SSRF rejections — those are deterministic
+///   - Body read stalls — already handled by BODY_CHUNK_TIMEOUT
+const TRANSIENT_RETRY_ATTEMPTS: usize = 2;
+const TRANSIENT_RETRY_BACKOFFS_MS: [u64; TRANSIENT_RETRY_ATTEMPTS] = [200, 600];
 const ACCEPT_HEADER: &str = "application/vnd.github.raw, text/markdown, text/x-markdown, text/html;q=0.9, application/json;q=0.8, text/plain;q=0.5";
 const USER_AGENT_VALUE: &str = "aft-opencode-plugin";
 
@@ -258,18 +271,7 @@ fn fetch_with_redirects(
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_public_url(&current_url, options)?;
-        let response = client
-            .get(current_url.clone())
-            .header(USER_AGENT, USER_AGENT_VALUE)
-            .header(ACCEPT, ACCEPT_HEADER)
-            .send()
-            .map_err(|error| {
-                UrlFetchError::new(format!(
-                    "Failed to fetch {}: {}",
-                    current_url.as_str(),
-                    reqwest_error_detail(&error)
-                ))
-            })?;
+        let response = send_with_transient_retries(&client, &current_url)?;
 
         if !response.status().is_redirection() {
             return Ok(response);
@@ -301,6 +303,67 @@ fn fetch_with_redirects(
     Err(UrlFetchError::new(format!(
         "Too many redirects fetching {original_url}"
     )))
+}
+
+/// Issue a single GET with the configured User-Agent + Accept headers and
+/// transparently retry only on transient connect/transport failures.
+///
+/// Returns the response (including 4xx/5xx — caller decides how to treat
+/// those). On a non-transient reqwest error (e.g. an HTTP-shaped reply that
+/// reqwest still surfaces as Err, or a TLS handshake fault that doesn't read
+/// as `is_connect`), the original error is returned immediately so the user
+/// sees the real failure without an artificial 800ms-plus delay.
+fn send_with_transient_retries(
+    client: &Client,
+    target: &Url,
+) -> Result<HttpResponse, UrlFetchError> {
+    let mut last_error: Option<reqwest::Error> = None;
+    for attempt in 0..=TRANSIENT_RETRY_ATTEMPTS {
+        let result = client
+            .get(target.clone())
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .header(ACCEPT, ACCEPT_HEADER)
+            .send();
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                if attempt < TRANSIENT_RETRY_ATTEMPTS && is_transient_reqwest_error(&error) {
+                    thread::sleep(Duration::from_millis(TRANSIENT_RETRY_BACKOFFS_MS[attempt]));
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(UrlFetchError::new(format!(
+                    "Failed to fetch {}: {}",
+                    target.as_str(),
+                    reqwest_error_detail(&error)
+                )));
+            }
+        }
+    }
+    // Loop fell through after the last allowed retry exhausted — surface the
+    // most recent transient error rather than swallowing it.
+    Err(UrlFetchError::new(format!(
+        "Failed to fetch {} after {} retries: {}",
+        target.as_str(),
+        TRANSIENT_RETRY_ATTEMPTS,
+        last_error
+            .as_ref()
+            .map(reqwest_error_detail)
+            .unwrap_or_else(|| "unknown transient error".to_string())
+    )))
+}
+
+/// Classify a reqwest error as transient (worth a quick retry) vs terminal.
+///
+/// Transient: TCP connect failures, request-build/send TCP-level failures
+/// that don't carry status, and timeouts. These typically clear on a single
+/// retry — agents shouldn't have to ask twice for a momentary blip.
+///
+/// Terminal: anything where reqwest got far enough to decode an HTTP-shaped
+/// reply (`is_status()`, `is_body()`, `is_decode()`). Retrying those would
+/// just hammer a server that already answered.
+fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
 }
 
 fn build_client(options: &UrlFetchOptions) -> Result<Client, UrlFetchError> {
