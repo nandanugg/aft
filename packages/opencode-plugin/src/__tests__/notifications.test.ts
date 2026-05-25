@@ -1,14 +1,17 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import {
+  __resetNotificationStateForTests,
   type ConfigureWarning,
   deliverConfigureWarnings,
   getSessionMessages,
   SESSION_MESSAGES_LIMIT,
+  sendFeatureAnnouncement,
+  sendWarning,
 } from "../notifications.js";
 
 const tempRoots = new Set<string>();
@@ -78,10 +81,55 @@ function baseWarning(overrides: Partial<ConfigureWarning> = {}): ConfigureWarnin
 }
 
 afterEach(() => {
+  __resetNotificationStateForTests();
   for (const root of tempRoots) {
     rmSync(root, { recursive: true, force: true });
   }
   tempRoots.clear();
+});
+
+describe("Desktop notification session routing", () => {
+  test("session-less warnings wait for an explicit session instead of using Desktop last-session state", async () => {
+    const { client, messages } = createClient();
+
+    await sendWarning({ client, directory: "/repo" }, "queued warning");
+    expect(messages).toHaveLength(0);
+
+    await sendWarning({ client, directory: "/repo", sessionId: "session-1" }, "current warning");
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toContain("queued warning");
+    expect(messages[1]).toContain("current warning");
+  });
+
+  test("session-less feature announcements persist only after queued delivery", async () => {
+    const storageDir = createStorageDir();
+    const versionFile = join(storageDir, "last_announced_version");
+    const { client, messages } = createClient();
+
+    await sendFeatureAnnouncement(
+      { client, directory: "/repo" },
+      "9.9.9",
+      ["Audit fix"],
+      "",
+      storageDir,
+    );
+
+    expect(messages).toHaveLength(0);
+    expect(existsSync(versionFile)).toBe(false);
+
+    await sendFeatureAnnouncement(
+      { client, directory: "/repo", sessionId: "session-1" },
+      "9.9.9",
+      ["Audit fix"],
+      "",
+      storageDir,
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("New in v9.9.9");
+    expect(readFileSync(versionFile, "utf-8")).toBe("9.9.9");
+  });
 });
 
 describe("deliverConfigureWarnings", () => {

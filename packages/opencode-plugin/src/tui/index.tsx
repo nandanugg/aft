@@ -7,7 +7,11 @@ import { createMemo, createSignal, onCleanup } from "solid-js";
 import packageJson from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
 import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
-import { createAftSidebarSlot, formatCompressionSidebarRows } from "./sidebar";
+import {
+  createAftSidebarSlot,
+  formatCompressionSidebarRows,
+  resolveTuiStorageDir,
+} from "./sidebar";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
 // JSON port file written by AftRpcServer ({ port, token }) and includes that
@@ -23,16 +27,7 @@ function getRpcClient(directory: string): AftRpcClient {
   let client = rpcClients.get(directory);
   if (client) return client;
 
-  // v0.27 moved AFT storage to the CortexKit root. The TUI plugin must use
-  // the same path as the server plugin (`resolveCortexKitStorageRoot()`),
-  // otherwise it polls stale legacy port files written by older versions
-  // and never picks up the live RPC server, leaving the sidebar/dialog
-  // stuck on the "AFT is starting up" placeholder forever.
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const dataHome = process.env.XDG_DATA_HOME || `${home}/.local/share`;
-  const storageDir = `${dataHome}/cortexkit/aft`;
-
-  client = new AftRpcClient(storageDir, directory);
+  client = new AftRpcClient(resolveTuiStorageDir(), directory);
   rpcClients.set(directory, client);
   return client;
 }

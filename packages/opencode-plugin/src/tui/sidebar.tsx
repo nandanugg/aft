@@ -7,6 +7,7 @@
 // session.updated/message.updated events with a small debounce, same as
 // magic-context, so the panel stays current without polling.
 
+import { resolveCortexKitStorageRoot } from "@cortexkit/aft-bridge";
 import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 
@@ -135,6 +136,13 @@ const SectionHeader = (props: { theme: TuiThemeCurrent; title: string; marginTop
   </box>
 );
 
+// v0.27 moved AFT storage to the CortexKit root. TUI code must call the
+// bridge helper rather than reconstructing HOME/XDG paths locally; the helper
+// carries the Windows LOCALAPPDATA/AppData behavior used by the server plugin.
+export function resolveTuiStorageDir(): string {
+  return resolveCortexKitStorageRoot();
+}
+
 // One RPC client per project directory — same pattern as the /aft-status
 // dialog handler in tui/index.tsx. Sharing the map avoids opening a second
 // connection just for the sidebar.
@@ -142,13 +150,7 @@ const sidebarClients = new Map<string, AftRpcClient>();
 function getClient(directory: string): AftRpcClient {
   let client = sidebarClients.get(directory);
   if (client) return client;
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const dataHome = process.env.XDG_DATA_HOME || `${home}/.local/share`;
-  // v0.27 moved AFT storage to the CortexKit root. Must match the server
-  // plugin's `resolveCortexKitStorageRoot()` or the sidebar will poll a
-  // stale legacy port file and never connect to the live RPC server.
-  const storageDir = `${dataHome}/cortexkit/aft`;
-  client = new AftRpcClient(storageDir, directory);
+  client = new AftRpcClient(resolveTuiStorageDir(), directory);
   sidebarClients.set(directory, client);
   return client;
 }

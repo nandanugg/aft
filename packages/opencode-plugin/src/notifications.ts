@@ -98,21 +98,25 @@ function getDesktopStatePath(): string | null {
 }
 
 interface DesktopState {
-  sessionId: string | null;
   serverUrl: string | null;
 }
 
-function readDesktopState(directory: string): DesktopState {
+function readDesktopState(): DesktopState {
   const statePath = getDesktopStatePath();
   if (!statePath || !existsSync(statePath)) {
-    return { sessionId: null, serverUrl: null };
+    return { serverUrl: null };
   }
 
   try {
     const raw = readFileSync(statePath, "utf-8");
     const state = JSON.parse(raw) as Record<string, unknown>;
 
-    // Extract sidecar URL from server state
+    // Extract sidecar URL from server state. We intentionally do NOT read
+    // layout.page.lastProjectSession here: that value is global per directory,
+    // not per Desktop window, and can route startup notifications to the wrong
+    // window when two windows have the same repo open. Desktop notifications
+    // require an explicit sessionId; session-less startup notices are queued
+    // until a caller has concrete session/window context.
     let serverUrl: string | null = null;
     const serverStr = state.server;
     if (typeof serverStr === "string") {
@@ -126,24 +130,65 @@ function readDesktopState(directory: string): DesktopState {
       }
     }
 
-    // Extract last session for directory
-    let sessionId: string | null = null;
-    const layoutPage = state["layout.page"];
-    if (typeof layoutPage === "string") {
-      const parsed = JSON.parse(layoutPage) as Record<string, unknown>;
-      const lastProjectSession = parsed.lastProjectSession as
-        | Record<string, { id?: string }>
-        | undefined;
-      if (lastProjectSession) {
-        const entry = lastProjectSession[directory];
-        sessionId = entry?.id ?? null;
-      }
-    }
-
-    return { sessionId, serverUrl };
+    return { serverUrl };
   } catch {
-    return { sessionId: null, serverUrl: null };
+    return { serverUrl: null };
   }
+}
+
+// --- Desktop notification queue ---
+
+type PendingDesktopNotification = {
+  key: string;
+  text: string;
+  shouldSkip?: () => boolean;
+  onDelivered?: () => void;
+};
+
+const MAX_PENDING_DESKTOP_NOTIFICATIONS = 20;
+const pendingDesktopNotifications = new Map<string, PendingDesktopNotification[]>();
+
+function getExplicitSessionId(opts: Pick<NotificationOptions, "sessionId">): string | null {
+  const sessionId = opts.sessionId?.trim();
+  return sessionId ? sessionId : null;
+}
+
+function enqueuePendingDesktopNotification(
+  directory: string,
+  notification: PendingDesktopNotification,
+): void {
+  if (!directory) return;
+  const pending = pendingDesktopNotifications.get(directory) ?? [];
+  if (pending.some((item) => item.key === notification.key)) return;
+
+  pending.push(notification);
+  if (pending.length > MAX_PENDING_DESKTOP_NOTIFICATIONS) {
+    pending.splice(0, pending.length - MAX_PENDING_DESKTOP_NOTIFICATIONS);
+  }
+  pendingDesktopNotifications.set(directory, pending);
+}
+
+async function flushPendingDesktopNotifications(
+  opts: Pick<NotificationOptions, "client" | "directory">,
+  sessionId: string,
+): Promise<void> {
+  const pending = pendingDesktopNotifications.get(opts.directory);
+  if (!pending?.length) return;
+
+  pendingDesktopNotifications.delete(opts.directory);
+  for (const notification of pending) {
+    if (notification.shouldSkip?.()) continue;
+    const delivered = await sendIgnoredMessage(opts.client, sessionId, notification.text);
+    if (delivered) {
+      notification.onDelivered?.();
+    } else {
+      enqueuePendingDesktopNotification(opts.directory, notification);
+    }
+  }
+}
+
+export function __resetNotificationStateForTests(): void {
+  pendingDesktopNotifications.clear();
 }
 
 // --- SDK message helpers ---
@@ -279,8 +324,10 @@ async function deleteMessage(
 export interface NotificationOptions {
   /** The OpenCode SDK client */
   client: unknown;
-  /** Project directory for Desktop state lookup */
+  /** Project directory used as the queue key for delayed Desktop notices. */
   directory: string;
+  /** Concrete OpenCode session/window to receive Desktop notifications. */
+  sessionId?: string;
   /** Server URL for message deletion (optional — from ctx.serverUrl) */
   serverUrl?: string;
 }
@@ -305,7 +352,7 @@ export interface ConfigureWarningOptions {
 
 /**
  * Send a persistent warning notification.
- * Desktop: ignored message, cleaned up on next startup when resolved.
+ * Desktop: ignored message when sessionId is explicit; otherwise queued.
  * TUI: toast with warning variant (inherently transient).
  */
 export async function sendWarning(opts: NotificationOptions, message: string): Promise<void> {
@@ -313,17 +360,21 @@ export async function sendWarning(opts: NotificationOptions, message: string): P
   const toastSent = await showTuiToast(opts.client, "AFT Warning", message, "warning", 10000);
   if (toastSent) return;
 
-  const { sessionId } = readDesktopState(opts.directory);
-  if (!sessionId) return;
-
   const text = `${WARNING_MARKER} ${message}`;
+  const sessionId = getExplicitSessionId(opts);
+  if (!sessionId) {
+    enqueuePendingDesktopNotification(opts.directory, { key: `warning:${message}`, text });
+    return;
+  }
+
+  await flushPendingDesktopNotifications(opts, sessionId);
   sessionLog(sessionId, `[aft-plugin] sending warning to session ${sessionId}`);
   await sendIgnoredMessage(opts.client, sessionId, text);
 }
 
 /**
  * Send a transient status notification.
- * Desktop: ignored message, auto-deletes after 3 seconds.
+ * Desktop: ignored message when sessionId is explicit, auto-deletes after 3 seconds.
  * TUI: toast with success variant, auto-dismissed by the TUI.
  */
 export async function sendStatus(opts: NotificationOptions, message: string): Promise<void> {
@@ -332,14 +383,15 @@ export async function sendStatus(opts: NotificationOptions, message: string): Pr
     return;
   }
 
-  const { sessionId, serverUrl: desktopServerUrl } = readDesktopState(opts.directory);
+  const sessionId = getExplicitSessionId(opts);
   if (!sessionId) return;
 
+  await flushPendingDesktopNotifications(opts, sessionId);
   const text = `${STATUS_MARKER} ${message}`;
   await sendIgnoredMessage(opts.client, sessionId, text);
 
   // Auto-delete after 3 seconds
-  const effectiveServerUrl = opts.serverUrl || desktopServerUrl;
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
   if (!effectiveServerUrl) return;
 
   setTimeout(async () => {
@@ -373,7 +425,7 @@ export async function sendStatus(opts: NotificationOptions, message: string): Pr
 /**
  * Send a feature announcement for a new version.
  * Tracked via a version file in storageDir — only fires once per version across all sessions.
- * Desktop: ignored message in the active session.
+ * Desktop: ignored message when sessionId is explicit; otherwise queued.
  * TUI: toast with info variant.
  */
 export async function sendFeatureAnnouncement(
@@ -383,24 +435,8 @@ export async function sendFeatureAnnouncement(
   footer: string,
   storageDir?: string,
 ): Promise<void> {
-  // Check if we already announced this version (persisted across sessions)
-  if (storageDir) {
-    // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
-    // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
-    // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
-    // spawn at every plugin init. Deferred to a future version that decides whether
-    // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
-    // other writer; this file stays in sync via direct legacy-file writes.
-    const versionFile = join(storageDir, "last_announced_version");
-    try {
-      if (existsSync(versionFile)) {
-        const lastVersion = readFileSync(versionFile, "utf-8").trim();
-        if (lastVersion === version) return;
-      }
-    } catch {
-      // ignore read errors — proceed with announcement
-    }
-  }
+  // Check if we already announced this version (persisted across sessions).
+  if (hasAnnouncedVersion(storageDir, version)) return;
 
   // Blank-line separator pins the persistent footer (Discord invite, etc.)
   // below the version-specific bullets so the footer reads as "always here"
@@ -413,28 +449,59 @@ export async function sendFeatureAnnouncement(
   // Try TUI toast first (works when client exposes tui.showToast),
   // fall back to Desktop ignored message
   const toastSent = await showTuiToast(opts.client, `AFT v${version}`, featureText, "info", 12000);
-  if (!toastSent) {
-    const { sessionId } = readDesktopState(opts.directory);
-    if (!sessionId) return;
-
-    const sections: string[] = [
-      `${FEATURE_MARKER} v${version}:`,
-      ...features.map((f) => `  • ${f}`),
-    ];
-    if (hasFooter) sections.push("", footer);
-    const text = sections.join("\n");
-    sessionLog(sessionId, `[aft-plugin] sending feature announcement for v${version}`);
-    await sendIgnoredMessage(opts.client, sessionId, text);
+  if (toastSent) {
+    persistAnnouncedVersion(storageDir, version);
+    return;
   }
 
-  // Persist the announced version
-  if (storageDir) {
-    try {
-      mkdirSync(storageDir, { recursive: true });
-      writeFileSync(join(storageDir, "last_announced_version"), version);
-    } catch {
-      // best-effort
-    }
+  const sections: string[] = [`${FEATURE_MARKER} v${version}:`, ...features.map((f) => `  • ${f}`)];
+  if (hasFooter) sections.push("", footer);
+  const text = sections.join("\n");
+  const pending = {
+    key: `feature:${version}`,
+    text,
+    shouldSkip: () => hasAnnouncedVersion(storageDir, version),
+    onDelivered: () => persistAnnouncedVersion(storageDir, version),
+  };
+
+  const sessionId = getExplicitSessionId(opts);
+  if (!sessionId) {
+    enqueuePendingDesktopNotification(opts.directory, pending);
+    return;
+  }
+
+  await flushPendingDesktopNotifications(opts, sessionId);
+  if (hasAnnouncedVersion(storageDir, version)) return;
+
+  sessionLog(sessionId, `[aft-plugin] sending feature announcement for v${version}`);
+  if (await sendIgnoredMessage(opts.client, sessionId, text)) {
+    persistAnnouncedVersion(storageDir, version);
+  }
+}
+
+function hasAnnouncedVersion(storageDir: string | undefined, version: string): boolean {
+  if (!storageDir) return false;
+  // v0.27 commit 11 deferral: the legacy `last_announced_version` file is read at
+  // plugin init, BEFORE any bridge is spawned (lazy-spawn architecture per commit
+  // 29508a5). Refactoring to `bridge.send("db_get_state")` would force eager bridge
+  // spawn at every plugin init. Deferred to a future version that decides whether
+  // to accept that trade-off. The Rust-side dual-write from commit 10 covers any
+  // other writer; this file stays in sync via direct legacy-file writes.
+  const versionFile = join(storageDir, "last_announced_version");
+  try {
+    return existsSync(versionFile) && readFileSync(versionFile, "utf-8").trim() === version;
+  } catch {
+    return false;
+  }
+}
+
+function persistAnnouncedVersion(storageDir: string | undefined, version: string): void {
+  if (!storageDir) return;
+  try {
+    mkdirSync(storageDir, { recursive: true });
+    writeFileSync(join(storageDir, "last_announced_version"), version);
+  } catch {
+    // best-effort
   }
 }
 
@@ -516,6 +583,12 @@ export async function deliverConfigureWarnings(
   opts: ConfigureWarningOptions,
   warnings: ConfigureWarning[],
 ): Promise<void> {
+  if (opts.projectRoot) {
+    await flushPendingDesktopNotifications(
+      { client: opts.client, directory: opts.projectRoot },
+      opts.sessionId,
+    );
+  }
   if (warnings.length === 0) return;
 
   // `warned_tools` now persists through the bridge DB state API. This loses the
@@ -545,10 +618,10 @@ export async function deliverConfigureWarnings(
 export async function cleanupWarnings(opts: NotificationOptions): Promise<void> {
   if (isTuiMode()) return; // TUI toasts don't persist
 
-  const { sessionId, serverUrl: desktopServerUrl } = readDesktopState(opts.directory);
+  const sessionId = getExplicitSessionId(opts);
   if (!sessionId) return;
 
-  const effectiveServerUrl = opts.serverUrl || desktopServerUrl;
+  const effectiveServerUrl = opts.serverUrl || readDesktopState().serverUrl;
   if (!effectiveServerUrl) return;
 
   const messages = await getSessionMessages(opts.client, sessionId);

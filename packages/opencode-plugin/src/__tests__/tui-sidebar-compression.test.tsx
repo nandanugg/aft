@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, mock, test } from "bun:test";
+import { join } from "node:path";
 import type { StatusCompression } from "../shared/status";
 
 mock.module("@opentui/solid/jsx-dev-runtime", () => ({
@@ -20,7 +21,7 @@ mock.module("solid-js", () => ({
   onCleanup: () => undefined,
 }));
 
-const { formatCompressionSidebarRows } = await import("../tui/sidebar.tsx");
+const { formatCompressionSidebarRows, resolveTuiStorageDir } = await import("../tui/sidebar.tsx");
 
 const compression = (overrides: Partial<StatusCompression> = {}): StatusCompression => ({
   project: {
@@ -34,6 +35,17 @@ const compression = (overrides: Partial<StatusCompression> = {}): StatusCompress
 });
 
 describe("sidebar compression rows", () => {
+  test("TUI storage resolution uses the bridge CortexKit storage helper", () => {
+    const original = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = "/tmp/aft-tui-storage-test";
+    try {
+      expect(resolveTuiStorageDir()).toBe(join("/tmp/aft-tui-storage-test", "cortexkit", "aft"));
+    } finally {
+      if (original === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = original;
+    }
+  });
+
   test("sidebar_renders_compression_when_project_events_present", () => {
     const rows = formatCompressionSidebarRows(compression());
 

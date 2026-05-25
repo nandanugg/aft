@@ -11,7 +11,7 @@ import {
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
-import { getOrCreatePtyTerminal, readPtyBytes } from "../shared/pty-cache.js";
+import { disposePtyTerminal, getOrCreatePtyTerminal, readPtyBytes } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { callBridge, optionalInt, projectRootFor } from "./_shared.js";
@@ -21,6 +21,7 @@ const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 300_000;
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
+const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
   | { kind: "substring"; value: string }
@@ -44,7 +45,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         .union([z.string(), z.object({ regex: z.string() })])
         .optional()
         .describe(
-          "Substring or regex pattern. Optional in sync mode; required with background:true.",
+          "Substring or regex pattern. Optional in sync mode; required with background:true. Sync substring watches keep only the overlap tail needed for boundary matches; sync regex watches use a 64 KB rolling output window.",
         ),
       background: z
         .boolean()
@@ -219,6 +220,9 @@ export async function waitForBashStatus(
                 scanBaseOffset + Buffer.byteLength(scanText.slice(0, match.index), "utf8"),
             });
           }
+          const trimmed = trimWaitScanBuffer(scanText, scanBaseOffset, waitFor);
+          scanText = trimmed.text;
+          scanBaseOffset = trimmed.baseOffset;
         }
       }
       if (terminal) {
@@ -237,6 +241,7 @@ export async function waitForBashStatus(
     }
   } finally {
     if (!sawTerminal) unmarkTaskWaiting(runtime.sessionID, taskId);
+    await disposePtyTerminal(watchPtyCacheKey(runtime, taskId));
   }
 }
 
@@ -325,6 +330,53 @@ function findWaitMatch(
   const match = pattern.value.exec(text);
   return match ? { text: match[0], index: match.index } : undefined;
 }
+
+function trimWaitScanBuffer(
+  text: string,
+  baseOffset: number,
+  pattern: BashWaitPattern,
+): { text: string; baseOffset: number } {
+  const keepFrom =
+    pattern.kind === "substring"
+      ? substringKeepStart(text, pattern.value)
+      : regexKeepStart(text, REGEX_WAIT_SCAN_WINDOW_BYTES);
+  if (keepFrom <= 0) return { text, baseOffset };
+
+  return {
+    text: text.slice(keepFrom),
+    baseOffset: baseOffset + Buffer.byteLength(text.slice(0, keepFrom), "utf8"),
+  };
+}
+
+function substringKeepStart(text: string, pattern: string): number {
+  const keepChars = Math.max(0, pattern.length - 1);
+  return text.length > keepChars ? text.length - keepChars : 0;
+}
+
+function regexKeepStart(text: string, maxBytes: number): number {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return 0;
+
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Buffer.byteLength(text.slice(mid), "utf8") > maxBytes) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+export function __trimWaitScanBufferForTests(
+  text: string,
+  baseOffset: number,
+  pattern: BashWaitPattern,
+): { text: string; baseOffset: number } {
+  return trimWaitScanBuffer(text, baseOffset, pattern);
+}
+
 function withWaited(data: Record<string, unknown>, waited: BashStatusWaited): BashStatusWithWait {
   return { ...data, waited };
 }

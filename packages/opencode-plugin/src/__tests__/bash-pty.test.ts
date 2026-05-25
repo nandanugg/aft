@@ -194,6 +194,7 @@ describe("OpenCode bash PTY layer", () => {
     );
     expect(result).toContain('matched "ready on pty" at offset 8');
     expect(result).toContain("ready on pty");
+    expect(__ptyCacheSizeForTests()).toBe(0);
   });
 
   test("Test 26c: bash_watch PTY scan is independent from bash_status cursor", async () => {
