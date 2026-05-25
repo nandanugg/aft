@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -129,6 +130,103 @@ describe("AFT RPC auth", () => {
       await expect(client.call("echo", {})).rejects.toThrow("403");
     } finally {
       await new Promise<void>((resolve) => tokenRequiredServer.close(() => resolve()));
+    }
+  });
+
+  test("client appends legacy port after stale per-instance entries and cleans stale JSON after two failures", async () => {
+    const fixture = makeFixture();
+    const { createServer } = await import("node:http");
+
+    let rpcCalls = 0;
+    const legacyServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
+      req.on("end", () => {
+        if (req.url?.startsWith("/rpc/")) {
+          rpcCalls++;
+          const params = JSON.parse(body) as Record<string, unknown>;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, rpcCalls, echoed: params }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+
+    await new Promise<void>((resolve) => legacyServer.listen(0, "127.0.0.1", resolve));
+    const address = legacyServer.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    const stalePortProbe = createServer((_req, res) => {
+      res.writeHead(500);
+      res.end();
+    });
+    await new Promise<void>((resolve) => stalePortProbe.listen(0, "127.0.0.1", resolve));
+    const staleAddress = stalePortProbe.address();
+    const stalePort = typeof staleAddress === "object" && staleAddress ? staleAddress.port : 0;
+    await new Promise<void>((resolve) => stalePortProbe.close(() => resolve()));
+
+    try {
+      const portsDir = rpcPortFileDir(fixture.storageDir, fixture.directory);
+      mkdirSync(portsDir, { recursive: true });
+      const stalePath = join(portsDir, "stale.json");
+      writeFileSync(stalePath, JSON.stringify({ port: stalePort, token: "stale-token" }), "utf-8");
+
+      const legacyPortPath = rpcPortFilePath(fixture.storageDir, fixture.directory);
+      mkdirSync(dirname(legacyPortPath), { recursive: true });
+      writeFileSync(legacyPortPath, String(port), "utf-8");
+
+      const client = new AftRpcClient(fixture.storageDir, fixture.directory);
+      const first = await client.call<{
+        ok: boolean;
+        rpcCalls: number;
+        echoed: Record<string, unknown>;
+      }>("echo", { value: "first" });
+      expect(first.ok).toBe(true);
+      expect(first.echoed.value).toBe("first");
+      expect(existsSync(stalePath)).toBe(true);
+
+      const second = await client.call<{
+        ok: boolean;
+        rpcCalls: number;
+        echoed: Record<string, unknown>;
+      }>("echo", { value: "second" });
+      expect(second.ok).toBe(true);
+      expect(second.rpcCalls).toBe(2);
+      expect(second.echoed.value).toBe("second");
+      expect(existsSync(stalePath)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => legacyServer.close(() => resolve()));
+    }
+  });
+
+  test("client call can be aborted while an RPC request is in flight", async () => {
+    const fixture = makeFixture();
+    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    server.handle("slow", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return { ok: true };
+    });
+
+    try {
+      await server.start();
+      const client = new AftRpcClient(fixture.storageDir, fixture.directory);
+      const controller = new AbortController();
+      const pending = client.call("slow", {}, { signal: controller.signal });
+      setTimeout(() => controller.abort(), 10);
+
+      await expect(pending).rejects.toThrow();
+    } finally {
+      server.stop();
     }
   });
 

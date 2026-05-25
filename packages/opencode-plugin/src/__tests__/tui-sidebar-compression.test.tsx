@@ -21,7 +21,9 @@ mock.module("solid-js", () => ({
   onCleanup: () => undefined,
 }));
 
-const { formatCompressionSidebarRows, resolveTuiStorageDir } = await import("../tui/sidebar.tsx");
+const { formatCompressionSidebarRows, resolveTuiStorageDir, scopedSidebarSnapshot } = await import(
+  "../tui/sidebar.tsx"
+);
 
 const compression = (overrides: Partial<StatusCompression> = {}): StatusCompression => ({
   project: {
@@ -35,7 +37,7 @@ const compression = (overrides: Partial<StatusCompression> = {}): StatusCompress
 });
 
 describe("sidebar compression rows", () => {
-  test("TUI storage resolution uses the bridge CortexKit storage helper", () => {
+  test("TUI storage resolution matches CortexKit storage without importing the bridge barrel", () => {
     const original = process.env.XDG_DATA_HOME;
     process.env.XDG_DATA_HOME = "/tmp/aft-tui-storage-test";
     try {
@@ -44,6 +46,16 @@ describe("sidebar compression rows", () => {
       if (original === undefined) delete process.env.XDG_DATA_HOME;
       else process.env.XDG_DATA_HOME = original;
     }
+  });
+
+  test("sidebar snapshot is scoped to the current directory and session", () => {
+    const snapshot = { version: "test" } as any;
+    const scoped = { directory: "/project/a", sessionID: "session-a", snapshot };
+
+    expect(scopedSidebarSnapshot(scoped, "/project/a", "session-a")).toBe(snapshot);
+    expect(scopedSidebarSnapshot(scoped, "/project/b", "session-a")).toBeNull();
+    expect(scopedSidebarSnapshot(scoped, "/project/a", "session-b")).toBeNull();
+    expect(scopedSidebarSnapshot(null, "/project/a", "session-a")).toBeNull();
   });
 
   test("sidebar_renders_compression_when_project_events_present", () => {

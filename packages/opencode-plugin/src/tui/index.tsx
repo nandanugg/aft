@@ -4,7 +4,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 
-import packageJson from "../../package.json";
+import { version as packageVersion } from "../../package.json";
 import { AftRpcClient } from "../shared/rpc-client";
 import { type AftStatusSnapshot, coerceAftStatus, formatBytes } from "../shared/status";
 import {
@@ -137,18 +137,45 @@ const StatusDialog = (props: StatusDialogProps) => {
   const [status, setStatus] = createSignal<AftStatusSnapshot | null>(props.initial);
   const [error, setError] = createSignal<string | null>(props.initialError);
 
-  const timer = setInterval(async () => {
+  let pollGeneration = 0;
+  let pollController: AbortController | null = null;
+  const pollStatus = async () => {
+    if (pollController) return;
+
+    const controller = new AbortController();
+    const requestGeneration = ++pollGeneration;
+    pollController = controller;
+
     try {
-      const response = await props.client.call("status", { sessionID: props.sessionID });
+      const response = await props.client.call(
+        "status",
+        { sessionID: props.sessionID },
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
       if ((response as Record<string, unknown>).success !== false) {
         setStatus(coerceAftStatus(response as Record<string, unknown>));
         setError(null);
       }
     } catch {
+      if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
       // transient — keep showing last good snapshot
+    } finally {
+      if (pollController === controller) pollController = null;
     }
+  };
+
+  const timer = setInterval(() => {
+    void pollStatus();
   }, POLL_INTERVAL_MS);
-  onCleanup(() => clearInterval(timer));
+  onCleanup(() => {
+    clearInterval(timer);
+    pollGeneration++;
+    if (pollController) {
+      pollController.abort();
+      pollController = null;
+    }
+  });
 
   // Visual cache-role badge: main is accent, worktree is warning,
   // not_initialized is muted. Matches the sidebar convention.
@@ -177,7 +204,7 @@ const StatusDialog = (props: StatusDialogProps) => {
           <b>⚡ AFT Status</b>
         </text>
         {status()?.cache_role !== "not_initialized" && (
-          <text fg={t().textMuted}>v{status()?.version ?? packageJson.version}</text>
+          <text fg={t().textMuted}>v{status()?.version ?? packageVersion}</text>
         )}
       </box>
 
@@ -597,7 +624,7 @@ const tui: TuiPlugin = async (api) => {
   // command palette entry so the sidebar is available immediately when the
   // user opens their first session.
   try {
-    api.slots.register(createAftSidebarSlot(api, packageJson.version));
+    api.slots.register(createAftSidebarSlot(api, packageVersion));
   } catch {
     // Older OpenCode TUI hosts may not implement api.slots; fall through
     // and keep the slash command working.

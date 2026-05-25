@@ -7,12 +7,12 @@
 // session.updated/message.updated events with a small debounce, same as
 // magic-context, so the panel stays current without polling.
 
-import { resolveCortexKitStorageRoot } from "@cortexkit/aft-bridge";
 import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 
 import { AftRpcClient } from "../shared/rpc-client";
 import { type AftStatusSnapshot, coerceAftStatus, type StatusCompression } from "../shared/status";
+import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
 
 const SINGLE_BORDER = { type: "single" } as any;
 const REFRESH_DEBOUNCE_MS = 200;
@@ -136,9 +136,9 @@ const SectionHeader = (props: { theme: TuiThemeCurrent; title: string; marginTop
   </box>
 );
 
-// v0.27 moved AFT storage to the CortexKit root. TUI code must call the
-// bridge helper rather than reconstructing HOME/XDG paths locally; the helper
-// carries the Windows LOCALAPPDATA/AppData behavior used by the server plugin.
+// v0.27 moved AFT storage to the CortexKit root. TUI code must use a
+// lightweight local path helper rather than the shared bridge barrel, which
+// also exports URL-fetch helpers unsuitable for Bun's TUI runtime.
 export function resolveTuiStorageDir(): string {
   return resolveCortexKitStorageRoot();
 }
@@ -155,45 +155,106 @@ function getClient(directory: string): AftRpcClient {
   return client;
 }
 
+export type ScopedSidebarStatus = {
+  directory: string;
+  sessionID: string;
+  snapshot: AftStatusSnapshot;
+};
+
+export function scopedSidebarSnapshot(
+  scoped: ScopedSidebarStatus | null,
+  directory: string,
+  sessionID: string,
+): AftStatusSnapshot | null {
+  if (!scoped) return null;
+  if (scoped.directory !== directory || scoped.sessionID !== sessionID) return null;
+  return scoped.snapshot;
+}
+
 const SidebarContent = (props: {
   api: TuiPluginApi;
   sessionID: () => string;
   theme: TuiThemeCurrent;
   pluginVersion: string;
 }) => {
-  const [status, setStatus] = createSignal<AftStatusSnapshot | null>(null);
-  // Once a request is in flight, suppress any overlapping refresh so we
-  // don't open a thundering herd of RPCs on rapid event bursts.
-  let inflight = false;
+  const [status, setStatus] = createSignal<ScopedSidebarStatus | null>(null);
+  let inflight: {
+    controller: AbortController;
+    generation: number;
+    directory: string;
+    sessionID: string;
+  } | null = null;
+  let generation = 0;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
 
+  const currentDirectory = () => props.api.state.path.directory ?? "";
+  const requestRender = () => {
+    try {
+      props.api.renderer.requestRender();
+    } catch {
+      // renderer may not be available during teardown; safe to ignore
+    }
+  };
+  const abortInflight = () => {
+    if (!inflight) return;
+    inflight.controller.abort();
+    inflight = null;
+  };
+  const clearStatusForContext = (directory: string, sessionID: string) => {
+    const current = status();
+    if (!current) return;
+    if (current.directory === directory && current.sessionID === sessionID) return;
+    setStatus(null);
+    requestRender();
+  };
+
   const refresh = async () => {
     const sid = props.sessionID();
-    if (!sid) return;
-    if (inflight) return;
-    const directory = props.api.state.path.directory ?? "";
-    if (!directory) return;
+    const directory = currentDirectory();
+    if (!sid || !directory) {
+      generation++;
+      abortInflight();
+      if (status()) {
+        setStatus(null);
+        requestRender();
+      }
+      return;
+    }
 
-    inflight = true;
+    clearStatusForContext(directory, sid);
+
+    if (inflight) {
+      if (inflight.directory === directory && inflight.sessionID === sid) return;
+      generation++;
+      abortInflight();
+    }
+
+    const requestGeneration = ++generation;
+    const controller = new AbortController();
+    inflight = { controller, generation: requestGeneration, directory, sessionID: sid };
+
     try {
       const client = getClient(directory);
-      const response = await client.call("status", { sessionID: sid });
+      const response = await client.call(
+        "status",
+        { sessionID: sid },
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted || requestGeneration !== generation) return;
+      if (currentDirectory() !== directory || props.sessionID() !== sid) return;
       if (response && (response as Record<string, unknown>).success !== false) {
         const snapshot = coerceAftStatus(response as Record<string, unknown>);
-        setStatus(snapshot);
-        try {
-          props.api.renderer.requestRender();
-        } catch {
-          // renderer may not be available during teardown; safe to ignore
-        }
+        setStatus({ directory, sessionID: sid, snapshot });
+        requestRender();
       }
     } catch {
+      if (controller.signal.aborted || requestGeneration !== generation) return;
       // RPC server may not be ready yet, or the bridge may be respawning
-      // after a binary swap — leave the previous snapshot visible rather
-      // than blanking the sidebar.
+      // after a binary swap. Keep the previous snapshot only when it belongs
+      // to the current project/session; mismatched snapshots were cleared above.
     } finally {
-      inflight = false;
+      if (inflight?.generation === requestGeneration) inflight = null;
     }
   };
 
@@ -206,6 +267,8 @@ const SidebarContent = (props: {
   };
 
   onCleanup(() => {
+    generation++;
+    abortInflight();
     if (debounceTimer) clearTimeout(debounceTimer);
     if (pollTimer) clearInterval(pollTimer);
   });
@@ -252,6 +315,8 @@ const SidebarContent = (props: {
               // best effort
             }
           }
+          generation++;
+          abortInflight();
           if (pollTimer) {
             clearInterval(pollTimer);
             pollTimer = undefined;
@@ -262,7 +327,7 @@ const SidebarContent = (props: {
     ),
   );
 
-  const s = createMemo(() => status());
+  const s = () => scopedSidebarSnapshot(status(), currentDirectory(), props.sessionID());
 
   // Lazy-bridge: while AFT has no live bridge yet, the RPC server returns a
   // synthetic snapshot with `cache_role === "not_initialized"`. In that state
