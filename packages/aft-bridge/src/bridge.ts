@@ -899,11 +899,15 @@ export class BinaryBridge {
 
       // Point ort to the auto-downloaded or system ONNX Runtime library.
       // An explicit ORT_DYLIB_PATH in the parent environment wins — that
-      // lets users (and the Docker E2E harness) test what happens when ort
-      // can't load the library, without our managed-install resolution
-      // silently masking the bad path.
-      if (!process.env.ORT_DYLIB_PATH && ortLibraryPath) {
+      // lets users (and the Docker/macOS E2E harnesses) test what happens
+      // when ort can't load the library, without our managed-install
+      // resolution silently masking the bad path. Log either way so the
+      // E2E harness can assert the env var made it through.
+      if (process.env.ORT_DYLIB_PATH) {
+        log(`ORT_DYLIB_PATH inherited from parent env: ${process.env.ORT_DYLIB_PATH}`);
+      } else if (ortLibraryPath) {
         env.ORT_DYLIB_PATH = ortLibraryPath;
+        log(`ORT_DYLIB_PATH set from managed ONNX Runtime: ${ortLibraryPath}`);
       }
     }
 
