@@ -141,6 +141,55 @@ fn bash_permission_scan_collects_redirect_target() {
 }
 
 #[test]
+fn dynamic_file_args_require_external_directory_wildcard() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let response = bash(&mut aft, "dynamic-file-arg", r#"rm "$DEST/file""#);
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "permission_required");
+    assert!(response["asks"].as_array().unwrap().iter().any(|ask| {
+        ask["kind"] == "external_directory"
+            && ask["patterns"].as_array().unwrap().iter().any(|p| p == "*")
+    }));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn relative_redirect_permission_grant_matches_absolute_cwd_pattern() {
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let external_dir = std::fs::canonicalize(outside.path()).unwrap();
+    let external_grant = format!("{}/*", external_dir.display());
+    let response = aft.send(
+        &serde_json::to_string(&json!({
+            "id": "relative-redirect-grant",
+            "method": "bash",
+            "params": {
+                "command": "echo hi > ./file.log",
+                "workdir": outside.path(),
+                "permissions_requested": true,
+                "permissions_granted": [external_grant, "echo hi > ./file.log"],
+            },
+        }))
+        .unwrap(),
+    );
+
+    assert_ne!(
+        response["code"], "permission_required",
+        "relative redirect should be canonicalized against workdir: {response:?}"
+    );
+    assert!(outside.path().join("file.log").exists());
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn bash_permission_scan_handles_source() {
     let root = TempDir::new().unwrap();
     let mut aft = AftProcess::spawn();
