@@ -454,6 +454,41 @@ fn find_node_at<'a>(
         return Some(*node);
     }
 
+    // If this is an export wrapper (TS/JS `export_statement`), look for the
+    // inner function/declaration inside. Symbol ranges for exported TS/JS
+    // functions point at the `export` keyword (see parser.rs), but the
+    // function_declaration child starts after `export `, so we need to walk
+    // into it explicitly rather than relying on a byte-pos containment check.
+    if node.kind() == "export_statement"
+        && node.start_byte() <= byte_pos
+        && byte_pos < node.end_byte()
+    {
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i as u32) {
+                if kinds.contains(&child.kind()) {
+                    return Some(child);
+                }
+                // Arrow-function case: `export const f = (...) => {...}` wraps
+                // a lexical_declaration with an arrow_function inside.
+                if kinds.contains(&"arrow_function") && child.kind() == "lexical_declaration" {
+                    let grand_count = child.child_count();
+                    for j in 0..grand_count {
+                        if let Some(grand) = child.child(j as u32) {
+                            if grand.kind() == "variable_declarator" {
+                                if let Some(value) = grand.child_by_field_name("value") {
+                                    if value.kind() == "arrow_function" {
+                                        return Some(value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i as u32) {

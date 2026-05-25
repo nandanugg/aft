@@ -1599,3 +1599,68 @@ fn generate_ts_namespace_import_line_round_trips_default_and_namespace() {
 
     assert_eq!(line, "import Foo, * as ns from './mod';");
 }
+
+// --- Merge into existing same-module import ---
+
+/// When the target module already has a named-import statement of the same
+/// kind, `add_import` should merge new `names` into that existing statement
+/// instead of inserting a duplicate `import { ... } from "lib"` line.
+///
+/// Regression for the Pi-reported bug where adding `{ baz }` to a file with
+/// `import { foo } from "lib"` produced two separate `import { ... } from "lib"`
+/// statements that the linter then complained about.
+#[test]
+fn add_import_merges_into_existing_same_module_named_import() {
+    let mut aft = AftProcess::spawn();
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("merge.ts");
+    fs::write(
+        &file,
+        "import { foo } from \"lib\";\n\nexport function use() {\n  return foo();\n}\n",
+    )
+    .unwrap();
+
+    // Configure aft against the temp dir as project root.
+    aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":"{}"}}"#,
+        dir.path().display()
+    ));
+
+    let resp = send_add_import(
+        &mut aft,
+        "merge1",
+        file.to_str().unwrap(),
+        "lib",
+        Some(&["baz"]),
+        None,
+        false,
+    );
+
+    assert_eq!(
+        resp["success"], true,
+        "merge add should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["added"], true, "should report added=true: {:?}", resp);
+
+    let content = fs::read_to_string(&file).unwrap();
+
+    // Single merged statement (no duplicate `from "lib"` line)
+    let from_lib_count =
+        content.matches("from \"lib\"").count() + content.matches("from 'lib'").count();
+    assert_eq!(
+        from_lib_count, 1,
+        "should have exactly one statement importing from 'lib':\n{}",
+        content
+    );
+
+    // Both names present
+    assert!(
+        content.contains("baz") && content.contains("foo"),
+        "merged statement should contain both names:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}

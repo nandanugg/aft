@@ -42,6 +42,51 @@ fn configure(aft: &mut AftProcess, root: &str) {
 // Success path tests
 // ---------------------------------------------------------------------------
 
+/// Inline an exported TS function. After the v0.30.x parser fix that
+/// included the `export` keyword in symbol ranges (commit 57d48d9), the
+/// inline path was unable to descend from `export_statement` to the inner
+/// `function_declaration` and returned a `symbol_not_found` error.
+#[test]
+fn inline_symbol_exported_function() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("exported.ts");
+    std::fs::write(
+        &file,
+        "export function double(n: number): number {\n  return n * 2;\n}\n\nexport function useIt(x: number): number {\n  return double(x);\n}\n",
+    )
+    .expect("write test file");
+
+    let root = tmp.path().display().to_string();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"double","call_site_line":6}}"#,
+        file.display()
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "inline of exported function should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["symbol"], "double");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        !content.contains("double(x)"),
+        "call should be replaced:\n{}",
+        content
+    );
+    assert!(
+        content.contains("x * 2"),
+        "body should be substituted with argument:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
 /// Basic inline: TS helper function call replaced with body.
 #[test]
 fn inline_symbol_basic_ts() {

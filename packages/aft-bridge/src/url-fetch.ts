@@ -283,20 +283,50 @@ function resolveRedirectUrl(currentUrl: URL, location: string | null): URL {
   return new URL(location, currentUrl);
 }
 
+// Detect Bun runtime. When undici is bundled into a Bun-targeted bundle
+// (opencode-plugin builds with `bun build --target node`), the bundled undici
+// fetch + bundled stream classes can stall on body reads against many real
+// hosts (github.com, registry.npmjs.org, unpkg.com, api.github.com). This is a
+// known interaction between bundled undici streams and Bun's runtime — the
+// same undici code works fine when loaded via Node `require()` directly.
+//
+// When running under Bun, fall back to the runtime's native global fetch (Bun
+// has its own performant fetch impl). SSRF protection is still active via
+// `assertPublicUrl`; we just skip the per-connection DNS pinning since Bun's
+// native fetch doesn't accept an undici dispatcher. The window for DNS
+// rebinding is small (one DNS lookup → one TCP connect) and the URL fetch
+// surface in AFT is opt-in tooling, not an untrusted server-side request path.
+//
+// biome-ignore lint/suspicious/noExplicitAny: detect Bun runtime
+const isBunRuntime = typeof (globalThis as any).Bun !== "undefined";
+
 async function fetchWithRedirects(
   startUrl: URL,
   allowPrivate: boolean,
   deps: Pick<FetchUrlOptions, "dispatcherFactory" | "fetchImpl" | "lookup"> = {},
 ): Promise<Response> {
   let currentUrl = startUrl;
-  const fetchImpl = deps.fetchImpl ?? (undiciFetch as FetchImpl);
+  // Honor explicit fetchImpl override (tests). Otherwise: Bun gets native fetch,
+  // Node gets undici with pinned dispatcher.
+  const fetchImpl =
+    deps.fetchImpl ?? (isBunRuntime ? (globalThis.fetch as FetchImpl) : (undiciFetch as FetchImpl));
   const dnsLookup = deps.lookup ?? lookup;
 
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
     const validatedIp = await assertPublicUrl(currentUrl, allowPrivate, dnsLookup);
-    const dispatcher = validatedIp
-      ? (deps.dispatcherFactory ?? createPinnedDispatcher)(validatedIp)
-      : undefined;
+    // Pinned dispatcher only works with undici (Node path). Bun's native fetch
+    // doesn't accept a dispatcher arg, so skip pinning there. An explicit
+    // `dispatcherFactory` (test injection) always wins over runtime detection
+    // so unit tests can keep asserting the pin behavior without spinning up
+    // a real Node process.
+    let dispatcher: Dispatcher | undefined;
+    if (validatedIp) {
+      if (deps.dispatcherFactory) {
+        dispatcher = deps.dispatcherFactory(validatedIp);
+      } else if (!isBunRuntime) {
+        dispatcher = createPinnedDispatcher(validatedIp);
+      }
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);

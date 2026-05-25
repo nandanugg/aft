@@ -135,30 +135,103 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    // --- Determine group and insertion point ---
+    // --- Determine group ---
     let group = imports::classify_group(lang, module);
-    let (insert_offset, needs_blank_before, needs_blank_after) =
-        imports::find_insertion_point(&source, &block, group, module, type_only);
 
-    // --- Generate import line ---
-    // For Go, check if we're inserting into a grouped import block
-    let import_line = if matches!(lang, LangId::Go) {
-        let in_group = imports::go_has_grouped_import(&source, &tree).is_some();
-        imports::generate_go_import_line_pub(module, default_import.as_deref(), in_group)
+    // --- Try to merge into an existing same-module, same-kind named import ---
+    //
+    // When adding `{ baz }` to a file that already has `import { foo } from "lib"`,
+    // the historical behavior inserted a second `import { baz } from "lib"` line
+    // (TS/JS, Rust, Py). That produces duplicate imports the linter then complains
+    // about, and the agent has to call `organize` afterwards to clean up.
+    //
+    // Instead, when the target module already has a value/type import statement of
+    // the matching kind with named specifiers, merge `names` into that statement's
+    // existing names (deduped + sorted) and replace its byte range. This only
+    // applies to languages where named imports are a list inside one statement —
+    // Go's "import (...)" block is handled separately by the insertion path.
+    let target_kind = if type_only {
+        imports::ImportKind::Type
     } else {
-        imports::generate_import_line(lang, module, &names, default_import.as_deref(), type_only)
+        imports::ImportKind::Value
+    };
+    let merge_target =
+        if !names.is_empty() && default_import.is_none() && !matches!(lang, LangId::Go) {
+            block.imports.iter().find(|imp| {
+                imp.module_path == module
+                    && imp.kind == target_kind
+                    && imp.namespace_import.is_none()
+                    && imp.default_import.is_none()
+                    && !imp.names.is_empty()
+            })
+        } else {
+            None
+        };
+
+    let (insert_offset, replace_end, insert_text, merged_into_existing) = if let Some(existing) =
+        merge_target
+    {
+        // Build the merged named-import list: union of existing + new, sorted.
+        let mut merged_names: Vec<String> = existing.names.clone();
+        for name in &names {
+            if !merged_names
+                .iter()
+                .any(|n| imports::specifier_matches(n, name))
+            {
+                merged_names.push(name.clone());
+            }
+        }
+        // Sort for deterministic output (matches generate_import_line behavior).
+        merged_names
+            .sort_by(|a, b| imports::specifier_local_name(a).cmp(imports::specifier_local_name(b)));
+
+        let merged_line = imports::generate_import_line(
+            lang,
+            &existing.module_path,
+            &merged_names,
+            None,
+            type_only,
+        );
+        (
+            existing.byte_range.start,
+            existing.byte_range.end,
+            merged_line,
+            true,
+        )
+    } else {
+        // Fall through to the original "find insertion point and insert a new
+        // statement" behavior.
+        let (insert_offset, needs_blank_before, needs_blank_after) =
+            imports::find_insertion_point(&source, &block, group, module, type_only);
+
+        // For Go, check if we're inserting into a grouped import block
+        let import_line = if matches!(lang, LangId::Go) {
+            let in_group = imports::go_has_grouped_import(&source, &tree).is_some();
+            imports::generate_go_import_line_pub(module, default_import.as_deref(), in_group)
+        } else {
+            imports::generate_import_line(
+                lang,
+                module,
+                &names,
+                default_import.as_deref(),
+                type_only,
+            )
+        };
+
+        // Build the text to insert
+        let mut insert_text = String::new();
+        if needs_blank_before {
+            insert_text.push('\n');
+        }
+        insert_text.push_str(&import_line);
+        insert_text.push('\n');
+        if needs_blank_after {
+            insert_text.push('\n');
+        }
+        (insert_offset, insert_offset, insert_text, false)
     };
 
-    // Build the text to insert
-    let mut insert_text = String::new();
-    if needs_blank_before {
-        insert_text.push('\n');
-    }
-    insert_text.push_str(&import_line);
-    insert_text.push('\n');
-    if needs_blank_after {
-        insert_text.push('\n');
-    }
+    let _ = merged_into_existing;
 
     // --- Auto-backup ---
     let backup_id = match edit::auto_backup(
@@ -174,9 +247,9 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // --- Insert ---
+    // --- Insert (or replace, when merging) ---
     let new_source =
-        match edit::replace_byte_range(&source, insert_offset, insert_offset, &insert_text) {
+        match edit::replace_byte_range(&source, insert_offset, replace_end, &insert_text) {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
