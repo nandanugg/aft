@@ -8,6 +8,19 @@ import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-gua
 
 type OpenCodePlugin = typeof import("../index.js").default;
 
+// Match PLUGIN_VERSION from package.json so the fake binary the resolver finds
+// satisfies the version-match expectation in findBinary. Without this, every
+// release that bumps the plugin version breaks the test because the resolver
+// rejects the cached fake at the old version path.
+const PLUGIN_VERSION: string = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require("../../package.json") as { version: string }).version;
+  } catch {
+    return "0.0.0";
+  }
+})();
+
 describe.serial("OpenCode migration bootstrap", () => {
   let tempDir: string;
   let releaseEnv: (() => void) | undefined;
@@ -16,7 +29,7 @@ describe.serial("OpenCode migration bootstrap", () => {
   let cachedAft: string;
 
   function writeFakeAft(exitCode: number): void {
-    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft 0.30.1"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
+    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft ${PLUGIN_VERSION}"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
     writeFileSync(aftPath, contents, "utf8");
     chmodSync(aftPath, 0o755);
     writeFileSync(cachedAft, contents, "utf8");
@@ -42,8 +55,8 @@ describe.serial("OpenCode migration bootstrap", () => {
       AFT_MIGRATION_ARGS_LOG: argsLog,
     });
 
-    cachedAft = join(xdgCacheHome, "aft", "bin", "v0.30.1", "aft");
-    mkdirSync(join(xdgCacheHome, "aft", "bin", "v0.30.1"), { recursive: true });
+    cachedAft = join(xdgCacheHome, "aft", "bin", `v${PLUGIN_VERSION}`, "aft");
+    mkdirSync(join(xdgCacheHome, "aft", "bin", `v${PLUGIN_VERSION}`), { recursive: true });
     writeFakeAft(0);
 
     mkdirSync(opencodeConfigDir, { recursive: true });

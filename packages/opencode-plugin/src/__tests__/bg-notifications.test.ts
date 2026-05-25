@@ -70,6 +70,12 @@ mock.module("../shared/live-server-client.js", () => ({
     liveServerAvailable =
       typeof serverUrlOrAvailable === "boolean" ? serverUrlOrAvailable : (available ?? false);
   },
+  // Bun's `mock.module()` is process-global and partial mocks leak across
+  // test files. The probe-related exports MUST be included even though this
+  // test file does not exercise them, because the live-server-client unit
+  // tests import from the same module path and would otherwise see
+  // `undefined` for these symbols when the mock is already installed.
+  probeServerReachable: async (_serverUrl?: string, _timeoutMs?: number) => liveServerAvailable,
   __resetLiveServerClientCacheForTests: () => {
     liveServerClient = null;
     lastLiveServerArgs = null;

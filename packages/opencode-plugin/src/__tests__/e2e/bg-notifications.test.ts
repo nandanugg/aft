@@ -28,6 +28,11 @@ mock.module("../../shared/live-server-client.js", () => ({
   },
   useLiveServerWake: () => true,
   setLiveServerWakeAvailable: () => {},
+  // Bun's `mock.module()` is process-global and partial mocks leak across
+  // test files; the live-server-client unit tests import from this same
+  // path, so probe-related exports MUST be included even if this file
+  // doesn't exercise them.
+  probeServerReachable: async () => true,
   __resetLiveServerClientCacheForTests: () => {
     e2eLiveServerClient = null;
   },
