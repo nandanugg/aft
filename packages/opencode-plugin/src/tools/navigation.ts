@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt } from "./_shared.js";
+import { callBridge, formatBridgeErrorMessage, optionalInt } from "./_shared.js";
 
 const z = tool.schema;
 
@@ -70,7 +70,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         }
         const response = await callBridge(ctx, context, args.op as string, params);
         if (response.success === false) {
-          throw new Error((response.message as string) || `${args.op} failed`);
+          throw new Error(formatBridgeErrorMessage(args.op as string, response, params));
         }
         return JSON.stringify(response);
       },

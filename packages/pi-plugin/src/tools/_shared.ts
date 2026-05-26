@@ -53,6 +53,74 @@ export function timeoutForCommand(command: string): number | undefined {
   return LONG_RUNNING_COMMAND_TIMEOUT_MS[command];
 }
 
+function asPlainObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function candidateLocation(candidate: Record<string, unknown>): string | undefined {
+  const file =
+    typeof candidate.file === "string" && candidate.file.length > 0 ? candidate.file : undefined;
+  if (!file) return undefined;
+  const line =
+    typeof candidate.line === "number" && Number.isFinite(candidate.line)
+      ? candidate.line
+      : undefined;
+  return line === undefined ? file : `${file}:${line}`;
+}
+
+function stringifyData(data: unknown): string | undefined {
+  if (data === undefined) return undefined;
+  try {
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return String(data);
+  }
+}
+
+/** Format bridge failure envelopes without dropping structured error data. */
+export function formatBridgeErrorMessage(
+  command: string,
+  response: Record<string, unknown>,
+  params: Record<string, unknown> = {},
+): string {
+  const code =
+    typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
+  const message =
+    typeof response.message === "string" && response.message.length > 0
+      ? response.message
+      : `${command} failed`;
+  const data = asPlainObject(response.data);
+
+  if (code === "ambiguous_target") {
+    const candidates = (Array.isArray(data?.candidates) ? data.candidates : [])
+      .map(asPlainObject)
+      .filter((candidate): candidate is Record<string, unknown> => candidate !== undefined)
+      .map(candidateLocation)
+      .filter((candidate): candidate is string => candidate !== undefined);
+
+    if (candidates.length > 0) {
+      const symbol =
+        typeof params.toSymbol === "string" && params.toSymbol.length > 0
+          ? params.toSymbol
+          : typeof data?.symbol === "string" && data.symbol.length > 0
+            ? data.symbol
+            : undefined;
+      const target = symbol ? `multiple symbols named "${symbol}"` : message.replace(/[.!?]+$/, "");
+      return `${command}: ${code} — ${target}. Pass toFile to disambiguate:\n${candidates
+        .map((candidate) => `  - ${candidate}`)
+        .join("\n")}`;
+    }
+  }
+
+  if (!code) return message;
+
+  const lines = [`${command}: ${code} — ${message}`];
+  const dataText = stringifyData(response.data);
+  if (dataText) lines.push(`data: ${dataText}`);
+  return lines.join("\n");
+}
+
 /** Get the session bridge for the current working directory. */
 export function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {
   return ctx.pool.getBridge(cwd);
@@ -106,11 +174,7 @@ export async function callBridge(
     Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
   );
   if (response.success === false) {
-    const message =
-      typeof response.message === "string" && response.message.length > 0
-        ? response.message
-        : `${command} failed`;
-    throw new Error(message);
+    throw new Error(formatBridgeErrorMessage(command, response, merged));
   }
   ingestBgCompletions(sessionId, response.bg_completions);
   return response;
