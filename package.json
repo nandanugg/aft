@@ -1,6 +1,10 @@
 {
   "private": true,
-  "workspaces": ["packages/*", "benchmarks", "tests/pi-rpc"],
+  "workspaces": [
+    "packages/*",
+    "benchmarks",
+    "tests/pi-rpc"
+  ],
   "author": "ualtinok",
   "license": "MIT",
   "scripts": {
@@ -19,7 +23,8 @@
     "test:windows-e2e": "bun run scripts/windows-vm/test.ts",
     "windows-vm:setup": "bun run scripts/windows-vm/setup.ts",
     "version-sync": "node scripts/version-sync.mjs",
-    "bench": "bun run benchmarks/src/runner.ts"
+    "bench": "bun run benchmarks/src/runner.ts",
+    "bench:codegraph-replication": "bun run benchmarks/codegraph-replication/src/cli.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.7",
