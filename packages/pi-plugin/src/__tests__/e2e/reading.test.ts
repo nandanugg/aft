@@ -76,6 +76,39 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(text).toContain("sample.go");
   });
 
+  test("outline files mode lists directory file metadata", async () => {
+    const result = await harness.callTool("aft_outline", { target: "directory", files: true });
+    const text = harness.text(result);
+
+    expect(text).toMatch(/alpha\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/beta\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/gamma\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+  });
+
+  test("outline files mode accepts array target of directories", async () => {
+    await mkdir(harness.path("outline-files-a"), { recursive: true });
+    await mkdir(harness.path("outline-files-b"), { recursive: true });
+    await writeFile(
+      harness.path("outline-files-a", "one.ts"),
+      "export function one() { return 1; }\n",
+      "utf8",
+    );
+    await writeFile(
+      harness.path("outline-files-b", "two.py"),
+      "def two():\n    return 2\n",
+      "utf8",
+    );
+
+    const result = await harness.callTool("aft_outline", {
+      target: [harness.path("outline-files-a"), harness.path("outline-files-b")],
+      files: true,
+    });
+    const text = harness.text(result);
+
+    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+\d+ bytes/);
+  });
+
   test("outline rejects empty string target", async () => {
     await expect(harness.callTool("aft_outline", { target: "" })).rejects.toThrow(/non-empty/);
   });

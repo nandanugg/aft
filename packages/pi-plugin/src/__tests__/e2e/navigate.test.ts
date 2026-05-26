@@ -1,7 +1,7 @@
 /**
- * E2E coverage for aft_navigate (5 ops).
+ * E2E coverage for aft_navigate (6 ops).
  * Each op is dispatched as its own Rust command name (call_tree, callers,
- * trace_to, impact, trace_data).
+ * trace_to, trace_to_symbol, impact, trace_data).
  */
 
 /// <reference path="../../bun-test.d.ts" />
@@ -64,6 +64,49 @@ maybeDescribe("aft_navigate (real bridge)", () => {
     });
     const text = harness.text(result);
     expect(text.length).toBeGreaterThan(0);
+  });
+
+  test("trace_to_symbol returns a path between reachable symbols", async () => {
+    const result = await harness.callTool("aft_navigate", {
+      op: "trace_to_symbol",
+      filePath: "sample.ts",
+      symbol: "funcC",
+      toSymbol: "decorate",
+      toFile: "sample.ts",
+    });
+    const text = harness.text(result);
+    const response = JSON.parse(text) as {
+      complete: boolean;
+      path: Array<{ file: string; line: number; symbol: string }>;
+    };
+
+    expect(response.complete).toBe(true);
+    expect(Array.isArray(response.path)).toBe(true);
+    expect(response.path.length).toBeGreaterThanOrEqual(2);
+    expect(response.path[0]).toMatchObject({ symbol: "funcC" });
+    expect(response.path[response.path.length - 1]).toMatchObject({ symbol: "decorate" });
+    expect(response.path.every((hop) => hop.file.endsWith("sample.ts"))).toBe(true);
+    expect(response.path.every((hop) => typeof hop.line === "number")).toBe(true);
+  });
+
+  test("trace_to_symbol reports no_path_found for unreachable symbols", async () => {
+    const result = await harness.callTool("aft_navigate", {
+      op: "trace_to_symbol",
+      filePath: "sample.ts",
+      symbol: "funcA",
+      toSymbol: "normalize",
+      toFile: "sample.ts",
+    });
+    const text = harness.text(result);
+    const response = JSON.parse(text) as {
+      complete: boolean;
+      path: null;
+      reason: string;
+    };
+
+    expect(response.complete).toBe(true);
+    expect(response.path).toBeNull();
+    expect(response.reason).toBe("no_path_found");
   });
 
   test("trace_data requires expression", async () => {
