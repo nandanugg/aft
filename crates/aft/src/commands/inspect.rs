@@ -40,12 +40,21 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     let manager = ctx.inspect_manager();
     let mut outcomes = BTreeMap::new();
     for category in InspectCategory::active() {
-        let outcome = manager.submit_category_with_callgraph(
-            snapshot.clone(),
-            *category,
-            scope.clone(),
-            callgraph_snapshot.clone(),
-        );
+        let outcome = if category.is_tier2() {
+            manager.tier2_run_with_reuse(
+                snapshot.clone(),
+                *category,
+                scope.clone(),
+                callgraph_snapshot.clone(),
+            )
+        } else {
+            manager.submit_category_with_callgraph(
+                snapshot.clone(),
+                *category,
+                scope.clone(),
+                callgraph_snapshot.clone(),
+            )
+        };
         outcomes.insert(*category, outcome);
     }
 
@@ -69,17 +78,17 @@ pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response 
     let mut queued = Vec::new();
     let mut errors = Vec::new();
     for category in categories {
-        match manager.submit_background_with_callgraph(
+        match manager.tier2_run_with_reuse(
             snapshot.clone(),
             category,
             scope.clone(),
             callgraph_snapshot.clone(),
         ) {
-            Ok(key) => queued.push(key.display_key()),
-            Err(message) => errors.push(serde_json::json!({
+            JobOutcome::Failed { message } => errors.push(serde_json::json!({
                 "category": category.as_str(),
                 "message": message,
             })),
+            _ => queued.push(category.to_string()),
         }
     }
 

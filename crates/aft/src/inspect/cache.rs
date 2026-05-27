@@ -10,6 +10,13 @@ use crate::cache_freshness::FileFreshness;
 
 use super::job::{FileContribution, InspectCategory, JobKey};
 
+#[derive(Debug, Default)]
+pub(crate) struct Tier2ContributionUpdates {
+    pub upserts: Vec<FileContribution>,
+    pub deletes: Vec<PathBuf>,
+    pub metadata_updates: Vec<(PathBuf, FileFreshness)>,
+}
+
 #[derive(Debug)]
 pub enum InspectCacheError {
     Io(std::io::Error),
@@ -231,6 +238,156 @@ impl InspectCache {
         let contribution_set_hash =
             contribution_set_hash_with_conn(&tx, key.category, &self.project_key)?;
         let aggregate_blob = serde_json::to_vec(&aggregate)?;
+        tx.execute(
+            "INSERT INTO tier2_aggregates \
+             (category, project_key, contribution_set_hash, aggregate, generated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(category, project_key) DO UPDATE SET \
+             contribution_set_hash = excluded.contribution_set_hash, \
+             aggregate = excluded.aggregate, \
+             generated_at = excluded.generated_at",
+            params![
+                key.category.as_str(),
+                self.project_key,
+                contribution_set_hash,
+                aggregate_blob,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO tier2_meta (category, project_key, last_full_run) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(category, project_key) DO UPDATE SET last_full_run = excluded.last_full_run",
+            params![key.category.as_str(), self.project_key, now],
+        )?;
+        tx.commit()?;
+
+        self.store_aggregated(key, aggregate)
+    }
+
+    pub(crate) fn apply_contribution_updates(
+        &self,
+        category: InspectCategory,
+        updates: Tier2ContributionUpdates,
+    ) -> Result<String, InspectCacheError> {
+        let now = unix_seconds_now();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let tx = conn.transaction()?;
+
+        for relative_file in updates.deletes {
+            tx.execute(
+                "DELETE FROM tier2_contributions WHERE category = ?1 AND project_key = ?2 AND file_path = ?3",
+                params![
+                    category.as_str(),
+                    self.project_key,
+                    relative_file.to_string_lossy().to_string()
+                ],
+            )?;
+        }
+
+        for (relative_file, freshness) in updates.metadata_updates {
+            tx.execute(
+                "UPDATE tier2_contributions \
+                 SET file_mtime_ns = ?4, file_size = ?5, file_hash = ?6 \
+                 WHERE category = ?1 AND project_key = ?2 AND file_path = ?3",
+                params![
+                    category.as_str(),
+                    self.project_key,
+                    relative_file.to_string_lossy().to_string(),
+                    system_time_to_ns(freshness.mtime),
+                    freshness.size as i64,
+                    hash_to_hex(freshness.content_hash),
+                ],
+            )?;
+        }
+
+        for contribution in updates.upserts {
+            let file_path = relative_string(&self.project_root, &contribution.file_path);
+            let blob = serde_json::to_vec(&contribution.contribution)?;
+            tx.execute(
+                "INSERT INTO tier2_contributions \
+                 (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(category, project_key, file_path) DO UPDATE SET \
+                 file_mtime_ns = excluded.file_mtime_ns, \
+                 file_size = excluded.file_size, \
+                 file_hash = excluded.file_hash, \
+                 contribution = excluded.contribution, \
+                 generated_at = excluded.generated_at",
+                params![
+                    contribution.category.as_str(),
+                    self.project_key,
+                    file_path,
+                    system_time_to_ns(contribution.freshness.mtime),
+                    contribution.freshness.size as i64,
+                    hash_to_hex(contribution.freshness.content_hash),
+                    blob,
+                    now,
+                ],
+            )?;
+        }
+
+        let contribution_set_hash =
+            contribution_set_hash_with_conn(&tx, category, &self.project_key)?;
+        tx.commit()?;
+
+        self.memory
+            .write()
+            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
+            .remove(&JobKey::for_project_category(category));
+
+        Ok(contribution_set_hash)
+    }
+
+    pub(crate) fn load_aggregate_if_hash_matches(
+        &self,
+        category: InspectCategory,
+        contribution_set_hash: &str,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        let payload = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+            conn.query_row(
+                "SELECT aggregate FROM tier2_aggregates \
+                 WHERE category = ?1 AND project_key = ?2 AND contribution_set_hash = ?3",
+                params![category.as_str(), self.project_key, contribution_set_hash],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        };
+
+        match payload {
+            Some(bytes) => {
+                let value = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+                self.store_aggregated(JobKey::for_project_category(category), value.clone())?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn store_tier2_aggregate(
+        &self,
+        key: JobKey,
+        contribution_set_hash: &str,
+        aggregate: serde_json::Value,
+    ) -> Result<(), InspectCacheError> {
+        if !key.category.is_tier2() {
+            self.store_aggregated(key, aggregate)?;
+            return Ok(());
+        }
+
+        let now = unix_seconds_now();
+        let aggregate_blob = serde_json::to_vec(&aggregate)?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO tier2_aggregates \
              (category, project_key, contribution_set_hash, aggregate, generated_at) \
