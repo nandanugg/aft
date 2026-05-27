@@ -1,0 +1,21 @@
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: benchmarks/codegraph-vs-aft-agent/Dockerfile
+    environment:
+      AGENT_ARMS: ${AGENT_ARMS:-aft,codegraph}
+      AGENT_MODEL: ${AGENT_MODEL:-opencode-go/deepseek-v4-flash-free}
+      AGENT_FALLBACK_MODEL: ${AGENT_FALLBACK_MODEL:-opencode-go/deepseek-v4-pro}
+      AGENT_TASK_LIMIT: ${AGENT_TASK_LIMIT:-}
+      AGENT_TIMEOUT_MS: ${AGENT_TIMEOUT_MS:-240000}
+      AGENT_DRY_RUN: ${AGENT_DRY_RUN:-}
+      OPENCODE_AUTH_JSON: /mnt/opencode-auth/auth.json
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./results:/workspace/benchmarks/codegraph-vs-aft-agent/results
+      - ./.bench:/workspace/benchmarks/codegraph-vs-aft-agent/.bench
+      # Mount host auth read-only outside OpenCode's writable data dir; the
+      # entrypoint copies auth.json into /root/.local/share/opencode.
+      - ${HOME}/.local/share/opencode:/mnt/opencode-auth:ro

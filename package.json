@@ -24,7 +24,13 @@
     "windows-vm:setup": "bun run scripts/windows-vm/setup.ts",
     "version-sync": "node scripts/version-sync.mjs",
     "bench": "bun run benchmarks/src/runner.ts",
-    "bench:codegraph-replication": "bun run benchmarks/codegraph-replication/src/cli.ts"
+    "bench:codegraph-replication": "bun run benchmarks/codegraph-replication/src/cli.ts",
+    "bench:aft-search:local": "cd benchmarks/aft-search && python3 run.py",
+    "bench:aft-search": "docker compose -f benchmarks/aft-search/docker-compose.yml run --rm aft-search",
+    "bench:aft-search:docker": "docker compose -f benchmarks/aft-search/docker-compose.yml run --rm aft-search",
+    "bench:codegraph-replication:docker": "docker compose -f benchmarks/codegraph-replication/docker-compose.yml run --rm codegraph-replication",
+    "bench:codegraph-vs-aft-retrieval": "sh -c 'docker compose -f benchmarks/codegraph-vs-aft-retrieval/docker-compose.yml run --rm aft && docker compose -f benchmarks/codegraph-vs-aft-retrieval/docker-compose.yml run --rm codegraph'",
+    "bench:codegraph-vs-aft-agent": "docker compose -f benchmarks/codegraph-vs-aft-agent/docker-compose.yml run --rm agent"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.7",

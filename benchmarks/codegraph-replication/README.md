@@ -99,3 +99,19 @@ Saved reports from this run:
 - The lexical baselines use exact fixed-string query matching; they are intentionally weak on natural-language `findRelevantContext` cases.
 - Single-run latency is noisy. Use `--runs 3` or higher for publishable latency numbers.
 - Token-efficiency and agent behavior are intentionally out of scope for v1; those belong to a separate benchmark axis.
+
+## Docker
+
+The local Bun command above is unchanged. To run in a reproducible container that builds AFT and installs Bun/Ripgrep inside Docker:
+
+```bash
+bun run bench:codegraph-replication:docker
+# or
+make run-codegraph-replication
+```
+
+Useful overrides:
+
+```bash
+CODEGRAPH_REPLICATION_DRIVER=aft-grep CODEGRAPH_REPLICATION_CORPUS=aft bun run bench:codegraph-replication:docker
+```
