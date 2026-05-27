@@ -816,10 +816,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
 
         #[link(name = "version")]
         extern "system" {
-            fn GetFileVersionInfoSizeW(
-                lptstrFilename: *const u16,
-                lpdwHandle: *mut u32,
-            ) -> u32;
+            fn GetFileVersionInfoSizeW(lptstrFilename: *const u16, lpdwHandle: *mut u32) -> u32;
             fn GetFileVersionInfoW(
                 lptstrFilename: *const u16,
                 dwHandle: u32,
@@ -838,8 +835,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
         struct VS_FIXEDFILEINFO {
             dw_signature: u32,
             dw_struc_version: u32,
-            dw_file_version_ms: u32,   // HIWORD major, LOWORD minor
-            dw_file_version_ls: u32,   // HIWORD build, LOWORD revision
+            dw_file_version_ms: u32, // HIWORD major, LOWORD minor
+            dw_file_version_ls: u32, // HIWORD build, LOWORD revision
             dw_product_version_ms: u32,
             dw_product_version_ls: u32,
             dw_file_flags_mask: u32,
@@ -876,8 +873,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             let path_len = GetModuleFileNameW(handle, path_buf.as_mut_ptr(), 260);
             if path_len > 0 {
                 let mut dummy_handle: u32 = 0;
-                let info_size =
-                    GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
+                let info_size = GetFileVersionInfoSizeW(path_buf.as_ptr(), &mut dummy_handle);
                 if info_size > 0 {
                     let mut info = vec![0u8; info_size as usize];
                     if GetFileVersionInfoW(
@@ -888,8 +884,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     ) != 0
                     {
                         let sub_block = "\\\0".encode_utf16().collect::<Vec<u16>>();
-                        let mut vs_info: *mut std::ffi::c_void =
-                            std::ptr::null_mut();
+                        let mut vs_info: *mut std::ffi::c_void = std::ptr::null_mut();
                         let mut vs_len: u32 = 0;
                         if VerQueryValueW(
                             info.as_mut_ptr() as *mut std::ffi::c_void,
@@ -901,8 +896,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                         {
                             let fixed = vs_info as *const VS_FIXEDFILEINFO;
                             detected_major = (*fixed).dw_file_version_ms >> 16;
-                            detected_minor =
-                                (*fixed).dw_file_version_ms & 0xFFFF;
+                            detected_minor = (*fixed).dw_file_version_ms & 0xFFFF;
                         }
                     }
                 }
@@ -913,9 +907,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             // Version compatibility check (mirrors the Linux/macOS path).
             // If version could not be detected (detected_major == 0) we let
             // the load succeed — the ort crate will diagnose further.
-            if detected_major != 0
-                && (detected_major != 1 || detected_minor < 20)
-            {
+            if detected_major != 0 && (detected_major != 1 || detected_minor < 20) {
                 let ver = format!("{}.{}", detected_major, detected_minor);
                 return Err(format_ort_version_mismatch(&ver, lib_name));
             }
