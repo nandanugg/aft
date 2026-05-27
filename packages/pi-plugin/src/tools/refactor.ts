@@ -7,7 +7,14 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  textResult,
+} from "./_shared.js";
 import {
   accentPath,
   asNumber,
@@ -126,11 +133,26 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         extract: "extract_function",
         inline: "inline_symbol",
       };
+      // Per-op required-field validation using isEmptyParam so empty strings
+      // ("") sent by GPT-family models trigger the proper "required" error
+      // instead of being passed through to Rust as a valid empty value.
+      if ((params.op === "move" || params.op === "inline") && isEmptyParam(params.symbol)) {
+        throw new Error(`'symbol' is required for '${params.op}' op`);
+      }
+      if (params.op === "move" && isEmptyParam(params.destination)) {
+        throw new Error("'destination' is required for 'move' op");
+      }
+      if (params.op === "extract" && isEmptyParam(params.name)) {
+        throw new Error("'name' is required for 'extract' op");
+      }
+
       const req: Record<string, unknown> = { file: params.filePath };
-      if (params.symbol !== undefined) req.symbol = params.symbol;
-      if (params.destination !== undefined) req.destination = params.destination;
-      if (params.scope !== undefined) req.scope = params.scope;
-      if (params.name !== undefined) req.name = params.name;
+      // Use isEmptyParam everywhere so "" / [] / null don't slip through as
+      // valid string params that Rust then has to deal with.
+      if (!isEmptyParam(params.symbol)) req.symbol = params.symbol;
+      if (!isEmptyParam(params.destination)) req.destination = params.destination;
+      if (!isEmptyParam(params.scope)) req.scope = params.scope;
+      if (!isEmptyParam(params.name)) req.name = params.name;
       const startLine = coerceOptionalInt(
         params.startLine,
         "startLine",

@@ -4,7 +4,7 @@ import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { storeToolMetadata } from "../metadata-store.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -22,14 +22,18 @@ function buildZoomTitle(args: {
   symbols?: string | string[];
   targets?: { filePath: string; symbol: string } | Array<{ filePath: string; symbol: string }>;
 }): string {
-  if (args.targets !== undefined && args.targets !== null) {
+  // Use isEmptyParam so empty arrays / null / "" don't produce
+  // "0 targets across files" — let the function fall through to the
+  // filePath/url/symbols branches instead.
+  if (!isEmptyParam(args.targets)) {
     if (Array.isArray(args.targets)) {
       if (args.targets.length === 1 && args.targets[0]) {
         return `${args.targets[0].filePath}#${args.targets[0].symbol}`;
       }
       return `${args.targets.length} targets across files`;
     }
-    return `${args.targets.filePath}#${args.targets.symbol}`;
+    // biome-ignore lint/style/noNonNullAssertion: isEmptyParam guards null/undefined
+    return `${args.targets!.filePath}#${args.targets!.symbol}`;
   }
 
   const path = args.filePath ?? args.url ?? "";
@@ -228,25 +232,33 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         ),
       },
       execute: async (args, context): Promise<string> => {
-        const hasFilePath = typeof args.filePath === "string" && args.filePath.length > 0;
-        const hasUrl = typeof args.url === "string" && args.url.length > 0;
-        const hasTargets = args.targets !== undefined && args.targets !== null;
-        const hasSymbols =
-          args.symbols !== undefined &&
-          args.symbols !== null &&
-          (typeof args.symbols === "string"
-            ? args.symbols.length > 0
-            : Array.isArray(args.symbols) && args.symbols.length > 0);
+        // GPT-family models send empty strings / empty arrays / empty objects
+        // instead of omitting optional params. Use `isEmptyParam` so e.g.
+        // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
+        // against fields the agent didn't actually intend to provide.
+        const hasFilePath = !isEmptyParam(args.filePath);
+        const hasUrl = !isEmptyParam(args.url);
+        const hasTargets = !isEmptyParam(args.targets);
+        const hasSymbols = !isEmptyParam(args.symbols);
 
-        // Set TUI title BEFORE any bridge call so even errors render with a
-        // meaningful tool-call header. OpenCode's default auto-title only
-        // surfaces the first scalar arg, which leaves array/object-only
-        // invocations (symbols: [...], targets: {...}, targets: [...]) showing
-        // up as a bare `aft_zoom` with no hint.
+        // Set TUI title + scalar metadata BEFORE any bridge call so even
+        // errors render with a meaningful tool-call header. OpenCode's UI
+        // only auto-renders SCALAR args (strings, numbers, booleans) — arrays
+        // and objects are dropped from the `[key=value, ...]` line. Stringify
+        // collection-shaped args here so `targets`/`symbols` stay visible.
         const zoomCallID = getCallID(context);
         if (zoomCallID) {
           const title = buildZoomTitle(args);
-          storeToolMetadata(context.sessionID, zoomCallID, { title, metadata: { title } });
+          const display: Record<string, unknown> = { title };
+          if (hasFilePath) display.filePath = args.filePath;
+          if (hasUrl) display.url = args.url;
+          if (hasSymbols) {
+            display.symbols =
+              typeof args.symbols === "string" ? args.symbols : JSON.stringify(args.symbols);
+          }
+          if (hasTargets) display.targets = JSON.stringify(args.targets);
+          if (args.contextLines !== undefined) display.contextLines = args.contextLines;
+          storeToolMetadata(context.sessionID, zoomCallID, { title, metadata: display });
         }
 
         // Multi-target mode (cross-file). Mutually exclusive with the other

@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { queryLspHints } from "../lsp.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -70,14 +70,17 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
 
-        if ((op === "move" || op === "inline") && typeof args.symbol !== "string") {
+        // Use isEmptyParam so empty strings (GPT-family models send "" for omitted
+        // required string params) trigger the proper "required" error instead of
+        // being silently accepted as a string and crashing downstream.
+        if ((op === "move" || op === "inline") && isEmptyParam(args.symbol)) {
           throw new Error(`'symbol' is required for '${op}' op`);
         }
-        if (op === "move" && typeof args.destination !== "string") {
+        if (op === "move" && isEmptyParam(args.destination)) {
           throw new Error("'destination' is required for 'move' op");
         }
         if (op === "extract") {
-          if (typeof args.name !== "string") throw new Error("'name' is required for 'extract' op");
+          if (isEmptyParam(args.name)) throw new Error("'name' is required for 'extract' op");
           if (args.startLine === undefined)
             throw new Error("'startLine' is required for 'extract' op");
           if (args.endLine === undefined) throw new Error("'endLine' is required for 'extract' op");

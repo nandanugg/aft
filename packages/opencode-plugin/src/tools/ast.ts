@@ -10,7 +10,7 @@ const z = tool.schema;
 
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, optionalInt } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -86,8 +86,11 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         pattern: args.pattern,
         lang: args.lang,
       };
-      if (args.paths) params.paths = args.paths;
-      if (args.globs) params.globs = args.globs;
+      // Use isEmptyParam so empty arrays ([]) sent by GPT-family models don't
+      // get forwarded to Rust as "scope present" — let Rust default to whole
+      // project_root instead of round-tripping a useless empty scope.
+      if (!isEmptyParam(args.paths)) params.paths = args.paths;
+      if (!isEmptyParam(args.globs)) params.globs = args.globs;
       if (args.contextLines !== undefined) params.context = Number(args.contextLines);
       const response = await callBridge(ctx, context, "ast_search", params);
 
@@ -229,8 +232,9 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         rewrite: args.rewrite,
         lang: args.lang,
       };
-      if (args.paths) params.paths = args.paths;
-      if (args.globs) params.globs = args.globs;
+      // Use isEmptyParam — see ast_search above for rationale.
+      if (!isEmptyParam(args.paths)) params.paths = args.paths;
+      if (!isEmptyParam(args.globs)) params.globs = args.globs;
       params.dry_run = args.dryRun === true;
       const response = await callBridge(ctx, context, "ast_replace", params);
 

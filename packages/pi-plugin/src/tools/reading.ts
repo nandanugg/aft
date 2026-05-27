@@ -9,7 +9,7 @@ import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-brid
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   accentPath,
   asRecord,
@@ -391,15 +391,14 @@ export function registerReadingTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const hasFilePath = typeof params.filePath === "string" && params.filePath.length > 0;
-        const hasUrl = typeof params.url === "string" && params.url.length > 0;
-        const hasTargets = params.targets !== undefined && params.targets !== null;
-        const hasSymbols =
-          params.symbols !== undefined &&
-          params.symbols !== null &&
-          (typeof params.symbols === "string"
-            ? params.symbols.length > 0
-            : Array.isArray(params.symbols) && params.symbols.length > 0);
+        // GPT-family models send empty strings / empty arrays / empty objects
+        // instead of omitting optional params. Use `isEmptyParam` so e.g.
+        // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
+        // against fields the agent didn't actually intend to provide.
+        const hasFilePath = !isEmptyParam(params.filePath);
+        const hasUrl = !isEmptyParam(params.url);
+        const hasTargets = !isEmptyParam(params.targets);
+        const hasSymbols = !isEmptyParam(params.symbols);
 
         // Multi-target mode (cross-file). Mutually exclusive with the other
         // modes so the agent doesn't accidentally provide overlapping inputs

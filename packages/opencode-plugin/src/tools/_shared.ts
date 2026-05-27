@@ -90,6 +90,26 @@ export function coerceOptionalInt(
 }
 
 /**
+ * True when a value represents "agent did not provide this param".
+ *
+ * GPT-family models send empty strings / empty arrays / null instead of
+ * omitting optional params entirely. Use this BEFORE mutual-exclusion
+ * checks so an empty `targets: []` or `url: ""` doesn't get counted as
+ * present and trigger a misleading "X is mutually exclusive with Y" error.
+ *
+ * Treats undefined / null / "" / [] / {} as empty. Booleans and numbers
+ * (including 0 and false) are NOT empty by themselves — only string and
+ * collection sentinels qualify.
+ */
+export function isEmptyParam(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "string") return value.length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value as object).length === 0;
+  return false;
+}
+
+/**
  * Per-command timeout overrides (milliseconds).
  *
  * Commands not listed fall back to the bridge-wide default (30s). Only

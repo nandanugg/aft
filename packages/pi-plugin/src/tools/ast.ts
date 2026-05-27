@@ -7,7 +7,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   asNumber,
   asRecord,
@@ -266,8 +266,11 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
           pattern: params.pattern,
           lang: params.lang,
         };
-        if (params.paths !== undefined) req.paths = params.paths;
-        if (params.globs !== undefined) req.globs = params.globs;
+        // Use isEmptyParam so empty arrays sent by GPT-family models don't
+        // get forwarded to Rust as "scope present" — let Rust default to whole
+        // project_root instead of round-tripping a useless empty scope.
+        if (!isEmptyParam(params.paths)) req.paths = params.paths;
+        if (!isEmptyParam(params.globs)) req.globs = params.globs;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
         const response = await callBridge(bridge, "ast_search", req, extCtx);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
@@ -301,8 +304,9 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
           rewrite: params.rewrite,
           lang: params.lang,
         };
-        if (params.paths !== undefined) req.paths = params.paths;
-        if (params.globs !== undefined) req.globs = params.globs;
+        // Use isEmptyParam — see ast_search above for rationale.
+        if (!isEmptyParam(params.paths)) req.paths = params.paths;
+        if (!isEmptyParam(params.globs)) req.globs = params.globs;
         // Rust ast_replace defaults to dry_run=true; apply by default to match description.
         req.dry_run = params.dryRun === true;
         const response = await callBridge(bridge, "ast_replace", req, extCtx);
