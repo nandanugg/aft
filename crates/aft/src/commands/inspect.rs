@@ -36,7 +36,10 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
 
-    let callgraph_snapshot = build_callgraph_snapshot(ctx, &snapshot.project_root);
+    // Callgraph snapshot is only used by Tier 2 scanners (dead_code etc.) in
+    // handle_inspect_tier2_run. handle_inspect itself is fully read-only for
+    // Tier 2 (cache hit only) and Tier 1 (todos, metrics) does not consume the
+    // callgraph snapshot, so skip the full-tree walk here.
     let manager = ctx.inspect_manager();
     let mut outcomes = BTreeMap::new();
     for category in InspectCategory::active() {
@@ -47,12 +50,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             // last Tier 2 run persisted, or Pending if nothing is cached yet.
             manager.tier2_read_cached(snapshot.clone(), *category, scope.clone())
         } else {
-            manager.submit_category_with_callgraph(
-                snapshot.clone(),
-                *category,
-                scope.clone(),
-                callgraph_snapshot.clone(),
-            )
+            manager.submit_category_with_callgraph(snapshot.clone(), *category, scope.clone(), None)
         };
         outcomes.insert(*category, outcome);
     }
