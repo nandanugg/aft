@@ -183,13 +183,13 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.32.0";
+const ANNOUNCEMENT_VERSION = "0.33.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "`aft_search` is now the primary code-search tool — auto-routes regex / literal / semantic / hybrid by query shape, with a `hint` override.",
-  'Semantic search stays queryable through edits — no more "rebuilding" fallback after every save.',
-  "Workflow hints promote `aft_search` as primary; `grep` is positioned as the specialized fallback.",
-  "Bare `\\n`, `\\t`, `\\r` queries correctly route to regex mode.",
-  'Empty params (`targets: []`, `url: ""`) no longer trigger misleading mutual-exclusion errors.',
+  "New `aft_inspect` — one call for codebase health: diagnostics, metrics, TODOs, dead code, unused exports, and duplicates.",
+  "Diagnostics now flow through `aft_inspect` (run it after a batch of edits) instead of arriving automatically on every edit.",
+  "`aft_navigate` is renamed to `aft_callgraph`; the Rust call graph now resolves cross-file callers.",
+  "Edits no longer echo the whole file back to the agent — much lower token cost per edit.",
+  "Batch of `aft_search` correctness fixes and undo-history/SSRF/Windows hardening.",
 ];
 
 /**

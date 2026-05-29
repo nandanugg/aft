@@ -197,7 +197,8 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
       "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run as background scans triggered on session idle; calls may return cached `stale_categories: [...]` results or `pending_categories: [...]` while a refresh is in progress (waits up to 1s for fresh data before falling back to cached).\n\n" +
-      "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.",
+      "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
+      "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     args: {
       sections: arg(
         z

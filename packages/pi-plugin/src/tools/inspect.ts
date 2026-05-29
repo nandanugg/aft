@@ -305,7 +305,8 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
       "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]` or stale `stale_categories: [...]`, Pi quietly starts a background Tier 2 warmup (deduped while in-flight and rate-limited per category to at most once every 4 minutes, matching OpenCode's default idle window). The current call may still return pending results while the cache warms; a later call can use cached data.\n\n" +
-      "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.",
+      "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
+      "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     parameters: InspectParams,
     async execute(
       _toolCallId: string,
