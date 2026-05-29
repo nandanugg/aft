@@ -602,7 +602,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         content,
         create_dirs: true,
         diagnostics: args.diagnostics ?? diagnosticsOnEditDefault(ctx),
-        include_diff: true,
+        include_diff_content: true,
       });
 
       // Error response (e.g. path validation failure)
@@ -917,7 +917,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       params.diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
-      params.include_diff = true;
+      params.include_diff_content = true;
 
       const data = await callBridge(ctx, context, command, params);
 
@@ -951,7 +951,18 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         }
       }
 
-      let result = JSON.stringify(data);
+      // Agent-facing result must NOT carry full before/after file contents.
+      // We requested `include_diff_content` purely for the UI metadata above;
+      // echoing it back to the model makes the payload scale with file size,
+      // not edit size (a 1-line change in a 600-line file = the whole file
+      // twice). Replace diff with counts-only for the agent — the model
+      // already knows what it changed.
+      const agentData = { ...data } as Record<string, unknown>;
+      if (agentData.diff && typeof agentData.diff === "object") {
+        const d = agentData.diff as { additions?: number; deletions?: number };
+        agentData.diff = { additions: d.additions ?? 0, deletions: d.deletions ?? 0 };
+      }
+      let result = JSON.stringify(agentData);
 
       const globSkipNote = formatGlobSkipReasonsNote(data.format_skip_reasons as unknown);
       if (globSkipNote) result += `\n\n${globSkipNote}`;
@@ -1205,7 +1216,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 content,
                 create_dirs: true,
                 diagnostics,
-                include_diff: true,
+                include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
               const wrDiff = writeResult.diff as
@@ -1278,7 +1289,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 content: newContent,
                 create_dirs: true,
                 diagnostics,
-                include_diff: true,
+                include_diff_content: true,
                 multi_file_write_paths: multiFileWritePaths,
               });
 

@@ -138,7 +138,7 @@ describe("Hoisted tool execute handlers", () => {
         content: "export {};\n",
         create_dirs: true,
         diagnostics: false,
-        include_diff: true,
+        include_diff_content: true,
         session_id: "test",
       },
     });
@@ -499,7 +499,7 @@ describe("Hoisted tool execute handlers", () => {
           { line_start: 4, line_end: 6, content: "replacement" },
         ],
         diagnostics: false,
-        include_diff: true,
+        include_diff_content: true,
         session_id: "test",
       },
     });
@@ -576,10 +576,47 @@ describe("Hoisted tool execute handlers", () => {
         replacement: "newName",
         replace_all: true,
         diagnostics: false,
-        include_diff: true,
+        include_diff_content: true,
         session_id: "test",
       },
     });
+  });
+
+  /// Diff-payload contract: the plugin requests full before/after from Rust
+  /// (include_diff_content) for UI metadata, but the AGENT-facing result must
+  /// strip the file content down to counts only. Echoing before/after into the
+  /// model context makes the payload scale with file size, not edit size.
+  test("edit agent result strips diff before/after to counts-only", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const bigBefore = `${"x".repeat(50_000)}\n`;
+    const bigAfter = `${"y".repeat(50_000)}\n`;
+    const { tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+      diff: { before: bigBefore, after: bigAfter, additions: 1, deletions: 1 },
+    }));
+
+    const result = await tools.edit.execute(
+      { filePath: "big.ts", oldString: "x", newString: "y" },
+      sdkCtx,
+    );
+
+    // Agent result must NOT contain the 50KB file content from either side.
+    expect(result).not.toContain(bigBefore);
+    expect(result).not.toContain(bigAfter);
+    expect(result.length).toBeLessThan(2_000);
+
+    // Counts survive for the agent's verification signal.
+    const parsed = JSON.parse(result.split("\n\n")[0]) as {
+      success: boolean;
+      diff?: { additions?: number; deletions?: number; before?: string; after?: string };
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.diff).toEqual({ additions: 1, deletions: 1 });
+    expect(parsed.diff?.before).toBeUndefined();
+    expect(parsed.diff?.after).toBeUndefined();
   });
 
   /// BUG-6a (per-file commit): when a 2-hunk patch has 1 success and 1

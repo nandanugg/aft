@@ -338,7 +338,7 @@ export function registerHoistedTools(
             file: params.filePath,
             content: params.content,
             diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
-            include_diff: true,
+            include_diff_content: true,
           },
           extCtx,
         );
@@ -389,7 +389,7 @@ export function registerHoistedTools(
             file: params.filePath,
             append_content: params.appendContent,
             diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
-            include_diff: true,
+            include_diff_content: true,
           };
           const response = await callBridge(bridge, "edit_match", req, extCtx);
           return buildMutationResult(params.filePath, response);
@@ -400,7 +400,7 @@ export function registerHoistedTools(
           match: params.oldString ?? "",
           replacement: params.newString ?? "",
           diagnostics: params.diagnostics ?? diagnosticsOnEditDefault(ctx),
-          include_diff: true,
+          include_diff_content: true,
         };
         if (params.replaceAll === true) req.replace_all = true;
         const occurrence = coerceOptionalInt(
@@ -532,11 +532,12 @@ export function buildMutationResult(
     replacements !== undefined
       ? `Edited ${filePath} (+${additions}/-${deletions}, ${replacements} replacement${replacements === 1 ? "" : "s"})`
       : `Wrote ${filePath} (+${additions}/-${deletions})`;
+  // Agent-facing text deliberately omits the diff body: the agent already
+  // knows what it changed (it supplied the edit), so echoing before/after into
+  // context wastes tokens proportional to file size. The line-numbered diff
+  // stays in `details.diff` for the TUI renderer only. Matches OpenCode native
+  // edit, which returns just "Edit applied successfully." to the model.
   let text = summaryHeader;
-  if (diffText) text += `\n\n${diffText}`;
-  if (truncated) {
-    text += "\n\n(diff truncated \u2014 file too large to include before/after content)";
-  }
   if (noOp) {
     // Surface the no-op signal explicitly so the agent can distinguish "the
     // tool failed silently" from "the edit matched but produced no net change".

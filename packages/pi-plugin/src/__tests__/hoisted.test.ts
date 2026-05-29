@@ -88,7 +88,7 @@ describe("hoisted tool adapters", () => {
       file: "README.md",
       append_content: "\nnext",
       diagnostics: false,
-      include_diff: true,
+      include_diff_content: true,
     });
   });
 
@@ -119,7 +119,7 @@ describe("hoisted tool adapters", () => {
       match: "before",
       replacement: "after",
       diagnostics: false,
-      include_diff: true,
+      include_diff_content: true,
     });
     expect(result.content[0].text).not.toContain("LSP diagnostics");
     expect(result.details.diagnostics).toBeUndefined();
@@ -229,7 +229,7 @@ describe("hoisted tool adapters", () => {
       file: "src/app.ts",
       content: "export {};\n",
       diagnostics: false,
-      include_diff: true,
+      include_diff_content: true,
     });
     expect(result.content[0].text).not.toContain("LSP diagnostics");
     expect(result.details.diagnostics).toBeUndefined();
