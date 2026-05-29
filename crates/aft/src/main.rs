@@ -863,7 +863,7 @@ fn drain_watcher_events(ctx: &AppContext) {
             );
             let mut status = ctx.semantic_index_status().borrow_mut();
             for path in &semantic_refresh_paths {
-                status.remove_refreshing_file(path);
+                status.cancel_refreshing_file(path);
             }
             semantic_status_changed = true;
         }
@@ -979,7 +979,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 let mut status = ctx.semantic_index_status().borrow_mut();
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in paths {
-                        status.add_refreshing_file(path);
+                        status.start_refreshing_file(path);
                     }
                     status_changed = true;
                 }
@@ -995,7 +995,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 let mut status = ctx.semantic_index_status().borrow_mut();
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in &completed_paths {
-                        status.remove_refreshing_file(path);
+                        status.complete_refreshing_file(path);
                     }
                     status_changed = true;
                 }
@@ -1005,7 +1005,7 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 let mut status = ctx.semantic_index_status().borrow_mut();
                 if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                     for path in &paths {
-                        status.remove_refreshing_file(path);
+                        status.complete_refreshing_file(path);
                     }
                     status_changed = true;
                 }

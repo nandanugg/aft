@@ -9,6 +9,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use aft::context::SemanticIndexStatus;
 use aft::search_index::SearchIndex;
 use aft::semantic_index::SemanticIndex;
 use serde_json::{json, Value};
@@ -227,6 +228,43 @@ where
         "semantic status did not become {label} in time; last response: {:?}",
         last_response
     );
+}
+
+#[test]
+fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completion() {
+    let file = Path::new("src/repeated.rs").to_path_buf();
+    let mut status = SemanticIndexStatus::ready();
+
+    status.add_refreshing_file(file.clone());
+    status.start_refreshing_file(file.clone());
+    status.add_refreshing_file(file.clone());
+
+    assert_eq!(status.refreshing_count(), 1);
+    let SemanticIndexStatus::Ready { refreshing } = &status else {
+        panic!("semantic status should stay ready");
+    };
+    assert_eq!(refreshing.as_slice(), std::slice::from_ref(&file));
+
+    status.complete_refreshing_file(&file);
+
+    assert_eq!(
+        status.refreshing_count(),
+        1,
+        "first refresh completion must not clear a queued refresh for the same file"
+    );
+    let SemanticIndexStatus::Ready { refreshing } = &status else {
+        panic!("semantic status should stay ready");
+    };
+    assert_eq!(refreshing.as_slice(), std::slice::from_ref(&file));
+
+    status.start_refreshing_file(file.clone());
+    status.complete_refreshing_file(&file);
+
+    assert_eq!(status.refreshing_count(), 0);
+    let SemanticIndexStatus::Ready { refreshing } = &status else {
+        panic!("semantic status should stay ready");
+    };
+    assert!(refreshing.is_empty());
 }
 
 #[test]
