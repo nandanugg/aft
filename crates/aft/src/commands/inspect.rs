@@ -470,6 +470,10 @@ fn diagnostics_summary_for(payload: Option<&Value>) -> Value {
             .get("servers_not_installed")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
+        "files_without_server": payload
+            .get("files_without_server")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 

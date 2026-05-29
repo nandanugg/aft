@@ -1625,6 +1625,62 @@ fn inspect_command_diagnostics_missing_server_is_incomplete_not_zero() {
 }
 
 #[test]
+fn inspect_command_diagnostics_no_server_for_filetype_reports_no_server_not_pending() {
+    // Regression: scoping diagnostics at a file type that has NO registered LSP
+    // server (here a Markdown file in a Rust project) used to report
+    // status: "pending" forever — implying results were still coming when none
+    // ever would. It must report a terminal "no_server" status, carry a
+    // files_without_server count, and NOT be listed in pending_categories.
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-no-server\"\n",
+    );
+    write_file(&root, "docs/readme.md", "# Title\n\nsome prose\n");
+    let ctx = configured_context(&root);
+    // No LSP server configured for Markdown — ensure_server_for_file returns
+    // no_server_registered for the scoped .md file.
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-no-server",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "docs/readme.md",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let summary = response["summary"]["diagnostics"].as_object().unwrap();
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("no_server"),
+        "no registered server must report terminal no_server, not pending: {response:#}"
+    );
+    assert!(
+        summary
+            .get("files_without_server")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= 1),
+        "files_without_server count must be surfaced: {response:#}"
+    );
+    assert!(
+        summary["servers_pending"]
+            .as_array()
+            .is_some_and(|servers| servers.is_empty()),
+        "no server is pending — nothing is coming: {response:#}"
+    );
+    // A terminal no_server state must NOT keep the category in pending_categories
+    // (which would tell the agent to keep waiting for a Tier-2 refresh).
+    assert!(
+        !scanner_state_contains(&response, "pending_categories", "diagnostics"),
+        "no_server diagnostics must not be reported as pending: {response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_diagnostics_details_honor_top_k() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-top-k\"\n");

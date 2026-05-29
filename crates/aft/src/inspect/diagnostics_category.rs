@@ -24,6 +24,12 @@ struct DiagnosticsCollection {
     servers_pending: BTreeSet<String>,
     servers_not_installed: BTreeSet<String>,
     scope_truncated: bool,
+    /// Number of scoped files whose extension has NO registered LSP server.
+    /// These files will never produce diagnostics — distinct from "pending"
+    /// (a server is running but hasn't reported yet). Without this, a scope of
+    /// only unsupported file types reported `status: "pending"` forever,
+    /// implying results were still coming when none ever would.
+    files_without_server: usize,
 }
 
 /// Main-thread implementation for the `diagnostics` inspect category.
@@ -82,9 +88,11 @@ fn collect_scoped_diagnostics(
 ) -> DiagnosticsCollection {
     let deadline = Instant::now() + INSPECT_DIAGNOSTICS_DEADLINE;
     let config = ctx.config().clone();
-    let (files, scope_truncated) = scoped_lsp_files(snapshot, scope, &config);
+    let scoped = scoped_lsp_files(snapshot, scope, &config);
+    let files = scoped.files;
     let mut collection = DiagnosticsCollection {
-        scope_truncated,
+        scope_truncated: scoped.truncated,
+        files_without_server: scoped.explicit_files_without_server,
         ..DiagnosticsCollection::default()
     };
 
@@ -116,6 +124,10 @@ fn collect_scoped_file(
 
     record_attempt_gaps(&outcomes, collection);
     if outcomes.no_server_registered() || outcomes.successful.is_empty() {
+        // No-server files are already excluded from the candidate set by
+        // scoped_lsp_files (which counts explicit file-roots into
+        // files_without_server); reaching here means the server exists but
+        // isn't ready, which record_attempt_gaps already tracked.
         return;
     }
 
@@ -248,11 +260,22 @@ fn scoped_warm_diagnostics(
         .collect()
 }
 
+struct ScopedLspFiles {
+    files: Vec<PathBuf>,
+    truncated: bool,
+    /// Count of explicit file-roots in the scope that have no registered LSP
+    /// server. Directory walks intentionally skip non-code files silently
+    /// (you don't want a `.md` in a walked dir flagged), but a scope that names
+    /// a specific file we cannot diagnose is a real "no server" signal the
+    /// agent must see — otherwise the status reads "pending" forever.
+    explicit_files_without_server: usize,
+}
+
 fn scoped_lsp_files(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     config: &Config,
-) -> (Vec<PathBuf>, bool) {
+) -> ScopedLspFiles {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
     } else {
@@ -261,9 +284,11 @@ fn scoped_lsp_files(
 
     let mut files = BTreeSet::new();
     let mut truncated = false;
+    let mut explicit_files_without_server = 0usize;
     for root in roots {
         if root.is_file() {
             if servers_for_file(&root, config).is_empty() {
+                explicit_files_without_server += 1;
                 continue;
             }
             files.insert(std::fs::canonicalize(&root).unwrap_or(root));
@@ -307,7 +332,11 @@ fn scoped_lsp_files(
         }
     }
 
-    (files.into_iter().collect(), truncated)
+    ScopedLspFiles {
+        files: files.into_iter().collect(),
+        truncated,
+        explicit_files_without_server,
+    }
 }
 
 impl DiagnosticsCollection {
@@ -318,8 +347,13 @@ impl DiagnosticsCollection {
             && self.servers_pending.is_empty()
             && self.servers_not_installed.is_empty()
             && !self.scope_truncated;
-        let status =
-            diagnostics_status(complete, self.scope_truncated, &self.servers_not_installed);
+        let status = diagnostics_status(
+            complete,
+            self.scope_truncated,
+            &self.servers_not_installed,
+            &self.servers_pending,
+            self.files_without_server,
+        );
         let items = self
             .diagnostics
             .iter()
@@ -336,6 +370,7 @@ impl DiagnosticsCollection {
             "status": status,
             "servers_pending": self.servers_pending.into_iter().collect::<Vec<_>>(),
             "servers_not_installed": self.servers_not_installed.into_iter().collect::<Vec<_>>(),
+            "files_without_server": self.files_without_server,
             "items": items,
         })
     }
@@ -369,12 +404,25 @@ fn diagnostics_status(
     complete: bool,
     scope_truncated: bool,
     servers_not_installed: &BTreeSet<String>,
+    servers_pending: &BTreeSet<String>,
+    files_without_server: usize,
 ) -> Option<&'static str> {
     if complete {
         None
     } else if scope_truncated || !servers_not_installed.is_empty() {
+        // Bounded gap: truncated scope, or a server exists but isn't installed.
         Some("incomplete")
+    } else if !servers_pending.is_empty() {
+        // A registered server is running but hasn't reported yet — results are
+        // genuinely still coming.
+        Some("pending")
+    } else if files_without_server > 0 {
+        // No registered server matched the scoped file type(s). Nothing will
+        // ever arrive — report that honestly instead of "pending" forever.
+        Some("no_server")
     } else {
+        // Not complete, but no pending server and no unsupported files either:
+        // treat as still-settling rather than asserting completeness.
         Some("pending")
     }
 }
