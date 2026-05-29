@@ -13,6 +13,7 @@ use crate::lsp::manager::{
 };
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
+use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
 const INSPECT_DIAGNOSTICS_DEADLINE: Duration = Duration::from_secs(1);
 const SCOPED_FILE_CAP: usize = 200;
@@ -57,6 +58,7 @@ pub(crate) fn run_diagnostics_category(
 
 fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
+    let mut tsconfig_membership = TsconfigMembershipCache::new();
     {
         let mut lsp = ctx.lsp();
         // No-scope inspect is intentionally cheap: drain already queued LSP
@@ -74,9 +76,10 @@ fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> Dia
         collection.diagnostics = lsp.get_all_diagnostics().into_iter().cloned().collect();
     }
 
-    collection
-        .diagnostics
-        .retain(|diagnostic| diagnostic.file.starts_with(&snapshot.project_root));
+    collection.diagnostics.retain(|diagnostic| {
+        diagnostic.file.starts_with(&snapshot.project_root)
+            && !tsconfig_membership.should_skip_diagnostics(&diagnostic.file)
+    });
     collection.sort_and_dedup();
     collection
 }
@@ -88,7 +91,8 @@ fn collect_scoped_diagnostics(
 ) -> DiagnosticsCollection {
     let deadline = Instant::now() + INSPECT_DIAGNOSTICS_DEADLINE;
     let config = ctx.config().clone();
-    let scoped = scoped_lsp_files(snapshot, scope, &config);
+    let mut tsconfig_membership = TsconfigMembershipCache::new();
+    let scoped = scoped_lsp_files(snapshot, scope, &config, &mut tsconfig_membership);
     let files = scoped.files;
     let mut collection = DiagnosticsCollection {
         scope_truncated: scoped.truncated,
@@ -104,7 +108,8 @@ fn collect_scoped_diagnostics(
         collect_scoped_file(ctx, &config, &file, deadline, &mut collection);
     }
 
-    collection.diagnostics = scoped_warm_diagnostics(ctx, snapshot, scope);
+    collection.diagnostics =
+        scoped_warm_diagnostics(ctx, snapshot, scope, &mut tsconfig_membership);
     collection.sort_and_dedup();
     collection
 }
@@ -238,6 +243,7 @@ fn scoped_warm_diagnostics(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
     scope: &JobScope,
+    tsconfig_membership: &mut TsconfigMembershipCache,
 ) -> Vec<StoredDiagnostic> {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
@@ -255,7 +261,11 @@ fn scoped_warm_diagnostics(
                 lsp.get_diagnostics_for_directory(root)
             }
         })
-        .filter(|diagnostic| scope.contains(&diagnostic.file))
+        .filter(|diagnostic| {
+            scope.contains(&diagnostic.file)
+                && diagnostic.file.starts_with(&snapshot.project_root)
+                && !tsconfig_membership.should_skip_diagnostics(&diagnostic.file)
+        })
         .cloned()
         .collect()
 }
@@ -275,6 +285,7 @@ fn scoped_lsp_files(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     config: &Config,
+    tsconfig_membership: &mut TsconfigMembershipCache,
 ) -> ScopedLspFiles {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
@@ -287,6 +298,9 @@ fn scoped_lsp_files(
     let mut explicit_files_without_server = 0usize;
     for root in roots {
         if root.is_file() {
+            if tsconfig_membership.should_skip_diagnostics(&root) {
+                continue;
+            }
             if servers_for_file(&root, config).is_empty() {
                 explicit_files_without_server += 1;
                 continue;
@@ -318,6 +332,9 @@ fn scoped_lsp_files(
                 continue;
             }
             let path = entry.path();
+            if tsconfig_membership.should_skip_diagnostics(path) {
+                continue;
+            }
             if servers_for_file(path, config).is_empty() {
                 continue;
             }
