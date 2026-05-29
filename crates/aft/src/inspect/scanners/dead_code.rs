@@ -215,8 +215,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         })
         .collect::<Vec<_>>();
 
-    let export_nodes = export_nodes(&parsed);
-    let edges_by_source = edges_by_source_export(&parsed, &export_nodes);
+    let edges_by_source = edges_by_source(&parsed);
     let reachable = reachable_exports(&parsed, &edges_by_source);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
@@ -257,31 +256,24 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
     })
 }
 
-fn export_nodes(contributions: &[DeadCodeContribution]) -> BTreeSet<ExportNode> {
-    contributions
-        .iter()
-        .flat_map(|contribution| {
-            contribution
-                .exports
-                .iter()
-                .map(|export| (contribution.file.clone(), export.symbol.clone()))
-        })
-        .collect()
-}
-
-fn edges_by_source_export(
+fn edges_by_source(
     contributions: &[DeadCodeContribution],
-    export_nodes: &BTreeSet<ExportNode>,
 ) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
     let mut edges: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
 
     for contribution in contributions {
         for call in &contribution.internal_calls {
-            let target = (call.file.clone(), call.symbol.clone());
-            if !export_nodes.contains(&target) || call.caller_symbol.is_empty() {
+            // Keep EVERY resolved edge, regardless of whether the target is an
+            // exported symbol. Liveness must traverse through private
+            // intermediaries (a private router/helper that forwards a root to a
+            // public handler). Restricting targets to exports severed the chain
+            // at the first private hop and made every handler reachable only via
+            // a private function look dead. Node identity is (file, symbol);
+            // private and exported symbols share the same node space.
+            if call.caller_symbol.is_empty() {
                 continue;
             }
-
+            let target = (call.file.clone(), call.symbol.clone());
             let source = (contribution.file.clone(), call.caller_symbol.clone());
             edges.entry(source).or_default().insert(target);
         }
@@ -334,16 +326,14 @@ fn project_internal_call(
     let target = parse_target(project_root, &call.target);
     let symbol = target.symbol?;
     let file = match target.file {
-        Some(file) => {
-            if exported_symbols_by_file
-                .get(&file)
-                .is_some_and(|symbols| symbols.contains(&symbol))
-            {
-                file
-            } else {
-                return None;
-            }
-        }
+        // Qualified target (file::symbol). The snapshot builder already
+        // resolved and validated this edge — cross-file targets are confirmed
+        // exports of the target file, and same-file targets are confirmed
+        // definitions (private functions included, e.g. `main.rs::dispatch`).
+        // Keep the edge regardless of the target's export visibility: liveness
+        // must flow THROUGH private intermediaries, otherwise a public handler
+        // reached only via a private router/helper looks unreachable.
+        Some(file) => file,
         None => resolve_unqualified_target(
             caller_file,
             &symbol,

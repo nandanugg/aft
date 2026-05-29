@@ -17,7 +17,7 @@ use super::job::{
     JobOutcome, JobScope,
 };
 use crate::cache_freshness::FileFreshness;
-use crate::callgraph::{CallGraph, EdgeResolution};
+use crate::callgraph::{is_bare_callee, resolve_symbol_query_in_data, CallGraph, EdgeResolution};
 use crate::symbols::SymbolKind;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
@@ -953,7 +953,27 @@ fn build_tier2_callgraph_snapshot(project_root: &Path) -> Arc<CallgraphSnapshot>
                         let file = canonicalize_for_snapshot(&file);
                         format!("{}::{symbol}", file.display())
                     }
-                    EdgeResolution::Unresolved { callee_name } => callee_name,
+                    // Unresolved cross-file edge. Before falling back to a bare
+                    // callee name, try to resolve it to a symbol DEFINED IN THE
+                    // SAME FILE (private functions included) — mirroring
+                    // build_reverse_index. This is what makes a local call like
+                    // `main()` -> `dispatch()` resolve to `main.rs::dispatch`
+                    // (the private command router) instead of leaking a bare
+                    // `dispatch` that dead_code then misresolves to an unrelated
+                    // exported `dispatch` in another file. Without this, liveness
+                    // breaks at every private same-file intermediary.
+                    EdgeResolution::Unresolved { callee_name } => {
+                        if is_bare_callee(&call.full_callee, &callee_name) {
+                            match resolve_symbol_query_in_data(&file_data, file, &callee_name) {
+                                Ok(symbol) => {
+                                    format!("{}::{symbol}", snapshot_file.display())
+                                }
+                                Err(_) => callee_name,
+                            }
+                        } else {
+                            callee_name
+                        }
+                    }
                 };
                 outbound_calls.push(CallgraphOutboundCall {
                     caller_file: snapshot_file.clone(),

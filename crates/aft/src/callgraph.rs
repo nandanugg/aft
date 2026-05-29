@@ -70,7 +70,7 @@ fn symbol_query_matches(symbol: &str, query: &str) -> bool {
     symbol == query || symbol_unqualified_name(symbol) == query
 }
 
-fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
+pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
     full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
 }
 
@@ -105,7 +105,7 @@ fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<S
     candidates
 }
 
-fn resolve_symbol_query_in_data(
+pub(crate) fn resolve_symbol_query_in_data(
     file_data: &FileCallData,
     file: &Path,
     symbol_name: &str,
