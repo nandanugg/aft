@@ -160,8 +160,15 @@ trap 'cleanup; exit 143' TERM
 
 configure_opencode_mock_port
 
+# Turn log: the mock appends a line each time it actually serves a turn
+# fixture. The harness reads it to prove the agent loop progressed beyond the
+# first request (tool result consumed → next request issued), which a hung or
+# no-op session that merely hits the timeout cannot do.
+TURN_LOG="$AIMOCK_RUN_DIR/turns.log"
+
 start_aimock() {
-    AIMOCK_PORT="$AIMOCK_PORT" node "$MOCK_SERVER" > "$AIMOCK_LOG" 2>&1 &
+    : > "$TURN_LOG"
+    AIMOCK_PORT="$AIMOCK_PORT" AFT_E2E_TURN_LOG="$TURN_LOG" node "$MOCK_SERVER" > "$AIMOCK_LOG" 2>&1 &
     AIMOCK_PID=$!
     for i in $(seq 1 15); do
         if curl -s "$AIMOCK_BASE_URL/v1/models" > /dev/null 2>&1; then
@@ -254,9 +261,22 @@ run_opencode_session \
 
 EXIT_CODE=$?
 
-# Basic health
-check "session completed" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]"
+# Basic health. exit 0 = clean, 124/137 = timeout/SIGKILL (OpenCode is known to
+# hang after the scripted session ends — see run_opencode_session). A timeout
+# alone is NOT proof of success, so the real gate is the turn-progression check
+# below: it proves the agent loop actually ran multiple turns (consumed a tool
+# result and issued the next request), which a hung/no-op session cannot fake.
+check "no fatal exit" "[ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 137 ]"
 check "no crash" "! grep -qi 'Binary crashed\|SIGABRT\|panicked' '$RESULT_FILE' 2>/dev/null"
+
+# Agent loop actually progressed: the mock must have served at least the first
+# few turns (outline → read → grep), which requires each tool call to round-trip
+# through the bridge and return a usable result. This is the positive signal
+# that replaces "session completed on timeout" false greens.
+TURNS_SERVED=$(wc -l < "$TURN_LOG" 2>/dev/null | tr -d ' ')
+echo "  Turns served by mock: ${TURNS_SERVED:-0} ($(tr '\n' ' ' < "$TURN_LOG" 2>/dev/null))"
+check "agent loop progressed (>=3 turns served)" "[ \"${TURNS_SERVED:-0}\" -ge 3 ]"
+check "first tool turn served (outline)" "grep -q 'turn-1-outline' '$TURN_LOG' 2>/dev/null"
 
 # Plugin startup
 check "plugin loaded" "grep -q 'Resolved binary\|Copied npm binary' '$PLUGIN_LOG' 2>/dev/null"
