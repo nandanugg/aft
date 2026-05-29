@@ -386,7 +386,12 @@ fn handle_semantic_or_hybrid_search(
                 req,
                 SearchResponseParts {
                     query: &params.query,
-                    interpreted_as: interpreted_as_label(mode),
+                    // While semantic rebuilds, only the lexical lane produced
+                    // these results (semantic input is empty here). Report
+                    // "lexical" when it ran; the "building" status + the
+                    // semantic_rebuilding/lexical_only_fallback extras tell the
+                    // agent semantic results are still coming.
+                    interpreted_as: fallback_executed_label(mode, lexical.ready),
                     query_kind: query_kind_label(shape.kind),
                     semantic_status: "building",
                     status: "building",
@@ -610,7 +615,9 @@ fn semantic_unavailable_or_fallback_response(
             req,
             SearchResponseParts {
                 query: &params.query,
-                interpreted_as: interpreted_as_label(mode),
+                // The trigram lexical lane produced these results; semantic
+                // never ran. Report what executed, not the routed mode.
+                interpreted_as: fallback_executed_label(mode, true),
                 query_kind: query_kind_label(shape.kind),
                 semantic_status,
                 status: "ready",
@@ -631,7 +638,6 @@ fn semantic_unavailable_or_fallback_response(
             req,
             ctx,
             params,
-            mode,
             shape,
             semantic_status,
             detail,
@@ -698,7 +704,6 @@ fn semantic_unavailable_grep_fallback_response(
     req: &RawRequest,
     ctx: &AppContext,
     params: &SemanticSearchParams,
-    mode: SearchMode,
     shape: &QueryShape,
     semantic_status: &'static str,
     detail: String,
@@ -727,7 +732,10 @@ fn semantic_unavailable_grep_fallback_response(
         req,
         SearchResponseParts {
             query: &params.query,
-            interpreted_as: lexical_fallback_interpreted_as(mode),
+            // This path ran a literal grep scan over the corpus (the results are
+            // GrepLine entries), so report "literal" — not the routed
+            // semantic/hybrid mode that never executed.
+            interpreted_as: "literal",
             query_kind: query_kind_label(shape.kind),
             semantic_status,
             status: "ready",
@@ -741,14 +749,6 @@ fn semantic_unavailable_grep_fallback_response(
             extras: semantic_unavailable_extras(true),
         },
     )
-}
-
-fn lexical_fallback_interpreted_as(mode: SearchMode) -> &'static str {
-    if mode == SearchMode::Semantic {
-        "hybrid"
-    } else {
-        interpreted_as_label(mode)
-    }
 }
 
 fn execute_degraded_grep_fallback(
@@ -1081,7 +1081,15 @@ pub fn fuse_hybrid_results(
             .collect();
     }
 
-    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().take(20).cloned().collect();
+    // Use every collected lexical candidate, not a hidden sub-cap. The lexical
+    // lane already bounds enumeration at LEXICAL_ENUMERATION_LIMIT upstream and
+    // returns candidates pre-ranked by score; an additional `.take(20)` here
+    // silently dropped candidates 21..=50 from both the semantic-boost map and
+    // the standalone-lexical results without that loss being reflected in
+    // `more_available`/`engine_capped`. The final output is already bounded by
+    // cap_per_file + truncate(top_k), so honoring all collected candidates is
+    // both more correct and honest about what was considered.
+    let lexical_top_files: HashMap<PathBuf, f32> = lexical_files.iter().cloned().collect();
     let mut results: Vec<HybridResult> = semantic
         .into_iter()
         .map(|result| {
@@ -1092,7 +1100,7 @@ pub fn fuse_hybrid_results(
 
     let semantic_files: HashSet<PathBuf> =
         results.iter().map(|result| result.file.clone()).collect();
-    for (file, score) in lexical_files.iter().take(20) {
+    for (file, score) in &lexical_files {
         if !semantic_files.contains(file) {
             results.push(lexical_only_result(file.clone(), *score, shape));
         }
@@ -1416,6 +1424,22 @@ fn interpreted_as_label(mode: SearchMode) -> &'static str {
     }
 }
 
+/// Honest `interpreted_as` for a response built on a semantic-unavailable
+/// fallback path. The query may have been *routed* as semantic/hybrid, but if
+/// semantic never executed, the field must report what actually produced the
+/// results — otherwise an agent reads "hybrid" and trusts a semantic ranking
+/// that never ran. `lexical_ran` is true when the lexical (trigram) lane
+/// produced the returned results; otherwise we report the routed mode (the
+/// attempt), with the `semantic_unavailable`/`status` fields conveying that it
+/// could not run.
+fn fallback_executed_label(mode: SearchMode, lexical_ran: bool) -> &'static str {
+    if lexical_ran {
+        "lexical"
+    } else {
+        interpreted_as_label(mode)
+    }
+}
+
 fn query_kind_label(kind: QueryKind) -> &'static str {
     match kind {
         QueryKind::Identifier => "Identifier",
@@ -1610,7 +1634,11 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["status"], "building");
         assert_eq!(response["semantic_status"], "building");
-        assert_eq!(response["interpreted_as"], "hybrid");
+        // While semantic builds, only the lexical lane produced results — so
+        // interpreted_as honestly reports "lexical", not the routed "hybrid"
+        // mode that hasn't executed yet. The "building" status + note convey
+        // that semantic results are still coming.
+        assert_eq!(response["interpreted_as"], "lexical");
         assert!(response["note"]
             .as_str()
             .expect("note")

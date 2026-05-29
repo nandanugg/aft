@@ -185,7 +185,10 @@ fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
     assert_eq!(response["semantic_unavailable"], true);
     assert_eq!(response["lexical_only_fallback"], true);
     assert_eq!(response["semantic_status"], semantic_status);
-    assert_eq!(response["interpreted_as"], "hybrid");
+    // Honesty: the trigram lexical lane produced these results; semantic never
+    // ran. interpreted_as must report what executed ("lexical"), not the routed
+    // hybrid mode that was attempted.
+    assert_eq!(response["interpreted_as"], "lexical");
     assert_eq!(response["status"], "ready");
     let results = response["results"].as_array().expect("results array");
     assert!(
@@ -213,7 +216,9 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
     assert_eq!(response["semantic_unavailable"], true);
     assert_eq!(response["lexical_only_fallback"], true);
     assert_eq!(response["semantic_status"], semantic_status);
-    assert_eq!(response["interpreted_as"], "hybrid");
+    // Honesty: this path ran a literal grep scan (results are GrepLine entries),
+    // so interpreted_as must report "literal", not the routed hybrid mode.
+    assert_eq!(response["interpreted_as"], "literal");
     assert_eq!(response["status"], "ready");
     assert_eq!(response["fully_degraded"], true);
     assert_eq!(response["engine_capped"], false);

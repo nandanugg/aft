@@ -79,6 +79,37 @@ fn identifier_file_only_in_lexical_top_twenty_surfaces() {
 }
 
 #[test]
+fn lexical_candidate_beyond_old_twenty_cap_still_surfaces() {
+    // Regression for the silent `.take(20)` sub-cap: with no semantic overlap,
+    // a lexical candidate ranked beyond the 20th position used to be dropped
+    // from fusion entirely (and the loss was not reflected in
+    // more_available/engine_capped). All collected lexical candidates must now
+    // be eligible — final bounding is cap_per_file + truncate(top_k) only.
+    let shape = classify("useState");
+    // 25 distinct lexical-only files (no semantic input), descending scores.
+    let lexical_files: Vec<(PathBuf, f32)> = (0..25)
+        .map(|i| {
+            (
+                PathBuf::from(format!("/project/src/file{i:02}.ts")),
+                2.5 - (i as f32) * 0.05,
+            )
+        })
+        .collect();
+    let target = PathBuf::from("/project/src/file23.ts"); // 24th-ranked (index 23)
+
+    let results = fuse_hybrid_results(Vec::new(), lexical_files, &shape, 100);
+
+    assert!(
+        results.iter().any(|result| result.file == target),
+        "lexical candidate beyond the old 20-cap must surface: {:?}",
+        results
+            .iter()
+            .map(|r| r.file.display().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn natural_language_query_with_no_lexical_lane_stays_semantic() {
     let shape = classify("how does auth work");
     let results = fuse_hybrid_results(
