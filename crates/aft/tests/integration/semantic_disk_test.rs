@@ -1,58 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once, OnceLock};
 
 use aft::cache_freshness::{self, FreshnessVerdict};
 use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
-use log::{Level, LevelFilter, Log, Metadata, Record};
 
-static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-static LOGGER_INIT: Once = Once::new();
-
-struct TestLogger;
-
-impl Log for TestLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Warn
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            TEST_LOGS
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .expect("lock test logs")
-                .push(format!("{}", record.args()));
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn init_test_logger() {
-    LOGGER_INIT.call_once(|| {
-        log::set_boxed_logger(Box::new(TestLogger)).expect("install test logger");
-        log::set_max_level(LevelFilter::Warn);
-    });
-    clear_logs();
-}
-
-fn clear_logs() {
-    TEST_LOGS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("lock test logs")
-        .clear();
-}
-
-fn take_logs() -> Vec<String> {
-    std::mem::take(
-        &mut *TEST_LOGS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("lock test logs"),
-    )
-}
+// Warn-level log capture is shared across all integration test modules via a
+// single process-global, thread-local-capturing logger. See test_helpers.
+// `init_test_logger()` also clears the current thread's buffer, so the old
+// local `clear_logs()` is no longer needed.
+use crate::test_helpers::{init_test_logger, take_logs};
 
 fn build_test_index(project_root: &Path) -> (SemanticIndex, PathBuf) {
     let source_file = project_root.join("src/lib.rs");
