@@ -492,6 +492,78 @@ fn scenarios() -> Vec<Scenario> {
                 name: None,
             }],
         },
+        Scenario {
+            name: "csharp_add_plain_using",
+            ext: "cs",
+            input: "namespace App;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "System",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "csharp_add_static_using",
+            ext: "cs",
+            input: "namespace App;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "System.Math",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["static"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "csharp_add_alias_using",
+            ext: "cs",
+            input: "namespace App;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "System.Console",
+                names: &[],
+                namespace: None,
+                alias: Some("Con"),
+                modifiers: &[],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "csharp_add_global_using",
+            ext: "cs",
+            input: "namespace App;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "System",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["global"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "csharp_add_global_static_using",
+            ext: "cs",
+            input: "namespace App;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "System.Math",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["global", "static"],
+                import_kind: None,
+            }],
+        },
+        Scenario {
+            name: "csharp_remove_using",
+            ext: "cs",
+            input: "using System;\nusing System.Text;\n\nnamespace App;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "System.Text",
+                name: None,
+            }],
+        },
     ]
 }
 
