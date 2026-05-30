@@ -70,6 +70,20 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Namespace import (`* as ns`) and whole-module alias — used by engines
+    // that support them (ES namespace; Solidity namespace + whole-file alias).
+    let namespace = req
+        .params
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let alias = req
+        .params
+        .get("alias")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // --- Validate ---
     let path = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
@@ -209,12 +223,16 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             let in_group = imports::go_has_grouped_import(&source, &tree).is_some();
             imports::generate_go_import_line_pub(module, default_import.as_deref(), in_group)
         } else {
-            imports::generate_import_line(
+            imports::generate_import(
                 lang,
-                module,
-                &names,
-                default_import.as_deref(),
-                type_only,
+                &imports::ImportRequest {
+                    module_path: module,
+                    names: &names,
+                    default_import: default_import.as_deref(),
+                    namespace: namespace.as_deref(),
+                    alias: alias.as_deref(),
+                    type_only,
+                },
             )
         };
 

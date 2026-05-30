@@ -1,6 +1,6 @@
 /**
  * aft_import — language-aware import add/remove/organize.
- * Supports TS, JS, TSX, Python, Rust, Go.
+ * Supports TS, JS, TSX, Python, Rust, Go, Solidity.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -28,9 +28,23 @@ const ImportParams = Type.Object({
     Type.String({ description: "Module path (required for add/remove), e.g. 'react', './utils'" }),
   ),
   names: Type.Optional(
-    Type.Array(Type.String(), { description: "Named imports to add, e.g. ['useState']" }),
+    Type.Array(Type.String(), {
+      description:
+        "Named imports to add, using native named-import text with per-name `as` aliasing where supported, e.g. ['useState'], Solidity ['ERC20', 'IERC20 as IToken']",
+    }),
   ),
-  defaultImport: Type.Optional(Type.String({ description: "Default import name (e.g. 'React')" })),
+  defaultImport: Type.Optional(
+    Type.String({ description: "Default import name, ES only (e.g. 'React')" }),
+  ),
+  namespace: Type.Optional(
+    Type.String({
+      description:
+        "Namespace binding: `import * as ns from 'mod'` (ES), `* as N from \"./X.sol\"` (Solidity)",
+    }),
+  ),
+  alias: Type.Optional(
+    Type.String({ description: 'Whole-module alias. Solidity: `import "./X.sol" as X`' }),
+  ),
   removeName: Type.Optional(
     Type.String({ description: "Named import to remove; omit to remove entire import" }),
   ),
@@ -126,7 +140,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_import",
     label: "import",
     description:
-      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go. Ops: `add`, `remove`, `organize`. Use aft_safety checkpoint/undo before broad cleanup.",
+      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity. Ops: `add`, `remove`, `organize`. Use aft_safety checkpoint/undo before broad cleanup.",
     parameters: ImportParams,
     async execute(
       _toolCallId: string,
@@ -148,6 +162,8 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if (params.module !== undefined) req.module = params.module;
       if (params.names !== undefined) req.names = params.names;
       if (params.defaultImport !== undefined) req.default_import = params.defaultImport;
+      if (params.namespace !== undefined) req.namespace = params.namespace;
+      if (params.alias !== undefined) req.alias = params.alias;
       if (params.removeName !== undefined) req.name = params.removeName;
       if (params.typeOnly !== undefined) req.type_only = params.typeOnly;
       if (params.validate !== undefined) req.validate = params.validate;

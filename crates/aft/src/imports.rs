@@ -102,6 +102,56 @@ pub enum ImportForm {
     /// Go import. `alias` replaces the `default_import` overload, including the
     /// blank (`_`) and dot (`.`) import bindings.
     Go { alias: Option<String> },
+    /// Solidity import, in one of four forms:
+    /// - side-effect: `import "x";` (all empty)
+    /// - named: `import { A, B as C } from "x";` (`named`)
+    /// - namespace: `import * as A from "x";` (`namespace`)
+    /// - whole-file alias: `import "x" as A;` (`alias`)
+    ///
+    /// `named` holds verbatim specifiers (`"A"`, `"B as C"`) like the ES form,
+    /// so [`specifier_imported_name`] / [`specifier_local_name`] apply.
+    Solidity {
+        named: Vec<String>,
+        namespace: Option<String>,
+        alias: Option<String>,
+    },
+}
+
+/// Structured request to generate a single import line. Superset of the fields
+/// the public `aft_import` schema exposes; each engine reads only the subset it
+/// supports. New languages add fields here rather than growing positional
+/// parameters on every generator signature.
+#[derive(Debug, Clone)]
+pub struct ImportRequest<'a> {
+    pub module_path: &'a str,
+    pub names: &'a [String],
+    pub default_import: Option<&'a str>,
+    /// ES `* as ns` / Solidity `* as A`.
+    pub namespace: Option<&'a str>,
+    /// Whole-module local alias (Solidity `import "x" as A`).
+    pub alias: Option<&'a str>,
+    pub type_only: bool,
+}
+
+impl<'a> ImportRequest<'a> {
+    /// Construct a request carrying only the legacy positional fields; new
+    /// fields default to absent. Used by the back-compat free-function wrappers.
+    pub fn legacy(
+        module_path: &'a str,
+        names: &'a [String],
+        default_import: Option<&'a str>,
+        namespace: Option<&'a str>,
+        type_only: bool,
+    ) -> Self {
+        ImportRequest {
+            module_path,
+            names,
+            default_import,
+            namespace,
+            alias: None,
+            type_only,
+        }
+    }
 }
 
 /// A single parsed import statement.
@@ -228,16 +278,9 @@ pub trait ImportSyntax: Sync {
     /// Parse all imports from a file's already-parsed tree.
     fn parse(&self, source: &str, tree: &Tree) -> ImportBlock;
 
-    /// Generate a single import line. `namespace_import` is ES-only; engines
-    /// that do not support a given parameter ignore it.
-    fn generate_line(
-        &self,
-        module_path: &str,
-        names: &[String],
-        default_import: Option<&str>,
-        namespace_import: Option<&str>,
-        type_only: bool,
-    ) -> String;
+    /// Generate a single import line from a structured [`ImportRequest`].
+    /// Engines read only the fields they support and ignore the rest.
+    fn generate_line(&self, req: &ImportRequest) -> String;
 
     /// Classify a module path into stdlib / external / internal.
     fn classify_group(&self, module_path: &str) -> ImportGroup;
@@ -249,20 +292,13 @@ impl ImportSyntax for EsSyntax {
     fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
         parse_ts_imports(source, tree)
     }
-    fn generate_line(
-        &self,
-        module_path: &str,
-        names: &[String],
-        default_import: Option<&str>,
-        namespace_import: Option<&str>,
-        type_only: bool,
-    ) -> String {
+    fn generate_line(&self, req: &ImportRequest) -> String {
         generate_ts_import_line(
-            module_path,
-            names,
-            default_import,
-            namespace_import,
-            type_only,
+            req.module_path,
+            req.names,
+            req.default_import,
+            req.namespace,
+            req.type_only,
         )
     }
     fn classify_group(&self, module_path: &str) -> ImportGroup {
@@ -275,15 +311,8 @@ impl ImportSyntax for PythonSyntax {
     fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
         parse_py_imports(source, tree)
     }
-    fn generate_line(
-        &self,
-        module_path: &str,
-        names: &[String],
-        default_import: Option<&str>,
-        _namespace_import: Option<&str>,
-        _type_only: bool,
-    ) -> String {
-        generate_py_import_line(module_path, names, default_import)
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_py_import_line(req.module_path, req.names, req.default_import)
     }
     fn classify_group(&self, module_path: &str) -> ImportGroup {
         classify_group_py(module_path)
@@ -295,15 +324,8 @@ impl ImportSyntax for RustSyntax {
     fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
         parse_rs_imports(source, tree)
     }
-    fn generate_line(
-        &self,
-        module_path: &str,
-        names: &[String],
-        _default_import: Option<&str>,
-        _namespace_import: Option<&str>,
-        type_only: bool,
-    ) -> String {
-        generate_rs_import_line(module_path, names, type_only)
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_rs_import_line(req.module_path, req.names, req.type_only)
     }
     fn classify_group(&self, module_path: &str) -> ImportGroup {
         classify_group_rs(module_path)
@@ -315,18 +337,26 @@ impl ImportSyntax for GoSyntax {
     fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
         parse_go_imports(source, tree)
     }
-    fn generate_line(
-        &self,
-        module_path: &str,
-        _names: &[String],
-        default_import: Option<&str>,
-        _namespace_import: Option<&str>,
-        _type_only: bool,
-    ) -> String {
-        generate_go_import_line(module_path, default_import, false)
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_go_import_line(req.module_path, req.default_import, false)
     }
     fn classify_group(&self, module_path: &str) -> ImportGroup {
         classify_group_go(module_path)
+    }
+}
+
+/// Solidity import engine. Supports named / namespace / whole-file-alias /
+/// side-effect forms (Phase 1: first new language onto the registry).
+struct SoliditySyntax;
+impl ImportSyntax for SoliditySyntax {
+    fn parse(&self, source: &str, tree: &Tree) -> ImportBlock {
+        parse_solidity_imports(source, tree)
+    }
+    fn generate_line(&self, req: &ImportRequest) -> String {
+        generate_solidity_import_line(req)
+    }
+    fn classify_group(&self, module_path: &str) -> ImportGroup {
+        classify_group_solidity(module_path)
     }
 }
 
@@ -334,6 +364,7 @@ static ES_SYNTAX: EsSyntax = EsSyntax;
 static PYTHON_SYNTAX: PythonSyntax = PythonSyntax;
 static RUST_SYNTAX: RustSyntax = RustSyntax;
 static GO_SYNTAX: GoSyntax = GoSyntax;
+static SOLIDITY_SYNTAX: SoliditySyntax = SoliditySyntax;
 
 /// Map a language to its import engine, or `None` when imports are unsupported.
 pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
@@ -342,12 +373,12 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Python => Some(&PYTHON_SYNTAX),
         LangId::Rust => Some(&RUST_SYNTAX),
         LangId::Go => Some(&GO_SYNTAX),
+        LangId::Solidity => Some(&SOLIDITY_SYNTAX),
         LangId::C
         | LangId::Cpp
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
-        | LangId::Solidity
         | LangId::Vue
         | LangId::Json
         | LangId::Scala
@@ -576,7 +607,18 @@ pub fn find_insertion_point(
     (insert_at, false, false)
 }
 
-/// Generate an import line for the given language.
+/// Generate a single import line from a structured [`ImportRequest`]. The full
+/// entry point — engines read the fields they support; unsupported languages
+/// yield an empty string.
+pub fn generate_import(lang: LangId, req: &ImportRequest) -> String {
+    match syntax_for(lang) {
+        Some(engine) => engine.generate_line(req),
+        None => String::new(),
+    }
+}
+
+/// Generate an import line for the given language. Back-compat wrapper over
+/// [`generate_import`] for callers that pass only the legacy positional fields.
 pub fn generate_import_line(
     lang: LangId,
     module_path: &str,
@@ -584,11 +626,14 @@ pub fn generate_import_line(
     default_import: Option<&str>,
     type_only: bool,
 ) -> String {
-    generate_import_line_with_namespace(lang, module_path, names, default_import, None, type_only)
+    generate_import(
+        lang,
+        &ImportRequest::legacy(module_path, names, default_import, None, type_only),
+    )
 }
 
-/// Generate an import line for the given language, including namespace imports
-/// for TS/JS/TSX (`import * as ns from 'mod'`).
+/// Generate an import line including namespace imports
+/// (`import * as ns from 'mod'`). Back-compat wrapper over [`generate_import`].
 pub fn generate_import_line_with_namespace(
     lang: LangId,
     module_path: &str,
@@ -597,16 +642,16 @@ pub fn generate_import_line_with_namespace(
     namespace_import: Option<&str>,
     type_only: bool,
 ) -> String {
-    match syntax_for(lang) {
-        Some(engine) => engine.generate_line(
+    generate_import(
+        lang,
+        &ImportRequest::legacy(
             module_path,
             names,
             default_import,
             namespace_import,
             type_only,
         ),
-        None => String::new(),
-    }
+    )
 }
 
 /// Check if the given language is supported by the import engine.
@@ -1735,6 +1780,185 @@ pub fn go_has_grouped_import(_source: &str, tree: &Tree) -> Option<Range<usize>>
     None
 }
 
+// ---------------------------------------------------------------------------
+// Solidity implementation
+// ---------------------------------------------------------------------------
+
+/// Classify a Solidity import path: relative (`./`, `../`) is internal,
+/// everything else (remappings, `@scope/...`, bare) is external. No stdlib.
+pub fn classify_group_solidity(module_path: &str) -> ImportGroup {
+    if module_path.starts_with('.') {
+        ImportGroup::Internal
+    } else {
+        ImportGroup::External
+    }
+}
+
+fn parse_solidity_imports(source: &str, tree: &Tree) -> ImportBlock {
+    let root = tree.root_node();
+    let mut imports = Vec::new();
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            if node.kind() == "import_directive" {
+                if let Some(imp) = parse_solidity_import_directive(source, &node) {
+                    imports.push(imp);
+                }
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    let byte_range = import_byte_range(&imports);
+    ImportBlock {
+        imports,
+        byte_range,
+    }
+}
+
+/// Parse one `import_directive`. The Solidity grammar emits a flat token
+/// sequence (verified by grammar fixture test), so the four forms are
+/// distinguished by the presence of `{` (named), `*` (namespace), a trailing
+/// `as` (whole-file alias), or none (side-effect).
+fn parse_solidity_import_directive(source: &str, node: &Node) -> Option<ImportStatement> {
+    let raw_text = source[node.byte_range()].to_string();
+    let byte_range = node.byte_range();
+
+    let mut children: Vec<(String, String)> = Vec::new();
+    let mut c = node.walk();
+    if c.goto_first_child() {
+        loop {
+            let ch = c.node();
+            children.push((ch.kind().to_string(), source[ch.byte_range()].to_string()));
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    // Every form carries exactly one string literal: the imported file path.
+    let module_path = children
+        .iter()
+        .find(|(k, _)| k == "string")
+        .map(|(_, t)| t.trim_matches('"').to_string())?;
+    if module_path.is_empty() {
+        return None;
+    }
+
+    let has_brace = children.iter().any(|(k, _)| k == "{");
+    let has_star = children.iter().any(|(k, _)| k == "*");
+
+    let mut named: Vec<String> = Vec::new();
+    let mut namespace: Option<String> = None;
+    let mut alias: Option<String> = None;
+
+    if has_brace {
+        named = parse_solidity_named_specifiers(&children);
+    } else if has_star {
+        namespace = solidity_identifier_after_as(&children);
+    } else {
+        // No `{`, no `*`: a trailing `as IDENT` is a whole-file alias;
+        // otherwise a bare side-effect import.
+        alias = solidity_identifier_after_as(&children);
+    }
+
+    let kind = if named.is_empty() && namespace.is_none() && alias.is_none() {
+        ImportKind::SideEffect
+    } else {
+        ImportKind::Value
+    };
+    let group = classify_group_solidity(&module_path);
+
+    Some(ImportStatement {
+        module_path,
+        names: named.clone(),
+        default_import: None,
+        // Namespace maps to the flat slot so existing readers (dedup) see it;
+        // the whole-file alias has no flat slot and lives only in `form`.
+        namespace_import: namespace.clone(),
+        kind,
+        group,
+        byte_range,
+        raw_text,
+        form: ImportForm::Solidity {
+            named,
+            namespace,
+            alias,
+        },
+    })
+}
+
+/// Return the `identifier` token immediately following the first `as`.
+fn solidity_identifier_after_as(children: &[(String, String)]) -> Option<String> {
+    let as_pos = children.iter().position(|(k, _)| k == "as")?;
+    children[as_pos + 1..]
+        .iter()
+        .find(|(k, _)| k == "identifier")
+        .map(|(_, t)| t.clone())
+}
+
+/// Collect named specifiers between `{` and `}` into verbatim strings,
+/// combining `A as B` into `"A as B"` to match the ES specifier convention.
+fn parse_solidity_named_specifiers(children: &[(String, String)]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_braces = false;
+    let mut current: Option<String> = None;
+    let mut expect_alias = false;
+    for (k, t) in children {
+        match k.as_str() {
+            "{" => in_braces = true,
+            "}" => {
+                if let Some(n) = current.take() {
+                    names.push(n);
+                }
+                in_braces = false;
+            }
+            _ if !in_braces => {}
+            "identifier" => {
+                if expect_alias {
+                    if let Some(n) = current.take() {
+                        names.push(format!("{n} as {t}"));
+                    }
+                    expect_alias = false;
+                } else {
+                    if let Some(n) = current.take() {
+                        names.push(n);
+                    }
+                    current = Some(t.clone());
+                }
+            }
+            "as" => expect_alias = true,
+            "," => {
+                if let Some(n) = current.take() {
+                    names.push(n);
+                }
+                expect_alias = false;
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Generate a Solidity import line in the appropriate form.
+fn generate_solidity_import_line(req: &ImportRequest) -> String {
+    if !req.names.is_empty() {
+        format!(
+            "import {{ {} }} from \"{}\";",
+            req.names.join(", "),
+            req.module_path
+        )
+    } else if let Some(ns) = req.namespace {
+        format!("import * as {} from \"{}\";", ns, req.module_path)
+    } else if let Some(al) = req.alias {
+        format!("import \"{}\" as {};", req.module_path, al)
+    } else {
+        format!("import \"{}\";", req.module_path)
+    }
+}
+
 /// Skip past a newline character at the given position.
 fn skip_newline(source: &str, pos: usize) -> usize {
     if pos < source.len() {
@@ -2464,5 +2688,196 @@ import { c } from 'charlie';
     fn generate_go_with_alias() {
         let line = generate_go_import_line("github.com/pkg/errors", Some("errs"), false);
         assert_eq!(line, "import errs \"github.com/pkg/errors\"");
+    }
+
+    // --- Solidity (Phase 1: first new language on the ImportSyntax registry) ---
+
+    fn parse_solidity(source: &str) -> (Tree, ImportBlock) {
+        let grammar = grammar_for(LangId::Solidity);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let block = parse_imports(source, &tree, LangId::Solidity);
+        (tree, block)
+    }
+
+    /// Grammar fixture (council #6): lock the tree-sitter-solidity node kinds the
+    /// parser depends on. If the grammar updates and renames these, this test
+    /// fails loudly before the parser silently mis-parses.
+    #[test]
+    fn solidity_grammar_node_kinds_are_stable() {
+        let grammar = grammar_for(LangId::Solidity);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let src = "import { Foo, Bar as Baz } from \"./A.sol\";\nimport * as N from \"./B.sol\";\nimport \"./C.sol\" as C;\nimport \"./D.sol\";\n";
+        let tree = parser.parse(src, None).unwrap();
+        let mut kinds: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        fn walk(node: tree_sitter::Node, kinds: &mut std::collections::BTreeSet<String>) {
+            kinds.insert(node.kind().to_string());
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    walk(c.node(), kinds);
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+        walk(tree.root_node(), &mut kinds);
+        for required in [
+            "import_directive",
+            "string",
+            "identifier",
+            "as",
+            "from",
+            "*",
+            "{",
+            "}",
+        ] {
+            assert!(
+                kinds.contains(required),
+                "solidity grammar missing node kind {required:?}; present: {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_solidity_all_four_forms() {
+        let (_, block) = parse_solidity(
+            "import \"./A.sol\";\nimport \"./B.sol\" as B;\nimport * as C from \"./C.sol\";\nimport { Foo, Bar as Baz } from \"./D.sol\";\n",
+        );
+        assert_eq!(block.imports.len(), 4);
+
+        // side-effect
+        assert_eq!(block.imports[0].module_path, "./A.sol");
+        assert_eq!(block.imports[0].kind, ImportKind::SideEffect);
+        assert_eq!(
+            block.imports[0].form,
+            ImportForm::Solidity {
+                named: vec![],
+                namespace: None,
+                alias: None
+            }
+        );
+
+        // whole-file alias
+        assert_eq!(
+            block.imports[1].form,
+            ImportForm::Solidity {
+                named: vec![],
+                namespace: None,
+                alias: Some("B".to_string())
+            }
+        );
+
+        // namespace
+        match &block.imports[2].form {
+            ImportForm::Solidity { namespace, .. } => assert_eq!(namespace.as_deref(), Some("C")),
+            other => panic!("expected Solidity namespace, got {other:?}"),
+        }
+        assert_eq!(block.imports[2].namespace_import.as_deref(), Some("C"));
+
+        // named with alias (verbatim specifier convention)
+        match &block.imports[3].form {
+            ImportForm::Solidity { named, .. } => {
+                assert_eq!(named, &vec!["Foo".to_string(), "Bar as Baz".to_string()]);
+            }
+            other => panic!("expected Solidity named, got {other:?}"),
+        }
+        assert_eq!(
+            block.imports[3].names,
+            vec!["Foo".to_string(), "Bar as Baz".to_string()]
+        );
+    }
+
+    #[test]
+    fn generate_solidity_all_forms() {
+        // side-effect
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest::legacy("./A.sol", &[], None, None, false)
+            ),
+            "import \"./A.sol\";"
+        );
+        // named
+        let names = vec!["Foo".to_string(), "Bar as Baz".to_string()];
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest::legacy("./D.sol", &names, None, None, false)
+            ),
+            "import { Foo, Bar as Baz } from \"./D.sol\";"
+        );
+        // namespace
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest::legacy("./C.sol", &[], None, Some("C"), false)
+            ),
+            "import * as C from \"./C.sol\";"
+        );
+        // whole-file alias
+        assert_eq!(
+            generate_import(
+                LangId::Solidity,
+                &ImportRequest {
+                    module_path: "./B.sol",
+                    names: &[],
+                    default_import: None,
+                    namespace: None,
+                    alias: Some("B"),
+                    type_only: false,
+                }
+            ),
+            "import \"./B.sol\" as B;"
+        );
+    }
+
+    #[test]
+    fn solidity_round_trips_through_parse_generate() {
+        // Every generated form must parse back to the same structured shape.
+        for src in [
+            "import \"./A.sol\";",
+            "import \"./B.sol\" as B;",
+            "import * as C from \"./C.sol\";",
+            "import { Foo, Bar as Baz } from \"./D.sol\";",
+        ] {
+            let (_, block) = parse_solidity(src);
+            assert_eq!(block.imports.len(), 1, "parse {src:?}");
+            let imp = &block.imports[0];
+            let (namespace, alias) = match &imp.form {
+                ImportForm::Solidity {
+                    namespace, alias, ..
+                } => (namespace.as_deref(), alias.as_deref()),
+                other => panic!("expected Solidity, got {other:?}"),
+            };
+            let regenerated = generate_import(
+                LangId::Solidity,
+                &ImportRequest {
+                    module_path: &imp.module_path,
+                    names: &imp.names,
+                    default_import: None,
+                    namespace,
+                    alias,
+                    type_only: false,
+                },
+            );
+            assert_eq!(regenerated, src, "round-trip mismatch for {src:?}");
+        }
+    }
+
+    #[test]
+    fn classify_group_solidity_relative_vs_external() {
+        assert_eq!(classify_group_solidity("./A.sol"), ImportGroup::Internal);
+        assert_eq!(
+            classify_group_solidity("../lib/B.sol"),
+            ImportGroup::Internal
+        );
+        assert_eq!(
+            classify_group_solidity("@openzeppelin/contracts/token/ERC20/ERC20.sol"),
+            ImportGroup::External
+        );
     }
 }

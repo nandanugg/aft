@@ -30,6 +30,14 @@ enum Op {
         default_import: Option<&'static str>,
         type_only: bool,
     },
+    /// Add with the structured namespace/alias fields (ES namespace, Solidity
+    /// namespace + whole-file alias) — exercises the new schema params end-to-end.
+    AddForm {
+        module: &'static str,
+        names: &'static [&'static str],
+        namespace: Option<&'static str>,
+        alias: Option<&'static str>,
+    },
     Remove {
         module: &'static str,
         /// `Some(name)` removes one named import; `None` removes the whole statement.
@@ -82,6 +90,29 @@ fn run_scenario(aft: &mut AftProcess, scenario: &Scenario) -> String {
                 }
                 if *type_only {
                     p["type_only"] = serde_json::json!(true);
+                }
+                p
+            }
+            Op::AddForm {
+                module,
+                names,
+                namespace,
+                alias,
+            } => {
+                let mut p = serde_json::json!({
+                    "id": format!("{}-{}", scenario.name, idx),
+                    "command": "add_import",
+                    "file": file_str,
+                    "module": module,
+                });
+                if !names.is_empty() {
+                    p["names"] = serde_json::json!(names);
+                }
+                if let Some(ns) = namespace {
+                    p["namespace"] = serde_json::json!(ns);
+                }
+                if let Some(al) = alias {
+                    p["alias"] = serde_json::json!(al);
                 }
                 p
             }
@@ -315,6 +346,75 @@ fn scenarios() -> Vec<Scenario> {
             ops: &[Op::Remove {
                 module: "os",
                 name: None,
+            }],
+        },
+        // ---- Solidity (Phase 1: first new engine — captures NEW behavior) ----
+        Scenario {
+            name: "sol_add_named",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract C {}\n",
+            ops: &[Op::Add {
+                module: "./Token.sol",
+                names: &["ERC20", "IERC20 as IToken"],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "sol_add_side_effect",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract C {}\n",
+            ops: &[Op::Add {
+                module: "@openzeppelin/contracts/utils/Context.sol",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "sol_remove_named",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport { A, B } from \"./Lib.sol\";\n\ncontract C {}\n",
+            ops: &[Op::Remove {
+                module: "./Lib.sol",
+                name: Some("B"),
+            }],
+        },
+        Scenario {
+            name: "sol_remove_entire",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport \"./Unused.sol\";\nimport { Keep } from \"./Keep.sol\";\n\ncontract C {}\n",
+            ops: &[Op::Remove {
+                module: "./Unused.sol",
+                name: None,
+            }],
+        },
+        Scenario {
+            name: "sol_organize_named",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport { Z } from \"./Z.sol\";\nimport { A } from \"@openzeppelin/A.sol\";\n\ncontract C {}\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "sol_add_namespace",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract C {}\n",
+            ops: &[Op::AddForm {
+                module: "./Math.sol",
+                names: &[],
+                namespace: Some("Math"),
+                alias: None,
+            }],
+        },
+        Scenario {
+            name: "sol_add_whole_file_alias",
+            ext: "sol",
+            input: "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ncontract C {}\n",
+            ops: &[Op::AddForm {
+                module: "./Utils.sol",
+                names: &[],
+                namespace: None,
+                alias: Some("Utils"),
             }],
         },
     ]
