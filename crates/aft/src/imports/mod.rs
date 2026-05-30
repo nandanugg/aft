@@ -13,6 +13,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::parser::{grammar_for, LangId};
 
+mod csharp;
+
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
@@ -398,10 +400,10 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Rust => Some(&RUST_SYNTAX),
         LangId::Go => Some(&GO_SYNTAX),
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
+        LangId::CSharp => Some(&csharp::CSHARP_SYNTAX),
         LangId::C
         | LangId::Cpp
         | LangId::Zig
-        | LangId::CSharp
         | LangId::Bash
         | LangId::Vue
         | LangId::Json
