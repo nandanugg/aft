@@ -2179,10 +2179,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        install_project_watcher_with, parse_lsp_paths_extra, validate_storage_dir,
-        WATCHER_GENERATION,
+        install_project_watcher_with, parse_lsp_paths_extra, parse_semantic_config,
+        validate_storage_dir, WATCHER_GENERATION,
     };
-    use crate::config::Config;
+    use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
@@ -2762,5 +2762,37 @@ mod tests {
         let valid_req = configure_request(json!(root.path()));
         assert!(super::handle_configure(&valid_req, &ctx).success);
         assert_eq!(ctx.configure_generation(), 1);
+    }
+
+    #[test]
+    fn semantic_max_files_defaults_to_20k() {
+        assert_eq!(SemanticBackendConfig::default().max_files, 20_000);
+    }
+
+    #[test]
+    fn parse_semantic_config_reads_max_files() {
+        let cfg = parse_semantic_config(
+            &json!({ "max_files": 50_000 }),
+            &SemanticBackendConfig::default(),
+        )
+        .expect("valid max_files");
+        assert_eq!(cfg.max_files, 50_000);
+    }
+
+    #[test]
+    fn parse_semantic_config_max_files_omitted_keeps_existing() {
+        let existing = SemanticBackendConfig {
+            max_files: 7_500,
+            ..SemanticBackendConfig::default()
+        };
+        let cfg = parse_semantic_config(&json!({ "model": "x" }), &existing).expect("valid config");
+        assert_eq!(cfg.max_files, 7_500);
+    }
+
+    #[test]
+    fn parse_semantic_config_rejects_non_integer_max_files() {
+        let base = SemanticBackendConfig::default();
+        assert!(parse_semantic_config(&json!({ "max_files": "lots" }), &base).is_err());
+        assert!(parse_semantic_config(&json!({ "max_files": 1.5 }), &base).is_err());
     }
 }

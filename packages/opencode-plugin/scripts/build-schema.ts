@@ -379,6 +379,13 @@ function buildSchema(): Record<string, unknown> {
             minimum: 1,
             description: "Maximum batch size used by the semantic embedding pipeline.",
           },
+          max_files: {
+            type: "integer",
+            minimum: 1,
+            default: 20000,
+            description:
+              "Maximum number of project files to semantically index (default 20000). Guards local fastembed memory on large roots; raise it for remote backends that embed server-side.",
+          },
         },
         additionalProperties: false,
         description: "External semantic backend configuration for embedding and retrieval.",

@@ -85,7 +85,7 @@ The schema is identical across harnesses. Only file location differs.
   //
   // USER-only fields: "backend", "base_url", "api_key_env" (project config cannot
   // inject these — strict-allowlist trust boundary). Project config can still tune
-  // "model", "timeout_ms", "max_batch_size".
+  // "model", "timeout_ms", "max_batch_size", "max_files".
   //
   // Switching "backend", "model", or "base_url" deletes the persisted index and
   // rebuilds from scratch on next session start (necessary because dimensions and
@@ -97,7 +97,8 @@ The schema is identical across harnesses. Only file location differs.
     // "base_url": "https://api.openai.com/v1",   // required for openai_compatible / ollama
     // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
     "timeout_ms": 25000,                // per-request timeout, kept under bridge limit
-    "max_batch_size": 64                // embeddings batched in groups of this size
+    "max_batch_size": 64,               // embeddings batched in groups of this size
+    "max_files": 20000                  // max files indexed (default 20000); raise for remote backends
   },
 
   // Restrict all file operations to the project root directory.
@@ -356,7 +357,8 @@ features guard against unbounded work to keep the bridge responsive:
 - **Call-graph ops** (`callers`, `trace_to`, `trace_data`, `impact`) return `project_too_large`
   above `max_callgraph_files` (default 5,000 — the empirical limit before the reverse-index build
   exceeds the bridge timeout on real workloads). Raise it in your config if you have patience.
-- **Semantic indexing** is skipped above 10,000 source files.
+- **Semantic indexing** is capped at `semantic.max_files` source files (default 20,000). Raise it
+  when using a remote backend that embeds server-side, or lower it on memory-constrained machines.
 - **`grep`, `glob`, `read`, `edit`, and other tools** work at any size.
 
 Commands with heavier workloads get longer per-call timeouts: 60s for `callers`, `trace_to`,

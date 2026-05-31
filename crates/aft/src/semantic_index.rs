@@ -3474,6 +3474,7 @@ mod tests {
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -3547,6 +3548,7 @@ mod tests {
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            max_files: 20_000,
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -3592,6 +3594,7 @@ mod tests {
             api_key_env: None,
             timeout_ms: 5_000,
             max_batch_size: 64,
+            max_files: 20_000,
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();

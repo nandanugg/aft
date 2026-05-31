@@ -1795,6 +1795,7 @@ mod tests {
                     api_key_env: None,
                     timeout_ms: 5_000,
                     max_batch_size: 64,
+                    max_files: 20_000,
                 },
                 ..Config::default()
             },
