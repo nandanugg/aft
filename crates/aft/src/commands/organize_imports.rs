@@ -10,6 +10,7 @@
 //! `use std::path::{Path, PathBuf};`). This implements D045's deferred merging.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::context::AppContext;
@@ -102,6 +103,17 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
                 "removed_duplicates": 0,
                 "no_op": true,
             }),
+        );
+    }
+
+    if imports_span_multiple_code_regions(&source, lang, &block.imports) {
+        return Response::error_with_data(
+            &req.id,
+            "multi_region_imports",
+            format!(
+                "organize_imports: imports in {file} span multiple code regions; refusing to organize because replacing the combined import range would corrupt intervening code"
+            ),
+            serde_json::json!({ "file": file }),
         );
     }
 
@@ -225,6 +237,113 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     Response::success(&req.id, result)
+}
+
+fn imports_span_multiple_code_regions(
+    source: &str,
+    lang: LangId,
+    imports: &[ImportStatement],
+) -> bool {
+    imports.windows(2).any(|pair| {
+        let previous = &pair[0];
+        let next = &pair[1];
+        if previous.byte_range.end > next.byte_range.start {
+            return true;
+        }
+
+        !import_gap_is_trivia(source, lang, previous.byte_range.end..next.byte_range.start)
+    })
+}
+
+fn import_gap_is_trivia(source: &str, lang: LangId, range: Range<usize>) -> bool {
+    let Some(gap) = source.get(range) else {
+        return false;
+    };
+
+    let mut offset = 0;
+    while offset < gap.len() {
+        let rest = &gap[offset..];
+        let ch = rest
+            .chars()
+            .next()
+            .expect("offset is within the trivia gap");
+
+        if ch.is_whitespace() {
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if lang == LangId::Lua && rest.starts_with("--[[") {
+            let Some(end) = rest.find("]]") else {
+                return false;
+            };
+            offset += end + 2;
+            continue;
+        }
+
+        if lang == LangId::Lua && rest.starts_with("--") {
+            offset += line_comment_len(rest);
+            continue;
+        }
+
+        if supports_slash_line_comments(lang) && rest.starts_with("//") {
+            offset += line_comment_len(rest);
+            continue;
+        }
+
+        if supports_block_comments(lang) && rest.starts_with("/*") {
+            let Some(end) = rest.find("*/") else {
+                return false;
+            };
+            offset += end + 2;
+            continue;
+        }
+
+        if supports_hash_line_comments(lang) && rest.starts_with('#') {
+            offset += line_comment_len(rest);
+            continue;
+        }
+
+        return false;
+    }
+
+    true
+}
+
+fn line_comment_len(s: &str) -> usize {
+    s.find('\n').unwrap_or(s.len())
+}
+
+fn supports_slash_line_comments(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Go
+            | LangId::Rust
+            | LangId::Solidity
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Scala
+            | LangId::CSharp
+            | LangId::Php
+            | LangId::Swift
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Vue
+    )
+}
+
+fn supports_block_comments(lang: LangId) -> bool {
+    supports_slash_line_comments(lang)
+}
+
+fn supports_hash_line_comments(lang: LangId) -> bool {
+    matches!(
+        lang,
+        LangId::Python | LangId::Ruby | LangId::Perl | LangId::Php
+    )
 }
 
 /// Organize imports: group by convention, sort within groups, deduplicate.

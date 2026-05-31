@@ -515,33 +515,59 @@ fn header_prologue_anchor(lang: LangId, source: &str, tree: &tree_sitter::Tree) 
 }
 
 fn validate_module_path_for_add(lang: LangId, module: &str) -> Result<(), &'static str> {
-    if !uses_strict_module_path_validation(lang) {
+    let module = module.trim();
+
+    if uses_path_module_validation(lang) {
+        if is_absolute_module_path(module) {
+            return Err("absolute paths are not allowed for this language");
+        }
         return Ok(());
     }
 
-    let module = module.trim();
-    if module.starts_with('/') {
-        return Err("absolute paths are not allowed for this language");
-    }
-    if contains_parent_path_segment(module) {
-        return Err("parent path traversal segments are not allowed for this language");
+    if uses_namespace_module_validation(lang) {
+        if module.starts_with('/') || module.contains('/') {
+            return Err("filesystem paths are not allowed for this language");
+        }
+        if module.starts_with('\\') || has_windows_drive_prefix(module) {
+            return Err("absolute paths are not allowed for this language");
+        }
+        if lang != LangId::Php && module.contains('\\') {
+            return Err("filesystem paths are not allowed for this language");
+        }
+        if module.contains("..") || contains_parent_path_segment(module) {
+            return Err("parent path traversal segments are not allowed for this language");
+        }
     }
 
     Ok(())
 }
 
-fn uses_strict_module_path_validation(lang: LangId) -> bool {
+fn uses_path_module_validation(lang: LangId) -> bool {
+    matches!(lang, LangId::C | LangId::Cpp | LangId::Solidity)
+}
+
+fn uses_namespace_module_validation(lang: LangId) -> bool {
     matches!(
         lang,
-        LangId::C
-            | LangId::Cpp
-            | LangId::Solidity
-            | LangId::Php
-            | LangId::Java
-            | LangId::Kotlin
-            | LangId::Scala
-            | LangId::CSharp
+        LangId::Php | LangId::Java | LangId::Kotlin | LangId::Scala | LangId::CSharp
     )
+}
+
+fn is_absolute_module_path(module: &str) -> bool {
+    module.starts_with('/') || module.starts_with('\\') || has_windows_drive_absolute_path(module)
+}
+
+fn has_windows_drive_absolute_path(module: &str) -> bool {
+    let bytes = module.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn has_windows_drive_prefix(module: &str) -> bool {
+    let bytes = module.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn contains_parent_path_segment(module: &str) -> bool {
