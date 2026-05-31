@@ -39,6 +39,18 @@ aft grep <pattern> [path]
 aft glob <pattern> [path]
 ```
 
+## Compact Output
+
+For large call-graph answers, request compact paginated output instead of full JSON.
+
+Use `output=compact` with:
+- `output_limit_chars` to cap the returned text page.
+- `output_cursor` to continue from a previous response's `next_cursor`.
+- `output_filter` to keep only matching lines, case-insensitively, before pagination.
+
+When `has_more=true`, repeat the same query with `output_cursor=<next_cursor>` to continue.
+Use `output_filter` for broad trees, for example `dispatch`, `handler`, or a package name.
+
 ## Tracing: control flow vs. data flow
 
 - Use `aft trace_to` for "how does execution reach this function?"

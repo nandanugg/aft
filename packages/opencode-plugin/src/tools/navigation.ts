@@ -52,6 +52,23 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           .describe(
             "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
           ),
+        output: z
+          .enum(["json", "structured", "compact", "text", "dense"])
+          .optional()
+          .describe(
+            "Output projection. Use 'compact' for dense text with pagination metadata.",
+          ),
+        outputLimitChars: optionalInt(1, 50_000).describe(
+          "Max compact text characters to return in this page (default 6000, max 50000)",
+        ),
+        outputCursor: z
+          .string()
+          .optional()
+          .describe("Cursor returned by a previous compact response's next_cursor"),
+        outputFilter: z
+          .string()
+          .optional()
+          .describe("Case-insensitive line filter applied before compact pagination"),
       },
       execute: async (args, context): Promise<string> => {
         const params: Record<string, unknown> = {
@@ -62,6 +79,12 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         if (args.expression !== undefined) params.expression = args.expression;
         if (args.toSymbol !== undefined) params.toSymbol = args.toSymbol;
         if (args.toFile !== undefined) params.toFile = args.toFile;
+        if (args.output !== undefined) params.output = args.output;
+        if (args.outputLimitChars !== undefined) {
+          params.output_limit_chars = Number(args.outputLimitChars);
+        }
+        if (args.outputCursor !== undefined) params.output_cursor = args.outputCursor;
+        if (args.outputFilter !== undefined) params.output_filter = args.outputFilter;
         if (args.op === "trace_data" && typeof args.expression !== "string") {
           throw new Error("'expression' is required for 'trace_data' op");
         }

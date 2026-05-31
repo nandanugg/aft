@@ -928,6 +928,23 @@ Call graph and data-flow analysis across the workspace.
 }
 ```
 
+Compact output is available for call-graph responses by passing `"output": "compact"`.
+The compact projection keeps the structured JSON contract as the source of truth, then renders a
+dense text page for agent consumption.
+
+Compact paging and filtering options:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `output_limit_chars` / `outputLimitChars` | integer | Max compact text chars in this response page (default `6000`, max `50000`) |
+| `output_cursor` / `outputCursor` | string | Cursor from the previous response's `next_cursor` |
+| `output_filter` / `outputFilter` | string | Case-insensitive line filter applied before paging |
+
+Compact responses include `text`, `cursor`, `limit_chars`, `total_chars`, `has_more`, and
+`next_cursor` when more text is available. To continue, resend the same query with
+`output_cursor` set to `next_cursor`. Filtering is intentionally line-based so agents can narrow
+large trees, for example `output_filter: "dispatch"`.
+
 ---
 
 ### aft_import

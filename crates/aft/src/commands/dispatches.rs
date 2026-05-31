@@ -1,5 +1,6 @@
 use crate::callgraph::DispatchesResult;
 use crate::context::AppContext;
+use crate::output::{graph_response, OutputFormat};
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `dispatches` request.
@@ -68,27 +69,19 @@ pub fn handle_dispatches(req: &RawRequest, ctx: &AppContext) -> Response {
             .into_iter()
             .map(|(k, handlers)| DispatchesResult { key: k, handlers })
             .collect();
-        let text = results
-            .iter()
-            .map(|r| r.render_text())
-            .collect::<Vec<_>>()
-            .join("");
-        let mut json = serde_json::json!({ "prefix": key, "results": results });
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert("text".to_string(), serde_json::Value::String(text));
+        if OutputFormat::from_request(req) == OutputFormat::Compact {
+            return graph_response(req, &results);
         }
-        Response::success(&req.id, json)
+        Response::success(
+            &req.id,
+            serde_json::json!({ "prefix": key, "results": results }),
+        )
     } else {
         let handlers = graph.find_by_dispatch_key(&key, max_files);
         let result = DispatchesResult {
             key: key.clone(),
             handlers,
         };
-        let text = result.render_text();
-        let mut result_json = serde_json::to_value(&result).unwrap_or_default();
-        if let Some(obj) = result_json.as_object_mut() {
-            obj.insert("text".to_string(), serde_json::Value::String(text));
-        }
-        Response::success(&req.id, result_json)
+        graph_response(req, &result)
     }
 }

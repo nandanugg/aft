@@ -52,6 +52,11 @@ All four keep the same agent-facing parameters as Pi's built-ins, so your prompt
 | `aft_transform`     | Scope-aware structural transformations (surface: `all`)                           |
 | `aft_refactor`      | Workspace-wide refactor: move symbol, extract function, inline call (surface: `all`) |
 
+`aft_callgraph` supports compact paginated output for large graph answers. Pass
+`output: "compact"` with optional `outputLimitChars`, `outputCursor`, and
+case-insensitive `outputFilter`; continue with the returned `next_cursor` when
+`has_more` is true.
+
 ### Slash command
 
 - `/aft-status` — show AFT version, search/semantic index state, LSP servers, storage paths

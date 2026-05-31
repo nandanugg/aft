@@ -13,10 +13,14 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::callgraph::CallGraph;
-use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
+use crate::config::{GoOverlayBackend, SemanticBackend, SemanticBackendConfig, UserServerDef};
 use crate::context::{
     AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
     SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+};
+use crate::go_overlay::{
+    load_available_snapshot, refresh_now, spawn_refresh, GoOverlayRequest, GoOverlayRuntimeConfig,
+    DEFAULT_GO_OVERLAY_TIMEOUT,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -1475,6 +1479,47 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     }
+    if let Some(v) = params
+        .get("enable_dispatch_edges")
+        .and_then(|v| v.as_bool())
+    {
+        if std::env::var("AFT_DISABLE_DISPATCH_EDGES").as_deref() != Ok("1") {
+            next_config.enable_dispatch_edges = v;
+        }
+    }
+    if let Some(v) = params
+        .get("enable_implementation_edges")
+        .and_then(|v| v.as_bool())
+    {
+        if std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES").as_deref() != Ok("1") {
+            next_config.enable_implementation_edges = v;
+        }
+    }
+    if let Some(v) = params.get("enable_writes_edges").and_then(|v| v.as_bool()) {
+        if std::env::var("AFT_DISABLE_WRITES_EDGES").as_deref() != Ok("1") {
+            next_config.enable_writes_edges = v;
+        }
+    }
+    if let Some(v) = params.get("emit_call_context").and_then(|v| v.as_bool()) {
+        if std::env::var("AFT_DISABLE_CALL_CONTEXT").as_deref() != Ok("1") {
+            next_config.emit_call_context = v;
+        }
+    }
+    if let Some(v) = params.get("emit_return_analysis").and_then(|v| v.as_bool()) {
+        if std::env::var("AFT_DISABLE_RETURN_ANALYSIS").as_deref() != Ok("1") {
+            next_config.emit_return_analysis = v;
+        }
+    }
+    if let Some(raw) = params.get("go_overlay_provider").and_then(|v| v.as_str()) {
+        let Some(backend) = GoOverlayBackend::from_name(raw) else {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("configure: invalid go_overlay_provider: {raw}"),
+            );
+        };
+        next_config.go_overlay_backend = backend;
+    }
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
         match parsed.and_then(|v| usize::try_from(v).ok()) {
@@ -2075,9 +2120,61 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         });
     }
 
-    // Initialize call graph with the project root
-    let graph = CallGraph::new(root_path.clone());
+    // Initialize call graph with the project root.
+    let mut graph = CallGraph::new(root_path.clone());
+    graph.enable_dispatch_edges = ctx.config().enable_dispatch_edges;
+    graph.enable_implementation_edges = ctx.config().enable_implementation_edges;
+    graph.enable_writes_edges = ctx.config().enable_writes_edges;
     *ctx.callgraph().borrow_mut() = Some(graph);
+
+    let helper_cache = resolve_cache_dir(&root_path, ctx.config().storage_dir.as_deref());
+    let helper_runtime =
+        GoOverlayRuntimeConfig::new(ctx.config().go_overlay_backend, helper_cache.clone());
+    let helper_request = GoOverlayRequest::new(
+        root_path.clone(),
+        DEFAULT_GO_OVERLAY_TIMEOUT,
+        crate::go_helper::HelperFlags {
+            no_dispatches: !ctx.config().enable_dispatch_edges,
+            no_implements: !ctx.config().enable_implementation_edges,
+            no_writes: !ctx.config().enable_writes_edges,
+            no_call_context: !ctx.config().emit_call_context,
+            no_return_analysis: !ctx.config().emit_return_analysis,
+        },
+        ctx.config().go_overlay_backend,
+    );
+
+    if let Some(cached) = load_available_snapshot(&helper_runtime, &helper_request) {
+        slog_info!(
+            "go-helper: loaded {} cached edges from {} via {}",
+            cached.output.edges.len(),
+            helper_cache.display(),
+            cached.meta.provider_id
+        );
+        ctx.install_go_helper(cached);
+    } else if root_path.join("go.mod").is_file() {
+        match refresh_now(&helper_runtime, &helper_request) {
+            Ok(snapshot) => {
+                slog_info!(
+                    "go-helper: {} edges (sync), {} skipped pkgs via {}",
+                    snapshot.output.edges.len(),
+                    snapshot.output.skipped.len(),
+                    snapshot.meta.provider_id
+                );
+                if let Err(error) =
+                    crate::go_overlay::write_cached_snapshot(&helper_cache, &snapshot)
+                {
+                    log::debug!("go-helper cache write failed: {error}");
+                }
+                ctx.install_go_helper(snapshot);
+            }
+            Err(error) => {
+                log::debug!("go-helper sync run unavailable: {error}");
+                ctx.mark_go_overlay_stale();
+                *ctx.go_helper_rx().borrow_mut() =
+                    Some(spawn_refresh(helper_runtime, helper_request));
+            }
+        }
+    }
 
     let bg_storage_root = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
     crate::bash_background::repair_legacy_root_tasks(&bg_storage_root, harness);

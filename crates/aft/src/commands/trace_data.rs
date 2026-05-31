@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::context::AppContext;
 use crate::error::AftError;
+use crate::output::graph_response;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_data` request.
@@ -113,10 +114,7 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
     let max_files = ctx.config().max_callgraph_files;
 
     match graph.trace_data(&file_path, &symbol, expression, depth, max_files) {
-        Ok(result) => {
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
-            Response::success(&req.id, result_json)
-        }
+        Ok(result) => graph_response(req, &result),
         Err(err @ AftError::ProjectTooLarge { .. }) => {
             Response::error(&req.id, "project_too_large", format!("{}", err))
         }

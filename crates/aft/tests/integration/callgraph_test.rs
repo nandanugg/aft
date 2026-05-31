@@ -377,6 +377,41 @@ fn callgraph_callers_cross_file() {
     aft.shutdown();
 }
 
+#[test]
+fn callgraph_callers_compact_output_uses_output_processor() {
+    let mut aft = AftProcess::spawn();
+    let fixtures = fixture_path("callgraph");
+    let root = fixtures.display().to_string();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"2","command":"callers","file":{},"symbol":"validate","depth":1,"output":"compact"}}"#,
+        crate::helpers::json_string(&format!("{}/helpers.ts", root))
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "compact callers should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["output"], "compact");
+    let text = resp["text"].as_str().expect("compact text");
+    assert!(text.contains("callers validate"));
+    assert!(text.contains("processData"));
+    assert!(text.contains("call"));
+    assert!(
+        resp.get("callers").is_none(),
+        "compact output should not include full structured callers payload"
+    );
+
+    aft.shutdown();
+}
+
 /// `callers` for a symbol with no callers returns empty result.
 #[test]
 fn callgraph_callers_empty_result() {

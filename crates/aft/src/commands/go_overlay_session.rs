@@ -12,9 +12,8 @@ use crate::config::GoOverlayBackend;
 use crate::context::AppContext;
 use crate::go_helper::HelperFlags;
 use crate::go_overlay::{
-    refresh_now, write_cached_snapshot, GoOverlayRequest, GoOverlayRuntimeConfig,
+    project_hash, refresh_now, write_cached_snapshot, GoOverlayRequest, GoOverlayRuntimeConfig,
 };
-use crate::persistent_cache::project_hash;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::resolve_cache_dir;
 
@@ -247,6 +246,9 @@ impl SessionInput {
             lease_ttl_secs,
             warm_timeout: Duration::from_secs(warm_timeout_secs),
             flags: HelperFlags {
+                no_dispatches: !ctx.config().enable_dispatch_edges,
+                no_implements: !ctx.config().enable_implementation_edges,
+                no_writes: !ctx.config().enable_writes_edges,
                 no_call_context: !ctx.config().emit_call_context,
                 no_return_analysis: !ctx.config().emit_return_analysis,
             },

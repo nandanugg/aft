@@ -114,7 +114,7 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 - **`aft_outline`**: every symbol in a file, directory, or remote URL, with its kind, name, line range, visibility, and nested members. One call instead of reading the whole file.
 - **`aft_zoom`**: inspect a specific function, class, or type with call-graph annotations for what it calls and what calls it.
 - **`aft_search`**: find code by *meaning* when grep keywords fall short. Hybrid semantic + lexical retrieval over an indexed codebase, with local, OpenAI-compatible, or Ollama embedding backends.
-- **`aft_callgraph`**: follow callers, callees, data flow, impact analysis, and the shortest call path between two symbols across the workspace.
+- **`aft_callgraph`**: follow callers, callees, data flow, impact analysis, and the shortest call path between two symbols across the workspace. Large graph answers can use compact paginated output with cursor continuation and case-insensitive line filtering.
 - **`aft_inspect`**: a one-call codebase-health report covering LSP errors and warnings, TODOs, metrics, dead code, unused exports, and duplicates. The Problems and inspections panels an IDE keeps open, on demand.
 - **`grep` / `glob`**: trigram-indexed regex search and file discovery, built in the background, persisted to disk, and kept fresh by a file watcher.
 

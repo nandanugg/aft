@@ -50,6 +50,18 @@ function navigateParamsSchema() {
           "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
       }),
     ),
+    output: Type.Optional(
+      StringEnum(["json", "structured", "compact", "text", "dense"] as const, {
+        description: "Output projection. Use compact for dense text with pagination metadata.",
+      }),
+    ),
+    outputLimitChars: optionalInt(1, 50_000),
+    outputCursor: Type.Optional(
+      Type.String({ description: "Cursor returned by compact next_cursor" }),
+    ),
+    outputFilter: Type.Optional(
+      Type.String({ description: "Case-insensitive line filter before compact pagination" }),
+    ),
   });
 }
 
@@ -106,6 +118,20 @@ export function buildNavigateSections(
 ): string[] {
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No navigation result.")];
+
+  if (response.output === "compact") {
+    const sections = [asString(response.text) ?? ""];
+    if (response.has_more === true) {
+      const next = asString(response.next_cursor);
+      sections.push(
+        theme.fg(
+          "muted",
+          `More compact output available${next ? `; retry with outputCursor="${next}"` : ""}.`,
+        ),
+      );
+    }
+    return sections.filter((section) => section.length > 0);
+  }
 
   if (args.op === "call_tree") {
     const lines: string[] = [];
@@ -273,6 +299,16 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (params.expression !== undefined) req.expression = params.expression;
       if (params.toSymbol !== undefined) req.toSymbol = params.toSymbol;
       if (params.toFile !== undefined) req.toFile = params.toFile;
+      if (params.output !== undefined) req.output = params.output;
+      const outputLimitChars = coerceOptionalInt(
+        params.outputLimitChars,
+        "outputLimitChars",
+        1,
+        50_000,
+      );
+      if (outputLimitChars !== undefined) req.output_limit_chars = outputLimitChars;
+      if (params.outputCursor !== undefined) req.output_cursor = params.outputCursor;
+      if (params.outputFilter !== undefined) req.output_filter = params.outputFilter;
       const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },

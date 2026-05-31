@@ -16,6 +16,11 @@ use crate::bash_background::{BgCompletion, BgTaskRegistry};
 use crate::callgraph::CallGraph;
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
+use crate::go_helper::{HelperError, HelperOutput};
+use crate::go_overlay::{
+    refresh_now, spawn_refresh, GoOverlayRequest, GoOverlayRuntimeConfig, GoOverlaySnapshot,
+    GoOverlaySnapshotMeta, DEFAULT_GO_OVERLAY_TIMEOUT,
+};
 use crate::harness::Harness;
 use crate::inspect::InspectManager;
 use crate::language::LanguageProvider;
@@ -23,13 +28,20 @@ use crate::lsp::manager::LspManager;
 use crate::lsp::registry::is_config_file_path_with_custom;
 use crate::parser::{SharedSymbolCache, SymbolCache};
 use crate::protocol::{
-    ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
+    ConfigureWarningsFrame, ProgressFrame, PushFrame, Response, StatusChangedFrame, StatusPayload,
 };
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
+
+#[derive(Debug, Clone, Default)]
+pub struct GoOverlayState {
+    pub stale: bool,
+    pub refreshing: bool,
+    pub last_error: Option<String>,
+}
 
 pub struct StatusEmitter {
     latest: Arc<Mutex<Option<StatusPayload>>>,
@@ -498,6 +510,11 @@ pub struct AppContext {
     /// root is configured or when the project has no gitignore files; in that
     /// case the watcher falls back to a small hardcoded infra-directory skip.
     gitignore: RefCell<Option<Arc<ignore::gitignore::Gitignore>>>,
+    go_helper_data: RefCell<Option<HelperOutput>>,
+    go_overlay_meta: RefCell<Option<GoOverlaySnapshotMeta>>,
+    go_overlay_state: RefCell<GoOverlayState>,
+    go_helper_rx:
+        RefCell<Option<crossbeam_channel::Receiver<Result<GoOverlaySnapshot, HelperError>>>>,
 }
 
 impl AppContext {
@@ -555,7 +572,224 @@ impl AppContext {
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: RefCell::new(None),
+            go_helper_data: RefCell::new(None),
+            go_overlay_meta: RefCell::new(None),
+            go_overlay_state: RefCell::new(GoOverlayState::default()),
+            go_helper_rx: RefCell::new(None),
         }
+    }
+
+    pub fn install_go_helper(&self, snapshot: GoOverlaySnapshot) {
+        *self.go_overlay_meta.borrow_mut() = Some(snapshot.meta.clone());
+        *self.go_helper_data.borrow_mut() = Some(snapshot.output.clone());
+        *self.go_overlay_state.borrow_mut() = GoOverlayState {
+            stale: false,
+            refreshing: false,
+            last_error: None,
+        };
+        let provider_id = snapshot.meta.provider_id.clone();
+        if let Some(graph) = self.callgraph.borrow_mut().as_mut() {
+            graph.set_go_helper_with_provider(snapshot.output, &provider_id);
+        }
+    }
+
+    pub fn go_helper_rx(
+        &self,
+    ) -> &RefCell<Option<crossbeam_channel::Receiver<Result<GoOverlaySnapshot, HelperError>>>> {
+        &self.go_helper_rx
+    }
+
+    pub fn go_overlay_meta(&self) -> Ref<'_, Option<GoOverlaySnapshotMeta>> {
+        self.go_overlay_meta.borrow()
+    }
+
+    pub fn go_overlay_state(&self) -> Ref<'_, GoOverlayState> {
+        self.go_overlay_state.borrow()
+    }
+
+    pub fn mark_go_overlay_stale(&self) {
+        let mut state = self.go_overlay_state.borrow_mut();
+        state.stale = true;
+        state.last_error = None;
+    }
+
+    pub fn mark_go_overlay_refreshing(&self) {
+        let mut state = self.go_overlay_state.borrow_mut();
+        state.refreshing = true;
+        state.last_error = None;
+    }
+
+    pub fn poll_go_helper(&self) {
+        let received = {
+            let rx_ref = self.go_helper_rx.borrow();
+            let Some(rx) = rx_ref.as_ref() else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Some(Err(HelperError::Io(
+                    "go overlay worker disconnected".to_string(),
+                ))),
+            }
+        };
+
+        if let Some(result) = received {
+            *self.go_helper_rx.borrow_mut() = None;
+            match result {
+                Ok(snapshot) => self.install_go_helper(snapshot),
+                Err(err) => {
+                    let mut state = self.go_overlay_state.borrow_mut();
+                    state.refreshing = false;
+                    state.last_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    pub fn require_go_overlay_project(&self, req_id: &str, command: &str) -> Option<Response> {
+        match self.ensure_go_overlay_for_current_project(DEFAULT_GO_OVERLAY_TIMEOUT) {
+            Ok(()) => None,
+            Err(err) => Some(Response::error(
+                req_id,
+                "go_overlay_unavailable",
+                format!("{command}: fresh Go overlay unavailable: {err}"),
+            )),
+        }
+    }
+
+    pub fn require_go_overlay(&self, req_id: &str, command: &str, file: &Path) -> Option<Response> {
+        match self.ensure_go_overlay_ready(file, DEFAULT_GO_OVERLAY_TIMEOUT) {
+            Ok(()) => None,
+            Err(err) => Some(Response::error(
+                req_id,
+                "go_overlay_unavailable",
+                format!("{command}: fresh Go overlay unavailable: {err}"),
+            )),
+        }
+    }
+
+    pub fn ensure_go_overlay_ready(
+        &self,
+        file: &Path,
+        timeout: Duration,
+    ) -> Result<(), HelperError> {
+        if crate::parser::detect_language(file) != Some(crate::parser::LangId::Go) {
+            self.poll_go_helper();
+            return Ok(());
+        }
+        self.ensure_go_overlay_for_current_project(timeout)
+    }
+
+    fn ensure_go_overlay_for_current_project(&self, timeout: Duration) -> Result<(), HelperError> {
+        let root = self
+            .config()
+            .project_root
+            .clone()
+            .ok_or_else(|| HelperError::Io("project not configured".into()))?;
+        if !root.join("go.mod").is_file() {
+            self.poll_go_helper();
+            return Ok(());
+        }
+
+        self.wait_go_helper(timeout);
+        {
+            let state = self.go_overlay_state.borrow();
+            if !state.stale && self.go_helper_data.borrow().is_some() {
+                return Ok(());
+            }
+            if !state.stale && state.last_error.is_some() {
+                return Err(HelperError::Io(
+                    state.last_error.clone().unwrap_or_else(|| "unknown".into()),
+                ));
+            }
+        }
+
+        let request = match self.current_go_overlay_request(timeout) {
+            Some(request) => request,
+            None => return Ok(()),
+        };
+        let runtime = self.current_go_overlay_runtime().ok_or_else(|| {
+            HelperError::Io("go overlay runtime unavailable without project root".into())
+        })?;
+        self.mark_go_overlay_refreshing();
+        match refresh_now(&runtime, &request) {
+            Ok(snapshot) => {
+                self.install_go_helper(snapshot);
+                Ok(())
+            }
+            Err(err) => {
+                let mut state = self.go_overlay_state.borrow_mut();
+                state.refreshing = false;
+                state.last_error = Some(err.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    pub fn schedule_go_overlay_refresh(&self, timeout: Duration) {
+        if self.go_helper_rx.borrow().is_some() {
+            self.mark_go_overlay_stale();
+            return;
+        }
+        let Some(runtime) = self.current_go_overlay_runtime() else {
+            return;
+        };
+        let Some(request) = self.current_go_overlay_request(timeout) else {
+            return;
+        };
+        self.mark_go_overlay_stale();
+        self.mark_go_overlay_refreshing();
+        *self.go_helper_rx.borrow_mut() = Some(spawn_refresh(runtime, request));
+    }
+
+    fn wait_go_helper(&self, timeout: Duration) {
+        let result = {
+            let rx_ref = self.go_helper_rx.borrow();
+            let Some(rx) = rx_ref.as_ref() else {
+                return;
+            };
+            rx.recv_timeout(timeout).ok()
+        };
+        if let Some(result) = result {
+            *self.go_helper_rx.borrow_mut() = None;
+            match result {
+                Ok(snapshot) => self.install_go_helper(snapshot),
+                Err(err) => {
+                    let mut state = self.go_overlay_state.borrow_mut();
+                    state.refreshing = false;
+                    state.last_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn current_go_overlay_runtime(&self) -> Option<GoOverlayRuntimeConfig> {
+        let config = self.config();
+        let root = config.project_root.clone()?;
+        let cache_dir =
+            crate::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
+        Some(GoOverlayRuntimeConfig::new(
+            config.go_overlay_backend,
+            cache_dir,
+        ))
+    }
+
+    fn current_go_overlay_request(&self, timeout: Duration) -> Option<GoOverlayRequest> {
+        let config = self.config();
+        let root = config.project_root.clone()?;
+        Some(GoOverlayRequest::new(
+            root,
+            timeout,
+            crate::go_helper::HelperFlags {
+                no_dispatches: !config.enable_dispatch_edges,
+                no_implements: !config.enable_implementation_edges,
+                no_writes: !config.enable_writes_edges,
+                no_call_context: !config.emit_call_context,
+                no_return_analysis: !config.emit_return_analysis,
+            },
+            config.go_overlay_backend,
+        ))
     }
 
     /// Borrow the cached project gitignore matcher. Returns `None` when no

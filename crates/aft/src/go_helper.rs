@@ -385,6 +385,12 @@ pub fn looks_like_go_project(root: &Path) -> bool {
 /// Feature flags controlling what the helper emits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HelperFlags {
+    /// When true, pass `-no-dispatches` to suppress dispatch/goroutine/defer edges.
+    pub no_dispatches: bool,
+    /// When true, pass `-no-implements` to suppress interface implementation edges.
+    pub no_implements: bool,
+    /// When true, pass `-no-writes` to suppress cross-package write edges.
+    pub no_writes: bool,
     /// When true, pass `-no-call-context` to suppress per-edge context annotations.
     pub no_call_context: bool,
     /// When true, pass `-no-return-analysis` to suppress return-site analysis.
@@ -407,6 +413,15 @@ pub fn run_helper(
 
     let mut cmd = Command::new(helper);
     cmd.arg("-root").arg(root);
+    if flags.no_dispatches {
+        cmd.arg("-no-dispatches");
+    }
+    if flags.no_implements {
+        cmd.arg("-no-implements");
+    }
+    if flags.no_writes {
+        cmd.arg("-no-writes");
+    }
     if flags.no_call_context {
         cmd.arg("-no-call-context");
     }

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::query_support::resolve_symbol_query;
 use crate::context::AppContext;
+use crate::output::graph_response;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `dispatched_by` request.
@@ -101,14 +102,7 @@ pub fn handle_dispatched_by(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let max_files = ctx.config().max_callgraph_files;
     match graph.dispatched_by(&file_path, &symbol, max_files) {
-        Ok(result) => {
-            let text = result.render_text();
-            let mut result_json = serde_json::to_value(&result).unwrap_or_default();
-            if let Some(obj) = result_json.as_object_mut() {
-                obj.insert("text".to_string(), serde_json::Value::String(text));
-            }
-            Response::success(&req.id, result_json)
-        }
+        Ok(result) => graph_response(req, &result),
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
 }

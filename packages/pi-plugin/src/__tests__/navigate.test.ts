@@ -42,6 +42,37 @@ describe("aft_callgraph adapter", () => {
     });
   });
 
+  test("forwards compact output pagination options", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      output: "compact",
+      text: "page",
+    }));
+    registerNavigateTool(api, makePluginContext(bridge));
+
+    await executeTool(tools.get("aft_callgraph")!, {
+      op: "call_tree",
+      filePath: "src/app.ts",
+      symbol: "run",
+      output: "compact",
+      outputLimitChars: 1200,
+      outputCursor: "6000",
+      outputFilter: "handler",
+    });
+
+    expect(calls[0].command).toBe("call_tree");
+    expect(calls[0].params).toEqual({
+      op: "call_tree",
+      file: "src/app.ts",
+      symbol: "run",
+      output: "compact",
+      output_limit_chars: 1200,
+      output_cursor: "6000",
+      output_filter: "handler",
+    });
+  });
+
   test("trace_data requires expression before bridge dispatch", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge();

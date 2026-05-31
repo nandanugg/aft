@@ -496,6 +496,19 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
+        "dispatched_by" => aft::commands::dispatched_by::handle_dispatched_by(&req, ctx),
+        "dispatches" => aft::commands::dispatches::handle_dispatches(&req, ctx),
+        "implementations" => aft::commands::implementations::handle_implementations(&req, ctx),
+        "writers" => aft::commands::writers::handle_writers(&req, ctx),
+        "go_overlay_session_open" => {
+            aft::commands::go_overlay_session::handle_go_overlay_session_open(&req, ctx)
+        }
+        "go_overlay_session_touch" => {
+            aft::commands::go_overlay_session::handle_go_overlay_session_touch(&req, ctx)
+        }
+        "go_overlay_session_close" => {
+            aft::commands::go_overlay_session::handle_go_overlay_session_close(&req, ctx)
+        }
         "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),
         "extract_function" => aft::commands::extract_function::handle_extract_function(&req, ctx),
         "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),

@@ -91,6 +91,40 @@ describe("aft_callgraph OpenCode adapter", () => {
     });
   });
 
+  test("forwards compact output pagination options", async () => {
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      output: "compact",
+      text: "page",
+    }));
+    const tools = navigationTools(makePluginContext(bridge));
+
+    await tools.aft_callgraph.execute(
+      {
+        op: "call_tree",
+        filePath: "src/app.ts",
+        symbol: "run",
+        output: "compact",
+        outputLimitChars: 1200,
+        outputCursor: "6000",
+        outputFilter: "handler",
+      },
+      makeToolContext(),
+    );
+
+    expect(calls[0]).toEqual({
+      command: "call_tree",
+      params: {
+        file: "src/app.ts",
+        symbol: "run",
+        output: "compact",
+        output_limit_chars: 1200,
+        output_cursor: "6000",
+        output_filter: "handler",
+      },
+    });
+  });
+
   test("trace_to_symbol ambiguous_target errors include candidates (Rust top-level shape)", async () => {
     // Rust's error_with_data() merges extras into the top-level response,
     // so production traffic has `candidates` next to `code`/`message`, NOT

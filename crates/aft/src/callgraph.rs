@@ -5,7 +5,7 @@
 //! detection.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -18,6 +18,7 @@ use tree_sitter::{Node, Parser};
 use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
+use crate::go_helper::{EdgeKind as HelperEdgeKind, HelperEdge, HelperOutput};
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
@@ -237,6 +238,106 @@ enum RustUseKind {
     Module,
 }
 
+/// Source that contributed an edge to the native graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphEdgeProvider {
+    /// AFT's tree-sitter/import resolver.
+    AftNative,
+    /// One-shot local `aft-go-helper` provider.
+    GoHelper,
+    /// Long-lived Go sidecar provider.
+    AftGoSidecar,
+}
+
+impl GraphEdgeProvider {
+    fn from_go_provider(provider_id: &str) -> Self {
+        match provider_id {
+            "aft-go-sidecar" => Self::AftGoSidecar,
+            _ => Self::GoHelper,
+        }
+    }
+}
+
+/// Native graph relationship kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphEdgeKind {
+    DirectCall,
+    ConcreteCall,
+    InterfaceCall,
+    DispatchRegistration,
+    Goroutine,
+    Defer,
+    Implements,
+    Writes,
+}
+
+impl GraphEdgeKind {
+    fn from_helper(kind: HelperEdgeKind) -> Self {
+        match kind {
+            HelperEdgeKind::Static => Self::DirectCall,
+            HelperEdgeKind::Concrete => Self::ConcreteCall,
+            HelperEdgeKind::Interface => Self::InterfaceCall,
+            HelperEdgeKind::Dispatches => Self::DispatchRegistration,
+            HelperEdgeKind::Goroutine => Self::Goroutine,
+            HelperEdgeKind::Defer => Self::Defer,
+            HelperEdgeKind::Implements => Self::Implements,
+            HelperEdgeKind::Writes => Self::Writes,
+        }
+    }
+}
+
+/// Common typed edge contract used by native AFT graph commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GraphEdge {
+    pub kind: GraphEdgeKind,
+    pub provider: GraphEdgeProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::go_helper::CallContext>,
+}
+
+impl GraphEdge {
+    fn native_direct() -> Self {
+        Self {
+            kind: GraphEdgeKind::DirectCall,
+            provider: GraphEdgeProvider::AftNative,
+            dispatch_key: None,
+            dispatch_via: None,
+            receiver: None,
+            package: None,
+            context: None,
+        }
+    }
+
+    fn from_helper(edge: &HelperEdge, provider: GraphEdgeProvider) -> Self {
+        let kind = GraphEdgeKind::from_helper(edge.kind);
+        Self {
+            kind,
+            provider,
+            dispatch_key: (kind == GraphEdgeKind::DispatchRegistration)
+                .then(|| edge.nearby_string.clone())
+                .flatten(),
+            dispatch_via: (kind == GraphEdgeKind::DispatchRegistration)
+                .then(|| edge.dispatched_via.clone())
+                .flatten(),
+            receiver: (kind == GraphEdgeKind::Implements && !edge.callee.receiver.is_empty())
+                .then(|| edge.callee.receiver.clone()),
+            package: (kind == GraphEdgeKind::Implements && !edge.callee.pkg.is_empty())
+                .then(|| edge.callee.pkg.clone()),
+            context: edge.context.clone(),
+        }
+    }
+}
+
 /// A single caller site: who calls a given symbol and from where.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallerSite {
@@ -250,6 +351,8 @@ pub struct CallerSite {
     pub col: u32,
     /// Whether the edge was resolved via import chain.
     pub resolved: bool,
+    /// Typed relationship metadata for this graph edge.
+    pub edge: GraphEdge,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +362,7 @@ struct IndexedCallerSite {
     line: u32,
     col: u32,
     resolved: bool,
+    edge: GraphEdge,
 }
 
 /// A group of callers from a single file.
@@ -276,6 +380,8 @@ pub struct CallerEntry {
     pub symbol: String,
     /// 1-based line number of the call.
     pub line: u32,
+    /// Typed relationship metadata for this graph edge.
+    pub edge: GraphEdge,
 }
 
 /// Result of a `callers_of` query.
@@ -311,6 +417,10 @@ pub struct CallTreeNode {
     pub signature: Option<String>,
     /// Whether this edge was resolved cross-file.
     pub resolved: bool,
+    /// Typed edge from the parent node into this node.
+    ///
+    /// `None` for the root node.
+    pub incoming_edge: Option<GraphEdge>,
     /// Child calls (recursive).
     pub children: Vec<CallTreeNode>,
     /// Whether traversal below this node stopped at the requested depth.
@@ -403,6 +513,10 @@ pub struct TraceHop {
     pub signature: Option<String>,
     /// Whether this hop is an entry point.
     pub is_entry_point: bool,
+    /// Typed edge from the previous hop into this hop.
+    ///
+    /// `None` for the first hop in a path.
+    pub incoming_edge: Option<GraphEdge>,
 }
 
 /// A complete path from an entry point to the target symbol (top-down).
@@ -486,6 +600,8 @@ pub struct ImpactCaller {
     pub call_expression: Option<String>,
     /// Parameter names extracted from the caller's signature.
     pub parameters: Vec<String>,
+    /// Typed relationship metadata for this affected edge.
+    pub edge: GraphEdge,
 }
 
 /// Result of an `impact` query — enriched callers analysis.
@@ -510,6 +626,258 @@ pub struct ImpactResult {
     pub depth_limited: bool,
     /// Number of caller edges omitted because of the depth limit.
     pub truncated: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Go overlay query types
+// ---------------------------------------------------------------------------
+
+/// One concrete type and all its implementing methods.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcreteTypeImpl {
+    /// Receiver type string, e.g. `"*pkg.T"`.
+    pub receiver: String,
+    /// Full package import path.
+    pub pkg: String,
+    /// Methods from this type that satisfy the interface.
+    pub methods: Vec<ConcreteMethodRef>,
+}
+
+/// A single concrete method reference within a ConcreteTypeImpl.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcreteMethodRef {
+    /// Method name.
+    pub name: String,
+    /// File containing the method, relative to project root.
+    pub file: String,
+    /// 1-based line number.
+    pub line: u32,
+}
+
+/// Interface metadata included in `ImplementationsResult`.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceInfo {
+    /// File containing the interface, relative to project root.
+    pub file: String,
+    /// Interface type name.
+    pub symbol: String,
+}
+
+/// Result of `implementations`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImplementationsResult {
+    /// The queried interface.
+    pub interface: InterfaceInfo,
+    /// Concrete types that implement this interface.
+    pub implementations: Vec<ConcreteTypeImpl>,
+}
+
+impl ImplementationsResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "implementations of {} ({})  total={}\n",
+            self.interface.symbol,
+            self.interface.file,
+            self.implementations.len(),
+        ));
+        if self.implementations.is_empty() {
+            out.push_str("  (no implementations found)\n");
+        } else {
+            for impl_type in &self.implementations {
+                out.push_str(&format!("  {} ({}):\n", impl_type.receiver, impl_type.pkg));
+                for method in &impl_type.methods {
+                    out.push_str(&format!(
+                        "    - {} ({}:{})\n",
+                        method.name, method.file, method.line
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One entry in the dispatch secondary index.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchEntry {
+    /// The handler being registered.
+    pub handler: DispatchCallee,
+    /// The call site that registers it.
+    pub registered_by: DispatchRegistrar,
+    /// FQN of the function that received the function-value argument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_via: Option<String>,
+}
+
+/// Callee side of a dispatch edge.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchCallee {
+    /// File path relative to project root.
+    pub file: String,
+    /// Symbol name of the handler function.
+    pub symbol: String,
+}
+
+/// Registrar call site of a dispatch edge.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchRegistrar {
+    /// File path relative to project root.
+    pub file: String,
+    /// Symbol that makes the registration call.
+    pub symbol: String,
+    /// 1-based line number.
+    pub line: u32,
+}
+
+/// Result of `dispatched_by`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchedByResult {
+    /// The queried symbol.
+    pub symbol: String,
+    /// The queried file, relative to project root.
+    pub file: String,
+    /// Call sites that pass this symbol as a function value.
+    pub dispatched_by: Vec<DispatchedBySite>,
+}
+
+/// A single call site that dispatches a handler.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchedBySite {
+    /// The registration call site.
+    pub caller: DispatchRegistrar,
+    /// The dispatch key, if one was found near the call site.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearby_string: Option<String>,
+    /// FQN of the function that received the function-value argument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_via: Option<String>,
+    /// Control-flow context at the registration call site.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::go_helper::CallContext>,
+}
+
+impl DispatchedByResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "dispatched_by {} ({})  total={}\n",
+            self.symbol,
+            self.file,
+            self.dispatched_by.len(),
+        ));
+        if self.dispatched_by.is_empty() {
+            out.push_str("  (no dispatch registrations found)\n");
+        } else {
+            for site in &self.dispatched_by {
+                let key = site
+                    .nearby_string
+                    .as_deref()
+                    .map(|value| format!(" key={value}"))
+                    .unwrap_or_default();
+                let via = site
+                    .dispatched_via
+                    .as_deref()
+                    .map(|value| format!(" via {value}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - {} ({}:{}){}{}\n",
+                    site.caller.symbol, site.caller.file, site.caller.line, key, via
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Result of `dispatches`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchesResult {
+    /// The key that was looked up.
+    pub key: String,
+    /// Handlers registered under this key.
+    pub handlers: Vec<DispatchEntry>,
+}
+
+impl DispatchesResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "dispatches key={} total={}\n",
+            self.key,
+            self.handlers.len(),
+        ));
+        if self.handlers.is_empty() {
+            out.push_str("  (no handlers found for this key)\n");
+        } else {
+            for handler in &self.handlers {
+                let via = handler
+                    .dispatched_via
+                    .as_deref()
+                    .map(|value| format!(" via {value}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - {} ({})  registered by {} ({}:{}){}\n",
+                    handler.handler.symbol,
+                    handler.handler.file,
+                    handler.registered_by.symbol,
+                    handler.registered_by.file,
+                    handler.registered_by.line,
+                    via,
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// Result of `writers`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WritersResult {
+    /// The queried variable name.
+    pub variable: String,
+    /// The queried file, relative to project root.
+    pub file: String,
+    /// Write sites.
+    pub writers: Vec<WriterSite>,
+}
+
+/// A single write site for a package-level variable.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriterSite {
+    /// File containing the writer function.
+    pub file: String,
+    /// Name of the function that performs the write.
+    pub symbol: String,
+    /// 1-based line number of the store instruction.
+    pub line: u32,
+}
+
+impl WritersResult {
+    /// Compact LLM-friendly rendering.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "writers {} ({})  total={}\n",
+            self.variable,
+            self.file,
+            self.writers.len(),
+        ));
+        if self.writers.is_empty() {
+            out.push_str("  (no cross-package writers found)\n");
+        } else {
+            for writer in &self.writers {
+                out.push_str(&format!(
+                    "  - {} ({}:{})\n",
+                    writer.symbol, writer.file, writer.line
+                ));
+            }
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +1076,16 @@ pub struct CallGraph {
     /// Reverse index: target_file → target_symbol → callers.
     /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
     reverse_index: Option<ReverseIndex>,
+    /// Optional Go helper output, used by Go overlay commands.
+    go_helper: Option<HelperOutput>,
+    /// Provider that produced the installed Go helper output.
+    go_helper_provider: GraphEdgeProvider,
+    /// Whether dispatch edge queries are enabled.
+    pub enable_dispatch_edges: bool,
+    /// Whether implementation edge queries are enabled.
+    pub enable_implementation_edges: bool,
+    /// Whether cross-package write edge queries are enabled.
+    pub enable_writes_edges: bool,
 }
 
 impl CallGraph {
@@ -719,7 +1097,27 @@ impl CallGraph {
             project_root,
             project_files: None,
             reverse_index: None,
+            go_helper: None,
+            go_helper_provider: GraphEdgeProvider::GoHelper,
+            enable_dispatch_edges: true,
+            enable_implementation_edges: true,
+            enable_writes_edges: true,
         }
+    }
+
+    /// Install Go helper output. This is additive metadata and invalidates
+    /// reverse indexes that may later be extended with helper edges.
+    pub fn set_go_helper(&mut self, data: HelperOutput) {
+        self.go_helper = Some(data);
+        self.go_helper_provider = GraphEdgeProvider::GoHelper;
+        self.reverse_index = None;
+    }
+
+    /// Install Go helper output with explicit provider metadata.
+    pub fn set_go_helper_with_provider(&mut self, data: HelperOutput, provider_id: &str) {
+        self.go_helper = Some(data);
+        self.go_helper_provider = GraphEdgeProvider::from_go_provider(provider_id);
+        self.reverse_index = None;
     }
 
     /// Get the project root directory.
@@ -967,7 +1365,7 @@ impl CallGraph {
             resolve_symbol_query_in_data(file_data, &canon, symbol)?
         };
         let mut visited = HashSet::new();
-        self.forward_tree_inner(&canon, &resolved_symbol, max_depth, 0, &mut visited)
+        self.forward_tree_inner(&canon, &resolved_symbol, max_depth, 0, None, &mut visited)
     }
 
     fn forward_tree_inner(
@@ -976,6 +1374,7 @@ impl CallGraph {
         symbol: &str,
         max_depth: usize,
         current_depth: usize,
+        incoming_edge: Option<GraphEdge>,
         visited: &mut HashSet<(PathBuf, String)>,
     ) -> Result<CallTreeNode, AftError> {
         let canon = self.canonicalize(file)?;
@@ -993,6 +1392,7 @@ impl CallGraph {
                 line,
                 signature,
                 resolved: true,
+                incoming_edge,
                 children: vec![], // cycle — stop recursion
                 depth_limited: false,
                 truncated: 0,
@@ -1041,6 +1441,7 @@ impl CallGraph {
                             symbol,
                             max_depth,
                             current_depth + 1,
+                            Some(GraphEdge::native_direct()),
                             visited,
                         ) {
                             Ok(child) => {
@@ -1056,6 +1457,7 @@ impl CallGraph {
                                     line: call_site.line,
                                     signature: None,
                                     resolved: false,
+                                    incoming_edge: Some(GraphEdge::native_direct()),
                                     children: vec![],
                                     depth_limited: false,
                                     truncated: 0,
@@ -1073,6 +1475,8 @@ impl CallGraph {
                             current_depth,
                             visited,
                         )? {
+                            let mut local_child = local_child;
+                            local_child.incoming_edge = Some(GraphEdge::native_direct());
                             depth_limited |= local_child.depth_limited;
                             truncated += local_child.truncated;
                             children.push(local_child);
@@ -1084,6 +1488,40 @@ impl CallGraph {
                             line: call_site.line,
                             signature: None,
                             resolved: false,
+                            incoming_edge: Some(GraphEdge::native_direct()),
+                            children: vec![],
+                            depth_limited: false,
+                            truncated: 0,
+                        });
+                    }
+                }
+            }
+
+            for (target_file, target_symbol, line, edge) in
+                self.helper_forward_edges(&canon, symbol)
+            {
+                match self.forward_tree_inner(
+                    &target_file,
+                    &target_symbol,
+                    max_depth,
+                    current_depth + 1,
+                    Some(edge.clone()),
+                    visited,
+                ) {
+                    Ok(mut child) => {
+                        child.incoming_edge = Some(edge);
+                        depth_limited |= child.depth_limited;
+                        truncated += child.truncated;
+                        children.push(child);
+                    }
+                    Err(_) => {
+                        children.push(CallTreeNode {
+                            name: target_symbol,
+                            file: self.relative_path(&target_file),
+                            line,
+                            signature: None,
+                            resolved: false,
+                            incoming_edge: Some(edge),
                             children: vec![],
                             depth_limited: false,
                             truncated: 0,
@@ -1104,6 +1542,7 @@ impl CallGraph {
             line: sym_line,
             signature: sym_signature,
             resolved: true,
+            incoming_edge,
             children,
             depth_limited,
             truncated,
@@ -1136,8 +1575,14 @@ impl CallGraph {
             return Ok(None);
         }
 
-        match self.forward_tree_inner(canon, &target_symbol, max_depth, current_depth + 1, visited)
-        {
+        match self.forward_tree_inner(
+            canon,
+            &target_symbol,
+            max_depth,
+            current_depth + 1,
+            Some(GraphEdge::native_direct()),
+            visited,
+        ) {
             Ok(child) => Ok(Some(child)),
             Err(_) => Ok(Some(CallTreeNode {
                 name: target_symbol,
@@ -1145,6 +1590,7 @@ impl CallGraph {
                 line: call_site.line,
                 signature: None,
                 resolved: false,
+                incoming_edge: Some(GraphEdge::native_direct()),
                 children: vec![],
                 depth_limited: false,
                 truncated: 0,
@@ -1301,13 +1747,83 @@ impl CallGraph {
                             line: call_site.line,
                             col: 0,
                             resolved,
+                            edge: GraphEdge::native_direct(),
                         });
                 }
             }
         }
 
+        self.add_go_helper_edges_to_reverse(&mut reverse);
+
         self.reverse_index = Some(reverse);
         Ok(())
+    }
+
+    fn add_go_helper_edges_to_reverse(&self, reverse: &mut ReverseIndex) {
+        let Some(helper) = self.go_helper.as_ref() else {
+            return;
+        };
+        let provider = self.go_helper_provider;
+
+        for edge in &helper.edges {
+            if !self.helper_edge_enabled(edge.kind) {
+                continue;
+            }
+
+            let (target_file, target_symbol, caller_file, caller_symbol, line) = match edge.kind {
+                HelperEdgeKind::Implements => (
+                    self.helper_abs_path(&edge.caller.file),
+                    edge.caller.symbol.clone(),
+                    self.helper_abs_path(&edge.callee.file),
+                    edge.callee.symbol.clone(),
+                    edge.callee.line,
+                ),
+                _ => (
+                    self.helper_abs_path(&edge.callee.file),
+                    edge.callee.symbol.clone(),
+                    self.helper_abs_path(&edge.caller.file),
+                    edge.caller.symbol.clone(),
+                    edge.caller.line,
+                ),
+            };
+
+            if target_file.as_os_str().is_empty()
+                || caller_file.as_os_str().is_empty()
+                || target_symbol.is_empty()
+                || caller_symbol.is_empty()
+            {
+                continue;
+            }
+
+            let target_file = std::fs::canonicalize(&target_file).unwrap_or(target_file);
+            let caller_file = Arc::new(std::fs::canonicalize(&caller_file).unwrap_or(caller_file));
+            let caller_symbol: SharedStr = Arc::from(caller_symbol);
+
+            reverse
+                .entry(target_file)
+                .or_default()
+                .entry(target_symbol)
+                .or_default()
+                .push(IndexedCallerSite {
+                    caller_file,
+                    caller_symbol,
+                    line,
+                    col: 0,
+                    resolved: true,
+                    edge: GraphEdge::from_helper(edge, provider),
+                });
+        }
+    }
+
+    fn helper_edge_enabled(&self, kind: HelperEdgeKind) -> bool {
+        match kind {
+            HelperEdgeKind::Dispatches | HelperEdgeKind::Goroutine | HelperEdgeKind::Defer => {
+                self.enable_dispatch_edges
+            }
+            HelperEdgeKind::Implements => self.enable_implementation_edges,
+            HelperEdgeKind::Writes => self.enable_writes_edges,
+            HelperEdgeKind::Static | HelperEdgeKind::Concrete | HelperEdgeKind::Interface => true,
+        }
     }
 
     fn reverse_sites(&self, file: &Path, symbol: &str) -> Option<&[IndexedCallerSite]> {
@@ -1316,6 +1832,485 @@ impl CallGraph {
             .get(file)?
             .get(symbol)
             .map(Vec::as_slice)
+    }
+
+    fn helper_abs_path(&self, helper_file: &str) -> PathBuf {
+        let path = Path::new(helper_file);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_root.join(path)
+        }
+    }
+
+    fn helper_forward_edges(
+        &self,
+        caller_file: &Path,
+        caller_symbol: &str,
+    ) -> Vec<(PathBuf, String, u32, GraphEdge)> {
+        let Some(helper) = self.go_helper.as_ref() else {
+            return Vec::new();
+        };
+        let caller_canon =
+            std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.to_path_buf());
+        let provider = self.go_helper_provider;
+        let mut edges = Vec::new();
+
+        for edge in &helper.edges {
+            if !self.helper_edge_enabled(edge.kind) {
+                continue;
+            }
+            if matches!(
+                edge.kind,
+                HelperEdgeKind::Static | HelperEdgeKind::Implements | HelperEdgeKind::Writes
+            ) {
+                continue;
+            }
+
+            let helper_caller = self.helper_abs_path(&edge.caller.file);
+            let helper_caller = std::fs::canonicalize(&helper_caller).unwrap_or(helper_caller);
+            if helper_caller != caller_canon
+                || !symbol_query_matches(&edge.caller.symbol, caller_symbol)
+            {
+                continue;
+            }
+
+            let target_file = self.helper_abs_path(&edge.callee.file);
+            let target_file = std::fs::canonicalize(&target_file).unwrap_or(target_file);
+            if edge.callee.symbol.is_empty() {
+                continue;
+            }
+
+            edges.push((
+                target_file,
+                edge.callee.symbol.clone(),
+                edge.callee.line,
+                GraphEdge::from_helper(edge, provider),
+            ));
+        }
+
+        edges
+    }
+
+    fn dispatch_entry_from_index(
+        &self,
+        target_file: &Path,
+        target_symbol: &str,
+        site: &IndexedCallerSite,
+    ) -> DispatchEntry {
+        DispatchEntry {
+            handler: DispatchCallee {
+                file: self.relative_path(target_file),
+                symbol: target_symbol.to_string(),
+            },
+            registered_by: DispatchRegistrar {
+                file: self.relative_path(site.caller_file.as_ref()),
+                symbol: site.caller_symbol.to_string(),
+                line: site.line,
+            },
+            dispatched_via: site.edge.dispatch_via.clone(),
+        }
+    }
+
+    fn dispatch_entry_from_helper(&self, edge: &HelperEdge) -> Option<DispatchEntry> {
+        if !self.helper_edge_enabled(edge.kind) || edge.kind != HelperEdgeKind::Dispatches {
+            return None;
+        }
+        if edge.callee.file.is_empty() || edge.callee.symbol.is_empty() {
+            return None;
+        }
+        if edge.caller.file.is_empty() || edge.caller.symbol.is_empty() {
+            return None;
+        }
+
+        let graph_edge = GraphEdge::from_helper(edge, self.go_helper_provider);
+        Some(DispatchEntry {
+            handler: DispatchCallee {
+                file: self.relative_path(&self.helper_abs_path(&edge.callee.file)),
+                symbol: edge.callee.symbol.clone(),
+            },
+            registered_by: DispatchRegistrar {
+                file: self.relative_path(&self.helper_abs_path(&edge.caller.file)),
+                symbol: edge.caller.symbol.clone(),
+                line: edge.caller.line,
+            },
+            dispatched_via: graph_edge.dispatch_via,
+        })
+    }
+
+    fn find_go_helper_dispatch_key(&self, key: &str) -> Option<Vec<DispatchEntry>> {
+        let helper = self.go_helper.as_ref()?;
+        let entries = helper
+            .edges
+            .iter()
+            .filter(|edge| edge.nearby_string.as_deref() == Some(key))
+            .filter_map(|edge| self.dispatch_entry_from_helper(edge))
+            .collect();
+        Some(entries)
+    }
+
+    fn find_go_helper_dispatch_key_prefix(
+        &self,
+        prefix: &str,
+    ) -> Option<Vec<(String, Vec<DispatchEntry>)>> {
+        let helper = self.go_helper.as_ref()?;
+        let mut grouped: BTreeMap<String, Vec<DispatchEntry>> = BTreeMap::new();
+        for edge in helper.edges.iter().filter(|edge| {
+            edge.kind == HelperEdgeKind::Dispatches
+                && edge
+                    .nearby_string
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with(prefix))
+        }) {
+            let Some(key) = edge.nearby_string.clone() else {
+                continue;
+            };
+            let Some(entry) = self.dispatch_entry_from_helper(edge) else {
+                continue;
+            };
+            grouped.entry(key).or_default().push(entry);
+        }
+        Some(grouped.into_iter().collect())
+    }
+
+    fn go_helper_dispatched_by(&self, file: &Path, symbol: &str) -> Option<DispatchedByResult> {
+        let helper = self.go_helper.as_ref()?;
+        let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let mut dispatched_by = Vec::new();
+
+        for edge in &helper.edges {
+            if !self.helper_edge_enabled(edge.kind) || edge.kind != HelperEdgeKind::Dispatches {
+                continue;
+            }
+            if !symbol_query_matches(&edge.callee.symbol, symbol) {
+                continue;
+            }
+            let callee_file = self.helper_abs_path(&edge.callee.file);
+            let callee_file = std::fs::canonicalize(&callee_file).unwrap_or(callee_file);
+            if callee_file != canon {
+                continue;
+            }
+            let graph_edge = GraphEdge::from_helper(edge, self.go_helper_provider);
+            dispatched_by.push(DispatchedBySite {
+                caller: DispatchRegistrar {
+                    file: self.relative_path(&self.helper_abs_path(&edge.caller.file)),
+                    symbol: edge.caller.symbol.clone(),
+                    line: edge.caller.line,
+                },
+                nearby_string: graph_edge.dispatch_key,
+                dispatched_via: graph_edge.dispatch_via,
+                context: graph_edge.context,
+            });
+        }
+
+        Some(DispatchedByResult {
+            symbol: symbol.to_string(),
+            file: self.relative_path(&canon),
+            dispatched_by,
+        })
+    }
+
+    fn go_helper_implementations_of(
+        &self,
+        file: &Path,
+        interface_symbol: &str,
+        include_mocks: bool,
+    ) -> Option<ImplementationsResult> {
+        let helper = self.go_helper.as_ref()?;
+        let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let mut by_receiver: BTreeMap<(String, String), Vec<ConcreteMethodRef>> = BTreeMap::new();
+
+        for edge in &helper.edges {
+            if !self.helper_edge_enabled(edge.kind) || edge.kind != HelperEdgeKind::Implements {
+                continue;
+            }
+            if !symbol_query_matches(&edge.caller.symbol, interface_symbol) {
+                continue;
+            }
+            let interface_file = self.helper_abs_path(&edge.caller.file);
+            let interface_file = std::fs::canonicalize(&interface_file).unwrap_or(interface_file);
+            if interface_file != canon {
+                continue;
+            }
+
+            let graph_edge = GraphEdge::from_helper(edge, self.go_helper_provider);
+            let receiver = graph_edge.receiver.unwrap_or_default();
+            let pkg = graph_edge.package.unwrap_or_default();
+            let file = self.relative_path(&self.helper_abs_path(&edge.callee.file));
+            if !include_mocks
+                && (receiver.contains("Mock")
+                    || file.contains("/mocks/")
+                    || file.starts_with("mocks/"))
+            {
+                continue;
+            }
+            by_receiver
+                .entry((receiver, pkg))
+                .or_default()
+                .push(ConcreteMethodRef {
+                    name: edge.callee.symbol.clone(),
+                    file,
+                    line: edge.callee.line,
+                });
+        }
+
+        let implementations = by_receiver
+            .into_iter()
+            .map(|((receiver, pkg), mut methods)| {
+                methods.sort_by(|a, b| a.name.cmp(&b.name).then(a.file.cmp(&b.file)));
+                ConcreteTypeImpl {
+                    receiver,
+                    pkg,
+                    methods,
+                }
+            })
+            .collect();
+
+        Some(ImplementationsResult {
+            interface: InterfaceInfo {
+                file: self.relative_path(&canon),
+                symbol: interface_symbol.to_string(),
+            },
+            implementations,
+        })
+    }
+
+    fn go_helper_writers_of(&self, file: &Path, symbol: &str) -> Option<WritersResult> {
+        let helper = self.go_helper.as_ref()?;
+        let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let mut writers = Vec::new();
+
+        for edge in &helper.edges {
+            if !self.helper_edge_enabled(edge.kind) || edge.kind != HelperEdgeKind::Writes {
+                continue;
+            }
+            if !symbol_query_matches(&edge.callee.symbol, symbol) {
+                continue;
+            }
+            let variable_file = self.helper_abs_path(&edge.callee.file);
+            let variable_file = std::fs::canonicalize(&variable_file).unwrap_or(variable_file);
+            if variable_file != canon {
+                continue;
+            }
+            writers.push(WriterSite {
+                file: self.relative_path(&self.helper_abs_path(&edge.caller.file)),
+                symbol: edge.caller.symbol.clone(),
+                line: edge.caller.line,
+            });
+        }
+
+        Some(WritersResult {
+            variable: symbol.to_string(),
+            file: self.relative_path(&canon),
+            writers,
+        })
+    }
+
+    /// Exact-match lookup for Go dispatch keys.
+    pub fn find_by_dispatch_key(&mut self, key: &str, max_files: usize) -> Vec<DispatchEntry> {
+        if let Some(entries) = self.find_go_helper_dispatch_key(key) {
+            return entries;
+        }
+
+        if self.build_reverse_index(max_files).is_err() {
+            return Vec::new();
+        }
+
+        let mut entries = Vec::new();
+        if let Some(reverse) = self.reverse_index.as_ref() {
+            for (target_file, by_symbol) in reverse {
+                for (target_symbol, sites) in by_symbol {
+                    for site in sites.iter().filter(|site| {
+                        site.edge.kind == GraphEdgeKind::DispatchRegistration
+                            && site.edge.dispatch_key.as_deref() == Some(key)
+                    }) {
+                        entries.push(self.dispatch_entry_from_index(
+                            target_file,
+                            target_symbol,
+                            site,
+                        ));
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// Prefix-match lookup for Go dispatch keys.
+    pub fn find_by_dispatch_key_prefix(
+        &mut self,
+        prefix: &str,
+        max_files: usize,
+    ) -> Vec<(String, Vec<DispatchEntry>)> {
+        if let Some(entries) = self.find_go_helper_dispatch_key_prefix(prefix) {
+            return entries;
+        }
+
+        if self.build_reverse_index(max_files).is_err() {
+            return Vec::new();
+        }
+
+        let mut grouped: BTreeMap<String, Vec<DispatchEntry>> = BTreeMap::new();
+        if let Some(reverse) = self.reverse_index.as_ref() {
+            for (target_file, by_symbol) in reverse {
+                for (target_symbol, sites) in by_symbol {
+                    for site in sites.iter().filter(|site| {
+                        site.edge.kind == GraphEdgeKind::DispatchRegistration
+                            && site
+                                .edge
+                                .dispatch_key
+                                .as_deref()
+                                .is_some_and(|value| value.starts_with(prefix))
+                    }) {
+                        let Some(key) = site.edge.dispatch_key.clone() else {
+                            continue;
+                        };
+                        grouped
+                            .entry(key)
+                            .or_default()
+                            .push(self.dispatch_entry_from_index(target_file, target_symbol, site));
+                    }
+                }
+            }
+        }
+
+        grouped.into_iter().collect()
+    }
+
+    /// Find all Go dispatch call sites that pass `symbol` from `file` as a function value.
+    pub fn dispatched_by(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        _max_files: usize,
+    ) -> Result<DispatchedByResult, AftError> {
+        let canon = self.canonicalize(file)?;
+        if let Some(result) = self.go_helper_dispatched_by(&canon, symbol) {
+            return Ok(result);
+        }
+
+        self.build_file(&canon)?;
+        self.build_reverse_index(_max_files)?;
+
+        let dispatched_by = self
+            .reverse_sites(&canon, symbol)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|site| site.edge.kind == GraphEdgeKind::DispatchRegistration)
+            .map(|site| DispatchedBySite {
+                caller: DispatchRegistrar {
+                    file: self.relative_path(site.caller_file.as_ref()),
+                    symbol: site.caller_symbol.to_string(),
+                    line: site.line,
+                },
+                nearby_string: site.edge.dispatch_key.clone(),
+                dispatched_via: site.edge.dispatch_via.clone(),
+                context: site.edge.context.clone(),
+            })
+            .collect();
+
+        Ok(DispatchedByResult {
+            symbol: symbol.to_string(),
+            file: self.relative_path(&canon),
+            dispatched_by,
+        })
+    }
+
+    /// Find concrete Go types that implement an interface.
+    pub fn implementations_of(
+        &mut self,
+        file: &Path,
+        interface_symbol: &str,
+        include_mocks: bool,
+        _max_files: usize,
+    ) -> Result<ImplementationsResult, AftError> {
+        let canon = self.canonicalize(file)?;
+        if let Some(result) =
+            self.go_helper_implementations_of(&canon, interface_symbol, include_mocks)
+        {
+            return Ok(result);
+        }
+
+        self.build_reverse_index(_max_files)?;
+
+        let mut by_receiver: BTreeMap<(String, String), Vec<ConcreteMethodRef>> = BTreeMap::new();
+        for site in self.reverse_sites(&canon, interface_symbol).unwrap_or(&[]) {
+            if site.edge.kind != GraphEdgeKind::Implements {
+                continue;
+            }
+            let receiver = site.edge.receiver.clone().unwrap_or_default();
+            let pkg = site.edge.package.clone().unwrap_or_default();
+            let file = self.relative_path(site.caller_file.as_ref());
+            if !include_mocks
+                && (receiver.contains("Mock")
+                    || file.contains("/mocks/")
+                    || file.starts_with("mocks/"))
+            {
+                continue;
+            }
+            by_receiver
+                .entry((receiver, pkg))
+                .or_default()
+                .push(ConcreteMethodRef {
+                    name: site.caller_symbol.to_string(),
+                    file,
+                    line: site.line,
+                });
+        }
+
+        let implementations = by_receiver
+            .into_iter()
+            .map(|((receiver, pkg), mut methods)| {
+                methods.sort_by(|a, b| a.name.cmp(&b.name).then(a.file.cmp(&b.file)));
+                ConcreteTypeImpl {
+                    receiver,
+                    pkg,
+                    methods,
+                }
+            })
+            .collect();
+
+        Ok(ImplementationsResult {
+            interface: InterfaceInfo {
+                file: self.relative_path(&canon),
+                symbol: interface_symbol.to_string(),
+            },
+            implementations,
+        })
+    }
+
+    /// Find all cross-package Go write sites for a package-level variable.
+    pub fn writers_of(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        _max_files: usize,
+    ) -> Result<WritersResult, AftError> {
+        let canon = self.canonicalize(file)?;
+        if let Some(result) = self.go_helper_writers_of(&canon, symbol) {
+            return Ok(result);
+        }
+
+        self.build_file(&canon)?;
+        self.build_reverse_index(_max_files)?;
+
+        let writers = self
+            .reverse_sites(&canon, symbol)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|site| site.edge.kind == GraphEdgeKind::Writes)
+            .map(|site| WriterSite {
+                file: self.relative_path(site.caller_file.as_ref()),
+                symbol: site.caller_symbol.to_string(),
+                line: site.line,
+            })
+            .collect();
+
+        Ok(WritersResult {
+            variable: symbol.to_string(),
+            file: self.relative_path(&canon),
+            writers,
+        })
     }
 
     /// Get callers of a symbol in a file, grouped by calling file.
@@ -1372,6 +2367,7 @@ impl CallGraph {
             let entry = CallerEntry {
                 symbol: caller_symbol,
                 line,
+                edge: site.edge,
             };
 
             if let Some(entries) = groups_map.get_mut(&caller_file) {
@@ -1459,9 +2455,16 @@ impl CallGraph {
             })
             .unwrap_or(false);
 
-        // BFS state: each item is a partial path (bottom-up, will be reversed later)
-        // Each path element: (canonicalized file, symbol name, line, signature)
-        type PathElem = (SharedPath, SharedStr, u32, Option<String>);
+        // BFS state: each item is a partial path (bottom-up, will be reversed later).
+        // `incoming_edge` is the typed edge from the previous top-down hop into
+        // this element. In bottom-up storage, it belongs to the callee element.
+        type PathElem = (
+            SharedPath,
+            SharedStr,
+            u32,
+            Option<String>,
+            Option<GraphEdge>,
+        );
         let mut complete_paths: Vec<Vec<PathElem>> = Vec::new();
         let mut max_depth_reached = false;
         let mut truncated_paths: usize = 0;
@@ -1472,6 +2475,7 @@ impl CallGraph {
             Arc::from(resolved_symbol.as_str()),
             target_line,
             target_sig,
+            None,
         )];
 
         // If the target itself is an entry point, record it as a trivial path
@@ -1488,7 +2492,7 @@ impl CallGraph {
                 continue;
             }
 
-            let Some((current_file, current_symbol, _, _)) = path.last() else {
+            let Some((current_file, current_symbol, _, _, _)) = path.last() else {
                 continue;
             };
 
@@ -1499,6 +2503,14 @@ impl CallGraph {
                     // Dead end: no callers and not an entry point
                     // (if it were an entry point, we'd have recorded it already)
                     if path.len() > 1 {
+                        if path.iter().any(|(_, _, _, _, edge)| {
+                            edge.as_ref().is_some_and(|edge| {
+                                edge.kind != GraphEdgeKind::DirectCall
+                                    || edge.provider != GraphEdgeProvider::AftNative
+                            })
+                        }) {
+                            complete_paths.push(path.clone());
+                        }
                         // Only count as truncated if this isn't the target itself
                         // (the target with no callers is just "no paths found")
                         truncated_paths += 1;
@@ -1510,7 +2522,7 @@ impl CallGraph {
             let mut has_new_path = false;
             for site in callers {
                 // Cycle detection: skip if this caller is already in the current path
-                if path.iter().any(|(file_path, sym, _, _)| {
+                if path.iter().any(|(file_path, sym, _, _, _)| {
                     file_path.as_ref() == site.caller_file.as_ref()
                         && sym.as_ref() == site.caller_symbol.as_ref()
                 }) {
@@ -1528,11 +2540,15 @@ impl CallGraph {
                     });
 
                 let mut new_path = path.clone();
+                if let Some(last) = new_path.last_mut() {
+                    last.4 = Some(site.edge.clone());
+                }
                 new_path.push((
                     Arc::clone(&site.caller_file),
                     Arc::clone(&site.caller_symbol),
                     caller_line,
                     caller_sig,
+                    None,
                 ));
 
                 // Check if this caller is an entry point
@@ -1561,6 +2577,14 @@ impl CallGraph {
 
             // If we had callers but none were new (all cycles), count as truncated
             if !has_new_path && path.len() > 1 {
+                if path.iter().any(|(_, _, _, _, edge)| {
+                    edge.as_ref().is_some_and(|edge| {
+                        edge.kind != GraphEdgeKind::DirectCall
+                            || edge.provider != GraphEdgeProvider::AftNative
+                    })
+                }) {
+                    complete_paths.push(path.clone());
+                }
                 truncated_paths += 1;
             }
         }
@@ -1574,7 +2598,7 @@ impl CallGraph {
                 let hops: Vec<TraceHop> = elems
                     .iter()
                     .enumerate()
-                    .map(|(i, (file_path, sym, line, sig))| {
+                    .map(|(i, (file_path, sym, line, sig, incoming_edge))| {
                         let is_ep = if i == 0 {
                             // First hop (after reverse) is the entry point
                             self.lookup_file_data(file_path.as_ref())
@@ -1597,6 +2621,7 @@ impl CallGraph {
                             line: *line,
                             signature: sig.clone(),
                             is_entry_point: is_ep,
+                            incoming_edge: incoming_edge.clone(),
                         }
                     })
                     .collect();
@@ -2001,6 +3026,7 @@ impl CallGraph {
                 is_entry_point: is_ep,
                 call_expression,
                 parameters: params,
+                edge: site.edge.clone(),
             });
         }
 
@@ -2644,6 +3670,7 @@ impl CallGraph {
                     line: site.line,
                     col: site.col,
                     resolved: site.resolved,
+                    edge: site.edge.clone(),
                 });
                 // Recurse: find callers of the caller
                 if current_depth + 1 < max_depth {
@@ -4656,6 +5683,128 @@ mod tests {
 
         // A genuinely-absent symbol still returns None (no false recovery).
         assert!(file_data.symbol_metadata_for("does_not_exist").is_none());
+    }
+
+    fn go_dispatch_helper_output(root: &Path) -> HelperOutput {
+        HelperOutput {
+            version: crate::go_helper::HELPER_SCHEMA_VERSION,
+            root: root.display().to_string(),
+            skipped: vec![],
+            returns: vec![],
+            edges: vec![HelperEdge {
+                caller: crate::go_helper::HelperCaller {
+                    file: "server.go".to_string(),
+                    line: 7,
+                    symbol: "startAsyncQueueServer".to_string(),
+                },
+                callee: crate::go_helper::HelperCallee {
+                    file: "handler.go".to_string(),
+                    line: 3,
+                    symbol: "HandleProviderSettlementTask".to_string(),
+                    receiver: String::new(),
+                    pkg: "example.com/nativegraph".to_string(),
+                },
+                kind: crate::go_helper::EdgeKind::Dispatches,
+                nearby_string: Some("provider_settlement:file_id".to_string()),
+                dispatched_via: Some("(*github.com/hibiken/asynq.ServeMux).HandleFunc".to_string()),
+                context: None,
+            }],
+        }
+    }
+
+    fn setup_go_dispatch_project() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/nativegraph\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("server.go"),
+            r#"package main
+
+type mux struct{}
+func (m *mux) HandleFunc(key string, handler any) {}
+
+func startAsyncQueueServer(m *mux) {
+    m.HandleFunc("provider_settlement:file_id", HandleProviderSettlementTask)
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("handler.go"),
+            r#"package main
+
+func HandleProviderSettlementTask() error {
+    return nil
+}
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn go_helper_edges_are_native_typed_graph_edges() {
+        let dir = setup_go_dispatch_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        graph.set_go_helper_with_provider(go_dispatch_helper_output(dir.path()), "aft-go-sidecar");
+
+        let handler = dir.path().join("handler.go");
+        let callers = graph
+            .callers_of(&handler, "HandleProviderSettlementTask", 1, usize::MAX)
+            .unwrap();
+        assert_eq!(callers.total_callers, 1);
+        let caller = &callers.callers[0].callers[0];
+        assert_eq!(caller.symbol, "startAsyncQueueServer");
+        assert_eq!(caller.edge.kind, GraphEdgeKind::DispatchRegistration);
+        assert_eq!(caller.edge.provider, GraphEdgeProvider::AftGoSidecar);
+        assert_eq!(
+            caller.edge.dispatch_key.as_deref(),
+            Some("provider_settlement:file_id")
+        );
+
+        let trace = graph
+            .trace_to(&handler, "HandleProviderSettlementTask", 3, usize::MAX)
+            .unwrap();
+        assert!(trace.paths.iter().any(|path| {
+            path.hops.iter().any(|hop| {
+                hop.incoming_edge
+                    .as_ref()
+                    .is_some_and(|edge| edge.kind == GraphEdgeKind::DispatchRegistration)
+            })
+        }));
+
+        let impact = graph
+            .impact(&handler, "HandleProviderSettlementTask", 1, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            impact.callers[0].edge.kind,
+            GraphEdgeKind::DispatchRegistration
+        );
+
+        let tree = graph
+            .forward_tree(&dir.path().join("server.go"), "startAsyncQueueServer", 1)
+            .unwrap();
+        assert!(tree.children.iter().any(|child| {
+            child.name == "HandleProviderSettlementTask"
+                && child
+                    .incoming_edge
+                    .as_ref()
+                    .is_some_and(|edge| edge.kind == GraphEdgeKind::DispatchRegistration)
+        }));
+
+        let dispatches = graph.find_by_dispatch_key("provider_settlement:file_id", usize::MAX);
+        assert_eq!(dispatches[0].handler.symbol, "HandleProviderSettlementTask");
+
+        let dispatched_by = graph
+            .dispatched_by(&handler, "HandleProviderSettlementTask", usize::MAX)
+            .unwrap();
+        assert_eq!(
+            dispatched_by.dispatched_by[0].caller.symbol,
+            "startAsyncQueueServer"
+        );
     }
 
     /// Create a temp directory with TypeScript files for testing.

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::context::AppContext;
+use crate::output::graph_response;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `call_tree` request.
@@ -93,10 +94,7 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     match graph.forward_tree(&file_path, &symbol, depth) {
-        Ok(tree) => {
-            let tree_json = serde_json::to_value(&tree).unwrap_or_default();
-            Response::success(&req.id, tree_json)
-        }
+        Ok(tree) => graph_response(req, &tree),
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
 }

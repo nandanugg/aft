@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::context::AppContext;
+use crate::output::graph_response;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `writers` request.
@@ -22,8 +23,7 @@ use crate::protocol::{RawRequest, Response};
 ///   "writers": [
 ///     { "file": "server/asynq.go", "symbol": "startServer", "line": 47 },
 ///     { "file": "server/registry.go", "symbol": "init", "line": 12 }
-///   ],
-///   "text": "..."
+///   ]
 /// }
 /// ```
 ///
@@ -75,14 +75,7 @@ pub fn handle_writers(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let max_files = ctx.config().max_callgraph_files;
     match graph.writers_of(&file_path, symbol, max_files) {
-        Ok(result) => {
-            let text = result.render_text();
-            let mut result_json = serde_json::to_value(&result).unwrap_or_default();
-            if let Some(obj) = result_json.as_object_mut() {
-                obj.insert("text".to_string(), serde_json::Value::String(text));
-            }
-            Response::success(&req.id, result_json)
-        }
+        Ok(result) => graph_response(req, &result),
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
 }

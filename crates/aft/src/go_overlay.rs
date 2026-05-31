@@ -15,7 +15,6 @@ use crate::config::GoOverlayBackend;
 use crate::go_helper::{
     self, find_helper_binary, HelperError, HelperFlags, HelperOutput, HELPER_SCHEMA_VERSION,
 };
-use crate::persistent_cache::{project_hash, write_helper_input_hash};
 
 const SIDECAR_PROVIDER_ID: &str = "aft-go-sidecar";
 const LOCAL_PROVIDER_ID: &str = "local_helper";
@@ -25,6 +24,22 @@ const SIDECAR_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const SIDECAR_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const SIDECAR_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Compute a stable, short project identifier: first 12 hex chars of
+/// SHA-256(canonical_absolute_root).
+pub fn project_hash(project_root: &Path) -> String {
+    let canon = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let root_str = canon.to_string_lossy();
+    let mut hasher = Sha256::new();
+    hasher.update(root_str.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)[..12].to_string()
+}
+
+fn write_helper_input_hash(cache_dir: &Path, hash: &str) -> std::io::Result<()> {
+    fs::create_dir_all(cache_dir)?;
+    fs::write(cache_dir.join("helper-input-hash"), format!("{hash}\n"))
+}
 
 #[derive(Debug, Clone)]
 pub struct GoOverlayRequest {
@@ -1033,6 +1048,9 @@ mod tests {
             request.root.clone(),
             Duration::from_secs(1),
             HelperFlags {
+                no_dispatches: false,
+                no_implements: false,
+                no_writes: false,
                 no_call_context: true,
                 no_return_analysis: false,
             },

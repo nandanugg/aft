@@ -87,6 +87,30 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoOverlayBackend {
+    LocalHelper,
+    AftGoSidecar,
+}
+
+impl GoOverlayBackend {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalHelper => "local_helper",
+            Self::AftGoSidecar => "aft_go_sidecar",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "local_helper" | "local" => Some(Self::LocalHelper),
+            "aft_go_sidecar" | "sidecar" | "aft-go-sidecar" => Some(Self::AftGoSidecar),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -144,6 +168,12 @@ pub struct Config {
     /// Default: 5_000 (matches measured per-op cost ceilings; raise for
     /// very large projects if you accept multi-minute per-call latency).
     pub max_callgraph_files: usize,
+    pub enable_dispatch_edges: bool,
+    pub enable_implementation_edges: bool,
+    pub enable_writes_edges: bool,
+    pub emit_call_context: bool,
+    pub emit_return_analysis: bool,
+    pub go_overlay_backend: GoOverlayBackend,
     pub semantic: SemanticBackendConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
@@ -232,6 +262,26 @@ impl Default for Config {
             // semantic_search/AST/LSP all remain unaffected by this cap —
             // it only gates `aft_callgraph` and `aft_refactor op="move"`.
             max_callgraph_files: 5_000,
+            enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            emit_call_context: std::env::var("AFT_DISABLE_CALL_CONTEXT")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            emit_return_analysis: std::env::var("AFT_DISABLE_RETURN_ANALYSIS")
+                .map(|v| v != "1")
+                .unwrap_or(true),
+            go_overlay_backend: std::env::var("AFT_GO_OVERLAY_BACKEND")
+                .ok()
+                .as_deref()
+                .and_then(GoOverlayBackend::from_name)
+                .unwrap_or(GoOverlayBackend::LocalHelper),
             semantic: SemanticBackendConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
