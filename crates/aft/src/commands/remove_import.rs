@@ -358,6 +358,24 @@ fn remove_name_from_imports(
                 );
                 edits.push((imp.byte_range.clone(), new_line));
             }
+        } else if imp.namespace_import.as_deref() == Some(target_name) {
+            // Removing the namespace import
+            if imp.names.is_empty() && imp.default_import.is_none() {
+                // Only namespace — remove entire statement
+                let range = line_range(source, &imp.byte_range);
+                edits.push((range, String::new()));
+            } else {
+                // Has default or named imports too — regenerate without namespace
+                let new_line = imports::generate_import_line_with_namespace(
+                    lang,
+                    &imp.module_path,
+                    &imp.names,
+                    imp.default_import.as_deref(),
+                    None,
+                    imp.kind == imports::ImportKind::Type,
+                );
+                edits.push((imp.byte_range.clone(), new_line));
+            }
         }
     }
 

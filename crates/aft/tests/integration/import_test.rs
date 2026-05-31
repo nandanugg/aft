@@ -1249,7 +1249,7 @@ fn organize_imports_preserves_side_effect_order() {
 }
 
 #[test]
-fn organize_imports_refuses_to_drop_inter_import_comments() {
+fn organize_imports_preserves_inter_import_comments() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1264,8 +1264,7 @@ fn organize_imports_refuses_to_drop_inter_import_comments() {
     fs::write(&file, original).unwrap();
 
     let resp = send_organize_imports(&mut aft, "org-comment-gap", &file.display().to_string());
-    assert_eq!(resp["success"], false, "organize should refuse: {resp:?}");
-    assert_eq!(resp["code"], "multi_region_imports");
+    assert_eq!(resp["success"], true, "organize should succeed: {resp:?}");
     let content = fs::read_to_string(&file).unwrap();
     assert_eq!(content, original, "comment gap must be preserved");
 
@@ -1383,6 +1382,40 @@ fn php_grouped_use_refuses_memberwise_add_and_remove() {
     );
     assert_eq!(remove_resp["code"], "unsupported_grouped_import");
     assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    fs::remove_file(&file).ok();
+    aft.shutdown();
+}
+
+#[test]
+fn organize_imports_go_grouped_block_refuses_internal_comments() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!(
+        "organize_go_grouped_comments_{}.go",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let original = "package main\n\nimport (\n\t\"fmt\"\n\t// keep me with this block\n\t\"os\"\n)\n\nfunc main() {}\n";
+    fs::write(&file, original).unwrap();
+
+    let resp = send_organize_imports(
+        &mut aft,
+        "org-go-grouped-comments",
+        &file.display().to_string(),
+    );
+    assert_eq!(
+        resp["success"], false,
+        "commented Go grouped imports should be refused: {resp:?}"
+    );
+    assert_eq!(resp["code"], "unsupported_import_comments");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "refused organize must leave the Go file byte-for-byte unchanged"
+    );
 
     fs::remove_file(&file).ok();
     aft.shutdown();

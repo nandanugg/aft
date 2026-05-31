@@ -23,10 +23,11 @@ pub(crate) fn classify_group_scala(module_path: &str) -> ImportGroup {
 }
 
 pub(crate) fn scala_block_uses_scala2_dialect(block: &ImportBlock) -> bool {
-    block
-        .imports
-        .iter()
-        .any(|imp| imp.raw_text.contains("=>") || imp.raw_text.contains("._"))
+    block.imports.iter().any(|imp| {
+        imp.raw_text.contains("=>")
+            || imp.raw_text.contains("._")
+            || imp.names.iter().any(|name| name.trim() == "_")
+    })
 }
 
 pub(crate) fn parse_scala_imports(source: &str, tree: &Tree) -> ImportBlock {

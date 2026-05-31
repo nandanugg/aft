@@ -41,6 +41,13 @@ enum Op {
         modifiers: &'static [&'static str],
         import_kind: Option<&'static str>,
     },
+    AddNamespace {
+        module: &'static str,
+        names: &'static [&'static str],
+        default_import: Option<&'static str>,
+        namespace: &'static str,
+        type_only: bool,
+    },
     Remove {
         module: &'static str,
         /// `Some(name)` removes one named import; `None` removes the whole statement.
@@ -124,6 +131,31 @@ fn run_scenario(aft: &mut AftProcess, scenario: &Scenario) -> String {
                 }
                 if let Some(kind) = import_kind {
                     p["import_kind"] = serde_json::json!(kind);
+                }
+                p
+            }
+            Op::AddNamespace {
+                module,
+                names,
+                default_import,
+                namespace,
+                type_only,
+            } => {
+                let mut p = serde_json::json!({
+                    "id": format!("{}-{}", scenario.name, idx),
+                    "command": "add_import",
+                    "file": file_str,
+                    "module": module,
+                    "namespace": namespace,
+                });
+                if !names.is_empty() {
+                    p["names"] = serde_json::json!(names);
+                }
+                if let Some(def) = default_import {
+                    p["default_import"] = serde_json::json!(def);
+                }
+                if *type_only {
+                    p["type_only"] = serde_json::json!(true);
                 }
                 p
             }
@@ -264,6 +296,39 @@ fn scenarios() -> Vec<Scenario> {
                 name: Some("React"),
             }],
         },
+        Scenario {
+            name: "ts_add_default_namespace_dedupes_exact",
+            ext: "ts",
+            input: "import Foo, * as NS from \"mod\";\n\nexport const x = Foo || NS;\n",
+            ops: &[Op::AddNamespace {
+                module: "mod",
+                names: &[],
+                default_import: Some("Foo"),
+                namespace: "NS",
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "ts_add_default_namespace_extends_plain_default",
+            ext: "ts",
+            input: "import Foo from \"mod\";\n\nexport const x = Foo;\n",
+            ops: &[Op::AddNamespace {
+                module: "mod",
+                names: &[],
+                default_import: Some("Foo"),
+                namespace: "NS",
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "ts_remove_namespace_from_default_namespace",
+            ext: "ts",
+            input: "import Foo, * as NS from \"./mod\";\n\nexport const x = Foo;\n",
+            ops: &[Op::Remove {
+                module: "./mod",
+                name: Some("NS"),
+            }],
+        },
         // ---- JavaScript (shares the ES engine — proves the JS dispatch path) ----
         Scenario {
             name: "js_add_named",
@@ -318,6 +383,12 @@ fn scenarios() -> Vec<Scenario> {
             name: "py_organize_grouped",
             ext: "py",
             input: "from . import local\nimport requests\nimport os\n\nx = 1\n",
+            ops: &[Op::Organize],
+        },
+        Scenario {
+            name: "py_organize_preserves_inter_import_comment",
+            ext: "py",
+            input: "import os\n# stdlib boundary\nimport sys\n\nx = 1\n",
             ops: &[Op::Organize],
         },
         // ---- Rust (the gnarliest: pub-in-default_import + use-tree merge) ----
@@ -724,6 +795,26 @@ class C {}
             }],
         },
         Scenario {
+            name: "csharp_add_with_in_namespace_comment",
+            ext: "cs",
+            input: "namespace App {\nusing System;\n// keep using section note\nusing System.Text;\n\nclass C {}\n}\n",
+            ops: &[Op::Add {
+                module: "System.Collections",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "csharp_remove_with_in_namespace_comment",
+            ext: "cs",
+            input: "namespace App {\nusing System;\n// keep using section note\nusing System.Text;\nusing System.Xml;\n\nclass C {}\n}\n",
+            ops: &[Op::Remove {
+                module: "System.Text",
+                name: None,
+            }],
+        },
+        Scenario {
             name: "csharp_remove_using",
             ext: "cs",
             input: "using System;\nusing System.Text;\n\nnamespace App;\n\nclass C {}\n",
@@ -806,6 +897,26 @@ class C {}
                 alias: None,
                 modifiers: &[],
                 import_kind: Some("const"),
+            }],
+        },
+        Scenario {
+            name: "php_add_with_in_namespace_comment",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Alpha;\n// keep use section note\nuse App\\Zulu;\n\nclass C {}\n",
+            ops: &[Op::Add {
+                module: "App\\Beta",
+                names: &[],
+                default_import: None,
+                type_only: false,
+            }],
+        },
+        Scenario {
+            name: "php_remove_with_in_namespace_comment",
+            ext: "php",
+            input: "<?php\n\nnamespace Demo;\n\nuse App\\Alpha;\n// keep use section note\nuse App\\Unused;\nuse App\\Zulu;\n\nclass C {}\n",
+            ops: &[Op::Remove {
+                module: "App\\Unused",
+                name: None,
             }],
         },
         Scenario {
@@ -956,6 +1067,22 @@ object Main { val x = 1 }
                     type_only: false,
                 },
             ],
+        },
+        Scenario {
+            name: "scala_add_uses_brace_wildcard_scala2_dialect",
+            ext: "scala",
+            input: r#"import a.{_}
+
+object Main { val x = 1 }
+"#,
+            ops: &[Op::AddForm {
+                module: "cats.syntax.all",
+                names: &[],
+                namespace: None,
+                alias: None,
+                modifiers: &["wildcard"],
+                import_kind: None,
+            }],
         },
         Scenario {
             name: "scala_remove_selector_preserves_scala2_arrow",

@@ -286,6 +286,24 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         None
     };
 
+    let namespace_merge_target = if names.is_empty()
+        && default_import.is_some()
+        && namespace.is_some()
+        && matches!(
+            lang,
+            LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
+        ) {
+        block.imports.iter().find(|imp| {
+            imp.module_path == module
+                && imp.kind == target_kind
+                && imp.names.is_empty()
+                && imp.default_import.as_deref() == default_import.as_deref()
+                && imp.namespace_import.is_none()
+        })
+    } else {
+        None
+    };
+
     let (insert_offset, replace_end, insert_text, merged_into_existing) = if let Some(existing) =
         merge_target
     {
@@ -308,6 +326,21 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             &existing.module_path,
             &merged_names,
             None,
+            type_only,
+        );
+        (
+            existing.byte_range.start,
+            existing.byte_range.end,
+            merged_line,
+            true,
+        )
+    } else if let Some(existing) = namespace_merge_target {
+        let merged_line = imports::generate_import_line_with_namespace(
+            lang,
+            &existing.module_path,
+            &existing.names,
+            existing.default_import.as_deref(),
+            namespace.as_deref(),
             type_only,
         );
         (

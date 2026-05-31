@@ -123,6 +123,17 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if lang == LangId::Go && go_grouped_import_block_has_comments(&_tree) {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_import_comments",
+            format!(
+                "organize_imports: Go grouped import block in {file} contains comments; refusing to organize because regrouping would drop or detach them"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
     // --- Auto-backup ---
     let backup_id = match edit::auto_backup(
         ctx,
@@ -139,7 +150,8 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Organize: group, sort, dedup ---
     let original_count = block.imports.len();
-    let (grouped, removed_duplicates) = organize(&block.imports, lang);
+    let comment_gaps = import_gaps_contain_comments(&source, lang, &block.imports);
+    let (mut grouped, mut removed_duplicates) = organize(&block.imports, lang);
 
     // --- Generate new import block ---
     let grouped_go_range = if matches!(lang, LangId::Go) {
@@ -154,6 +166,12 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let new_import_text = if matches!(lang, LangId::Go) && grouped_go_range.is_some() {
         generate_go_grouped_block(&grouped)
+    } else if comment_gaps {
+        let (preserved_grouped, preserved_removed, preserved_text) =
+            organize_preserving_comment_gaps(&source, lang, &block.imports);
+        grouped = preserved_grouped;
+        removed_duplicates = preserved_removed;
+        preserved_text
     } else {
         generate_organized_block(&grouped, lang)
     };
@@ -281,6 +299,63 @@ fn go_import_declarations_span_multiple_code_regions(
     })
 }
 
+fn go_grouped_import_block_has_comments(tree: &tree_sitter::Tree) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            if node.kind() == "import_declaration"
+                && go_import_declaration_is_grouped(&node)
+                && node_contains_comment(node)
+            {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn go_import_declaration_is_grouped(node: &tree_sitter::Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().kind() == "import_spec_list" {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn node_contains_comment(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() == "comment" {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if node_contains_comment(cursor.node()) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
 pub(crate) fn imports_span_multiple_code_regions(
     source: &str,
     lang: LangId,
@@ -297,12 +372,26 @@ pub(crate) fn imports_span_multiple_code_regions(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ImportGapTrivia {
+    has_comment: bool,
+}
+
 fn import_gap_is_trivia(source: &str, lang: LangId, range: Range<usize>) -> bool {
-    let Some(gap) = source.get(range) else {
-        return false;
-    };
+    scan_import_gap(source, lang, range).is_some()
+}
+
+fn import_gap_has_comment(source: &str, lang: LangId, range: Range<usize>) -> bool {
+    scan_import_gap(source, lang, range)
+        .map(|gap| gap.has_comment)
+        .unwrap_or(false)
+}
+
+fn scan_import_gap(source: &str, lang: LangId, range: Range<usize>) -> Option<ImportGapTrivia> {
+    let gap = source.get(range)?;
 
     let mut offset = 0;
+    let mut has_comment = false;
     while offset < gap.len() {
         let rest = &gap[offset..];
         let ch = rest
@@ -316,29 +405,45 @@ fn import_gap_is_trivia(source: &str, lang: LangId, range: Range<usize>) -> bool
         }
 
         if lang == LangId::Lua && rest.starts_with("--[[") {
-            return false;
+            let end = rest.find("]]")?;
+            offset += end + 2;
+            has_comment = true;
+            continue;
         }
 
         if lang == LangId::Lua && rest.starts_with("--") {
-            return false;
+            offset += line_comment_len(rest);
+            has_comment = true;
+            continue;
         }
 
         if supports_slash_line_comments(lang) && rest.starts_with("//") {
-            return false;
+            offset += line_comment_len(rest);
+            has_comment = true;
+            continue;
         }
 
         if supports_block_comments(lang) && rest.starts_with("/*") {
-            return false;
+            let end = rest.find("*/")?;
+            offset += end + 2;
+            has_comment = true;
+            continue;
         }
 
         if supports_hash_line_comments(lang) && rest.starts_with('#') {
-            return false;
+            offset += line_comment_len(rest);
+            has_comment = true;
+            continue;
         }
 
-        return false;
+        return None;
     }
 
-    true
+    Some(ImportGapTrivia { has_comment })
+}
+
+fn line_comment_len(rest: &str) -> usize {
+    rest.find('\n').unwrap_or(rest.len())
 }
 
 fn supports_slash_line_comments(lang: LangId) -> bool {
@@ -373,6 +478,59 @@ fn supports_hash_line_comments(lang: LangId) -> bool {
     )
 }
 
+fn import_gaps_contain_comments(source: &str, lang: LangId, imports: &[ImportStatement]) -> bool {
+    imports.windows(2).any(|pair| {
+        import_gap_has_comment(
+            source,
+            lang,
+            pair[0].byte_range.end..pair[1].byte_range.start,
+        )
+    })
+}
+
+fn organize_preserving_comment_gaps(
+    source: &str,
+    lang: LangId,
+    imports: &[ImportStatement],
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize, String) {
+    let mut grouped = Vec::new();
+    let mut removed_duplicates = 0;
+    let mut output = String::new();
+    let mut segment_start = 0;
+
+    for idx in 0..imports.len() {
+        let next_gap = imports.get(idx + 1).map(|next| {
+            let range = imports[idx].byte_range.end..next.byte_range.start;
+            (import_gap_has_comment(source, lang, range.clone()), range)
+        });
+        let is_boundary = next_gap
+            .as_ref()
+            .map(|(has_comment, _)| *has_comment)
+            .unwrap_or(true);
+
+        if !is_boundary {
+            continue;
+        }
+
+        let mut refs: Vec<&ImportStatement> = imports[segment_start..=idx].iter().collect();
+        refs.sort_by_key(|imp| imp.byte_range.start);
+        let (segment_grouped, segment_removed) = organize_ordered_import_refs(&refs, lang);
+        output.push_str(&generate_organized_block(&segment_grouped, lang));
+        grouped.extend(segment_grouped);
+        removed_duplicates += segment_removed;
+
+        if let Some((true, range)) = next_gap {
+            if let Some(gap) = source.get(range) {
+                output.push_str(gap);
+            }
+        }
+
+        segment_start = idx + 1;
+    }
+
+    (grouped, removed_duplicates, output)
+}
+
 /// Organize imports: group by convention, sort within groups, deduplicate.
 /// Returns (grouped imports in order, count of removed duplicates).
 fn organize(
@@ -381,14 +539,20 @@ fn organize(
 ) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
     let mut refs: Vec<&ImportStatement> = imports.iter().collect();
     refs.sort_by_key(|imp| imp.byte_range.start);
+    organize_ordered_import_refs(&refs, lang)
+}
 
+fn organize_ordered_import_refs(
+    refs: &[&ImportStatement],
+    lang: LangId,
+) -> (Vec<(ImportGroup, Vec<OrganizedImport>)>, usize) {
     if preserves_side_effect_order(lang)
         && refs.iter().any(|imp| imp.kind == ImportKind::SideEffect)
     {
-        return organize_preserving_side_effect_order(&refs, lang);
+        return organize_preserving_side_effect_order(refs, lang);
     }
 
-    organize_import_refs(&refs, lang)
+    organize_import_refs(refs, lang)
 }
 
 fn organize_import_refs(

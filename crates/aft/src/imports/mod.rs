@@ -637,24 +637,41 @@ pub fn is_duplicate_with_namespace(
             return true;
         }
 
-        if names.is_empty()
-            && default_import.is_none()
-            && namespace_import.is_some()
-            && imp.names.is_empty()
-            && imp.default_import.is_none()
-            && imp.namespace_import.as_deref() == namespace_import
-        {
-            return true;
-        }
-
         // Kind must match for dedup (value imports don't dedup against type imports)
         if imp.kind != target_kind && imp.kind != ImportKind::SideEffect {
             continue;
         }
 
-        // Check default import match
+        // Default+namespace imports are one ES binding shape. A plain default
+        // import must not satisfy a request for `default, * as ns`, and a
+        // different namespace alias must not either.
+        if let (Some(def), Some(namespace)) = (default_import, namespace_import) {
+            if imp.default_import.as_deref() == Some(def)
+                && imp.namespace_import.as_deref() == Some(namespace)
+                && names
+                    .iter()
+                    .all(|n| imp.names.iter().any(|stored| specifier_matches(stored, n)))
+            {
+                return true;
+            }
+            continue;
+        }
+
+        // Namespace-only requests are satisfied by any existing same-module
+        // import that already binds that namespace alias, even if it also has a
+        // default binding.
+        if names.is_empty()
+            && default_import.is_none()
+            && namespace_import.is_some()
+            && imp.namespace_import.as_deref() == namespace_import
+        {
+            return true;
+        }
+
+        // Check default import match. This branch only handles requests that do
+        // not also ask for a namespace; that combined shape is checked above.
         if let Some(def) = default_import {
-            if imp.default_import.as_deref() == Some(def) && imp.namespace_import.is_none() {
+            if namespace_import.is_none() && imp.default_import.as_deref() == Some(def) {
                 return true;
             }
         }
