@@ -59,6 +59,7 @@ call_aft() {
   local cmd="$1"
   local params="$2"
   local anchor="${3:-}"
+  local wait_for_helper="${4:-false}"
 
   local work_dir
   if [ -n "$anchor" ]; then
@@ -67,14 +68,13 @@ call_aft() {
     work_dir="$PWD"
   fi
 
-  # wait_for_helper=true makes configure block until the Go helper
-  # finishes, so same-process queries (the entire CLI flow) see resolved
-  # interface-dispatch edges. Without it, the helper thread gets killed
-  # when aft exits right after answering the command — cache never gets
-  # written, and cross-package interface calls stay unresolved.
+  # Graph commands pass wait_for_helper=true so same-process queries see
+  # resolved Go interface-dispatch edges. Plain read/search commands leave it
+  # false; otherwise reading a SQL migration inside a large Go repo can block on
+  # helper indexing even though the command does not use graph data.
   local config_req
   local cmd_req
-  config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  config_req=$(jq -cn --arg root "$work_dir" --argjson wait "$wait_for_helper" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:$wait}')
   cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
@@ -148,7 +148,7 @@ case "$CMD" in
     else
       PARAMS=$(jq -cn --arg f "$FILE" '{file:$f}')
     fi
-    call_aft "zoom" "$PARAMS" "$FILE"
+    call_aft "zoom" "$PARAMS" "$FILE" true
     ;;
 
   call_tree)
@@ -157,7 +157,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft call_tree <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "call_tree" "$PARAMS" "$FILE"
+    call_aft "call_tree" "$PARAMS" "$FILE" true
     ;;
 
   callers)
@@ -166,7 +166,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft callers <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "callers" "$PARAMS" "$FILE"
+    call_aft "callers" "$PARAMS" "$FILE" true
     ;;
 
   impact)
@@ -175,7 +175,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft impact <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "impact" "$PARAMS" "$FILE"
+    call_aft "impact" "$PARAMS" "$FILE" true
     ;;
 
   trace_to)
@@ -184,7 +184,7 @@ case "$CMD" in
     [ -z "$FILE" ] || [ -z "$SYMBOL" ] && { echo "Usage: aft trace_to <file> <symbol>"; exit 1; }
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" '{file:$f,symbol:$s}')
-    call_aft "trace_to" "$PARAMS" "$FILE"
+    call_aft "trace_to" "$PARAMS" "$FILE" true
     ;;
 
   trace_data)
@@ -201,7 +201,7 @@ case "$CMD" in
 
     PARAMS=$(jq -cn --arg f "$FILE" --arg s "$SYMBOL" --arg e "$EXPR" --argjson d "$DEPTH" \
       '{file:$f,symbol:$s,expression:$e,depth:$d}')
-    call_aft "trace_data" "$PARAMS" "$FILE"
+    call_aft "trace_data" "$PARAMS" "$FILE" true
     ;;
 
   read)
