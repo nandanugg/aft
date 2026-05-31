@@ -460,3 +460,106 @@ fn grep_fallback_supports_end_of_line_anchor() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+
+#[test]
+fn grep_explicit_gitignored_file_is_searched() {
+    // ripgrep parity: naming a gitignored file explicitly searches it anyway.
+    let project = setup_project(&[
+        ("captures/log.txt", "needle in a gitignored capture\n"),
+        (".gitignore", "captures/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-explicit-gitignored",
+            "command": "grep",
+            "pattern": "needle",
+            "path": "captures/log.txt",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 1,
+        "explicitly-named gitignored file must be searched: {response:?}"
+    );
+    assert_eq!(
+        response["no_files_matched_scope"], false,
+        "explicit existing file must not report empty scope: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_aftignore_excludes_from_directory_search() {
+    // .aftignore excludes paths from AFT's directory walk, layered on .gitignore.
+    let project = setup_project(&[
+        ("keep.rs", "findme here\n"),
+        ("vendored/sub.rs", "findme in vendored\n"),
+        (".aftignore", "vendored/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-aftignore-dir",
+            "command": "grep",
+            "pattern": "findme",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 1,
+        ".aftignored dir must be excluded from directory search: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_explicit_aftignored_file_is_searched() {
+    // Explicitly naming an .aftignored file still searches it (ripgrep parity).
+    let project = setup_project(&[
+        ("vendored/sub.rs", "needle in aftignored vendored\n"),
+        (".aftignore", "vendored/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-explicit-aftignored",
+            "command": "grep",
+            "pattern": "needle",
+            "path": "vendored/sub.rs",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["total_matches"], 1,
+        "explicitly-named .aftignored file must be searched: {response:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}

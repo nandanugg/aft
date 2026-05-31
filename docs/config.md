@@ -364,3 +364,21 @@ features guard against unbounded work to keep the bridge responsive:
 Commands with heavier workloads get longer per-call timeouts: 60s for `callers`, `trace_to`,
 `trace_data`, `impact`, `grep`, `glob`; 45s for `semantic_search`; 30s for everything else.
 For best results in very large trees, point AFT at a specific project subdirectory.
+
+
+## Ignoring files (`.gitignore` / `.aftignore`)
+
+Every AFT walk — trigram index, semantic index, call graph, and `aft_inspect` —
+honors `.gitignore` (including `.git/info/exclude` and nested `.gitignore`
+files) and skips common build directories (`node_modules`, `target`, `dist`,
+`build`, `.venv`, and similar).
+
+AFT also honors an optional **`.aftignore`** file: the same syntax as
+`.gitignore`, hierarchical, and working in non-git projects, layered on top of
+`.gitignore`. Use it to exclude paths AFT shouldn't index that you can't put in
+`.gitignore` — most commonly git submodules. Edits under an `.aftignore`d path
+also stop triggering reindexing.
+
+Naming a file explicitly in `grep` (e.g. `path: "captures/log.txt"`) searches it
+even when it is gitignored or `.aftignore`d, matching ripgrep — an explicitly
+named file is always searched.

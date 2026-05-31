@@ -1475,6 +1475,10 @@ pub(crate) fn walk_project_files_from(
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        // `.aftignore` — AFT-specific ignores layered on top of .gitignore.
+        // Honored hierarchically like .gitignore (works in non-git projects too),
+        // so users can exclude paths git can't (e.g. submodules) from indexing.
+        .add_custom_ignore_filename(".aftignore")
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {

@@ -679,8 +679,10 @@ fn watcher_path_is_infra_skip(path: &std::path::Path) -> bool {
     })
 }
 
-fn watcher_path_is_gitignore(path: &std::path::Path) -> bool {
-    path.file_name().map(|n| n == ".gitignore").unwrap_or(false)
+fn watcher_path_is_ignore_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .map(|n| n == ".gitignore" || n == ".aftignore")
+        .unwrap_or(false)
 }
 
 fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
@@ -706,8 +708,11 @@ where
 
     // If any .gitignore file changed, rebuild the matcher before filtering
     // this same batch so sibling events are checked against fresh rules.
-    if raw_paths.iter().any(|path| watcher_path_is_gitignore(path)) {
-        log::debug!("watcher: .gitignore changed, rebuilding matcher before filter");
+    if raw_paths
+        .iter()
+        .any(|path| watcher_path_is_ignore_file(path))
+    {
+        log::debug!("watcher: .gitignore/.aftignore changed, rebuilding matcher before filter");
         ctx.rebuild_gitignore();
     }
 

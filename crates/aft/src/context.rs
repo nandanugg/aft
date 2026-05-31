@@ -618,6 +618,20 @@ impl AppContext {
                 );
             }
         }
+        // Root .aftignore — AFT-specific ignores layered on top of .gitignore.
+        // Lets users exclude paths git can't (e.g. submodules) from AFT's
+        // walks/indexes. Honored by the watcher matcher too, so edits under an
+        // aftignored path don't trigger reindexing.
+        let root_aftignore = Path::new(&root).join(".aftignore");
+        if root_aftignore.exists() {
+            if let Some(err) = builder.add(&root_aftignore) {
+                crate::slog_warn!(
+                    "aftignore parse error in {}: {}",
+                    root_aftignore.display(),
+                    err
+                );
+            }
+        }
         // .git/info/exclude — manually added because GitignoreBuilder::new()
         // does not auto-discover it (verified against ignore-0.4.25 source).
         let info_exclude = Path::new(&root).join(".git").join("info").join("exclude");
@@ -650,10 +664,13 @@ impl AppContext {
             })
             .build();
         for entry in walker.flatten() {
-            if entry.file_name() == ".gitignore" && entry.path() != root_ignore {
+            let file_name = entry.file_name();
+            let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
+            let is_nested_aftignore = file_name == ".aftignore" && entry.path() != root_aftignore;
+            if is_nested_gitignore || is_nested_aftignore {
                 if let Some(err) = builder.add(entry.path()) {
                     crate::slog_warn!(
-                        "nested gitignore parse error in {}: {}",
+                        "nested ignore parse error in {}: {}",
                         entry.path().display(),
                         err
                     );

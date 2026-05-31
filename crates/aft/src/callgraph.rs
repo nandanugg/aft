@@ -4583,6 +4583,7 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .git_ignore(true)     // respect .gitignore
         .git_global(true)     // respect global gitignore
         .git_exclude(true)    // respect .git/info/exclude
+        .add_custom_ignore_filename(".aftignore") // AFT-specific ignores (e.g. submodules)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
@@ -5102,6 +5103,38 @@ export function funcB() {
         assert!(
             !file_names.contains(&"dep.ts".to_string()),
             "Should exclude node_modules, got: {:?}",
+            file_names
+        );
+    }
+
+    #[test]
+    fn callgraph_walker_excludes_aftignored() {
+        let dir = TempDir::new().unwrap();
+
+        // .aftignore is honored without a git repo (custom ignore file).
+        fs::write(dir.path().join(".aftignore"), "vendored/\n").unwrap();
+        fs::write(dir.path().join("main.ts"), "export function main() {}").unwrap();
+        fs::create_dir(dir.path().join("vendored")).unwrap();
+        fs::write(
+            dir.path().join("vendored").join("sub.ts"),
+            "export function sub() {}",
+        )
+        .unwrap();
+
+        let files: Vec<PathBuf> = walk_project_files(dir.path()).collect();
+        let file_names: Vec<String> = files
+            .iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            file_names.contains(&"main.ts".to_string()),
+            "Should include main.ts, got: {:?}",
+            file_names
+        );
+        assert!(
+            !file_names.contains(&"sub.ts".to_string()),
+            "Should exclude .aftignored sub.ts, got: {:?}",
             file_names
         );
     }
