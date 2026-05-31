@@ -685,6 +685,12 @@ fn watcher_path_is_ignore_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+fn watcher_path_is_source(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
+}
+
 fn watcher_project_root(ctx: &AppContext) -> Option<std::path::PathBuf> {
     let configured_root = ctx.config().project_root.clone();
     ctx.canonical_cache_root_opt()
@@ -787,6 +793,78 @@ where
     }
 }
 
+fn semantic_project_files_for_refresh(
+    root: &std::path::Path,
+    max_files: usize,
+) -> Result<Vec<std::path::PathBuf>, usize> {
+    aft::search_index::walk_project_files_bounded_default_matching(
+        root,
+        max_files,
+        aft::semantic_index::is_semantic_indexed_extension,
+    )
+}
+
+fn replay_search_index_pending_updates(
+    index: &mut aft::search_index::SearchIndex,
+    pending_paths: Vec<std::path::PathBuf>,
+) {
+    for path in pending_paths {
+        if path.exists() {
+            index.update_file(&path);
+        } else {
+            index.remove_file(&path);
+        }
+    }
+}
+
+fn spawn_search_corpus_refresh(
+    ctx: &AppContext,
+    root: std::path::PathBuf,
+    config: aft::config::Config,
+) {
+    if let Some(index) = ctx.search_index().borrow_mut().as_mut() {
+        index.ready = false;
+    }
+
+    let (tx, rx): (
+        crossbeam_channel::Sender<aft::search_index::SearchIndex>,
+        crossbeam_channel::Receiver<aft::search_index::SearchIndex>,
+    ) = crossbeam_channel::unbounded();
+    *ctx.search_index_rx().borrow_mut() = Some(rx);
+    ctx.reset_symbol_cache();
+
+    let is_worktree_bridge = ctx.is_worktree_bridge();
+    let session_id = log_ctx::current_session();
+    thread::spawn(move || {
+        log_ctx::with_session(session_id, || {
+            let cache_dir =
+                aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
+            let _cache_lock = if is_worktree_bridge {
+                None
+            } else {
+                match aft::search_index::CacheLock::acquire(&cache_dir) {
+                    Ok(lock) => Some(lock),
+                    Err(error) => {
+                        aft::slog_warn!(
+                            "failed to acquire search cache lock for ignore refresh: {}",
+                            error
+                        );
+                        None
+                    }
+                }
+            };
+            let index = aft::search_index::SearchIndex::build_with_limit(
+                &root,
+                config.search_index_max_file_size,
+            );
+            if !is_worktree_bridge {
+                index.write_to_disk(&cache_dir, index.stored_git_head());
+            }
+            let _ = tx.send(index);
+        });
+    });
+}
+
 fn refresh_corpus_after_ignore_change(ctx: &AppContext) {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return;
@@ -800,27 +878,13 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) {
     }
 
     if config.search_index {
-        let index = aft::search_index::SearchIndex::build_with_limit(
-            &root,
-            config.search_index_max_file_size,
-        );
-        if !ctx.is_worktree_bridge() {
-            let cache_dir =
-                aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
-            index.write_to_disk(&cache_dir, index.stored_git_head());
-        }
-        *ctx.search_index_rx().borrow_mut() = None;
-        *ctx.search_index().borrow_mut() = Some(index);
-        ctx.reset_symbol_cache();
+        spawn_search_corpus_refresh(ctx, root.clone(), config.clone());
         status_changed = true;
-        aft::slog_info!("refreshed search index after ignore-rule change");
+        aft::slog_info!("started search index refresh after ignore-rule change");
     }
 
     if config.semantic_search {
-        match aft::search_index::walk_project_files_bounded_default(
-            &root,
-            config.semantic.max_files,
-        ) {
+        match semantic_project_files_for_refresh(&root, config.semantic.max_files) {
             Ok(current_files) => {
                 if let Some(sender) = ctx.semantic_refresh_sender() {
                     let file_count = current_files.len();
@@ -841,6 +905,8 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) {
                             status_changed = true;
                         }
                     }
+                } else if ctx.semantic_index_rx().borrow().is_some() {
+                    ctx.mark_pending_semantic_corpus_refresh();
                 }
             }
             Err(_) => {
@@ -919,6 +985,18 @@ fn drain_watcher_events(ctx: &AppContext) {
         return;
     }
 
+    if ctx.search_index_rx().borrow().is_some() {
+        ctx.add_pending_search_index_paths(changed.iter().cloned());
+    }
+    let semantic_source_paths = changed
+        .iter()
+        .filter(|path| watcher_path_is_source(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if ctx.semantic_index_rx().borrow().is_some() && !semantic_source_paths.is_empty() {
+        ctx.add_pending_semantic_index_paths(semantic_source_paths.clone());
+    }
+
     if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
         for path in &changed {
             symbol_cache.invalidate(path);
@@ -929,10 +1007,8 @@ fn drain_watcher_events(ctx: &AppContext) {
     let mut graph_ref = ctx.callgraph().borrow_mut();
     if let Some(graph) = graph_ref.as_mut() {
         for path in &changed {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if SOURCE_EXTENSIONS.contains(&ext) {
-                    graph.invalidate_file(path);
-                }
+            if watcher_path_is_source(path) {
+                graph.invalidate_file(path);
             }
         }
     }
@@ -953,15 +1029,9 @@ fn drain_watcher_events(ctx: &AppContext) {
     let mut semantic_refresh_paths = Vec::new();
     if let Some(index) = semantic_index_ref.as_mut() {
         let mut stale_paths = Vec::new();
-        for path in &changed {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if SOURCE_EXTENSIONS.contains(&ext) {
-                    index.invalidate_file(path);
-                    if path.exists() {
-                        stale_paths.push(path.clone());
-                    }
-                }
-            }
+        for path in &semantic_source_paths {
+            index.invalidate_file(path);
+            stale_paths.push(path.clone());
         }
         if !stale_paths.is_empty() {
             let mut status = ctx.semantic_index_status().borrow_mut();
@@ -1019,7 +1089,11 @@ fn drain_search_index_events(ctx: &AppContext) {
         latest
     };
 
-    if let Some(index) = latest {
+    if let Some(mut index) = latest {
+        let pending_paths = ctx.take_pending_search_index_paths();
+        if !pending_paths.is_empty() {
+            replay_search_index_pending_updates(&mut index, pending_paths);
+        }
         *ctx.search_index().borrow_mut() = Some(index);
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
@@ -1045,6 +1119,8 @@ fn drain_semantic_index_events(ctx: &AppContext) {
 
     let mut keep_receiver = true;
     let mut status_changed = false;
+    let mut replay_refresh_paths = Vec::new();
+    let mut replay_corpus_refresh = false;
     for event in events {
         match event {
             SemanticIndexEvent::Progress {
@@ -1060,13 +1136,23 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                     entries_total,
                 };
             }
-            SemanticIndexEvent::Ready(index) => {
+            SemanticIndexEvent::Ready(mut index) => {
+                let pending_paths = ctx.take_pending_semantic_index_paths();
+                for path in pending_paths {
+                    if watcher_path_is_source(&path) {
+                        index.invalidate_file(&path);
+                        replay_refresh_paths.push(path);
+                    }
+                }
+                replay_corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
                 *ctx.semantic_index().borrow_mut() = Some(index);
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
                 keep_receiver = false;
                 status_changed = true;
             }
             SemanticIndexEvent::Failed(error) => {
+                let _ = ctx.take_pending_semantic_index_paths();
+                let _ = ctx.take_pending_semantic_corpus_refresh();
                 *ctx.semantic_index().borrow_mut() = None;
                 ctx.clear_semantic_refresh_worker();
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
@@ -1079,6 +1165,73 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     if !keep_receiver {
         *ctx.semantic_index_rx().borrow_mut() = None;
     }
+
+    if replay_corpus_refresh {
+        if let Some(root) = ctx.canonical_cache_root_opt() {
+            let config = ctx.config().clone();
+            match semantic_project_files_for_refresh(&root, config.semantic.max_files) {
+                Ok(current_files) => {
+                    let file_count = current_files.len();
+                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                        stage: "refreshing_corpus".to_string(),
+                        files: Some(file_count),
+                        entries_done: None,
+                        entries_total: None,
+                    };
+                    let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+                        sender
+                            .send(SemanticRefreshRequest::Corpus { current_files })
+                            .is_ok()
+                    });
+                    if !sent {
+                        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(
+                            "semantic corpus refresh worker unavailable".to_string(),
+                        );
+                    }
+                    status_changed = true;
+                }
+                Err(_) => {
+                    ctx.clear_semantic_refresh_worker();
+                    *ctx.semantic_index().borrow_mut() = None;
+                    *ctx.semantic_index_status().borrow_mut() =
+                        SemanticIndexStatus::Failed(format!(
+                            "too many files (>{}) for semantic indexing (max {})",
+                            config.semantic.max_files, config.semantic.max_files
+                        ));
+                    status_changed = true;
+                }
+            }
+        }
+    } else if !replay_refresh_paths.is_empty() {
+        {
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                for path in &replay_refresh_paths {
+                    status.add_refreshing_file(path.clone());
+                }
+                status_changed = true;
+            }
+        }
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest::Files {
+                    paths: replay_refresh_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            aft::slog_warn!(
+                "semantic refresh worker unavailable; dropping {} replayed file(s)",
+                replay_refresh_paths.len()
+            );
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            for path in &replay_refresh_paths {
+                status.cancel_refreshing_file(path);
+            }
+            status_changed = true;
+        }
+    }
+
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
