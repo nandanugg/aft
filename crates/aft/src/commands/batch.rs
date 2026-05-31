@@ -25,9 +25,11 @@ struct ResolvedEdit {
 ///       - `{ "match": "...", "replacement": "..." }` — string match-replace
 ///       - `{ "line_start": N, "line_end": N, "content": "..." }` — line range replacement (1-based, inclusive)
 ///
-/// Returns on success: `{ file, edits_applied, syntax_valid, backup_id? }`
+/// Returns on success: `{ file, edits_applied, syntax_valid?, backup_id? }`.
+/// `syntax_valid` is absent when syntax validation could not run.
 /// Returns on failure: error with the failing edit index.
 pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -87,17 +89,18 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // Phase 2: Auto-backup once before applying (skip for dry-run)
-    let dry_run = edit::is_dry_run(&req.params);
-    let backup_id = if !dry_run {
-        match edit::auto_backup(ctx, req.session(), &path, "batch: pre-batch backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
+    // Phase 2: Auto-backup once before applying
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "batch: pre-batch backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
         }
-    } else {
-        None
     };
 
     // Phase 3: Sort edits by byte_start descending (bottom-to-top) to prevent drift
@@ -133,17 +136,6 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         };
     }
 
-    // Dry-run: return combined diff without modifying disk
-    if dry_run {
-        let dr = edit::dry_run_diff(&source, &content, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid, "edits_applied": resolved.len(),
-            }),
-        );
-    }
-
     // Phase 5: Write, format, and validate via shared pipeline
     let mut write_result =
         match edit::write_format_validate(&path, &content, &ctx.config(), &req.params) {
@@ -154,19 +146,20 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("batch: {} edits in {}", edits.len(), file);
 
-    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
-
     let mut result = serde_json::json!({
         "file": file,
         "edits_applied": edits.len(),
-        "syntax_valid": syntax_valid,
         "formatted": write_result.formatted,
     });
+
+    if let Some(valid) = write_result.syntax_valid {
+        result["syntax_valid"] = serde_json::json!(valid);
+    }
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -225,7 +218,7 @@ fn resolve_edit(
 
         if fuzzy_matches[0].pass > 1 {
             log::debug!(
-                "[aft] batch: edit[{}] fuzzy match (pass {}) for '{}'",
+                "batch: edit[{}] fuzzy match (pass {}) for '{}'",
                 index,
                 fuzzy_matches[0].pass,
                 match_str

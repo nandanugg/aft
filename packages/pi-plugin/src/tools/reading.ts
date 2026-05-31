@@ -5,11 +5,11 @@
 
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
-import { discoverSourceFiles } from "../shared/discover-files.js";
+import { formatZoomMultiTargetResult, formatZoomText } from "@cortexkit/aft-bridge";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   accentPath,
   asRecord,
@@ -25,35 +25,80 @@ import {
 } from "./render-helpers.js";
 
 const OutlineParams = Type.Object({
-  filePath: Type.Optional(
-    Type.String({
-      description: "Path to a single file to outline. Directories are auto-detected.",
-    }),
-  ),
+  target: Type.Union([Type.String(), Type.Array(Type.String())], {
+    description:
+      "What to outline: a file path, directory path, URL (http:// or https://), or array of file paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file. Directory walks cap at 200 files.",
+  }),
   files: Type.Optional(
-    Type.Array(Type.String(), { description: "Array of file paths to outline in one call" }),
-  ),
-  directory: Type.Optional(
-    Type.String({ description: "Directory to outline recursively (200 file cap)" }),
+    Type.Boolean({
+      description:
+        "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+    }),
   ),
 });
 
-const ZoomParams = Type.Object({
+const ZoomTarget = Type.Object({
   filePath: Type.String({ description: "Path to file (absolute or project-relative)" }),
-  symbol: Type.Optional(
-    Type.String({ description: "Symbol name (function/class/type) or Markdown heading" }),
+  symbol: Type.String({ description: "Symbol name in that file" }),
+});
+
+const ZoomParams = Type.Object({
+  filePath: Type.Optional(
+    Type.String({ description: "Path to file (absolute or project-relative)" }),
+  ),
+  url: Type.Optional(
+    Type.String({
+      description: "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+    }),
   ),
   symbols: Type.Optional(
-    Type.Array(Type.String(), { description: "Multiple symbols — returns array of matches" }),
+    Type.Union([Type.String(), Type.Array(Type.String())], {
+      description:
+        "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+    }),
+  ),
+  targets: Type.Optional(
+    Type.Union([ZoomTarget, Type.Array(ZoomTarget)], {
+      description:
+        "Cross-file batch: `{ filePath, symbol }` or an array of them. Mutually exclusive with filePath/url/symbols.",
+    }),
   ),
   contextLines: Type.Optional(
     Type.Number({ description: "Lines of context before/after (default: 3)" }),
   ),
+  callgraph: Type.Optional(
+    Type.Boolean({
+      description:
+        "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+    }),
+  ),
 });
+
+function isUrl(s: string): boolean {
+  return s.startsWith("http://") || s.startsWith("https://");
+}
+
+/** Best-effort label for renderers when zoom is called with `filePath` OR `url`. */
+function zoomTargetLabel(args: { filePath?: string; url?: string }): string {
+  return args.filePath ?? args.url ?? "(no target)";
+}
 
 export interface ReadingSurface {
   outline: boolean;
   zoom: boolean;
+}
+
+interface ZoomBatchSymbolResult {
+  name: string;
+  success: boolean;
+  content?: string;
+  error?: string;
+}
+
+interface ZoomBatchResult {
+  complete: boolean;
+  symbols: ZoomBatchSymbolResult[];
+  text: string;
 }
 
 /** Exported for renderer unit tests. */
@@ -72,6 +117,33 @@ export function buildZoomSections(
   payload: unknown,
   theme: Theme,
 ): string[] {
+  const batch = asRecord(payload);
+  if (Array.isArray(batch?.symbols)) {
+    const header = batch.complete === false ? [theme.fg("warning", "Incomplete zoom results")] : [];
+    const items = batch.symbols as unknown[];
+    return [
+      ...header,
+      ...items.map((item) => {
+        const record = asRecord(item);
+        if (!record) return theme.fg("muted", "No zoom result available.");
+        const name = asString(record.name) ?? "(unknown symbol)";
+        if (record.success === false) {
+          return theme.fg(
+            "error",
+            `Symbol "${name}" not found: ${asString(record.error) ?? "zoom failed"}`,
+          );
+        }
+        const content = asString(record.content);
+        return [
+          `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(zoomTargetLabel(args)))}`,
+          content,
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }),
+    ];
+  }
+
   const items = Array.isArray(payload) ? payload : payload ? [payload] : [];
   if (items.length === 0) return [theme.fg("muted", "No zoom result available.")];
 
@@ -86,10 +158,11 @@ export function buildZoomSections(
       const startLine =
         range && typeof range.start_line === "number" ? range.start_line : undefined;
       const endLine = range && typeof range.end_line === "number" ? range.end_line : undefined;
+      const targetLabel = zoomTargetLabel(args);
       const location =
         startLine !== undefined
-          ? `${shortenPath(args.filePath)}:${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ""}`
-          : shortenPath(args.filePath);
+          ? `${shortenPath(targetLabel)}:${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ""}`
+          : shortenPath(targetLabel);
       const lines = [`${theme.fg("accent", name)} ${theme.fg("muted", `[${kind}] ${location}`)}`];
 
       const content = asString(record.content);
@@ -139,13 +212,11 @@ export function renderOutlineCall(
   theme: Theme,
   context: RenderContextLike,
 ) {
-  const summary = args.filePath
-    ? accentPath(theme, args.filePath)
-    : args.directory
-      ? `${theme.fg("muted", "dir")} ${accentPath(theme, args.directory)}`
-      : args.files && args.files.length > 0
-        ? theme.fg("accent", `${args.files.length} files`)
-        : undefined;
+  const summary = Array.isArray(args.target)
+    ? theme.fg("accent", `${args.target.length} ${args.files ? "directories" : "files"}`)
+    : typeof args.target === "string"
+      ? `${accentPath(theme, args.target)}${args.files ? " files" : ""}`
+      : undefined;
   return renderToolCall("outline", summary, theme, context);
 }
 
@@ -165,12 +236,27 @@ export function renderZoomCall(
   theme: Theme,
   context: RenderContextLike,
 ) {
-  const target = args.symbol
-    ? theme.fg("toolOutput", args.symbol)
-    : args.symbols && args.symbols.length > 0
-      ? theme.fg("toolOutput", `${args.symbols.length} symbols`)
-      : theme.fg("toolOutput", "lines");
-  return renderToolCall("zoom", `${accentPath(theme, args.filePath)} ${target}`, theme, context);
+  // `symbols` accepts string OR string[]; renderer adapts to both shapes.
+  const symbols = args.symbols;
+  const targets = args.targets;
+  let summary: string;
+  if (typeof symbols === "string") {
+    summary = theme.fg("toolOutput", symbols);
+  } else if (Array.isArray(symbols) && symbols.length > 0) {
+    summary = theme.fg("toolOutput", `${symbols.length} symbols`);
+  } else if (Array.isArray(targets) && targets.length > 0) {
+    summary = theme.fg("toolOutput", `${targets.length} targets`);
+  } else if (targets && typeof targets === "object" && !Array.isArray(targets)) {
+    summary = theme.fg("toolOutput", (targets as { symbol?: string }).symbol ?? "1 target");
+  } else {
+    summary = theme.fg("toolOutput", "lines");
+  }
+  return renderToolCall(
+    "zoom",
+    `${accentPath(theme, zoomTargetLabel(args))} ${summary}`,
+    theme,
+    context,
+  );
 }
 
 /** Exported for renderer unit tests. */
@@ -194,7 +280,7 @@ export function registerReadingTools(
       name: "aft_outline",
       label: "outline",
       description:
-        "Structural outline of source code or Markdown. For code, returns symbols (functions, classes, types) with line ranges. For Markdown/HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom.\n\nProvide exactly ONE of: `filePath`, `files`, or `directory`.",
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
       parameters: OutlineParams,
       async execute(
         _toolCallId: string,
@@ -204,48 +290,87 @@ export function registerReadingTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const hasFilePath = typeof params.filePath === "string" && params.filePath.length > 0;
-        const hasFiles = Array.isArray(params.files) && params.files.length > 0;
-        const hasDirectory = typeof params.directory === "string" && params.directory.length > 0;
+        const target = params.target;
+        const filesMode = params.files === true;
+        const isArray = Array.isArray(target) && target.length > 0;
 
-        const provided = [hasFilePath, hasFiles, hasDirectory].filter(Boolean).length;
-        if (provided === 0) {
-          throw new Error("Provide exactly one of 'filePath', 'files', or 'directory'");
-        }
-        if (provided > 1) {
-          throw new Error(
-            "Provide exactly ONE of 'filePath', 'files', or 'directory' — not multiple",
-          );
-        }
+        if (filesMode) {
+          if (Array.isArray(target)) {
+            if (target.length === 0) {
+              throw new Error("'target' must be a non-empty string or array of strings");
+            }
+            const response = await callBridge(bridge, "outline", { target, files: true }, extCtx);
+            if (response.success === false) {
+              throw new Error((response.message as string) || "outline failed");
+            }
+            return textResult(formatOutlineFilesText(response), response);
+          }
 
-        // Auto-detect directory passed as filePath.
-        let dirArg = hasDirectory ? params.directory : undefined;
-        if (!dirArg && hasFilePath) {
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
+          }
+
+          let isDirectory = false;
           try {
-            const resolved = resolve(extCtx.cwd, params.filePath as string);
+            const resolved = resolve(extCtx.cwd, target);
             const st = await stat(resolved);
-            if (st.isDirectory()) dirArg = params.filePath;
+            isDirectory = st.isDirectory();
           } catch {
-            // not a dir or missing — fall through
+            // Let Rust report missing paths with its structured error shape.
           }
+
+          const request = isDirectory
+            ? { directory: resolve(extCtx.cwd, target), files: true }
+            : { file: target, files: true };
+          const response = await callBridge(bridge, "outline", request, extCtx);
+          if (response.success === false) {
+            throw new Error((response.message as string) || "outline failed");
+          }
+          return textResult(formatOutlineFilesText(response), response);
         }
 
-        if (dirArg) {
-          const dirPath = resolve(extCtx.cwd, dirArg);
-          const files = await discoverSourceFiles(dirPath);
-          if (files.length === 0) {
-            return textResult(`No source files found under ${dirArg}`);
+        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
+        if (typeof target === "string" && isUrl(target)) {
+          const response = await callBridge(bridge, "outline", { file: target }, extCtx);
+          if (response.success === false) {
+            throw new Error((response.message as string) || "outline failed");
           }
-          const response = await callBridge(bridge, "outline", { files }, extCtx);
           return textResult(formatOutlineText(response));
         }
 
-        if (hasFiles) {
-          const response = await callBridge(bridge, "outline", { files: params.files }, extCtx);
+        // Multi-file mode
+        if (isArray) {
+          const response = await callBridge(
+            bridge,
+            "outline",
+            { files: target as string[] },
+            extCtx,
+          );
           return textResult(formatOutlineText(response));
         }
 
-        const response = await callBridge(bridge, "outline", { file: params.filePath }, extCtx);
+        if (typeof target !== "string" || target.length === 0) {
+          throw new Error("'target' must be a non-empty string or array of strings");
+        }
+
+        // Stat to disambiguate file vs directory
+        let isDirectory = false;
+        try {
+          const resolved = resolve(extCtx.cwd, target);
+          const st = await stat(resolved);
+          isDirectory = st.isDirectory();
+        } catch {
+          // path doesn't exist locally — fall through to single-file mode and let
+          // Rust report the real error
+        }
+
+        if (isDirectory) {
+          const dirPath = resolve(extCtx.cwd, target);
+          const response = await callBridge(bridge, "outline", { directory: dirPath }, extCtx);
+          return textResult(JSON.stringify(response, null, 2), response);
+        }
+
+        const response = await callBridge(bridge, "outline", { file: target }, extCtx);
         return textResult(formatOutlineText(response));
       },
       renderCall(args, theme, context) {
@@ -262,7 +387,7 @@ export function registerReadingTools(
       name: "aft_zoom",
       label: "zoom",
       description:
-        "Inspect a code symbol or Markdown/HTML section. For code, returns the full source of the symbol with call-graph annotations (calls/called-by). Pass `symbols` for batched lookups.",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them.",
       parameters: ZoomParams,
       async execute(
         _toolCallId: string,
@@ -272,27 +397,145 @@ export function registerReadingTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
+        // GPT-family models send empty strings / empty arrays / empty objects
+        // instead of omitting optional params. Use `isEmptyParam` so e.g.
+        // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
+        // against fields the agent didn't actually intend to provide.
+        // `targets` also accepts nested object/array shapes. Only treat
+        // `targets` as not-provided when EVERY entry is fully empty
+        // (`[{filePath: "", symbol: ""}]`, `{filePath: "", symbol: ""}`)
+        // — that's the GPT-class "I didn't intend this param" signal.
+        // If any entry has even one non-empty field, the agent intends
+        // targets mode; let the per-entry validation below surface the
+        // specific error ("targets[0].filePath must be non-empty" etc).
+        const hasTargetsProvided = (t: unknown): boolean => {
+          if (isEmptyParam(t)) return false;
+          const entryEmpty = (entry: unknown): boolean => {
+            if (!entry || typeof entry !== "object") return true;
+            const fp = (entry as { filePath?: unknown }).filePath;
+            const sym = (entry as { symbol?: unknown }).symbol;
+            const fpEmpty = typeof fp !== "string" || fp.length === 0;
+            const symEmpty = typeof sym !== "string" || sym.length === 0;
+            return fpEmpty && symEmpty;
+          };
+          if (Array.isArray(t)) return !t.every(entryEmpty);
+          return !entryEmpty(t);
+        };
+        const hasFilePath = !isEmptyParam(params.filePath);
+        const hasUrl = !isEmptyParam(params.url);
+        const hasTargets = hasTargetsProvided(params.targets);
+        const hasSymbols = !isEmptyParam(params.symbols);
+        const wantCallgraph = params.callgraph === true;
 
-        // Multi-symbol: fire in parallel and JSON-stringify the array.
-        // Uses callBridge (not bridge.send directly) so each parallel request
-        // carries Pi's native session_id — otherwise multi-symbol zoom would
-        // bypass per-session undo/checkpoint scoping.
-        if (Array.isArray(params.symbols) && params.symbols.length > 0) {
-          const results = await Promise.all(
-            params.symbols.map((sym) => {
-              const req: Record<string, unknown> = { file: params.filePath, symbol: sym };
+        // Multi-target mode (cross-file). Mutually exclusive with the other
+        // modes so the agent doesn't accidentally provide overlapping inputs
+        // that get silently ignored.
+        if (hasTargets) {
+          if (hasFilePath || hasUrl || hasSymbols) {
+            throw new Error(
+              "'targets' is mutually exclusive with 'filePath', 'url', and 'symbols'",
+            );
+          }
+          const targets = Array.isArray(params.targets)
+            ? (params.targets as Array<{ filePath: string; symbol: string }>)
+            : ([params.targets] as Array<{ filePath: string; symbol: string }>);
+          if (targets.length === 0) {
+            throw new Error("'targets' must be a non-empty object or array");
+          }
+          for (const [i, entry] of targets.entries()) {
+            if (!entry || typeof entry.filePath !== "string" || entry.filePath.length === 0) {
+              throw new Error(`targets[${i}].filePath must be a non-empty string`);
+            }
+            if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
+              throw new Error(`targets[${i}].symbol must be a non-empty string`);
+            }
+          }
+          const responses = await Promise.all(
+            targets.map((t) => {
+              const req: Record<string, unknown> = { file: t.filePath, symbol: t.symbol };
               if (params.contextLines !== undefined) req.context_lines = params.contextLines;
-              return callBridge(bridge, "zoom", req, extCtx);
+              if (wantCallgraph) req.callgraph = true;
+              return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
+                success: false,
+                message: err instanceof Error ? err.message : String(err),
+              }));
             }),
           );
-          return textResult(JSON.stringify(results, null, 2));
+          const entries = targets.map((t, i) => ({
+            targetLabel: t.filePath,
+            name: t.symbol,
+            response: responses[i] ?? { success: false, message: "missing zoom response" },
+          }));
+          const batch = formatZoomMultiTargetResult(entries);
+          return textResult(batch.text, batch);
         }
 
-        const req: Record<string, unknown> = { file: params.filePath };
-        if (params.symbol) req.symbol = params.symbol;
+        if (!hasFilePath && !hasUrl) {
+          throw new Error("Provide exactly one of 'filePath', 'url', or 'targets'");
+        }
+        if (hasFilePath && hasUrl) {
+          throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
+        }
+
+        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
+        const file = hasUrl ? (params.url as string) : (params.filePath as string);
+
+        // Header label — what the agent typed, not the on-disk cache path.
+        const targetLabel = (hasUrl ? params.url : params.filePath) ?? file;
+
+        // Normalize symbols → array (or undefined if not provided).
+        // String input is treated as a single-element array; the single-symbol
+        // shortcut returns the raw zoom text instead of a batch wrapper so the
+        // happy path doesn't show "Incomplete" framing.
+        const symbolsArray: string[] | undefined = hasSymbols
+          ? typeof params.symbols === "string"
+            ? [params.symbols]
+            : (params.symbols as string[])
+          : undefined;
+
+        if (symbolsArray) {
+          const results = await Promise.all(
+            symbolsArray.map((sym) => {
+              const req: Record<string, unknown> = { file, symbol: sym };
+              if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+              if (wantCallgraph) req.callgraph = true;
+              return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
+                success: false,
+                message: err instanceof Error ? err.message : String(err),
+              }));
+            }),
+          );
+          if (symbolsArray.length === 1) {
+            const response = results[0] ?? { success: false, message: "missing zoom response" };
+            if ((response as { success?: boolean }).success === false) {
+              throw new Error(
+                ((response as { message?: string }).message as string) || "zoom failed",
+              );
+            }
+            return textResult(
+              formatZoomText(targetLabel, response as Record<string, unknown>),
+              response,
+            );
+          }
+          const batch = formatZoomBatchResult(targetLabel, symbolsArray, results);
+          return textResult(batch.text, batch);
+        }
+
+        // No symbols specified: zoom by line-range fallback (or whole file).
+        const req: Record<string, unknown> = { file };
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
+        if (wantCallgraph) req.callgraph = true;
         const response = await callBridge(bridge, "zoom", req, extCtx);
-        return textResult(JSON.stringify(response, null, 2));
+        if (response.success === false) {
+          throw new Error((response.message as string) || "zoom failed");
+        }
+        // The agent gets the formatted plain-text view; the Pi UI renderer
+        // needs the raw response as a structured payload so it can produce
+        // its own pretty box (name + kind + location header + indented body).
+        // Without `details` the renderer would fall back to JSON.parse on the
+        // formatted text (which isn't JSON) and print "No zoom result
+        // available" even though the agent sees the real content.
+        return textResult(formatZoomText(targetLabel, response), response);
       },
       renderCall(args, theme, context) {
         return renderZoomCall(args, theme, context);
@@ -302,6 +545,46 @@ export function registerReadingTools(
       },
     });
   }
+}
+
+/**
+ * Format multi-symbol zoom results as plain text. Successful entries use
+ * `formatZoomText` (line-numbered, no JSON escapes); failures render as
+ * `Symbol "name" not found: <reason>`. Sections are blank-line separated.
+ *
+ * Exported for regression tests. Output is byte-identical to the OpenCode
+ * plugin's formatZoomBatchResult — both hosts share `formatZoomText` from
+ * `@cortexkit/aft-bridge` so the agent sees the same shape across hosts.
+ */
+export function formatZoomBatchResult(
+  targetLabel: string,
+  symbols: string[],
+  responses: Record<string, unknown>[],
+): ZoomBatchResult {
+  const entries = symbols.map((name, index): ZoomBatchSymbolResult => {
+    const response = responses[index] ?? { success: false, message: "missing zoom response" };
+    if (response.success === false) {
+      const message =
+        typeof response.message === "string" && response.message.length > 0
+          ? response.message
+          : "zoom failed";
+      return { name, success: false, error: message };
+    }
+    return { name, success: true, content: formatZoomText(targetLabel, response) };
+  });
+  const complete = entries.every((entry) => entry.success);
+  const sections: string[] = [];
+  if (!complete) {
+    sections.push("Incomplete zoom results: one or more symbols failed.");
+  }
+  for (const entry of entries) {
+    if (entry.success) {
+      sections.push(entry.content ?? "");
+    } else {
+      sections.push(`Symbol "${entry.name}" not found: ${entry.error ?? "zoom failed"}`);
+    }
+  }
+  return { complete, symbols: entries, text: sections.join("\n\n") };
 }
 
 /**
@@ -315,6 +598,8 @@ interface SkippedOutlineFile {
   reason: string;
 }
 
+const MAX_UNCHECKED_FILES_IN_FOOTER = 10;
+
 function formatOutlineText(response: Record<string, unknown>): string {
   const text = (response.text as string | undefined) ?? "";
   const skipped = response.skipped_files as SkippedOutlineFile[] | undefined;
@@ -324,4 +609,49 @@ function formatOutlineText(response: Record<string, unknown>): string {
   const lines = skipped.map(({ file, reason }) => `  ${file} — ${reason}`).join("\n");
   const header = text.length > 0 ? `${text}\n\n` : "";
   return `${header}Skipped ${skipped.length} file(s):\n${lines}`;
+}
+
+export function formatOutlineFilesText(response: Record<string, unknown>): string {
+  const text = formatOutlineText(response);
+  const uncheckedFiles = Array.isArray(response.unchecked_files)
+    ? response.unchecked_files.filter(
+        (file): file is string => typeof file === "string" && file.length > 0,
+      )
+    : [];
+  const isPartial =
+    response.complete === false || response.walk_truncated === true || uncheckedFiles.length > 0;
+
+  if (!isPartial) {
+    return text;
+  }
+
+  const footer: string[] = [];
+  if (response.walk_truncated === true) {
+    const uncheckedCount = uncheckedFiles.length;
+    const suffix =
+      uncheckedCount > 0
+        ? ` ${uncheckedCount} additional files in this directory were not indexed.`
+        : " Some files in this directory were not indexed.";
+    footer.push(`⚠ Partial result: walk truncated at 200 files.${suffix}`);
+  } else {
+    const suffix =
+      uncheckedFiles.length > 0
+        ? ` ${uncheckedFiles.length} files in this directory were not indexed.`
+        : " Some files in this directory were not indexed.";
+    footer.push(`⚠ Partial result:${suffix}`);
+  }
+
+  if (uncheckedFiles.length > 0) {
+    footer.push("Unchecked files:");
+    footer.push(
+      ...uncheckedFiles.slice(0, MAX_UNCHECKED_FILES_IN_FOOTER).map((file) => `  ${file}`),
+    );
+    const remaining = uncheckedFiles.length - MAX_UNCHECKED_FILES_IN_FOOTER;
+    if (remaining > 0) {
+      footer.push(`  ... +${remaining} more`);
+    }
+  }
+
+  const header = text.length > 0 ? `${text}\n\n` : "";
+  return `${header}${footer.join("\n")}`;
 }

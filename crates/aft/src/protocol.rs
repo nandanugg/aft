@@ -1,5 +1,436 @@
 use serde::{Deserialize, Serialize};
 
+use crate::bash_background::BgTaskStatus;
+
+/// Full payload returned by the `status` command and cached by status push frames.
+pub type StatusPayload = serde_json::Value;
+
+/// v0.18 streaming semantics for hoisted bash.
+///
+/// Foreground `bash` execution may emit zero or more `progress` frames before
+/// its final `Response`. Each progress frame is NDJSON on stdout with the same
+/// `request_id` as the original request and a `kind` of `stdout` or `stderr`.
+/// The final response remains the existing `{ id, success, ... }` envelope so
+/// older callers can ignore streaming frames. Bash permission prompts use the
+/// recognized `permission_required` error code; Phase 1 Track C will attach the
+/// full permission ask payload and retry loop.
+pub const ERROR_PERMISSION_REQUIRED: &str = "permission_required";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub request_id: String,
+    pub kind: ProgressKind,
+    pub chunk: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PermissionAskFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub request_id: String,
+    pub asks: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BashCompletedFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub task_id: String,
+    pub session_id: String,
+    pub status: BgTaskStatus,
+    pub exit_code: Option<i32>,
+    pub command: String,
+    /// Tail of stdout+stderr (≤300 bytes), already decoded as lossy UTF-8.
+    /// Empty string when no output was captured. Used by plugins to inline
+    /// short results in the system-reminder so agents don't need a follow-up
+    /// `bash_status` round-trip for typical short commands.
+    #[serde(default)]
+    pub output_preview: String,
+    /// True when the task produced more output than `output_preview` shows
+    /// (rotated buffer, file > 300 bytes, etc). Plugins use this to render a
+    /// `…` prefix and signal that `bash_status` would return more.
+    #[serde(default)]
+    pub output_truncated: bool,
+    /// Token count of raw stdout+stderr before compression. Omitted when the
+    /// payload exceeded the 128 KiB per-stream tokenization cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_tokens: Option<u32>,
+    /// Token count of the compressed completion payload. Omitted when raw
+    /// tokenization was skipped due to the cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compressed_tokens: Option<u32>,
+    /// True when output exceeded the tokenization cap and was not measured.
+    #[serde(default)]
+    pub tokens_skipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BashLongRunningFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub task_id: String,
+    pub session_id: String,
+    pub command: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BashPatternMatchFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    pub task_id: String,
+    pub session_id: String,
+    pub watch_id: String,
+    pub match_text: String,
+    pub match_offset: u64,
+    pub context: String,
+    pub once: bool,
+    pub reason: &'static str,
+}
+
+/// Pushed after configure has completed, when the deferred file walk and
+/// language detection produce warnings (missing formatter/checker/LSP binaries,
+/// or "project too large" file-count exceeded). The walk runs in a background
+/// thread so configure itself returns in <100 ms even on huge directories
+/// (e.g. user's $HOME). When the walk finishes, AFT pushes one frame with
+/// the merged warnings — the plugin delivers them through the same path as
+/// the synchronous warnings that configure used to return.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigureWarningsFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    /// Session id from the configure request that spawned the deferred walk.
+    /// Project-shared bridges can serve multiple sessions, so plugins need this
+    /// to route async warning notifications back to the initiating session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Project root the warnings refer to. Plugins use this to scope the
+    /// session-id deduplication of repeated identical warnings.
+    pub project_root: String,
+    /// Source-file count discovered by the bounded walk (may stop short of
+    /// the full count if `max_callgraph_files` is exceeded).
+    pub source_file_count: usize,
+    /// `true` when the walk hit the configured `max_callgraph_files` cap;
+    /// in that case `source_file_count` is `cap + 1`.
+    pub source_file_count_exceeds_max: bool,
+    /// Configured callgraph file cap, echoed for plugin display.
+    pub max_callgraph_files: usize,
+    /// Merged formatter/checker/LSP missing-binary warnings.
+    pub warnings: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusChangedFrame {
+    #[serde(rename = "type")]
+    pub frame_type: &'static str,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub snapshot: StatusPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum PushFrame {
+    Progress(ProgressFrame),
+    BashCompleted(BashCompletedFrame),
+    BashLongRunning(BashLongRunningFrame),
+    BashPatternMatch(BashPatternMatchFrame),
+    ConfigureWarnings(ConfigureWarningsFrame),
+    StatusChanged(StatusChangedFrame),
+}
+
+impl PermissionAskFrame {
+    pub fn new(request_id: impl Into<String>, asks: serde_json::Value) -> Self {
+        Self {
+            frame_type: "permission_ask",
+            request_id: request_id.into(),
+            asks,
+        }
+    }
+}
+
+impl ProgressFrame {
+    pub fn new(
+        request_id: impl Into<String>,
+        kind: ProgressKind,
+        chunk: impl Into<String>,
+    ) -> Self {
+        Self {
+            frame_type: "progress",
+            request_id: request_id.into(),
+            kind,
+            chunk: chunk.into(),
+        }
+    }
+}
+
+impl ConfigureWarningsFrame {
+    pub fn new(
+        project_root: impl Into<String>,
+        source_file_count: usize,
+        source_file_count_exceeds_max: bool,
+        max_callgraph_files: usize,
+        warnings: Vec<serde_json::Value>,
+    ) -> Self {
+        Self::new_with_session_id(
+            None,
+            project_root,
+            source_file_count,
+            source_file_count_exceeds_max,
+            max_callgraph_files,
+            warnings,
+        )
+    }
+
+    pub fn new_with_session_id(
+        session_id: Option<String>,
+        project_root: impl Into<String>,
+        source_file_count: usize,
+        source_file_count_exceeds_max: bool,
+        max_callgraph_files: usize,
+        warnings: Vec<serde_json::Value>,
+    ) -> Self {
+        Self {
+            frame_type: "configure_warnings",
+            session_id,
+            project_root: project_root.into(),
+            source_file_count,
+            source_file_count_exceeds_max,
+            max_callgraph_files,
+            warnings,
+        }
+    }
+}
+
+impl StatusChangedFrame {
+    pub fn new(session_id: Option<String>, snapshot: StatusPayload) -> Self {
+        Self {
+            frame_type: "status_changed",
+            session_id,
+            snapshot: status_push_payload(snapshot),
+        }
+    }
+}
+
+fn status_push_payload(mut snapshot: StatusPayload) -> StatusPayload {
+    if let Some(object) = snapshot.as_object_mut() {
+        object.remove("session");
+        if let Some(compression) = object
+            .get_mut("compression")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            compression.remove("session");
+        }
+    }
+    snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[derive(Debug, Deserialize)]
+    struct ConfigureWarningsFrameRoundTrip {
+        #[serde(rename = "type")]
+        frame_type: String,
+        session_id: Option<String>,
+        project_root: String,
+        source_file_count: usize,
+        max_callgraph_files: usize,
+        warnings: Vec<serde_json::Value>,
+    }
+
+    #[test]
+    fn configure_warnings_frame_serializes_null_session_id_by_default() {
+        let frame = ConfigureWarningsFrame::new(
+            "/repo",
+            42,
+            false,
+            5_000,
+            vec![json!({
+                "kind": "formatter_not_installed",
+                "tool": "biome",
+                "hint": "Install biome."
+            })],
+        );
+
+        let json = serde_json::to_string(&frame).expect("serialize ConfigureWarningsFrame");
+        let decoded: ConfigureWarningsFrameRoundTrip =
+            serde_json::from_str(&json).expect("deserialize ConfigureWarningsFrame JSON");
+
+        assert_eq!(decoded.session_id, None);
+    }
+
+    #[test]
+    fn configure_warnings_frame_serializes_session_id() {
+        let frame = ConfigureWarningsFrame::new_with_session_id(
+            Some("session-1".to_string()),
+            "/repo",
+            42,
+            false,
+            5_000,
+            vec![json!({
+                "kind": "formatter_not_installed",
+                "tool": "biome",
+                "hint": "Install biome."
+            })],
+        );
+
+        let json = serde_json::to_string(&frame).expect("serialize ConfigureWarningsFrame");
+        let decoded: ConfigureWarningsFrameRoundTrip =
+            serde_json::from_str(&json).expect("deserialize ConfigureWarningsFrame JSON");
+
+        assert_eq!(decoded.frame_type, "configure_warnings");
+        assert_eq!(decoded.session_id.as_deref(), Some("session-1"));
+        assert_eq!(decoded.project_root, "/repo");
+        assert_eq!(decoded.source_file_count, 42);
+        assert_eq!(decoded.max_callgraph_files, 5_000);
+        assert_eq!(decoded.warnings[0]["tool"], "biome");
+    }
+
+    #[test]
+    fn status_changed_frame_serializes_correctly() {
+        let frame = StatusChangedFrame::new(
+            None,
+            json!({
+                "version": "0.24.0",
+                "project_root": "/repo",
+                "cache_role": "main",
+                "canonical_root": "/repo",
+                "search_index": { "status": "ready" },
+                "semantic_index": { "status": "disabled" },
+            }),
+        );
+
+        let json = serde_json::to_value(PushFrame::StatusChanged(frame)).unwrap();
+        assert_eq!(json["type"], "status_changed");
+        assert!(json["session_id"].is_null());
+        assert_eq!(json["snapshot"]["cache_role"], "main");
+        assert_eq!(json["snapshot"]["project_root"], "/repo");
+    }
+
+    #[test]
+    fn status_changed_frame_strips_session_scoped_push_fields() {
+        let frame = StatusChangedFrame::new(
+            None,
+            json!({
+                "version": "0.24.0",
+                "checkpoints_total": 7,
+                "session": { "id": "default", "tracked_files": 2, "checkpoints": 1 },
+                "compression": {
+                    "project": { "events": 3 },
+                    "session": { "events": 99 }
+                }
+            }),
+        );
+
+        assert!(frame.snapshot.get("session").is_none());
+        assert_eq!(frame.snapshot["checkpoints_total"], 7);
+        assert_eq!(frame.snapshot["compression"]["project"]["events"], 3);
+        assert!(frame.snapshot["compression"].get("session").is_none());
+    }
+}
+
+impl BashCompletedFrame {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        status: BgTaskStatus,
+        exit_code: Option<i32>,
+        command: impl Into<String>,
+        output_preview: impl Into<String>,
+        output_truncated: bool,
+        original_tokens: Option<u32>,
+        compressed_tokens: Option<u32>,
+        tokens_skipped: bool,
+    ) -> Self {
+        Self {
+            frame_type: "bash_completed",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            status,
+            exit_code,
+            command: command.into(),
+            output_preview: output_preview.into(),
+            output_truncated,
+            original_tokens,
+            compressed_tokens,
+            tokens_skipped,
+        }
+    }
+}
+
+impl BashLongRunningFrame {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        command: impl Into<String>,
+        elapsed_ms: u64,
+    ) -> Self {
+        Self {
+            frame_type: "bash_long_running",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            command: command.into(),
+            elapsed_ms,
+        }
+    }
+}
+
+impl BashPatternMatchFrame {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        watch_id: impl Into<String>,
+        match_text: impl Into<String>,
+        match_offset: u64,
+        context: impl Into<String>,
+        once: bool,
+    ) -> Self {
+        Self {
+            frame_type: "bash_pattern_match",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            watch_id: watch_id.into(),
+            match_text: match_text.into(),
+            match_offset,
+            context: context.into(),
+            once,
+            reason: "pattern_match",
+        }
+    }
+
+    pub fn task_exit(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        match_text: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            frame_type: "bash_pattern_match",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            watch_id: "exit".to_string(),
+            match_text: match_text.into(),
+            match_offset: 0,
+            context: context.into(),
+            once: true,
+            reason: "task_exit",
+        }
+    }
+}
+
 /// Fallback session identifier used when a request arrives without one.
 ///
 /// Introduced alongside project-shared bridges (issue #14): one `aft` process
@@ -18,6 +449,7 @@ pub const DEFAULT_SESSION_ID: &str = "__default__";
 #[derive(Debug, Deserialize)]
 pub struct RawRequest {
     pub id: String,
+    #[serde(alias = "method")]
     pub command: String,
     /// Optional LSP hints from the plugin (R031 forward compatibility).
     #[serde(default)]
@@ -77,7 +509,7 @@ impl RawRequest {
 ///    use a `<step>_skipped_reason` field. Approved values:
 ///    - `format_skipped_reason`: `"unsupported_language"` |
 ///      `"no_formatter_configured"` | `"formatter_not_installed"` |
-///      `"timeout"` | `"error"`
+///      `"formatter_excluded_path"` | `"timeout"` | `"error"`
 ///    - `validate_skipped_reason`: `"unsupported_language"` |
 ///      `"no_checker_configured"` | `"checker_not_installed"` |
 ///      `"timeout"` | `"error"`

@@ -3,11 +3,11 @@
  * 6 languages: typescript, tsx, javascript, python, rust, go.
  */
 
-import { StringEnum } from "@mariozechner/pi-ai";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
 import {
   asNumber,
   asRecord,
@@ -60,6 +60,19 @@ export interface AstSurface {
   astReplace: boolean;
 }
 
+/**
+ * Append the server-side `hint` field if present. Rust attaches a hint to
+ * zero-match responses when the pattern looks like a common mistake (regex
+ * syntax, language-specific shape, today's Rust match-arm `|` trap).
+ * See `crates/aft/src/ast_grep_hints.rs` for the rules.
+ */
+function appendHintSection(response: Record<string, unknown>, sections: string[], theme: Theme) {
+  const hint = asString(response.hint);
+  if (hint && hint.length > 0) {
+    sections.push(theme.fg("warning", hint));
+  }
+}
+
 /** Append honest scope reporting (no_files_matched_scope + scope_warnings) when present. */
 function appendScopeSections(response: Record<string, unknown>, sections: string[], theme: Theme) {
   if (response.no_files_matched_scope === true) {
@@ -101,6 +114,7 @@ export function buildAstSearchSections(payload: unknown, theme: Theme): string[]
   if (matches.length === 0) {
     const sections = [header, theme.fg("muted", "No AST matches found.")];
     appendScopeSections(response, sections, theme);
+    appendHintSection(response, sections, theme);
     return sections;
   }
 
@@ -155,6 +169,7 @@ export function buildAstReplaceSections(payload: unknown, theme: Theme): string[
   if (files.length === 0) {
     sections.push(theme.fg("muted", "No files changed."));
     appendScopeSections(response, sections, theme);
+    appendHintSection(response, sections, theme);
     return sections;
   }
 
@@ -251,8 +266,11 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
           pattern: params.pattern,
           lang: params.lang,
         };
-        if (params.paths !== undefined) req.paths = params.paths;
-        if (params.globs !== undefined) req.globs = params.globs;
+        // Use isEmptyParam so empty arrays sent by GPT-family models don't
+        // get forwarded to Rust as "scope present" — let Rust default to whole
+        // project_root instead of round-tripping a useless empty scope.
+        if (!isEmptyParam(params.paths)) req.paths = params.paths;
+        if (!isEmptyParam(params.globs)) req.globs = params.globs;
         if (params.contextLines !== undefined) req.context_lines = params.contextLines;
         const response = await callBridge(bridge, "ast_search", req, extCtx);
         return textResult((response.text as string | undefined) ?? JSON.stringify(response));
@@ -286,8 +304,9 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
           rewrite: params.rewrite,
           lang: params.lang,
         };
-        if (params.paths !== undefined) req.paths = params.paths;
-        if (params.globs !== undefined) req.globs = params.globs;
+        // Use isEmptyParam — see ast_search above for rationale.
+        if (!isEmptyParam(params.paths)) req.paths = params.paths;
+        if (!isEmptyParam(params.globs)) req.globs = params.globs;
         // Rust ast_replace defaults to dry_run=true; apply by default to match description.
         req.dry_run = params.dryRun === true;
         const response = await callBridge(bridge, "ast_replace", req, extCtx);

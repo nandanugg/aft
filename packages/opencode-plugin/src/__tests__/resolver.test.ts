@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { findBinarySync, platformKey } from "../resolver.js";
+import { findBinarySync, platformKey } from "@cortexkit/aft-bridge";
 
 // ---------------------------------------------------------------------------
 // platformKey() — pure mapping, no side effects
@@ -38,10 +38,14 @@ describe("platformKey", () => {
     );
   });
 
-  test("win32 + arm64 is unsupported", () => {
-    expect(() => platformKey("win32", "arm64")).toThrow(
-      /Unsupported architecture: arm64 on platform win32/,
-    );
+  test("win32 + arm64 → win32-arm64 (native ARM64 binary)", () => {
+    // v0.28.0 ships a real aarch64-pc-windows-msvc binary as
+    // @cortexkit/aft-win32-arm64. Previously this key mapped to win32-x64
+    // so ARM64 hosts ran the x64 build under Microsoft Prism emulation —
+    // see packages/aft-bridge/src/platform.ts. With native ARM64, the
+    // resolver, downloader, and ONNX layer pick the matching artifacts
+    // and skip emulation overhead entirely.
+    expect(platformKey("win32", "arm64")).toBe("win32-arm64");
   });
 
   test("defaults to process.platform and process.arch when no args", () => {

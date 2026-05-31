@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { log, warn } from "../logger";
-import { rpcPortFilePath } from "./rpc-utils";
+import { rpcPortFileDir } from "./rpc-utils";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -13,9 +13,14 @@ export class AftRpcServer {
   private token: string | null = null;
   private handlers = new Map<string, RpcHandler>();
   private portFilePath: string;
+  private portsDir: string;
+  /** Unique per-instance ID — distinguishes our entry from duplicate plugin loads. */
+  private instanceId: string;
 
   constructor(storageDir: string, directory: string) {
-    this.portFilePath = rpcPortFilePath(storageDir, directory);
+    this.portsDir = rpcPortFileDir(storageDir, directory);
+    this.instanceId = randomBytes(8).toString("hex");
+    this.portFilePath = join(this.portsDir, `${this.instanceId}.json`);
   }
 
   /** Register an RPC method handler. */
@@ -46,9 +51,12 @@ export class AftRpcServer {
         // Write port file atomically
         try {
           const dir = dirname(this.portFilePath);
-          mkdirSync(dir, { recursive: true });
+          mkdirSync(dir, { recursive: true, mode: 0o700 });
           const tmpPath = `${this.portFilePath}.tmp`;
-          writeFileSync(tmpPath, JSON.stringify({ port: this.port, token: this.token }), "utf-8");
+          writeFileSync(tmpPath, JSON.stringify({ port: this.port, token: this.token }), {
+            encoding: "utf-8",
+            mode: 0o600,
+          });
           renameSync(tmpPath, this.portFilePath);
           log(`RPC server listening on 127.0.0.1:${this.port}`);
         } catch (err) {
@@ -130,10 +138,11 @@ export class AftRpcServer {
 
       const { token: _token, ...handlerParams } = params;
 
-      log(`RPC call: ${method} params=${JSON.stringify(handlerParams).slice(0, 200)}`);
+      // Successful RPC calls are intentionally NOT logged. The /aft-status
+      // TUI dialog polls every 1.5s while open, which used to spam the log
+      // with RPC call/result pairs. Errors are still logged (real signal).
       handler(handlerParams)
         .then((result) => {
-          log(`RPC result: ${method} => ${JSON.stringify(result).slice(0, 200)}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
         })

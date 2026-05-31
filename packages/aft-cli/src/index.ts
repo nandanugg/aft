@@ -18,7 +18,9 @@ function printHelp(): void {
   console.log("  Commands:");
   console.log("    setup            Interactive setup wizard");
   console.log("    doctor           Check and fix configuration issues");
-  console.log("    doctor --force   Force clear plugin cache (fixes stale versions)");
+  console.log("    doctor lsp <file> Inspect LSP setup for one file");
+  console.log("    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch)");
+  console.log("    doctor --clear   Select caches to clear with an interactive prompt");
   console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
   console.log("");
   console.log("  Harness selection:");
@@ -27,9 +29,11 @@ function printHelp(): void {
   console.log("    (default: auto-detect, prompt if multiple detected)");
   console.log("");
   console.log("  Usage:");
-  console.log("    bunx --bun @cortexkit/aft setup");
-  console.log("    bunx --bun @cortexkit/aft doctor");
-  console.log("    bunx --bun @cortexkit/aft doctor --issue");
+  console.log("    npx @cortexkit/aft setup");
+  console.log("    npx @cortexkit/aft doctor");
+  console.log("    npx @cortexkit/aft doctor lsp ./src/main.py");
+  console.log("    npx @cortexkit/aft doctor --clear");
+  console.log("    npx @cortexkit/aft doctor --issue");
   console.log("");
 }
 
@@ -39,10 +43,20 @@ async function main(): Promise<number> {
     return runSetup(args);
   }
   if (command === "doctor") {
+    if (args[0] === "lsp") {
+      const { runLspDoctor } = await import("./commands/lsp.js");
+      return runLspDoctor({ argv: args.slice(1) });
+    }
+    if (args[0] === "filters") {
+      const { runDoctorFilters } = await import("./commands/doctor-filters.js");
+      return runDoctorFilters({ argv: args.slice(1) });
+    }
     const { runDoctor } = await import("./commands/doctor.js");
     const force = args.includes("--force");
+    const clear = args.includes("--clear");
+    const fix = args.includes("--fix");
     const issue = args.includes("--issue");
-    return runDoctor({ force, issue, argv: args });
+    return runDoctor({ clear, fix, force, issue, argv: args });
   }
   printHelp();
   return command ? 1 : 0;

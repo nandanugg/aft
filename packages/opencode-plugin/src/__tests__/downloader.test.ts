@@ -1,10 +1,12 @@
+/// <reference path="../bun-test.d.ts" />
+
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PLATFORM_ASSET_MAP } from "../platform.js";
+import { PLATFORM_ASSET_MAP } from "@cortexkit/aft-bridge";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const tempRoots = new Set<string>();
@@ -46,12 +48,13 @@ describe("downloadBinary error paths", () => {
     const result = runDownloaderScript(`
       Object.defineProperty(process, "platform", { value: "plan9" });
       Object.defineProperty(process, "arch", { value: "x64" });
-      const { downloadBinary } = await import("./src/downloader.ts");
+      const { downloadBinary } = await import("@cortexkit/aft-bridge");
       console.log(String(await downloadBinary("v1.2.3")));
     `);
 
     expect(result.stdout).toBe("null");
-    expect(result.stderr).toContain("[aft-plugin] Unsupported platform: plan9-x64");
+    // No host logger registered in subprocess — falls back to [aft-bridge] prefix
+    expect(result.stderr).toContain("Unsupported platform: plan9-x64");
   });
 
   test("returns null and logs HTTP download failures", () => {
@@ -65,7 +68,7 @@ describe("downloadBinary error paths", () => {
           }
           return new Response("bad", { status: 502, statusText: "Bad Gateway" });
         };
-        const { downloadBinary } = await import("./src/downloader.ts");
+        const { downloadBinary } = await import("@cortexkit/aft-bridge");
         console.log(String(await downloadBinary("v9.9.9")));
       `,
       { XDG_CACHE_HOME: cacheRoot },
@@ -89,7 +92,7 @@ describe("downloadBinary error paths", () => {
           }
           return new Response("binary payload", { status: 200 });
         };
-        const { downloadBinary } = await import("./src/downloader.ts");
+        const { downloadBinary } = await import("@cortexkit/aft-bridge");
         console.log(String(await downloadBinary("v1.0.0")));
       `,
       { XDG_CACHE_HOME: cacheRoot },
@@ -113,7 +116,7 @@ describe("downloadBinary error paths", () => {
           }
           return new Response("binary payload", { status: 200 });
         };
-        const { downloadBinary } = await import("./src/downloader.ts");
+        const { downloadBinary } = await import("@cortexkit/aft-bridge");
         console.log(String(await downloadBinary("v2.0.0")));
       `,
       { XDG_CACHE_HOME: cacheRoot },
@@ -138,7 +141,7 @@ describe("downloadBinary error paths", () => {
           }
           return new Response("binary payload", { status: 200 });
         };
-        const { downloadBinary } = await import("./src/downloader.ts");
+        const { downloadBinary } = await import("@cortexkit/aft-bridge");
         console.log(String(await downloadBinary("v3.0.0")));
       `,
       { XDG_CACHE_HOME: cacheRoot },
@@ -150,5 +153,95 @@ describe("downloadBinary error paths", () => {
       `Checksum verification failed: checksums.sha256 found but no entry for ${currentAssetName}`,
     );
     expect(result.stderr).toContain("Binary download aborted for security reasons");
+  });
+});
+
+describe("downloadBinary tag normalization (regression for v0.25.1 404 bug)", () => {
+  // Background: prior to v0.25.2, `findBinary` → `ensureBinary("0.25.1")` (no `v`
+  // prefix) constructed `releases/download/0.25.1/<asset>` which 404'd because
+  // GitHub release tags always have the `v` prefix. The cache layout was also
+  // split between `<cache>/0.25.1/` and `<cache>/v0.25.1/`. Normalization now
+  // happens at the boundary so any caller convention works.
+
+  test("constructs v-prefixed URL when caller passes bare version (no leading v)", () => {
+    if (!currentAssetName) throw new Error(`Unsupported test platform: ${currentPlatformKey}`);
+    const cacheRoot = createCacheRoot();
+    const result = runDownloaderScript(
+      `
+        const seenUrls = [];
+        globalThis.fetch = async (url) => {
+          seenUrls.push(String(url));
+          // Return 502 so the download fails fast but URL gets captured first.
+          return new Response("nope", { status: 502, statusText: "Bad Gateway" });
+        };
+        const { downloadBinary } = await import("@cortexkit/aft-bridge");
+        await downloadBinary("0.25.1");
+        console.log(JSON.stringify(seenUrls));
+      `,
+      { XDG_CACHE_HOME: cacheRoot },
+    );
+
+    const urls = JSON.parse(result.stdout) as string[];
+    expect(urls).toContain(
+      `https://github.com/cortexkit/aft/releases/download/v0.25.1/${currentAssetName}`,
+    );
+    expect(urls).toContain(
+      "https://github.com/cortexkit/aft/releases/download/v0.25.1/checksums.sha256",
+    );
+    // Critically: NO URL should reference the bare "0.25.1" without the prefix.
+    for (const url of urls) {
+      expect(url).not.toContain("/releases/download/0.25.1/");
+    }
+  });
+
+  test("caches under v-prefixed dir when caller passes bare version", () => {
+    if (!currentAssetName) throw new Error(`Unsupported test platform: ${currentPlatformKey}`);
+    const cacheRoot = createCacheRoot();
+    runDownloaderScript(
+      `
+        globalThis.fetch = async (url) => {
+          return new Response("nope", { status: 502, statusText: "Bad Gateway" });
+        };
+        const { downloadBinary } = await import("@cortexkit/aft-bridge");
+        await downloadBinary("0.42.0");
+      `,
+      { XDG_CACHE_HOME: cacheRoot },
+    );
+
+    // The (failed) download attempt should have created the v-prefixed cache
+    // directory, not the bare-version one. Cleanup of partial download .tmp
+    // files leaves an empty directory; we only assert the dir structure.
+    expect(existsSync(join(cacheRoot, "aft", "bin", "v0.42.0"))).toBe(true);
+    expect(existsSync(join(cacheRoot, "aft", "bin", "0.42.0"))).toBe(false);
+  });
+
+  test("ensureBinary normalizes bare version for cache hit", () => {
+    if (!currentAssetName) throw new Error(`Unsupported test platform: ${currentPlatformKey}`);
+    const cacheRoot = createCacheRoot();
+
+    // Pre-seed the cache at the v-prefixed path (where downloadBinary would
+    // have written it). ensureBinary("0.7.7") should find this cached file
+    // because it normalizes before lookup.
+    const cachedDir = join(cacheRoot, "aft", "bin", "v0.7.7");
+    const cachedPath = join(cachedDir, binaryName);
+    mkdtempSync; // keep import used
+    spawnSync("mkdir", ["-p", cachedDir]);
+    writeFileSync(cachedPath, '#!/bin/sh\necho "aft 0.7.7"\n', "utf8");
+    chmodSync(cachedPath, 0o755);
+
+    const result = runDownloaderScript(
+      `
+        // Fail any unexpected network attempt so we can prove the cache hit.
+        globalThis.fetch = async () => {
+          throw new Error("should not fetch — cache should have been hit");
+        };
+        const { ensureBinary } = await import("@cortexkit/aft-bridge");
+        const found = await ensureBinary("0.7.7");
+        console.log(found ?? "null");
+      `,
+      { XDG_CACHE_HOME: cacheRoot },
+    );
+
+    expect(result.stdout).toBe(cachedPath);
   });
 });

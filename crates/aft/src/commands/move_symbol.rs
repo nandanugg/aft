@@ -12,7 +12,7 @@ use crate::edit;
 use crate::error::AftError;
 use crate::imports;
 use crate::lsp_hints;
-use crate::parser::{detect_language, LangId};
+use crate::parser::{detect_language, grammar_for, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::SymbolKind;
 
@@ -23,13 +23,13 @@ use crate::symbols::SymbolKind;
 ///   - `symbol` (string, required) — name of the symbol to move
 ///   - `destination` (string, required) — target file path
 ///   - `scope` (string, optional) — scope qualifier for disambiguation
-///   - `dry_run` (bool, optional) — preview diffs without modifying disk
 ///
 /// On success: `{ ok, files_modified, consumers_updated, checkpoint_name,
 ///   results: [{ file, syntax_valid, formatted }] }`
-/// On dry-run: `{ ok, dry_run, diffs: [{ file, diff, syntax_valid }] }`
 /// On failure after partial write: `{ error with failed_file, rolled_back }`
 pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
+
     // --- Extract and validate params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -65,7 +65,6 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let scope = req.params.get("scope").and_then(|v| v.as_str());
-    let dry_run = edit::is_dry_run(&req.params);
 
     let source_path_raw = match ctx.validate_path(&req.id, Path::new(file)) {
         Ok(path) => path,
@@ -106,6 +105,48 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "invalid_request",
             "move_symbol: source and destination are the same file",
         );
+    }
+
+    let source_lang = match detect_language(source_path) {
+        Some(lang @ (LangId::TypeScript | LangId::Tsx | LangId::JavaScript)) => lang,
+        Some(lang) => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                format!(
+                    "move_symbol currently supports TypeScript/JavaScript only; got {:?}",
+                    lang
+                ),
+            );
+        }
+        None => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                "move_symbol currently supports TypeScript/JavaScript only; got unknown",
+            );
+        }
+    };
+
+    match detect_language(dest_path) {
+        Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {}
+        Some(lang) => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                format!(
+                    "move_symbol currently supports TypeScript/JavaScript only; got {:?}",
+                    lang
+                ),
+            );
+        }
+        None => {
+            return Response::error(
+                &req.id,
+                "unsupported_language",
+                "move_symbol currently supports TypeScript/JavaScript only; got unknown",
+            );
+        }
     }
 
     // --- Call graph guard (D089) ---
@@ -184,12 +225,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             })
             .collect();
 
-        return Response::success(
+        return Response::error_with_data(
             &req.id,
-            serde_json::json!({
-                "code": "ambiguous_symbol",
-                "candidates": candidates,
-            }),
+            "ambiguous_symbol",
+            format!("symbol '{}' is ambiguous in {}", symbol_name, file),
+            serde_json::json!({ "candidates": candidates }),
         );
     }
 
@@ -218,13 +258,39 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Extract symbol text from source ---
-    let start_byte = edit::line_col_to_byte(
+    let raw_start_byte = edit::line_col_to_byte(
         &source_content,
         target.range.start_line,
         target.range.start_col,
     );
     let end_byte =
         edit::line_col_to_byte(&source_content, target.range.end_line, target.range.end_col);
+
+    // For TS/JS, the parser reports the symbol range starting at the inner
+    // declaration (e.g. `function greet(...)`) not the wrapping `export
+    // statement`. If we use raw_start_byte directly, two bugs follow:
+    //   1. The destination loses its `export` keyword (we'd then re-add it
+    //      via `prepare_exported_symbol`, which DOES work for the destination).
+    //   2. The source removal leaves the trailing `export ` behind, which
+    //      then attaches to the next declaration when blank-line cleanup
+    //      collapses the gap. Repro: moving `greet` out of
+    //         `export function greet(...) {}\n\nfunction other(): number {}\n`
+    //      produced `export function other(): number {}` in the source.
+    //
+    // Fix: when target.exported is true, expand start_byte backwards to
+    // include the `export` keyword (and `default` if present). We walk over
+    // whitespace then look for the literal token, which is robust because the
+    // parser already told us this declaration IS exported — there must be an
+    // `export` keyword somewhere immediately before it.
+    let start_byte = if target.exported
+        && matches!(
+            source_lang,
+            LangId::TypeScript | LangId::Tsx | LangId::JavaScript
+        ) {
+        find_export_keyword_start(&source_content, raw_start_byte).unwrap_or(raw_start_byte)
+    } else {
+        raw_start_byte
+    };
 
     let symbol_text = match source_content.get(start_byte..end_byte) {
         Some(symbol_text) => symbol_text,
@@ -240,11 +306,14 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Prepare the text to add to destination: ensure it has export prefix
+    // Prepare the text to add to destination: ensure it has export prefix.
+    // When start_byte was extended above, the symbol_text already includes
+    // `export`; prepare_exported_symbol's idempotency check leaves it alone.
+    let moved_symbol_is_default = symbol_text.trim_start().starts_with("export default");
     let dest_symbol_text = prepare_exported_symbol(symbol_text);
 
     // Prepare source with symbol removed
-    let new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
+    let mut new_source = match remove_symbol_from_source(&source_content, start_byte, end_byte) {
         Ok(s) => s,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
@@ -287,7 +356,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Collect consumer files that need import rewriting
     // CallerGroup.file is relative to project root — resolve to absolute
     let project_root = graph.project_root().to_path_buf();
-    let consumer_files: Vec<PathBuf> = consumers
+    let mut consumer_files: Vec<PathBuf> = consumers
         .iter()
         .map(|cg| {
             let p = PathBuf::from(&cg.file);
@@ -299,9 +368,29 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         })
         .filter(|p| p != source_path && p != dest_path)
         .collect();
+    collect_ts_js_files(&project_root, &mut consumer_files, source_path, dest_path);
+    consumer_files.sort();
+    consumer_files.dedup();
 
-    // Detect language for import rewriting
-    let lang = detect_language(source_path);
+    // `lang` already detected above for the export-keyword extension.
+
+    // If the original source still references the moved symbol after removing
+    // its declaration, it is also a consumer. Run the same import-rewrite path
+    // against the post-removal source text so those local references resolve.
+    let source_rewritten_as_consumer = if let Some(rewritten) = rewrite_consumer_imports(
+        &new_source,
+        source_path,
+        source_path,
+        dest_path,
+        symbol_name,
+        Some(source_lang),
+        moved_symbol_is_default,
+    ) {
+        new_source = rewritten;
+        true
+    } else {
+        false
+    };
 
     // --- Compute consumer rewrites ---
     let mut consumer_rewrites: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, new)
@@ -320,52 +409,13 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             source_path,
             dest_path,
             symbol_name,
-            lang,
+            Some(source_lang),
+            moved_symbol_is_default,
         );
 
         if let Some(rewritten) = new_consumer {
             consumer_rewrites.push((consumer_file.clone(), consumer_content, rewritten));
         }
-    }
-
-    // --- Dry-run mode (D071) ---
-    if dry_run {
-        let mut diffs: Vec<serde_json::Value> = Vec::new();
-
-        // Source file diff
-        let source_dr = edit::dry_run_diff(&source_content, &new_source, source_path);
-        diffs.push(serde_json::json!({
-            "file": file,
-            "diff": source_dr.diff,
-            "syntax_valid": source_dr.syntax_valid,
-        }));
-
-        // Destination file diff
-        let dest_dr = edit::dry_run_diff(&dest_content, &new_dest, dest_path);
-        diffs.push(serde_json::json!({
-            "file": destination,
-            "diff": dest_dr.diff,
-            "syntax_valid": dest_dr.syntax_valid,
-        }));
-
-        // Consumer file diffs
-        for (path, original, new_content) in &consumer_rewrites {
-            let dr = edit::dry_run_diff(original, new_content, &path);
-            diffs.push(serde_json::json!({
-                "file": path.display().to_string(),
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-            }));
-        }
-
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "diffs": diffs,
-            }),
-        );
     }
 
     // --- Create checkpoint (D105) ---
@@ -386,13 +436,49 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let mut backup_ids: Vec<String> = Vec::new();
+    let dest_existed = dest_path.exists();
+    {
+        let mut files_to_backup: Vec<PathBuf> = vec![source_path.to_path_buf()];
+        if dest_existed {
+            files_to_backup.push(dest_path.to_path_buf());
+        }
+        for (path, _, _) in &consumer_rewrites {
+            files_to_backup.push(path.clone());
+        }
+        files_to_backup.sort();
+        files_to_backup.dedup();
+
+        let mut backup_store = ctx.backup().borrow_mut();
+        for path in files_to_backup {
+            match backup_store.snapshot_with_op(
+                req.session(),
+                &path,
+                "move_symbol: pre-move backup",
+                Some(&op_id),
+            ) {
+                Ok(id) => backup_ids.push(id),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            }
+        }
+        if !dest_existed {
+            match backup_store.snapshot_op_tombstone(
+                req.session(),
+                &op_id,
+                dest_path,
+                "move_symbol: destination file created during move",
+            ) {
+                Ok(id) => backup_ids.push(id),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            }
+        }
+    }
+
     // --- Apply mutations ---
     // Track files for rollback
     let mut written_files: Vec<PathBuf> = Vec::new();
     let mut new_files: Vec<PathBuf> = Vec::new();
     let mut results: Vec<serde_json::Value> = Vec::new();
-
-    let dest_existed = dest_path.exists();
 
     // 1. Write source file (symbol removed)
     match edit::write_format_validate(&source_path, &new_source, &ctx.config(), &req.params) {
@@ -409,7 +495,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             }));
         }
         Err(e) => {
-            restore_checkpoint(ctx, req.session(), &checkpoint_name);
+            if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
             return move_error(
                 &req.id,
                 file,
@@ -439,20 +529,29 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             }));
         }
         Err(e) => {
-            restore_checkpoint(ctx, req.session(), &checkpoint_name);
-            cleanup_new_files(&new_files);
+            let mut files_to_delete = new_files.clone();
+            if !dest_existed {
+                files_to_delete.push(dest_path.to_path_buf());
+            }
+            let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
+            cleanup_new_files(&files_to_delete);
+            if restored {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), &op_id);
+            }
             return move_error(
                 &req.id,
                 destination,
                 &written_files,
-                &new_files,
+                &files_to_delete,
                 &format!("failed to write destination: {}", e),
             );
         }
     }
 
     // 3. Write consumer files (imports rewritten)
-    let mut consumers_updated = 0;
+    let mut consumers_updated = usize::from(source_rewritten_as_consumer);
     for (path, _original, new_content) in &consumer_rewrites {
         match edit::write_format_validate(&path, new_content, &ctx.config(), &req.params) {
             Ok(wr) => {
@@ -469,8 +568,13 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 }));
             }
             Err(e) => {
-                restore_checkpoint(ctx, req.session(), &checkpoint_name);
+                let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
                 cleanup_new_files(&new_files);
+                if restored {
+                    ctx.backup()
+                        .borrow_mut()
+                        .discard_operation_entries(req.session(), &op_id);
+                }
                 return move_error(
                     &req.id,
                     &path.display().to_string(),
@@ -485,7 +589,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let files_modified = results.len();
 
     log::debug!(
-        "[aft] move_symbol: {} from {} to {} ({} consumers updated)",
+        "move_symbol: {} from {} to {} ({} consumers updated)",
         symbol_name,
         file,
         destination,
@@ -499,6 +603,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             "files_modified": files_modified,
             "consumers_updated": consumers_updated,
             "checkpoint_name": checkpoint_name,
+            "backup_ids": backup_ids,
             "results": results,
         }),
     )
@@ -646,6 +751,75 @@ fn normalize_path(path: &Path) -> PathBuf {
     parts.iter().collect()
 }
 
+/// For TS/JS exported declarations, walk backwards from `decl_start` to find
+/// the start of the `export` (or `export default`) keyword that the parser
+/// reported as wrapping this declaration. Returns the byte offset of the `e`
+/// in `export`, or `None` if no plausible export keyword is found within a
+/// reasonable lookback (in which case the caller falls back to decl_start).
+///
+/// Why text-level: the symbol resolver already gave us `target.exported = true`
+/// based on AST analysis (it walked export_statement parents). At this point
+/// we trust that an `export` keyword exists immediately before the declaration
+/// — we just need to locate its byte position to extend the cut range.
+///
+/// Handles:
+///   - `export function f() {}`           — single keyword
+///   - `export default function f() {}`   — `default` between export and decl
+///   - `export\n  default\n  function f` — newlines/whitespace between tokens
+///
+/// Does NOT handle (returns None, falls back to decl_start):
+///   - `export { foo } from '...'`        — re-exports (parser shouldn't mark
+///     these as `exported: true` for the inner symbol anyway)
+///   - Any case where lookback exceeds 200 bytes without finding `export`
+fn find_export_keyword_start(source: &str, decl_start: usize) -> Option<usize> {
+    if decl_start == 0 {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    // Bound the lookback to keep this O(1) in practice. 200 bytes is enough
+    // for `export default async function /* comment */` style headers without
+    // scanning unrelated code on pathological inputs.
+    let window_start = decl_start.saturating_sub(200);
+
+    // Scan the window for the LAST `export` token whose start lands on a
+    // word boundary (i.e. preceded by start-of-file, whitespace, or a
+    // newline) and whose match is followed by whitespace or `default`.
+    // Iterate from window.len()-6 down to 0 so we have room for the 6-byte
+    // "export" match starting at i.
+    let window = &bytes[window_start..decl_start];
+    if window.len() < 6 {
+        return None;
+    }
+    let mut i = window.len() - 6 + 1; // +1 because we decrement on entry
+    while i > 0 {
+        i -= 1;
+        if window[i] == b'e' {
+            // Try to match "export" starting here
+            if window.get(i..i + 6) == Some(b"export") {
+                // Word-boundary check on the LEFT (no identifier char before)
+                let left_ok = i == 0
+                    || !matches!(window[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$');
+                // Word-boundary check on the RIGHT (whitespace/newline)
+                let right_ok = window
+                    .get(i + 6)
+                    .is_some_and(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+                if left_ok && right_ok {
+                    let abs = window_start + i;
+                    // Verify there's only whitespace and/or `default` between
+                    // the keyword end and decl_start. If something else lives
+                    // there, this isn't the export keyword wrapping our decl.
+                    let between = &bytes[abs + 6..decl_start];
+                    let s = std::str::from_utf8(between).ok()?.trim();
+                    if s.is_empty() || s == "default" {
+                        return Some(abs);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Prepare the symbol text for the destination file.
 /// Ensures it has an `export` keyword prefix.
 fn prepare_exported_symbol(symbol_text: &str) -> String {
@@ -730,6 +904,29 @@ fn append_symbol_to_dest(dest_content: &str, symbol_text: &str) -> String {
     }
 }
 
+fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, dest_path: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
+                continue;
+            }
+            collect_ts_js_files(&path, out, source_path, dest_path);
+        } else if matches!(
+            detect_language(&path),
+            Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript)
+        ) {
+            let canon = std::fs::canonicalize(&path).unwrap_or(path);
+            if canon != source_path && canon != dest_path {
+                out.push(canon);
+            }
+        }
+    }
+}
+
 /// Rewrite a consumer file's imports to point to the new destination.
 ///
 /// Finds imports from the source file that include the moved symbol,
@@ -742,6 +939,7 @@ fn rewrite_consumer_imports(
     dest_file: &Path,
     symbol_name: &str,
     lang: Option<LangId>,
+    moved_symbol_is_default: bool,
 ) -> Option<String> {
     let lang = lang?;
 
@@ -750,18 +948,14 @@ fn rewrite_consumer_imports(
         return None;
     }
 
-    // Parse imports
-    let (_source_text, _tree, block) = match imports::parse_file_imports(consumer_file, lang) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
+    // Parse imports from the content passed in. For the source file this is
+    // the post-removal text, not the original on-disk content.
+    let (tree, block) = parse_imports_from_content(consumer_content, lang)?;
 
-    // Use the consumer_content we already read (should match source_text)
     let content = consumer_content;
 
     // Find imports from the source file that reference the moved symbol
-    let mut result = content.to_string();
-    let mut offset_delta: isize = 0; // track byte shifts from prior edits
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     // Process imports in reverse order to maintain byte offsets
     let mut matching_imports: Vec<(usize, &imports::ImportStatement)> = block
@@ -777,78 +971,143 @@ fn rewrite_consumer_imports(
     let mut made_changes = false;
 
     for (_, imp) in &matching_imports {
-        let has_moved_symbol = imp.names.iter().any(|n| n == symbol_name)
-            || imp.default_import.as_deref() == Some(symbol_name);
-
-        if !has_moved_symbol {
+        let moved_bindings = moved_bindings_for_import(imp, symbol_name, moved_symbol_is_default);
+        if moved_bindings.is_empty() {
             continue;
         }
 
         let new_import_path = compute_relative_import_path(consumer_file, dest_file);
 
-        // Check if this import has other symbols besides the moved one
+        // Check if this import has other symbols besides the moved one. Default
+        // imports are only moved when the target declaration was the default
+        // export, preserving the consumer's local alias (`import Bar ...`).
         let remaining_names: Vec<String> = imp
             .names
             .iter()
-            .filter(|n| n.as_str() != symbol_name)
+            .filter(|n| !moved_bindings.named.iter().any(|moved| moved == *n))
             .cloned()
             .collect();
-        let remaining_default = if imp.default_import.as_deref() == Some(symbol_name) {
+        let remaining_default = if moved_bindings.default_import.is_some() {
             None
         } else {
             imp.default_import.clone()
         };
+        let remaining_namespace = if moved_bindings.namespace_import.is_some() {
+            None
+        } else {
+            imp.namespace_import.clone()
+        };
 
         let type_only = imp.kind == imports::ImportKind::Type;
+        let moved_import =
+            generate_import_for_bindings(lang, &new_import_path, &moved_bindings, type_only);
 
         // Build the replacement text
-        let start = match (imp.byte_range.start as isize).checked_add(offset_delta) {
-            Some(v) if v >= 0 => v as usize,
-            _ => return None, // offset overflow — skip rewrite
-        };
-        let end = match (imp.byte_range.end as isize).checked_add(offset_delta) {
-            Some(v) if v >= 0 => v as usize,
-            _ => return None, // offset overflow — skip rewrite
-        };
-
-        if remaining_names.is_empty() && remaining_default.is_none() {
-            // All symbols in this import are moving — replace entire import with new path
-            // Preserve the original import structure but change the path
-            let new_import = generate_import_with_alias(
-                &imp.raw_text,
-                symbol_name,
-                &new_import_path,
-                type_only,
-                lang,
-            );
-            let old_len = end - start;
-            result = format!("{}{}{}", &result[..start], new_import, &result[end..]);
-            offset_delta += new_import.len() as isize - old_len as isize;
+        if remaining_names.is_empty()
+            && remaining_default.is_none()
+            && remaining_namespace.is_none()
+        {
+            // All symbols in this import are moving — replace entire import with
+            // a same-kind import from the new path.
+            edits.push((imp.byte_range.clone(), moved_import));
         } else {
-            // Some symbols remain — keep old import for remaining, add new import for moved
-            let kept_import = imports::generate_import_line(
+            // Some symbols remain — keep old import for remaining, add new import for moved.
+            let kept_import = imports::generate_import_line_with_namespace(
                 lang,
                 &imp.module_path,
                 &remaining_names,
                 remaining_default.as_deref(),
+                remaining_namespace.as_deref(),
                 type_only,
-            );
-
-            // Generate new import for the moved symbol
-            let moved_import = generate_import_with_alias(
-                &imp.raw_text,
-                symbol_name,
-                &new_import_path,
-                type_only,
-                lang,
             );
 
             let replacement = format!("{}\n{}", kept_import, moved_import);
-            let old_len = end - start;
-            result = format!("{}{}{}", &result[..start], replacement, &result[end..]);
-            offset_delta += replacement.len() as isize - old_len as isize;
+            edits.push((imp.byte_range.clone(), replacement));
+        }
+    }
+
+    {
+        let root = tree.root_node();
+        let mut exports = Vec::new();
+        let mut cursor = root.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let node = cursor.node();
+                if node.kind() == "export_statement"
+                    && export_path_matches_file(content, &node, consumer_file, source_file)
+                {
+                    exports.push(node);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
         }
 
+        exports.sort_by(|a, b| b.byte_range().start.cmp(&a.byte_range().start));
+        for node in exports {
+            if export_statement_has_wildcard(content, &node) {
+                // TODO: safely rewrite `export * from "..."` once moved-symbol
+                // provenance can distinguish which names are provided by the star.
+                crate::slog_warn!(
+                    "move_symbol: leaving wildcard re-export unchanged in {}",
+                    consumer_file.display()
+                );
+                continue;
+            }
+            if !export_statement_contains_name(content, &node, symbol_name) {
+                continue;
+            }
+            let Some(module_range) = export_module_string_range(content, &node) else {
+                continue;
+            };
+            let Some((moved_specs, remaining_specs)) =
+                partition_export_specifiers(content, &node, symbol_name)
+            else {
+                continue;
+            };
+            let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+            if remaining_specs.is_empty() {
+                edits.push((module_range, new_import_path));
+            } else {
+                let old_path = &content[module_range];
+                let replacement = format!(
+                    "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
+                    remaining_specs.join(", "),
+                    old_path,
+                    moved_specs.join(", "),
+                    new_import_path
+                );
+                edits.push((node.byte_range(), replacement));
+            }
+        }
+    }
+
+    if paths_equivalent(consumer_file, source_file)
+        && content_references_identifier(content, lang, symbol_name)
+    {
+        if let Some(insert_edit) = build_add_moved_import_edit(
+            content,
+            &block,
+            consumer_file,
+            dest_file,
+            symbol_name,
+            lang,
+            moved_symbol_is_default,
+        ) {
+            edits.push(insert_edit);
+        }
+    }
+
+    edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    let mut result = content.to_string();
+    for (range, replacement) in edits {
+        result = format!(
+            "{}{}{}",
+            &result[..range.start],
+            replacement,
+            &result[range.end..]
+        );
         made_changes = true;
     }
 
@@ -859,37 +1118,793 @@ fn rewrite_consumer_imports(
     }
 }
 
-/// Generate an import statement preserving any alias from the original import text.
-///
-/// If the original import has `{ X as Y }`, the new import preserves the alias.
-fn generate_import_with_alias(
-    original_raw: &str,
-    symbol_name: &str,
-    new_module_path: &str,
-    type_only: bool,
-    _lang: LangId,
-) -> String {
-    // Check if the original import uses an alias for this symbol
-    // Pattern: `X as Y` inside braces
-    let alias = extract_alias(original_raw, symbol_name);
+fn export_path_matches_file(
+    source: &str,
+    node: &tree_sitter::Node,
+    consumer_file: &Path,
+    source_file: &Path,
+) -> bool {
+    export_module_path(source, node)
+        .as_deref()
+        .is_some_and(|path| import_path_matches_file(path, consumer_file, source_file))
+}
 
-    let names = if let Some(alias_name) = &alias {
-        vec![format!("{} as {}", symbol_name, alias_name)]
+fn export_module_path(source: &str, node: &tree_sitter::Node) -> Option<String> {
+    export_module_string_range(source, node).map(|range| source[range].to_string())
+}
+
+fn export_module_string_range(
+    source: &str,
+    node: &tree_sitter::Node,
+) -> Option<std::ops::Range<usize>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind() == "string" {
+            let raw = &source[child.byte_range()];
+            let start = child.byte_range().start + 1;
+            let end = child.byte_range().end.saturating_sub(1);
+            if (raw.starts_with('\'') || raw.starts_with('"'))
+                && (raw.ends_with('\'') || raw.ends_with('"'))
+                && start <= end
+            {
+                return Some(start..end);
+            }
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    None
+}
+
+fn export_statement_has_wildcard(source: &str, node: &tree_sitter::Node) -> bool {
+    source[node.byte_range()].contains("export *")
+}
+
+fn export_statement_contains_name(
+    source: &str,
+    node: &tree_sitter::Node,
+    symbol_name: &str,
+) -> bool {
+    partition_export_specifiers(source, node, symbol_name)
+        .is_some_and(|(moved, _)| !moved.is_empty())
+}
+
+fn partition_export_specifiers(
+    source: &str,
+    node: &tree_sitter::Node,
+    symbol_name: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let text = &source[node.byte_range()];
+    let open = text.find('{')?;
+    let close = text[open + 1..].find('}').map(|idx| open + 1 + idx)?;
+    let mut moved = Vec::new();
+    let mut remaining = Vec::new();
+    for spec in text[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if imports::specifier_matches(spec, symbol_name) {
+            moved.push(spec.to_string());
+        } else {
+            remaining.push(spec.to_string());
+        }
+    }
+    Some((moved, remaining))
+}
+
+#[derive(Debug, Default)]
+struct MovedImportBindings {
+    named: Vec<String>,
+    default_import: Option<String>,
+    namespace_import: Option<String>,
+}
+
+impl MovedImportBindings {
+    fn is_empty(&self) -> bool {
+        self.named.is_empty() && self.default_import.is_none() && self.namespace_import.is_none()
+    }
+}
+
+fn moved_bindings_for_import(
+    imp: &imports::ImportStatement,
+    symbol_name: &str,
+    moved_symbol_is_default: bool,
+) -> MovedImportBindings {
+    let named = if moved_symbol_is_default {
+        Vec::new()
+    } else {
+        imp.names
+            .iter()
+            .filter(|n| imports::specifier_matches(n, symbol_name))
+            .cloned()
+            .collect()
+    };
+
+    let default_import = if moved_symbol_is_default {
+        imp.default_import.clone()
+    } else {
+        None
+    };
+
+    MovedImportBindings {
+        named,
+        default_import,
+        namespace_import: None,
+    }
+}
+
+fn generate_import_for_bindings(
+    lang: LangId,
+    module_path: &str,
+    bindings: &MovedImportBindings,
+    type_only: bool,
+) -> String {
+    imports::generate_import_line_with_namespace(
+        lang,
+        module_path,
+        &bindings.named,
+        bindings.default_import.as_deref(),
+        bindings.namespace_import.as_deref(),
+        type_only,
+    )
+}
+
+fn parse_imports_from_content(
+    content: &str,
+    lang: LangId,
+) -> Option<(tree_sitter::Tree, imports::ImportBlock)> {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content.as_bytes(), None)?;
+    let block = imports::parse_imports(content, &tree, lang);
+    Some((tree, block))
+}
+
+fn build_add_moved_import_edit(
+    content: &str,
+    block: &imports::ImportBlock,
+    consumer_file: &Path,
+    dest_file: &Path,
+    symbol_name: &str,
+    lang: LangId,
+    moved_symbol_is_default: bool,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let new_import_path = compute_relative_import_path(consumer_file, dest_file);
+    let names = if moved_symbol_is_default {
+        Vec::new()
     } else {
         vec![symbol_name.to_string()]
     };
+    let default_import = moved_symbol_is_default.then_some(symbol_name);
 
-    let type_prefix = if type_only { "type " } else { "" };
-    let names_str = names.join(", ");
-    format!(
-        "import {}{{ {} }} from '{}';",
-        type_prefix, names_str, new_module_path
+    if imports::is_duplicate(block, &new_import_path, &names, default_import, false) {
+        return None;
+    }
+
+    let group = imports::classify_group(lang, &new_import_path);
+    let (insert_offset, needs_blank_before, needs_blank_after) =
+        imports::find_insertion_point(content, block, group, &new_import_path, false);
+    let import_line =
+        imports::generate_import_line(lang, &new_import_path, &names, default_import, false);
+
+    let mut insert_text = String::new();
+    if needs_blank_before {
+        insert_text.push('\n');
+    }
+    insert_text.push_str(&import_line);
+    insert_text.push('\n');
+    if needs_blank_after {
+        insert_text.push('\n');
+    }
+
+    Some((insert_offset..insert_offset, insert_text))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentifierNamespace {
+    Value,
+    Type,
+}
+
+fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str) -> bool {
+    let grammar = grammar_for(lang);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(content.as_bytes(), None) else {
+        return false;
+    };
+
+    let root = tree.root_node();
+    if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        node_references_identifier(&root, content, symbol_name)
+    } else {
+        node_references_identifier_naive(&root, content, symbol_name)
+    }
+}
+
+fn node_references_identifier(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    if is_reference_identifier_node(node.kind()) && node_text_matches(content, node, symbol_name) {
+        let namespace = reference_namespace(node);
+        if !identifier_is_binding_position(node, content, symbol_name, namespace)
+            && !identifier_is_shadowed_by_enclosing_scope(node, content, symbol_name, namespace)
+        {
+            return true;
+        }
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if node_references_identifier(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn node_references_identifier_naive(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if is_reference_identifier_node(node.kind()) && node_text_matches(content, node, symbol_name) {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if node_references_identifier_naive(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_reference_identifier_node(kind: &str) -> bool {
+    matches!(kind, "identifier" | "type_identifier" | "jsx_identifier")
+}
+
+fn reference_namespace(node: &tree_sitter::Node) -> IdentifierNamespace {
+    if node.kind() == "type_identifier" {
+        IdentifierNamespace::Type
+    } else {
+        IdentifierNamespace::Value
+    }
+}
+
+fn identifier_is_binding_position(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "import_statement" {
+            return true;
+        }
+
+        if declaration_name_matches_target(&parent, node, content, symbol_name, namespace) {
+            return true;
+        }
+
+        match parent.kind() {
+            "variable_declarator" if namespace == IdentifierNamespace::Value => {
+                if parent.child_by_field_name("name").is_some_and(|name| {
+                    pattern_contains_binding_node(&name, node, content, symbol_name)
+                }) {
+                    return true;
+                }
+            }
+            "formal_parameters" | "required_parameter" | "optional_parameter" | "rest_pattern"
+            | "assignment_pattern" | "object_pattern" | "array_pattern" | "pair_pattern"
+                if namespace == IdentifierNamespace::Value =>
+            {
+                if pattern_contains_binding_node(&parent, node, content, symbol_name) {
+                    return true;
+                }
+            }
+            "catch_clause" if namespace == IdentifierNamespace::Value => {
+                if parent
+                    .child_by_field_name("parameter")
+                    .is_some_and(|param| {
+                        pattern_contains_binding_node(&param, node, content, symbol_name)
+                    })
+                {
+                    return true;
+                }
+            }
+            "type_parameter" if namespace == IdentifierNamespace::Type => {
+                if type_parameter_name_matches_target(&parent, node, content, symbol_name) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        current = parent;
+    }
+
+    false
+}
+
+fn identifier_is_shadowed_by_enclosing_scope(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if scope_introduces_shadowing_binding(&parent, node, content, symbol_name, namespace) {
+            return true;
+        }
+        current = parent;
+    }
+
+    false
+}
+
+fn scope_introduces_shadowing_binding(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    match scope.kind() {
+        kind if is_function_like_scope(kind) => {
+            function_scope_binds_name(scope, reference, content, symbol_name, namespace)
+        }
+        "statement_block" | "switch_body" => {
+            block_scope_binds_name(scope, content, symbol_name, namespace)
+        }
+        "catch_clause" => catch_scope_binds_name(scope, reference, content, symbol_name, namespace),
+        "for_statement" | "for_in_statement" | "for_of_statement" => {
+            loop_scope_binds_name(scope, reference, content, symbol_name, namespace)
+        }
+        _ => false,
+    }
+}
+
+fn is_function_like_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
     )
+}
+
+fn function_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    if !node_contains(&body, reference) {
+        return false;
+    }
+
+    match namespace {
+        IdentifierNamespace::Value => {
+            function_inner_name_binds_name(scope, content, symbol_name)
+                || scope
+                    .child_by_field_name("parameters")
+                    .is_some_and(|params| pattern_binds_name(&params, content, symbol_name))
+                || function_var_declarations_bind_name(scope, content, symbol_name)
+        }
+        IdentifierNamespace::Type => {
+            class_declaration_name_matches(scope, content, symbol_name)
+                || scope
+                    .child_by_field_name("type_parameters")
+                    .is_some_and(|params| type_parameters_bind_name(&params, content, symbol_name))
+        }
+    }
+}
+
+fn function_inner_name_binds_name(
+    scope: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if scope.kind() == "method_definition" {
+        return false;
+    }
+    name_field_matches(scope, content, symbol_name)
+}
+
+fn class_declaration_name_matches(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class"
+    ) && name_field_matches(node, content, symbol_name)
+}
+
+fn function_var_declarations_bind_name(
+    scope: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    scope
+        .child_by_field_name("body")
+        .is_some_and(|body| var_declarations_bind_name_in_scope(&body, content, symbol_name))
+}
+
+fn var_declarations_bind_name_in_scope(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if is_function_like_scope(child.kind()) {
+            continue;
+        }
+        if child.kind() == "variable_declaration"
+            && declaration_binds_name(&child, content, symbol_name, IdentifierNamespace::Value)
+        {
+            return true;
+        }
+        if var_declarations_bind_name_in_scope(&child, content, symbol_name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn block_scope_binds_name(
+    block: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let child_count = block.child_count();
+    for i in 0..child_count {
+        let Some(child) = block.child(i as u32) else {
+            continue;
+        };
+        if direct_scope_child_binds_name(&child, content, symbol_name, namespace) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn direct_scope_child_binds_name(
+    child: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if declaration_binds_name(child, content, symbol_name, namespace) {
+        return true;
+    }
+
+    if child.kind() == "export_statement" {
+        let child_count = child.child_count();
+        for i in 0..child_count {
+            if let Some(export_child) = child.child(i as u32) {
+                if declaration_binds_name(&export_child, content, symbol_name, namespace) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn catch_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if namespace != IdentifierNamespace::Value {
+        return false;
+    }
+
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    if !node_contains(&body, reference) {
+        return false;
+    }
+
+    scope
+        .child_by_field_name("parameter")
+        .is_some_and(|param| pattern_binds_name(&param, content, symbol_name))
+}
+
+fn loop_scope_binds_name(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    if namespace != IdentifierNamespace::Value
+        || !reference_is_in_loop_bound_scope(scope, reference)
+    {
+        return false;
+    }
+
+    ["initializer", "left"].iter().any(|field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|node| loop_header_declares_name(&node, content, symbol_name))
+    })
+}
+
+fn reference_is_in_loop_bound_scope(
+    scope: &tree_sitter::Node,
+    reference: &tree_sitter::Node,
+) -> bool {
+    ["condition", "increment", "body"].iter().any(|field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|node| node_contains(&node, reference))
+    })
+}
+
+fn loop_header_declares_name(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    matches!(
+        node.kind(),
+        "lexical_declaration" | "variable_declaration" | "variable_declarator"
+    ) && declaration_binds_name(node, content, symbol_name, IdentifierNamespace::Value)
+}
+
+fn declaration_binds_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    match node.kind() {
+        "variable_declarator" if namespace == IdentifierNamespace::Value => node
+            .child_by_field_name("name")
+            .is_some_and(|name| pattern_binds_name(&name, content, symbol_name)),
+        "lexical_declaration" | "variable_declaration"
+            if namespace == IdentifierNamespace::Value =>
+        {
+            node_children_bind_name(node, content, symbol_name, namespace)
+        }
+        "function_declaration" | "generator_function_declaration" => {
+            namespace == IdentifierNamespace::Value
+                && name_field_matches(node, content, symbol_name)
+        }
+        "class_declaration" | "abstract_class_declaration" | "class" | "enum_declaration" => {
+            name_field_matches(node, content, symbol_name)
+        }
+        "interface_declaration" | "type_alias_declaration" => {
+            namespace == IdentifierNamespace::Type && name_field_matches(node, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_bind_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if declaration_binds_name(&child, content, symbol_name, namespace) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn declaration_name_matches_target(
+    declaration: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+    namespace: IdentifierNamespace,
+) -> bool {
+    let name_binds_namespace = match declaration.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function" => namespace == IdentifierNamespace::Value,
+        "class_declaration" | "abstract_class_declaration" | "class" | "enum_declaration" => true,
+        "interface_declaration" | "type_alias_declaration" => {
+            namespace == IdentifierNamespace::Type
+        }
+        _ => false,
+    };
+
+    name_binds_namespace
+        && declaration.child_by_field_name("name").is_some_and(|name| {
+            same_node(&name, target) && node_text_matches(content, target, symbol_name)
+        })
+}
+
+fn type_parameter_name_matches_target(
+    type_parameter: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    type_parameter
+        .child_by_field_name("name")
+        .is_some_and(|name| {
+            same_node(&name, target) && node_text_matches(content, target, symbol_name)
+        })
+}
+
+fn type_parameters_bind_name(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    if node.kind() == "type_parameter" && name_field_matches(node, content, symbol_name) {
+        return true;
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if type_parameters_bind_name(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pattern_binds_name(pattern: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            node_text_matches(content, pattern, symbol_name)
+        }
+        "required_parameter" | "optional_parameter" => pattern
+            .child_by_field_name("pattern")
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "assignment_pattern" => pattern
+            .child_by_field_name("left")
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .or_else(|| pattern.child_by_field_name("key"))
+            .is_some_and(|child| pattern_binds_name(&child, content, symbol_name)),
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            node_children_pattern_bind_name(pattern, content, symbol_name)
+        }
+        kind if kind.ends_with("_pattern") => {
+            node_children_pattern_bind_name(pattern, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_pattern_bind_name(
+    node: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if pattern_binds_name(&child, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pattern_contains_binding_node(
+    pattern: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    if !node_contains(pattern, target) {
+        return false;
+    }
+
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            same_node(pattern, target) && node_text_matches(content, target, symbol_name)
+        }
+        "required_parameter" | "optional_parameter" => {
+            pattern.child_by_field_name("pattern").is_some_and(|child| {
+                pattern_contains_binding_node(&child, target, content, symbol_name)
+            })
+        }
+        "assignment_pattern" => pattern.child_by_field_name("left").is_some_and(|child| {
+            pattern_contains_binding_node(&child, target, content, symbol_name)
+        }),
+        "pair_pattern" => pattern
+            .child_by_field_name("value")
+            .or_else(|| pattern.child_by_field_name("key"))
+            .is_some_and(|child| {
+                pattern_contains_binding_node(&child, target, content, symbol_name)
+            }),
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            node_children_pattern_contain_binding_node(pattern, target, content, symbol_name)
+        }
+        kind if kind.ends_with("_pattern") => {
+            node_children_pattern_contain_binding_node(pattern, target, content, symbol_name)
+        }
+        _ => false,
+    }
+}
+
+fn node_children_pattern_contain_binding_node(
+    node: &tree_sitter::Node,
+    target: &tree_sitter::Node,
+    content: &str,
+    symbol_name: &str,
+) -> bool {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if pattern_contains_binding_node(&child, target, content, symbol_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn name_field_matches(node: &tree_sitter::Node, content: &str, symbol_name: &str) -> bool {
+    node.child_by_field_name("name")
+        .is_some_and(|name| node_text_matches(content, &name, symbol_name))
+}
+
+fn same_node(a: &tree_sitter::Node, b: &tree_sitter::Node) -> bool {
+    a.kind() == b.kind() && a.start_byte() == b.start_byte() && a.end_byte() == b.end_byte()
+}
+
+fn node_contains(container: &tree_sitter::Node, node: &tree_sitter::Node) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+}
+
+fn node_text_matches(content: &str, node: &tree_sitter::Node, expected: &str) -> bool {
+    content
+        .get(node.byte_range())
+        .is_some_and(|text| text == expected)
 }
 
 /// Extract an alias for a symbol from an import statement's raw text.
 ///
 /// Looks for `symbol_name as alias` pattern in the import text.
+#[cfg(test)]
 fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
     // Look for `symbolName as aliasName` pattern
     let pattern = format!("{} as ", symbol_name);
@@ -908,14 +1923,17 @@ fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
 }
 
 /// Restore a checkpoint by name, scoped to the caller's session.
-fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) {
+fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) -> bool {
     let cp_store = ctx.checkpoint().borrow();
     if let Err(e) = cp_store.restore(session, name) {
         log::debug!(
-            "[aft] move_symbol rollback: failed to restore checkpoint '{}': {}",
+            "move_symbol rollback: failed to restore checkpoint '{}': {}",
             name,
             e
         );
+        false
+    } else {
+        true
     }
 }
 
@@ -925,7 +1943,7 @@ fn cleanup_new_files(new_files: &[PathBuf]) {
         if path.exists() {
             if let Err(e) = std::fs::remove_file(path) {
                 log::debug!(
-                    "[aft] move_symbol rollback: failed to delete new file {}: {}",
+                    "move_symbol rollback: failed to delete new file {}: {}",
                     path.display(),
                     e
                 );
@@ -960,7 +1978,7 @@ fn move_error(
     }
 
     log::debug!(
-        "[aft] move_symbol failed at {}: {} — rolled back {} files",
+        "move_symbol failed at {}: {} — rolled back {} files",
         failed_file,
         message,
         rolled_back.len()
@@ -1147,5 +2165,66 @@ mod tests {
             result,
             "export function bar() {}\n\nexport function foo() {}\n"
         );
+    }
+
+    // --- find_export_keyword_start ----------------------------------------
+
+    #[test]
+    fn find_export_keyword_simple_export() {
+        // `export function greet(...)` — decl_start=7 (start of "function")
+        let source = "export function greet() {}\n";
+        assert_eq!(find_export_keyword_start(source, 7), Some(0));
+    }
+
+    #[test]
+    fn find_export_keyword_export_default() {
+        // `export default function f(...)` — decl_start=15 (start of "function")
+        let source = "export default function f() {}\n";
+        assert_eq!(find_export_keyword_start(source, 15), Some(0));
+    }
+
+    #[test]
+    fn find_export_keyword_with_jsdoc_above() {
+        // The JSDoc lives on prior lines; `export` is still the immediate
+        // predecessor of `function`. Decl_start lands on `f` of `function`.
+        let source = "/** doc */\nexport function f() {}\n";
+        let decl_start = source.find("function").unwrap();
+        assert_eq!(find_export_keyword_start(source, decl_start), Some(11));
+    }
+
+    #[test]
+    fn find_export_keyword_no_export() {
+        // Plain `function f()` — no preceding export keyword. Helper must
+        // return None so the caller falls back to the raw decl_start.
+        let source = "function f() {}\n";
+        assert_eq!(find_export_keyword_start(source, 0), None);
+    }
+
+    #[test]
+    fn find_export_keyword_unrelated_word_before() {
+        // A `report` token that ENDS with the bytes "ort" but doesn't start
+        // with `export` should not be matched. Decl_start lands after "report ".
+        let source = "let report = 1;\nfunction f() {}\n";
+        let decl_start = source.find("function").unwrap();
+        // Walking backwards we'd see " " then "report ;1 = troper " etc. No
+        // "export" token, so None.
+        assert_eq!(find_export_keyword_start(source, decl_start), None);
+    }
+
+    #[test]
+    fn find_export_keyword_does_not_match_substring() {
+        // `_export` (with leading underscore) is part of a different
+        // identifier; it must NOT match because the left word boundary
+        // check sees `_` before `e`.
+        let source = "let _export = 1;\nfunction f() {}\n";
+        let decl_start = source.find("function").unwrap();
+        assert_eq!(find_export_keyword_start(source, decl_start), None);
+    }
+
+    #[test]
+    fn find_export_keyword_at_zero_decl_start() {
+        // Edge case: caller passed 0 (decl is at start of file). No export
+        // can be before position 0. Return None.
+        assert_eq!(find_export_keyword_start("function f() {}", 0), None);
     }
 }

@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use super::query_support::resolve_symbol_query;
 use crate::context::AppContext;
 use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
@@ -37,7 +36,7 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let raw_symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
+    let symbol = match req.params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Response::error(
@@ -66,14 +65,6 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(5)
         .min(100) as usize;
 
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
-        Err(resp) => return resp,
-    };
-    if let Some(resp) = ctx.require_go_overlay(&req.id, "trace_data", &file_path) {
-        return resp;
-    }
-
     let mut cg_ref = ctx.callgraph().borrow_mut();
     let graph = match cg_ref.as_mut() {
         Some(g) => g,
@@ -85,39 +76,45 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-    let symbol = match resolve_symbol_query(ctx, &file_path, raw_symbol) {
-        Ok(symbol) => symbol,
-        Err(err) => return Response::error(&req.id, err.code(), err.to_string()),
+
+    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
     };
 
-    // Build file data first to check if the symbol exists
-    match graph.build_file(&file_path) {
-        Ok(data) => {
-            let has_symbol = data.calls_by_symbol.contains_key(&symbol)
-                || data.exported_symbols.contains(&symbol)
-                || data.symbol_metadata.contains_key(&symbol);
-            if !has_symbol {
-                return Response::error(
-                    &req.id,
-                    "symbol_not_found",
-                    format!("trace_data: symbol '{}' not found in {}", raw_symbol, file),
-                );
-            }
-        }
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
+    let project_root = ctx.config().project_root.clone();
+    if let Some(project_root) = project_root {
+        let canonical_root = std::fs::canonicalize(&project_root).unwrap_or(project_root.clone());
+        let input_for_resolution = if file_path.is_relative() {
+            project_root.join(&file_path)
+        } else {
+            file_path.clone()
+        };
+        let canonical_input =
+            std::fs::canonicalize(&input_for_resolution).unwrap_or(input_for_resolution);
+        if !canonical_input.starts_with(&canonical_root) {
+            return Response::error(
+                &req.id,
+                "path_outside_project_root",
+                format!(
+                    "Callgraph operations require paths inside project_root. Got: {} (project_root: {})",
+                    file_path.display(),
+                    project_root.display(),
+                ),
+            );
         }
     }
+
+    let symbol = match graph.resolve_symbol_query(&file_path, symbol) {
+        Ok(symbol) => symbol,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
 
     let max_files = ctx.config().max_callgraph_files;
 
     match graph.trace_data(&file_path, &symbol, expression, depth, max_files) {
         Ok(result) => {
-            let text = result.render_text();
-            let mut result_json = serde_json::to_value(&result).unwrap_or_default();
-            if let Some(obj) = result_json.as_object_mut() {
-                obj.insert("text".to_string(), serde_json::Value::String(text));
-            }
+            let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }
         Err(err @ AftError::ProjectTooLarge { .. }) => {

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { BinaryBridge, compareSemver } from "../bridge.js";
+import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
@@ -22,9 +23,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("spawns binary and ping returns pong", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     const response = await bridge.send("ping");
 
@@ -33,10 +39,192 @@ describe("BinaryBridge lifecycle", () => {
     expect(bridge.isAlive()).toBe(true);
   });
 
-  test("multiple sequential requests return correct responses (ID correlation)", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
+  test("parses pushed bash_completed frames without request correlation", async () => {
+    const completions: unknown[] = [];
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onBashCompletion: (completion) => {
+          completions.push(completion);
+        },
+      },
+      { harness: "opencode" },
+    );
+
+    (bridge as any).onStdoutData(
+      `${JSON.stringify({
+        type: "bash_completed",
+        task_id: "task-1",
+        session_id: "s1",
+        status: "completed",
+        exit_code: 0,
+        command: "echo done",
+      })}\n`,
+    );
+
+    expect(completions).toEqual([
+      {
+        type: "bash_completed",
+        task_id: "task-1",
+        session_id: "s1",
+        status: "completed",
+        exit_code: 0,
+        command: "echo done",
+      },
+    ]);
+  });
+
+  test("routes pushed configure_warnings frames with session_id to the warning handler", async () => {
+    const deliveries: unknown[] = [];
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
+      },
+      { harness: "opencode" },
+    );
+
+    (bridge as any).onStdoutData(
+      `${JSON.stringify({
+        type: "configure_warnings",
+        session_id: "session-1",
+        project_root: "/repo",
+        source_file_count: 10,
+        source_file_count_exceeds_max: false,
+        max_callgraph_files: 5_000,
+        warnings: [
+          {
+            kind: "formatter_not_installed",
+            language: "typescript",
+            tool: "biome",
+            hint: "Install biome.",
+          },
+        ],
+      })}\n`,
+    );
+
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toEqual({
+      projectRoot: "/repo",
+      sessionId: "session-1",
+      client: undefined,
+      warnings: [
+        {
+          kind: "formatter_not_installed",
+          language: "typescript",
+          tool: "biome",
+          hint: "Install biome.",
+        },
+      ],
     });
+  });
+
+  test("handles pushed configure_warnings frames with missing session_id gracefully", async () => {
+    const deliveries: unknown[] = [];
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
+      },
+      { harness: "opencode" },
+    );
+
+    expect(() => {
+      (bridge as any).onStdoutData(
+        `${JSON.stringify({
+          type: "configure_warnings",
+          project_root: "/repo",
+          source_file_count: 10,
+          source_file_count_exceeds_max: false,
+          max_callgraph_files: 5_000,
+          warnings: [
+            {
+              kind: "formatter_not_installed",
+              language: "typescript",
+              tool: "biome",
+              hint: "Install biome.",
+            },
+          ],
+        })}\n`,
+      );
+    }).not.toThrow();
+
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toEqual({
+      projectRoot: "/repo",
+      sessionId: null,
+      client: undefined,
+      warnings: [
+        {
+          kind: "formatter_not_installed",
+          language: "typescript",
+          tool: "biome",
+          hint: "Install biome.",
+        },
+      ],
+    });
+  });
+
+  test("uses the session_id to pick the matching configure warning client", async () => {
+    const deliveries: unknown[] = [];
+    const clientA = { name: "client-a" };
+    const clientB = { name: "client-b" };
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        onConfigureWarnings: (context) => {
+          deliveries.push(context);
+        },
+      },
+      { harness: "opencode" },
+    );
+    (bridge as any).configureWarningClients.set("session-a", clientA);
+    (bridge as any).configureWarningClients.set("session-b", clientB);
+
+    (bridge as any).onStdoutData(
+      `${JSON.stringify({
+        type: "configure_warnings",
+        session_id: "session-a",
+        project_root: "/repo",
+        source_file_count: 10,
+        source_file_count_exceeds_max: false,
+        max_callgraph_files: 5_000,
+        warnings: [
+          {
+            kind: "formatter_not_installed",
+            language: "typescript",
+            tool: "biome",
+            hint: "Install biome.",
+          },
+        ],
+      })}\n`,
+    );
+
+    expect(deliveries).toHaveLength(1);
+    expect((deliveries[0] as { client?: unknown }).client).toBe(clientA);
+  });
+
+  test("multiple sequential requests return correct responses (ID correlation)", async () => {
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     // Send multiple requests sequentially — each gets a unique ID internally
     const r1 = await bridge.send("ping");
@@ -60,10 +248,15 @@ describe("BinaryBridge lifecycle", () => {
     // Issue #14: SIGKILL/SIGTERM are external kills, not crashes — we explicitly
     // do NOT auto-restart to avoid process avalanches when many bridges receive
     // SIGTERM together. Recovery still works: the next send() lazy-spawns.
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      maxRestarts: 3,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        maxRestarts: 3,
+      },
+      { harness: "opencode" },
+    );
 
     // First request to ensure the process is running
     const r1 = await bridge.send("ping");
@@ -74,8 +267,9 @@ describe("BinaryBridge lifecycle", () => {
     expect(proc).not.toBeNull();
     proc.kill("SIGKILL");
 
-    // Let the exit handler run (it should NOT schedule an auto-restart).
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // Wait for the exit handler to observe the killed child. It should NOT
+    // schedule an auto-restart; the next request lazy-spawns instead.
+    await waitForBridgeProcessExit(bridge, proc.pid);
 
     // Next request lazy-spawns a fresh bridge.
     const r2 = await bridge.send("ping");
@@ -85,9 +279,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("shutdown cleans up child process (no orphans)", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     // Ensure process is alive
     const r = await bridge.send("ping");
@@ -106,10 +305,15 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("request to dead bridge after max retries rejects with error", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      maxRestarts: 0, // no restarts allowed
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        maxRestarts: 0, // no restarts allowed
+      },
+      { harness: "opencode" },
+    );
 
     // Start the process
     const r = await bridge.send("ping");
@@ -120,7 +324,7 @@ describe("BinaryBridge lifecycle", () => {
     proc.kill("SIGKILL");
 
     // Wait for crash detection
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForBridgeProcessExit(bridge, proc.pid);
 
     // Next send should spawn a fresh process (ensureSpawned) — but then kill it again
     // Actually with maxRestarts=0, handleCrash won't restart, but ensureSpawned
@@ -138,9 +342,14 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("multiple parallel first calls share one configure (no race)", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
 
     // Fire 5 requests in parallel — all arrive before configure completes.
     // Before the shared-promise fix, the 4th+ call would hit the depth limit.
@@ -164,13 +373,18 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("bridge death during version check prevents configured=true", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      // Set a minVersion so checkVersion actually sends a "version" command
-      minVersion: "0.0.1",
-      // Disable auto-restart so the killed process stays dead
-      maxRestarts: 0,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        // Set a minVersion so checkVersion actually sends a "version" command
+        minVersion: "0.0.1",
+        // Disable auto-restart so the killed process stays dead
+        maxRestarts: 0,
+      },
+      { harness: "opencode" },
+    );
 
     // Intercept checkVersion to kill the process mid-flight.
     // We monkey-patch the private checkVersion method to simulate a crash
@@ -182,7 +396,7 @@ describe("BinaryBridge lifecycle", () => {
       if (proc) {
         proc.kill("SIGKILL");
         // Wait for the exit event to fire and handleCrash to run
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await waitForBridgeProcessExit(this, proc.pid);
       }
       // Return normally — simulates checkVersion swallowing the error
     };
@@ -194,12 +408,15 @@ describe("BinaryBridge lifecycle", () => {
     expect((bridge as any).configured).toBe(false);
   });
 
-  test("crash error surfaces stderr tail for diagnostics", async () => {
+  test("crash error stays clean for the agent and points to the log", async () => {
     // Fake binary: writes recognizable stderr lines, briefly sleeps so the
-    // bridge has time to queue `configure`, then exits non-zero. The exit
-    // handler then runs handleCrash() which rejects pending requests — and
-    // the rejection must now include the stderr tail so callers see WHY
-    // the child died, not just that it died.
+    // bridge has time to queue `configure`, then exits non-zero.
+    //
+    // Agent-facing rejection contract: the rejection error must NOT carry
+    // stderr tail noise (loaded N backups, invalidated K files, or — as in
+    // this fixture — the actual cause). Operator diagnostics belong in the
+    // plugin log; the agent only needs a pointer to it. Anything else just
+    // burns context on output the agent can't act on.
     const fakeBin = join(tmpdir(), `aft-fake-crash-${Date.now()}.sh`);
     await writeFile(
       fakeBin,
@@ -218,10 +435,15 @@ describe("BinaryBridge lifecycle", () => {
     );
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000, // must exceed the fake binary's sleep
-        maxRestarts: 0, // force straight to the "giving up" path
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000, // must exceed the fake binary's sleep
+          maxRestarts: 0, // force straight to the "giving up" path
+        },
+        { harness: "opencode" },
+      );
 
       let caught: Error | null = null;
       try {
@@ -231,9 +453,15 @@ describe("BinaryBridge lifecycle", () => {
       }
       expect(caught).not.toBeNull();
       const msg = caught?.message ?? "";
-      expect(msg).toContain("fatal: semantic index corrupted");
-      expect(msg).toContain("caused by: bad cache magic");
-      expect(msg).toContain("stderr lines");
+      // Agent gets a concise, actionable error (prefix is the bridge default
+      // when no errorPrefix is provided to BinaryBridge directly in tests)
+      expect(msg).toContain("Binary crashed");
+      expect(msg).toContain("(see ");
+      // Agent does NOT get the stderr tail dumped into the rejection
+      expect(msg).not.toContain("fatal: semantic index corrupted");
+      expect(msg).not.toContain("caused by: bad cache magic");
+      expect(msg).not.toContain("--- last");
+      expect(msg).not.toContain("stderr lines");
     } finally {
       await rm(fakeBin).catch(() => {});
     }
@@ -248,10 +476,15 @@ describe("BinaryBridge lifecycle", () => {
     await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000, // bridge-wide default
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000, // bridge-wide default
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       const start = Date.now();
       // Use "version" to skip the auto-configure path (configure/version are
@@ -271,11 +504,147 @@ describe("BinaryBridge lifecycle", () => {
     }
   });
 
+  test("keepBridgeOnTimeout: child process survives transport timeout for retry-friendly commands", async () => {
+    // Fake binary that hangs forever on input — same pattern as the timeout
+    // test above. Prove that with keepBridgeOnTimeout=true the same hung child
+    // process is still alive after the request rejects, so subsequent commands
+    // can race through it without a respawn (and don't pay the bridge-restart
+    // cost just because one bash call's response was late).
+    const fakeBin = join(tmpdir(), `aft-fake-slow-keep-${Date.now()}.sh`);
+    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+
+    try {
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
+
+      // First request: timeout with keepBridgeOnTimeout — should reject without
+      // killing the bridge.
+      const err1 = await bridge
+        .send("version", {}, { timeoutMs: 50, keepBridgeOnTimeout: true })
+        .catch((e) => e);
+      expect(err1).toBeInstanceOf(Error);
+      expect((err1 as Error).message).toContain("timed out");
+
+      // Without keepBridgeOnTimeout, handleTimeout() would have killed the
+      // child. With it set, the child is still alive — verify by calling the
+      // private getter via cast (test-only).
+      const child = (bridge as unknown as { process: { killed: boolean } | null }).process;
+      expect(child).not.toBeNull();
+      expect(child?.killed).toBe(false);
+
+      // Compare with default (no keep flag): same hung binary. Per the
+      // starvation-timeout mitigation, a SINGLE non-keep timeout no longer
+      // kills the bridge — a transient/slow response keeps the warm bridge
+      // alive (consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD). The child
+      // is only torn down once repeated silent timeouts indicate a genuine
+      // hang. This hung binary emits no output, so each timeout counts toward
+      // the hang threshold (2); the second consecutive non-keep timeout
+      // triggers handleTimeout and clears the process.
+      const err2 = await bridge.send("version", {}, { timeoutMs: 50 }).catch((e) => e);
+      expect(err2).toBeInstanceOf(Error);
+      expect((err2 as Error).message).toContain("timed out");
+      // First non-keep timeout: bridge kept warm (child still alive).
+      const childMid = (bridge as unknown as { process: { killed: boolean } | null }).process;
+      expect(childMid).not.toBeNull();
+
+      const err3 = await bridge.send("version", {}, { timeoutMs: 50 }).catch((e) => e);
+      expect(err3).toBeInstanceOf(Error);
+      expect((err3 as Error).message).toContain("timed out");
+      // Second consecutive silent timeout crosses the hang threshold →
+      // handleTimeout kills the child. maxRestarts=0 means no respawn, so the
+      // process is now null.
+      const childAfter = (bridge as unknown as { process: { killed: boolean } | null }).process;
+      expect(childAfter).toBeNull();
+    } finally {
+      await rm(fakeBin).catch(() => {});
+    }
+  });
+
+  test("send rejects params that contain reserved id key before writing", async () => {
+    const marker = join(tmpdir(), `aft-fake-id-collision-started-${Date.now()}`);
+    const fakeBin = join(tmpdir(), `aft-fake-id-collision-${Date.now()}.sh`);
+    await writeFile(
+      fakeBin,
+      ["#!/bin/sh", `touch ${JSON.stringify(marker)}`, "sleep 30", ""].join("\n"),
+      {
+        mode: 0o755,
+      },
+    );
+
+    try {
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
+
+      await expect(bridge.send("foo", { id: "evil" })).rejects.toThrow(
+        "params cannot contain reserved key 'id'",
+      );
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      await rm(fakeBin).catch(() => {});
+      await rm(marker).catch(() => {});
+    }
+  });
+
+  test("per-request transportTimeoutMs override sets the bridge timer", async () => {
+    const fakeBin = join(tmpdir(), `aft-fake-transport-timeout-${Date.now()}.sh`);
+    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+
+    const originalSetTimeout = globalThis.setTimeout;
+    const delays: unknown[] = [];
+    globalThis.setTimeout = ((
+      handler: Parameters<typeof setTimeout>[0],
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      delays.push(timeout);
+      return originalSetTimeout(handler, Math.min(Number(timeout ?? 0), 1), ...args);
+    }) as typeof setTimeout;
+
+    try {
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 30_000,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
+
+      const err = await bridge.send("version", {}, { transportTimeoutMs: 60_000 }).catch((e) => e);
+
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain("timed out after 60000ms");
+      expect(delays).toContain(60_000);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      await rm(fakeBin).catch(() => {});
+    }
+  });
+
   test("restart counter decays even after max restarts is reached", async () => {
-    bridge = new BinaryBridge(BINARY_PATH, PROJECT_CWD, {
-      timeoutMs: TEST_TIMEOUT_MS,
-      maxRestarts: 1,
-    });
+    bridge = new BinaryBridge(
+      BINARY_PATH,
+      PROJECT_CWD,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+        maxRestarts: 1,
+      },
+      { harness: "opencode" },
+    );
     const originalResetMs = (BinaryBridge as any).RESTART_RESET_MS;
 
     try {
@@ -285,7 +654,7 @@ describe("BinaryBridge lifecycle", () => {
       (bridge as any).handleCrash();
 
       expect(bridge.restartCount).toBe(1);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitUntil(() => bridge?.restartCount === 0, 500, "restart counter to decay");
       expect(bridge.restartCount).toBe(0);
     } finally {
       (BinaryBridge as any).RESTART_RESET_MS = originalResetMs;
@@ -298,10 +667,15 @@ describe("BinaryBridge lifecycle", () => {
 
     let staleChild: ChildProcess | null = null;
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: TEST_TIMEOUT_MS,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
       (bridge as any).spawnProcess();
       staleChild = (bridge as any).process as ChildProcessWithoutNullStreams;
@@ -319,49 +693,63 @@ describe("BinaryBridge lifecycle", () => {
     }
   });
 
-  test("stderr tail is bounded (doesn't grow unboundedly)", async () => {
-    // Emit 200 stderr lines before crashing. Only the last 20 should be kept
-    // per BinaryBridge.STDERR_TAIL_MAX — prevents memory leaks when a child
-    // panics in a long loop before its final exit.
+  test("stderr tail ring buffer is bounded (doesn't grow unboundedly)", async () => {
+    // Emit 250 stderr lines into a long-lived bridge — only the last 20 should
+    // be kept per BinaryBridge.STDERR_TAIL_MAX. The tail no longer lives in
+    // agent-facing errors (operator diagnostics belong in aft-plugin.log only),
+    // so we assert directly against the internal ring buffer.
     const fakeBin = join(tmpdir(), `aft-fake-flood-${Date.now()}.sh`);
     await writeFile(
       fakeBin,
       [
         "#!/bin/sh",
         "i=0",
-        "while [ $i -lt 200 ]; do",
+        "while [ $i -lt 250 ]; do",
         '  echo "noise line $i" >&2',
         "  i=$((i + 1))",
         "done",
         'echo "MARKER_LAST" >&2',
-        "sleep 0.3",
-        "exit 1",
+        // Hold the process open so the stderr ring is observable before the
+        // child exits and the spawnProcess() reset clears it.
+        "sleep 5",
         "",
       ].join("\n"),
       { mode: 0o755 },
     );
 
     try {
-      bridge = new BinaryBridge(fakeBin, PROJECT_CWD, {
-        timeoutMs: 5_000,
-        maxRestarts: 0,
-      });
+      bridge = new BinaryBridge(
+        fakeBin,
+        PROJECT_CWD,
+        {
+          timeoutMs: 5_000,
+          maxRestarts: 0,
+        },
+        { harness: "opencode" },
+      );
 
-      let caught: Error | null = null;
-      try {
-        await bridge.send("ping");
-      } catch (e) {
-        caught = e as Error;
+      // Spawn the process so stderr starts streaming. We don't wait on a
+      // response — the fake binary doesn't speak NDJSON.
+      (bridge as any).spawnProcess();
+
+      // Poll for MARKER_LAST to land in the ring buffer. Under load, the
+      // 250+1 stderr lines can take longer than a fixed sleep would allow,
+      // so we deadline-poll instead.
+      const deadline = Date.now() + 5_000;
+      let ring: string[] = (bridge as any).stderrTail as string[];
+      while (Date.now() < deadline) {
+        ring = (bridge as any).stderrTail as string[];
+        if (ring.some((line) => line.includes("MARKER_LAST"))) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      const msg = caught?.message ?? "";
-      // The last marker must be present — tail is capturing the end, not the start.
-      expect(msg).toContain("MARKER_LAST");
-      // Early lines should have been evicted (far beyond the 20-line cap).
-      expect(msg).not.toContain("noise line 0\n");
-      expect(msg).not.toContain("noise line 100\n");
-      // The message shouldn't be megabytes long; cap at a generous but fixed
-      // size that reflects ~20 lines * ~30 chars/line + framing.
-      expect(msg.length).toBeLessThan(2_000);
+
+      // Ring is capped at STDERR_TAIL_MAX (20) regardless of how many lines arrived.
+      expect(ring.length).toBeLessThanOrEqual(20);
+      // Last marker is preserved — the tail captures the END of the stream.
+      expect(ring.some((line) => line.includes("MARKER_LAST"))).toBe(true);
+      // Early lines have been evicted.
+      expect(ring.some((line) => line === "noise line 0")).toBe(false);
+      expect(ring.some((line) => line === "noise line 100")).toBe(false);
     } finally {
       await rm(fakeBin).catch(() => {});
     }
@@ -398,5 +786,35 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function waitForBridgeProcessExit(
+  bridge: BinaryBridge,
+  pid: number | undefined,
+  timeoutMs = 5_000,
+): Promise<void> {
+  if (pid === undefined) throw new Error("bridge child process is missing a pid");
+  await waitUntil(
+    () => {
+      const current = (bridge as unknown as { process: ChildProcess | null }).process;
+      return current?.pid !== pid || !isProcessAlive(pid);
+    },
+    timeoutMs,
+    `bridge child ${pid} to exit`,
+  );
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
+  const started = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`timed out waiting for ${description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }

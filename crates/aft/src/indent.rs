@@ -34,12 +34,25 @@ impl IndentStyle {
     pub fn default_for(lang: LangId) -> Self {
         match lang {
             LangId::Python => IndentStyle::Spaces(4),
-            LangId::TypeScript | LangId::Tsx | LangId::JavaScript => IndentStyle::Spaces(2),
+            LangId::TypeScript
+            | LangId::Tsx
+            | LangId::JavaScript
+            | LangId::Vue
+            | LangId::Json
+            | LangId::Scala
+            | LangId::Ruby
+            | LangId::Lua => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {
                 IndentStyle::Spaces(4)
             }
+            LangId::Solidity
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::Swift
+            | LangId::Php
+            | LangId::Perl => IndentStyle::Spaces(4),
             LangId::Html => IndentStyle::Spaces(2),
             LangId::Markdown => IndentStyle::Spaces(4),
         }

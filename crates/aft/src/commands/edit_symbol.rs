@@ -18,9 +18,11 @@ use crate::symbols::Range;
 ///   - `content` (string, optional) — replacement/insertion content (required for replace/insert_*)
 ///   - `scope` (string, optional) — scope qualifier to disambiguate (e.g. "ClassName")
 ///
-/// Returns on success: `{ file, symbol, operation, range, new_range?, syntax_valid, backup_id }`
+/// Returns on success: `{ file, symbol, operation, range, new_range?, syntax_valid?, backup_id }`.
+/// `syntax_valid` is absent when syntax validation could not run.
 /// Returns on ambiguity: `{ code: "ambiguous_symbol", candidates: [...] }`
 pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -249,23 +251,13 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
-
     // Auto-backup before writing
     let backup_id = match edit::auto_backup(
         ctx,
         req.session(),
         &path,
         &format!("edit_symbol: {} {}", operation, symbol_name),
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -283,7 +275,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("edit_symbol: {} in {}", symbol_name, file);
@@ -312,16 +304,17 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         _ => None,
     };
 
-    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
-
     let mut result = serde_json::json!({
         "file": file,
         "symbol": symbol_name,
         "operation": operation,
         "range": original_range,
-        "syntax_valid": syntax_valid,
         "formatted": write_result.formatted,
     });
+
+    if let Some(valid) = write_result.syntax_valid {
+        result["syntax_valid"] = serde_json::json!(valid);
+    }
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -374,10 +367,17 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
 
-    // Include diff info if requested (for UI metadata)
+    // Read final content once for both no_op detection and diff info.
+    // Honest reporting: when the symbol replacement produced byte-identical
+    // file content (e.g. replacing a symbol with its own body, or formatter
+    // normalized the change away), surface `no_op: true`. See GitHub #45.
+    let final_content = std::fs::read_to_string(&path).unwrap_or_default();
+    if source == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(&path).unwrap_or_default();
-        result["diff"] = edit::compute_diff_info(&source, &final_content);
+        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
     Response::success(&req.id, result)

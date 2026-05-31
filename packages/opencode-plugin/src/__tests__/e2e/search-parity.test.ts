@@ -35,13 +35,16 @@ type GlobCase = {
 };
 
 const initialBinary = await prepareBinary();
+const isCI = process.env.CI === "true";
 const ripgrepAvailable = hasCommand("rg", ["--version"]);
 
 if (!ripgrepAvailable) {
   console.warn("Skipping e2e search parity tests: ripgrep (rg) is not installed.");
 }
 
-const maybeDescribe = describe.skipIf(!initialBinary.binaryPath || !ripgrepAvailable);
+const maybeDescribe = isCI
+  ? describe.skipIf(!initialBinary.binaryPath)
+  : describe.skipIf(!initialBinary.binaryPath || !ripgrepAvailable);
 
 const grepCases: GrepCase[] = [
   {
@@ -285,7 +288,8 @@ async function configureBridge(
 ): Promise<void> {
   const response = await harness.bridge.send("configure", {
     project_root: harness.tempDir,
-    experimental_search_index: options.experimentalSearchIndex,
+    harness: "opencode",
+    search_index: options.experimentalSearchIndex,
   });
 
   if (response.success !== true) {

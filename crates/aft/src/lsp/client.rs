@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -12,17 +12,29 @@ use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::jsonrpc::{
     Notification, Request, RequestId, Response as JsonRpcResponse, ServerMessage,
 };
+use crate::lsp::position::path_to_uri;
 use crate::lsp::registry::ServerKind;
 use crate::lsp::{transport, LspError};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const STDERR_TAIL_LINES: usize = 64;
+const STDERR_LINE_BYTES: usize = 4 * 1024;
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
+type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
+
+#[cfg(windows)]
+fn is_windows_batch_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
 
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +99,10 @@ pub struct LspClient {
     root: PathBuf,
     state: ServerState,
     child: Child,
+    /// Child PID captured at spawn time. Used by Drop to untrack the
+    /// PID from the shared registry; we capture once rather than reading
+    /// `child.id()` later because Drop ordering with the Child can race.
+    child_pid: u32,
     writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
 
     /// Pending request responses, keyed by request ID.
@@ -97,10 +113,29 @@ pub struct LspClient {
     /// `None` until `initialize()` succeeds; conservative defaults thereafter
     /// when the server doesn't advertise diagnosticProvider.
     diagnostic_caps: Option<ServerDiagnosticCapabilities>,
+    /// Whether the server advertised static `workspace.didChangeWatchedFiles`
+    /// support during `initialize`. Dynamic registration is tracked separately
+    /// in `watched_file_registrations`; either path permits notifications.
+    /// Intentional default: `false` (conservative — requires server opt-in).
+    supports_watched_files: bool,
+    /// Dynamic `workspace/didChangeWatchedFiles` registrations requested by
+    /// the server via `client/registerCapability`. Per LSP, the client must
+    /// not send watched-file notifications merely because a server mentions
+    /// dynamic registration during initialize; a real registration is required.
+    watched_file_registrations: WatchedFileRegistrations,
+    /// Shared registry that tracks live LSP child PIDs across the process
+    /// so the signal handler can SIGKILL them on SIGTERM/SIGINT before
+    /// aft exits. Cloned via `Arc` — multiple clients share the same set.
+    child_registry: LspChildRegistry,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl LspClient {
     /// Spawn a new language server process and start the background reader thread.
+    ///
+    /// `child_registry` is a shared handle that records this child's PID so
+    /// the signal handler can SIGKILL it on SIGTERM/SIGINT. Tests that don't
+    /// care about signal cleanup can pass `LspChildRegistry::new()`.
     pub fn spawn(
         kind: ServerKind,
         root: PathBuf,
@@ -108,21 +143,62 @@ impl LspClient {
         args: &[String],
         env: &HashMap<String, String>,
         event_tx: Sender<LspEvent>,
+        child_registry: LspChildRegistry,
     ) -> io::Result<Self> {
+        #[cfg(windows)]
+        let mut command = if is_windows_batch_file(binary) {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/C").arg(binary.as_os_str());
+            command
+        } else {
+            Command::new(binary)
+        };
+        #[cfg(not(windows))]
         let mut command = Command::new(binary);
         command
             .args(args)
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Use null() instead of piped() to prevent deadlock when the server
-            // writes more than ~64KB to stderr (piped buffer fills, server blocks)
-            .stderr(Stdio::null());
+            // Drain stderr on a background thread so failed shims/crashes have
+            // actionable diagnostics without risking pipe-buffer deadlock.
+            .stderr(Stdio::piped());
         for (key, value) in env {
             command.env(key, value);
         }
 
-        let mut child = command.spawn()?;
+        // Put each LSP child in its own process group so we can SIGKILL the
+        // whole group on shutdown. Critical for npm-wrapped servers like
+        // biome (`node biome lsp-proxy` spawns `cli-darwin-arm64 biome
+        // lsp-proxy` as a child); killing just the wrapper PID leaves the
+        // real server orphaned to PID 1.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    // If aft is killed with SIGKILL, Rust cleanup and our
+                    // signal-handler thread never run. Ask the kernel to kill
+                    // the LSP process group as soon as the parent dies. This is
+                    // best-effort Linux coverage for the otherwise unhandleable
+                    // parent-death path.
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() == 1 {
+                        return Err(io::Error::other("parent died before LSP spawn completed"));
+                    }
+                }
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = child_registry.spawn_tracked(&mut command)?;
+        let child_pid = child.id();
 
         let stdout = child
             .stdout
@@ -132,11 +208,19 @@ impl LspClient {
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("language server missing stdin pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("language server missing stderr pipe"))?;
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let pending = Arc::new(Mutex::new(PendingMap::new()));
+        let watched_file_registrations = Arc::new(Mutex::new(HashSet::new()));
         let reader_pending = Arc::clone(&pending);
         let reader_writer = Arc::clone(&writer);
+        let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
         let reader_kind = kind.clone();
         let reader_root = root.clone();
 
@@ -148,7 +232,7 @@ impl LspClient {
                         if let Ok(mut guard) = reader_pending.lock() {
                             if let Some(tx) = guard.remove(&response.id) {
                                 if tx.send(response).is_err() {
-                                    log::debug!("[aft-lsp] response channel closed");
+                                    log::debug!("response channel closed");
                                 }
                             }
                         } else {
@@ -168,6 +252,11 @@ impl LspClient {
                         });
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
+                        record_watched_file_registration(
+                            &reader_watched_file_registrations,
+                            &method,
+                            params.as_ref(),
+                        );
                         // Auto-respond to server requests to prevent deadlocks.
                         // Server requests (like client/registerCapability,
                         // window/workDoneProgress/create) block the server until
@@ -224,10 +313,15 @@ impl LspClient {
             root,
             state: ServerState::Starting,
             child,
+            child_pid,
             writer,
             pending,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
+            supports_watched_files: false,
+            watched_file_registrations,
+            child_registry,
+            stderr_tail,
         })
     }
 
@@ -240,13 +334,7 @@ impl LspClient {
         self.ensure_can_send()?;
         self.state = ServerState::Initializing;
 
-        let normalized = normalize_windows_path(workspace_root);
-        let root_url = url::Url::from_file_path(&normalized).map_err(|_| {
-            LspError::NotFound(format!(
-                "failed to convert workspace root '{}' to file URI",
-                workspace_root.display()
-            ))
-        })?;
+        let root_url = path_to_uri(workspace_root)?;
         let root_uri = lsp_types::Uri::from_str(root_url.as_str()).map_err(|_| {
             LspError::NotFound(format!(
                 "failed to convert workspace root '{}' to file URI",
@@ -261,6 +349,9 @@ impl LspClient {
                 "workspace": {
                     "workspaceFolders": true,
                     "configuration": true,
+                    "didChangeWatchedFiles": {
+                        "dynamicRegistration": true
+                    },
                     // LSP 3.17 workspace diagnostic pull. We declare refreshSupport=false
                     // because we drive diagnostics on-demand via pull/push and re-query
                     // when the agent calls lsp_diagnostics again — we don't need the
@@ -312,14 +403,35 @@ impl LspClient {
 
         let params = serde_json::from_value::<lsp_types::InitializeParams>(params_value)?;
 
-        let result = self.send_request::<lsp_types::request::Initialize>(params)?;
+        let result_value = self.send_request_value(
+            <lsp_types::request::Initialize as lsp_types::request::Request>::METHOD,
+            params,
+        )?;
+        let result: lsp_types::InitializeResult = serde_json::from_value(result_value.clone())?;
 
         // Capture diagnostic capabilities from the initialize response. We parse
         // from a re-serialized JSON Value because the lsp-types crate's
         // diagnostic_provider strict variants reject some shapes real servers
         // emit (e.g. bare `true`), and we want defensive Default fallback.
-        let caps_value = serde_json::to_value(&result.capabilities).unwrap_or(Value::Null);
+        let caps_value = result_value
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
+
+        // Capture initialize-time (static) workspace/didChangeWatchedFiles
+        // support. Runtime client/registerCapability subscriptions are recorded
+        // separately by the reader thread. Missing capability is unsupported by
+        // default; callers must not send notifications unless one of those two
+        // server opt-in paths is present.
+        self.supports_watched_files = caps_value
+            .pointer("/workspace/didChangeWatchedFiles/dynamicRegistration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || caps_value
+                .pointer("/workspace/didChangeWatchedFiles")
+                .map(|v| v.is_object() || v.as_bool() == Some(true))
+                .unwrap_or(false);
 
         self.send_notification::<lsp_types::notification::Initialized>(serde_json::from_value(
             json!({}),
@@ -335,12 +447,70 @@ impl LspClient {
         self.diagnostic_caps.as_ref()
     }
 
+    /// Whether the server advertised initialize-time
+    /// `workspace/didChangeWatchedFiles` support. Dynamic registrations are
+    /// reported by `has_watched_file_registration()`.
+    pub fn supports_watched_files(&self) -> bool {
+        self.supports_watched_files
+    }
+
+    /// Whether this server currently has an active dynamic watched-file
+    /// registration. This, not the initialize-time capability shape, controls
+    /// whether `workspace/didChangeWatchedFiles` may be sent.
+    pub fn has_watched_file_registration(&self) -> bool {
+        self.watched_file_registrations
+            .lock()
+            .map(|registrations| !registrations.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Send a request and wait for the response.
     pub fn send_request<R>(&mut self, params: R::Params) -> Result<R::Result, LspError>
     where
         R: lsp_types::request::Request,
         R::Params: serde::Serialize,
         R::Result: DeserializeOwned,
+    {
+        self.ensure_can_send()?;
+
+        let value = self.send_request_value(R::METHOD, params)?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Send a request and wait up to `timeout` for the response. If the local
+    /// deadline expires, remove the pending response handler and notify the
+    /// server with `$/cancelRequest` so it can stop work.
+    pub fn send_request_with_timeout<R>(
+        &mut self,
+        params: R::Params,
+        timeout: Duration,
+    ) -> Result<R::Result, LspError>
+    where
+        R: lsp_types::request::Request,
+        R::Params: serde::Serialize,
+        R::Result: DeserializeOwned,
+    {
+        self.ensure_can_send()?;
+
+        let value = self.send_request_value_with_timeout(R::METHOD, params, timeout)?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    fn send_request_value<P>(&mut self, method: &'static str, params: P) -> Result<Value, LspError>
+    where
+        P: serde::Serialize,
+    {
+        self.send_request_value_with_timeout(method, params, REQUEST_TIMEOUT)
+    }
+
+    fn send_request_value_with_timeout<P>(
+        &mut self,
+        method: &'static str,
+        params: P,
+        timeout: Duration,
+    ) -> Result<Value, LspError>
+    where
+        P: serde::Serialize,
     {
         self.ensure_can_send()?;
 
@@ -351,7 +521,7 @@ impl LspClient {
             pending.insert(id.clone(), tx);
         }
 
-        let request = Request::new(id.clone(), R::METHOD, Some(serde_json::to_value(params)?));
+        let request = Request::new(id.clone(), method, Some(serde_json::to_value(params)?));
         {
             let mut writer = self
                 .writer
@@ -363,22 +533,21 @@ impl LspClient {
             }
         }
 
-        let response = match rx.recv_timeout(REQUEST_TIMEOUT) {
+        let response = match rx.recv_timeout(timeout) {
             Ok(response) => response,
             Err(RecvTimeoutError::Timeout) => {
                 self.remove_pending(&id);
+                self.send_cancel_request(&id)?;
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for '{}' response from {:?}",
-                    R::METHOD,
-                    self.kind
+                    method, self.kind
                 )));
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.remove_pending(&id);
                 return Err(LspError::ServerNotReady(format!(
                     "language server {:?} disconnected while waiting for '{}'",
-                    self.kind,
-                    R::METHOD
+                    self.kind, method
                 )));
             }
         };
@@ -390,7 +559,7 @@ impl LspClient {
             });
         }
 
-        serde_json::from_value(response.result.unwrap_or(Value::Null)).map_err(Into::into)
+        Ok(response.result.unwrap_or(Value::Null))
     }
 
     /// Send a notification (fire-and-forget).
@@ -412,11 +581,13 @@ impl LspClient {
     /// Graceful shutdown: send shutdown request, then exit notification.
     pub fn shutdown(&mut self) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
+            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
         if self.child.try_wait()?.is_some() {
             self.state = ServerState::Exited;
+            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
@@ -446,8 +617,10 @@ impl LspClient {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                // Kill the entire process group, not just the wrapper PID, so
+                // npm-wrapped servers (biome's `node biome lsp-proxy` spawns
+                // a separate cli-darwin-arm64 child) don't leak orphans.
+                kill_lsp_child_group(&mut self.child);
                 self.state = ServerState::Exited;
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for {:?} to exit",
@@ -456,6 +629,21 @@ impl LspClient {
             }
             thread::sleep(EXIT_POLL_INTERVAL);
         }
+    }
+
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|tail| stderr_tail_to_string(&tail))
+            .unwrap_or_default()
+    }
+
+    pub fn child_exited(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_some()
+    }
+
+    pub fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 
     pub fn state(&self) -> ServerState {
@@ -491,24 +679,144 @@ impl LspClient {
             pending.remove(id);
         }
     }
+
+    fn send_cancel_request(&mut self, id: &RequestId) -> Result<(), LspError> {
+        let notification = Notification::new("$/cancelRequest", Some(json!({ "id": id })));
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
+        transport::write_notification(&mut *writer, &notification)?;
+        Ok(())
+    }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Untrack first so the signal handler can't race with this kill and
+        // try to SIGKILL a PID that's already been reaped.
+        self.child_registry.untrack(self.child_pid);
+        kill_lsp_child_group(&mut self.child);
     }
 }
 
-/// Normalize a path for file URI conversion.
-/// On Windows, strips the extended-length `\\?\` prefix that `Url::from_file_path` cannot handle.
-/// On other platforms, returns the path unchanged.
-fn normalize_windows_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path.to_path_buf()
+fn spawn_stderr_drain_thread(
+    stderr: std::process::ChildStderr,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(mut tail) = stderr_tail.lock() {
+                        append_stderr_tail(&mut tail, &line);
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn append_stderr_tail(tail: &mut VecDeque<String>, line: &str) {
+    if tail.len() == STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(trim_stderr_line(line));
+}
+
+fn trim_stderr_line(line: &str) -> String {
+    let line = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+    if line.len() <= STDERR_LINE_BYTES {
+        return line.to_string();
+    }
+
+    let mut start = line.len() - STDERR_LINE_BYTES;
+    while start < line.len() && !line.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &line[start..])
+}
+
+fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
+    tail.iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Force-terminate an LSP child and its entire process group on Unix.
+/// On Windows, `taskkill /F /T` kills the process tree.
+///
+/// Necessary because some LSP servers ship as npm-installed Node shims that
+/// spawn the real binary as a child. Killing only the wrapper PID leaves the
+/// real server orphaned to PID 1 and accumulates over time.
+fn kill_lsp_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i32;
+        crate::bash_background::process::terminate_pgid(pgid, Some(child));
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        crate::bash_background::process::terminate_process(child);
+        let _ = child.wait();
+    }
+}
+
+fn record_watched_file_registration(
+    registrations: &WatchedFileRegistrations,
+    method: &str,
+    params: Option<&Value>,
+) {
+    match method {
+        "client/registerCapability" => {
+            let Some(items) = params
+                .and_then(|params| params.get("registrations"))
+                .and_then(|registrations| registrations.as_array())
+            else {
+                return;
+            };
+            if let Ok(mut guard) = registrations.lock() {
+                for item in items {
+                    if item.get("method").and_then(Value::as_str)
+                        == Some("workspace/didChangeWatchedFiles")
+                    {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            guard.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        "client/unregisterCapability" => {
+            let Some(items) = params
+                .and_then(|params| params.get("unregisterations"))
+                .and_then(|registrations| registrations.as_array())
+            else {
+                return;
+            };
+            if let Ok(mut guard) = registrations.lock() {
+                for item in items {
+                    if item.get("method").and_then(Value::as_str)
+                        == Some("workspace/didChangeWatchedFiles")
+                    {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            guard.remove(id);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

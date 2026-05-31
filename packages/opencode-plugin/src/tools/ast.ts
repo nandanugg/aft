@@ -10,9 +10,11 @@ const z = tool.schema;
 
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
 import {
   askEditPermission,
+  assertExternalDirectoryPermission,
+  permissionDeniedResponse,
   resolveAbsolutePath,
   resolveRelativePatterns,
   workspacePattern,
@@ -26,26 +28,33 @@ function showOutputToUser(context: unknown, output: string): void {
   ctx.metadata?.({ metadata: { output } });
 }
 
-/** Provide helpful hints when a pattern returns 0 matches. */
-function getEmptyResultHint(pattern: string, lang: string): string | null {
-  const src = pattern.trim();
+/**
+ * Pull the server-side `hint` field out of an ast-grep response. Rust now
+ * attaches a hint to zero-match responses when the pattern looks like a
+ * common mistake (regex syntax, language-specific shape, today's Rust
+ * match-arm `|` trap). See `crates/aft/src/ast_grep_hints.rs` for the rules.
+ *
+ * Plugin-side rendering is intentionally thin — all detection logic lives in
+ * Rust so OpenCode and Pi behave identically.
+ */
+function extractHint(response: Record<string, unknown>): string | null {
+  const hint = response.hint;
+  return typeof hint === "string" && hint.length > 0 ? hint : null;
+}
 
-  if (lang === "python") {
-    if (src.startsWith("class ") && src.endsWith(":")) {
-      return `Hint: Python class patterns need a body. Try: "${src.slice(0, -1)}" or "${src}\n    $$$"`;
-    }
-    if ((src.startsWith("def ") || src.startsWith("async def ")) && src.endsWith(":")) {
-      return `Hint: Python function patterns need a body. Try adding "\\n    $$$" after the colon.`;
-    }
+async function checkAstPathsPermission(
+  context: Parameters<ToolDefinition["execute"]>[1],
+  paths: unknown,
+): Promise<string | undefined> {
+  if (!Array.isArray(paths)) return undefined;
+  const uniquePaths = Array.from(
+    new Set(paths.filter((p): p is string => typeof p === "string" && p.length > 0)),
+  );
+  for (const p of uniquePaths) {
+    const denial = await assertExternalDirectoryPermission(context, p, { kind: "directory" });
+    if (denial) return denial;
   }
-
-  if (["javascript", "typescript", "tsx"].includes(lang)) {
-    if (/^(export\s+)?(async\s+)?function\s+\$[A-Z_]+\s*$/i.test(src)) {
-      return `Hint: Function patterns need params and body. Try: "function $NAME($$$) { $$$ }"`;
-    }
-  }
-
-  return null;
+  return undefined;
 }
 
 const SUPPORTED_LANGS = ["typescript", "tsx", "javascript", "python", "rust", "go"] as const;
@@ -57,8 +66,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
-      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'\n\n" +
-      "Returns: Text summary — 'Found N match(es) across M file(s)' followed by file:line blocks with matched text and captured meta-variables.",
+      "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python'",
     args: {
       pattern: z
         .string()
@@ -66,18 +74,23 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
       globs: z.array(z.string()).optional().describe("Include/exclude globs (prefix ! to exclude)"),
-      contextLines: z
-        .number()
-        .optional()
-        .describe("Number of context lines to show around each match"),
+      contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "Number of context lines to show around each match",
+      ),
     },
     execute: async (args, context): Promise<string> => {
+      const externalDenied = await checkAstPathsPermission(context, args.paths);
+      if (externalDenied) return permissionDeniedResponse(externalDenied);
+
       const params: Record<string, unknown> = {
         pattern: args.pattern,
         lang: args.lang,
       };
-      if (args.paths) params.paths = args.paths;
-      if (args.globs) params.globs = args.globs;
+      // Use isEmptyParam so empty arrays ([]) sent by GPT-family models don't
+      // get forwarded to Rust as "scope present" — let Rust default to whole
+      // project_root instead of round-tripping a useless empty scope.
+      if (!isEmptyParam(args.paths)) params.paths = args.paths;
+      if (!isEmptyParam(args.globs)) params.globs = args.globs;
       if (args.contextLines !== undefined) params.context = Number(args.contextLines);
       const response = await callBridge(ctx, context, "ast_search", params);
 
@@ -121,8 +134,10 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         if (data.scope_warnings && data.scope_warnings.length > 0) {
           output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
         }
-        // Add hints for common pattern mistakes
-        const hint = getEmptyResultHint(args.pattern as string, args.lang as string);
+        // Server-side hint for common pattern mistakes (attached by Rust
+        // when the pattern looks like regex syntax, language-specific shape
+        // mistake, or today's Rust match-arm `|` trap).
+        const hint = extractHint(response as Record<string, unknown>);
         if (hint) {
           output += `\n\n${hint}`;
         }
@@ -158,8 +173,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
-      "**Warning: This tool modifies files directly.** Use dryRun=true to preview. Consider creating an aft_safety checkpoint before bulk replacements.\n\n" +
-      "Returns: Text summary — 'Replaced N match(es) across M file(s)' (or '[DRY RUN] Would replace...') followed by file:line blocks with before/after text.",
+      "**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements.",
     args: {
       pattern: z
         .string()
@@ -173,7 +187,25 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     execute: async (args, context): Promise<string> => {
       const isDryRun = args.dryRun === true;
 
+      const externalDenied = await checkAstPathsPermission(context, args.paths);
+      if (externalDenied) return permissionDeniedResponse(externalDenied);
+
       if (!isDryRun) {
+        const paths = Array.isArray(args.paths) ? (args.paths as string[]) : ["."];
+        // External-directory check first (mirrors opencode-native grep/glob directory checks).
+        if (!Array.isArray(args.paths)) {
+          const asked = new Set<string>();
+          for (const targetPath of paths) {
+            const absPath = resolveAbsolutePath(context, targetPath);
+            if (asked.has(absPath)) continue;
+            asked.add(absPath);
+            const denial = await assertExternalDirectoryPermission(context, absPath, {
+              kind: "directory",
+            });
+            if (denial) return permissionDeniedResponse(denial);
+          }
+        }
+
         const explicitPaths = Array.isArray(args.paths)
           ? resolveRelativePatterns(context, args.paths as string[])
           : [];
@@ -191,9 +223,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
           metadata,
         );
         if (permissionError) {
-          const output = `Permission denied: ${permissionError}`;
-          showOutputToUser(context, output);
-          return output;
+          return permissionDeniedResponse(permissionError);
         }
       }
 
@@ -202,8 +232,9 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         rewrite: args.rewrite,
         lang: args.lang,
       };
-      if (args.paths) params.paths = args.paths;
-      if (args.globs) params.globs = args.globs;
+      // Use isEmptyParam — see ast_search above for rationale.
+      if (!isEmptyParam(args.paths)) params.paths = args.paths;
+      if (!isEmptyParam(args.globs)) params.globs = args.globs;
       params.dry_run = args.dryRun === true;
       const response = await callBridge(ctx, context, "ast_replace", params);
 
@@ -214,7 +245,20 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
 
       const data = response as {
         ok?: boolean;
+        // Apply-mode shape (Rust commands/ast_replace.rs returns these in
+        // `matches[]` only on the `ast_search`-shaped path; `ast_replace`
+        // itself emits per-file results in `files[]`).
         matches?: Array<{ file?: string; line?: number; text?: string; replacement?: string }>;
+        // Per-file results carry a unified diff string in dry-run mode and
+        // a write outcome in apply mode. See crates/aft/src/commands/ast_replace.rs.
+        files?: Array<{
+          file?: string;
+          replacements?: number;
+          diff?: string; // present in dry-run only
+          backup_id?: string; // present in apply mode when snapshot succeeded
+          ok?: boolean; // false on per-file write failure
+          error?: string;
+        }>;
         total_matches?: number;
         total_replacements?: number;
         total_files?: number;
@@ -239,11 +283,51 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         if (data.scope_warnings && data.scope_warnings.length > 0) {
           output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
         }
+        // Server-side hint when zero replacements happened. Especially
+        // important here: "0 replacements" looks like a clean no-op but
+        // can mean silent corruption (today's `|` bug). The hint tells
+        // the agent why the pattern matched nothing.
+        const hint = extractHint(response as Record<string, unknown>);
+        if (hint) {
+          output += `\n\n${hint}`;
+        }
       } else {
         output = isDryRun
           ? `[DRY RUN] Would replace ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`
           : `Replaced ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`;
-        if (data.matches) {
+
+        // Dry-run: render per-file unified diff so the agent can SEE the
+        // proposed change (catches anonymous-`$$$` and other rewrite bugs
+        // BEFORE applying). The Rust handler caps each diff at a sane size,
+        // and we additionally cap total diff bytes here so a 1000-file
+        // rewrite doesn't dump a megabyte of diff into the agent's context.
+        if (isDryRun && data.files && data.files.length > 0) {
+          const MAX_DIFF_BYTES = 8 * 1024; // 8 KB total preview budget
+          let used = 0;
+          let filesShown = 0;
+          for (const f of data.files) {
+            const relFile = f.file ?? "unknown";
+            const reps = f.replacements ?? 0;
+            const diff = f.diff ?? "";
+            if (used + diff.length > MAX_DIFF_BYTES) {
+              const remaining = data.files.length - filesShown;
+              if (remaining > 0) {
+                output += `\n... (${remaining} more file(s) omitted from preview to stay under ${MAX_DIFF_BYTES / 1024}KB; total ${matchCount} replacements across ${filesWithMatches} files)\n`;
+              }
+              break;
+            }
+            output += `${relFile} (${reps} replacement${reps === 1 ? "" : "s"}):\n`;
+            output += diff;
+            if (!diff.endsWith("\n")) output += "\n";
+            output += "\n";
+            used += diff.length;
+            filesShown += 1;
+          }
+        } else if (data.matches) {
+          // Apply-mode legacy path: render per-match before/after (this
+          // path is reached when the response carries `matches[]` rather
+          // than `files[]` — currently the search shape, kept for
+          // forward-compat with handler refactors).
           for (const m of data.matches) {
             const relFile = m.file ?? "unknown";
             const line = m.line ?? 0;
@@ -253,6 +337,14 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
               output += `  + ${m.replacement.trim()}\n`;
             }
             output += "\n";
+          }
+        } else if (data.files && data.files.length > 0) {
+          // Apply-mode + files[] only: list files with replacement counts
+          // (no diff in apply mode — the file is already on disk).
+          for (const f of data.files) {
+            const relFile = f.file ?? "unknown";
+            const reps = f.replacements ?? 0;
+            output += `  ${relFile}: ${reps} replacement${reps === 1 ? "" : "s"}\n`;
           }
         }
       }

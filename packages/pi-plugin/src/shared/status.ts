@@ -1,12 +1,26 @@
+export interface StatusCompressionAggregate {
+  events: number;
+  original_tokens: number;
+  compressed_tokens: number;
+  savings_tokens: number;
+}
+
+export interface StatusCompression {
+  project: StatusCompressionAggregate;
+  session: StatusCompressionAggregate;
+}
+
 export interface AftStatusSnapshot {
   version: string;
   project_root: string | null;
+  canonical_root: string | null;
+  cache_role: string;
   features: {
     format_on_edit: boolean;
     validate_on_edit: string;
     restrict_to_project_root: boolean;
-    experimental_search_index: boolean;
-    experimental_semantic_search: boolean;
+    search_index: boolean;
+    semantic_search: boolean;
   };
   search_index: {
     status: string;
@@ -21,6 +35,7 @@ export interface AftStatusSnapshot {
     files?: number | null;
     entries_done?: number | null;
     entries_total?: number | null;
+    refreshing_count: number;
     entries: number | null;
     dimension: number | null;
     error?: string | null;
@@ -36,6 +51,21 @@ export interface AftStatusSnapshot {
     warm_entries: number;
   };
   storage_dir: string | null;
+  /** Total checkpoints across all sessions sharing this bridge. */
+  checkpoints_total: number;
+  /** Current session's own slice of undo/checkpoint state. */
+  session: {
+    id: string;
+    tracked_files: number;
+    checkpoints: number;
+  };
+  /** Compression aggregate passthrough; rendering is added separately. */
+  compression?: StatusCompression;
+  /**
+   * Set on synthetic "not_initialized" snapshots when no bridge has spawned
+   * yet. Renderers display this in place of empty status rows.
+   */
+  message?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -62,12 +92,44 @@ function readOptionalNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function readCompressionAggregate(value: unknown): StatusCompressionAggregate {
+  const aggregate = asRecord(value);
+  return {
+    events: readNumber(aggregate.events),
+    original_tokens: readNumber(aggregate.original_tokens),
+    compressed_tokens: readNumber(aggregate.compressed_tokens),
+    savings_tokens: readNumber(aggregate.savings_tokens),
+  };
+}
+
+function readCompression(value: unknown): StatusCompression | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const compression = asRecord(value);
+  return {
+    project: readCompressionAggregate(compression.project),
+    session: readCompressionAggregate(compression.session),
+  };
+}
+
 function formatFlag(enabled: boolean): string {
   return enabled ? "enabled" : "disabled";
 }
 
 function formatCount(value: number | null): string {
   return value == null ? "—" : value.toLocaleString("en-US");
+}
+
+export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
+  if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
+    return "Rebuilding (model changed)";
+  }
+  return status;
+}
+
+export function formatSemanticRefreshing(refreshingCount: number): string | null {
+  if (!Number.isFinite(refreshingCount) || refreshingCount <= 0) return null;
+  if (refreshingCount > 20) return "Ready (many files refreshing)";
+  return `Ready (${refreshingCount} file(s) refreshing)`;
 }
 
 export function formatBytes(bytes: number): string {
@@ -95,16 +157,22 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   };
   const disk = asRecord(response.disk);
   const symbolCache = asRecord(response.symbol_cache);
+  const session = asRecord(response.session);
 
   return {
     version: readString(response.version, "unknown"),
     project_root: readNullableString(response.project_root),
+    canonical_root: readNullableString(response.canonical_root),
+    cache_role: readString(response.cache_role, "not_initialized"),
+    message: typeof response.message === "string" ? response.message : undefined,
     features: {
       format_on_edit: readBoolean(features.format_on_edit),
       validate_on_edit: readString(features.validate_on_edit, "off"),
       restrict_to_project_root: readBoolean(features.restrict_to_project_root),
-      experimental_search_index: readBoolean(features.experimental_search_index),
-      experimental_semantic_search: readBoolean(features.experimental_semantic_search),
+      search_index: readBoolean(features.search_index ?? features.experimental_search_index),
+      semantic_search: readBoolean(
+        features.semantic_search ?? features.experimental_semantic_search,
+      ),
     },
     search_index: {
       status: readString(searchIndex.status, "unknown"),
@@ -119,6 +187,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       files: readOptionalNumber(semanticIndex.files),
       entries_done: readOptionalNumber(semanticIndex.entries_done),
       entries_total: readOptionalNumber(semanticIndex.entries_total),
+      refreshing_count: readNumber(semanticIndex.refreshing_count),
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
       error: readNullableString(semanticIndex.error),
@@ -134,6 +203,13 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       warm_entries: readNumber(symbolCache.warm_entries),
     },
     storage_dir: readNullableString(response.storage_dir),
+    checkpoints_total: readNumber(response.checkpoints_total),
+    session: {
+      id: readString(session.id, "__default__"),
+      tracked_files: readNumber(session.tracked_files),
+      checkpoints: readNumber(session.checkpoints),
+    },
+    compression: readCompression(response.compression),
   };
 }
 
@@ -141,11 +217,13 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   const lines = [
     `AFT version: ${status.version}`,
     `Project root: ${status.project_root ?? "(not configured)"}`,
+    `Canonical root: ${status.canonical_root ?? "(not configured)"}`,
+    `Cache role: ${status.cache_role}`,
     "",
     "Enabled features",
     `- format_on_edit: ${formatFlag(status.features.format_on_edit)}`,
-    `- experimental_search_index: ${formatFlag(status.features.experimental_search_index)}`,
-    `- experimental_semantic_search: ${formatFlag(status.features.experimental_semantic_search)}`,
+    `- search_index: ${formatFlag(status.features.search_index)}`,
+    `- semantic_search: ${formatFlag(status.features.semantic_search)}`,
     "",
     "Search index",
     `- status: ${status.search_index.status}`,
@@ -153,9 +231,13 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${status.semantic_index.status}`,
-    `- entries: ${formatCount(status.semantic_index.entries)}`,
+    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- ${refreshing}`);
+  }
+  lines.push(`- entries: ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- backend: ${status.semantic_index.backend}`);
   }
@@ -206,11 +288,13 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     "",
     `- **Version:** \`${status.version}\``,
     `- **Project root:** \`${status.project_root ?? "(not configured)"}\``,
+    `- **Canonical root:** \`${status.canonical_root ?? "(not configured)"}\``,
+    `- **Cache role:** \`${status.cache_role}\``,
     "",
     "### Enabled features",
     `- \`format_on_edit\`: ${formatFlag(status.features.format_on_edit)}`,
-    `- \`experimental_search_index\`: ${formatFlag(status.features.experimental_search_index)}`,
-    `- \`experimental_semantic_search\`: ${formatFlag(status.features.experimental_semantic_search)}`,
+    `- \`search_index\`: ${formatFlag(status.features.search_index)}`,
+    `- \`semantic_search\`: ${formatFlag(status.features.semantic_search)}`,
     "",
     "### Search index",
     `- **Status:** \`${status.search_index.status}\``,
@@ -218,9 +302,13 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${status.semantic_index.status}\``,
-    `- **Entries:** ${formatCount(status.semantic_index.entries)}`,
+    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- **Refresh:** ${refreshing}`);
+  }
+  lines.push(`- **Entries:** ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- **Backend:** ${status.semantic_index.backend}`);
   }

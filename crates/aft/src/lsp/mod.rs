@@ -1,12 +1,15 @@
+pub mod child_registry;
 pub mod client;
 pub mod diagnostics;
 pub mod document;
 pub mod jsonrpc;
 pub mod manager;
 pub mod position;
+pub mod pull_params;
 pub mod registry;
 pub mod roots;
 pub mod transport;
+pub mod tsconfig_membership;
 
 /// LSP subsystem error type.
 #[derive(Debug)]

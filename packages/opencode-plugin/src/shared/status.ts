@@ -1,24 +1,37 @@
+export interface StatusCompressionAggregate {
+  events: number;
+  original_tokens: number;
+  compressed_tokens: number;
+  savings_tokens: number;
+}
+
+export interface StatusCompression {
+  project: StatusCompressionAggregate;
+  session: StatusCompressionAggregate;
+}
+
 export interface AftStatusSnapshot {
   version: string;
   project_root: string | null;
-  go_overlay: {
-    backend: string;
-    state: string;
-    provider_id: string | null;
-    provider_version: string | null;
-    schema_version: number | null;
-    feature_hash: string | null;
-    env_hash: string | null;
-    source_fingerprint: string | null;
-    produced_at: string | null;
-    last_error: string | null;
-  };
+  canonical_root: string | null;
+  cache_role: string;
+  /**
+   * True when at least one heavy AFT subsystem has been auto-disabled for
+   * the current project root. `degraded_reasons` enumerates why (e.g.
+   * `["home_root"]`, `["search_too_many_files:20000"]`). The sidebar / TUI
+   * dialog surface this so users know `aft_search`, `aft_callgraph` etc.
+   * won't return results from this session and can choose to open a
+   * project subdirectory instead.
+   */
+  degraded: boolean;
+  /** Machine-readable degraded-mode reasons. Empty when `degraded === false`. */
+  degraded_reasons: string[];
   features: {
     format_on_edit: boolean;
     validate_on_edit: string;
     restrict_to_project_root: boolean;
-    experimental_search_index: boolean;
-    experimental_semantic_search: boolean;
+    search_index: boolean;
+    semantic_search: boolean;
   };
   search_index: {
     status: string;
@@ -33,6 +46,7 @@ export interface AftStatusSnapshot {
     files?: number | null;
     entries_done?: number | null;
     entries_total?: number | null;
+    refreshing_count: number;
     entries: number | null;
     dimension: number | null;
     error?: string | null;
@@ -56,6 +70,16 @@ export interface AftStatusSnapshot {
     tracked_files: number;
     checkpoints: number;
   };
+  /** Compression aggregate passthrough; rendering is added separately. */
+  compression?: StatusCompression;
+  /**
+   * Human-readable explanation for a synthetic snapshot (e.g.
+   * `cache_role === "not_initialized"`). When the plugin returns a placeholder
+   * because no bridge has been spawned yet, this message tells the user what
+   * to expect; the TUI dialog renders it instead of an empty grid of zeros.
+   * Empty string when the snapshot is real bridge data.
+   */
+  message: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -82,12 +106,44 @@ function readOptionalNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function readCompressionAggregate(value: unknown): StatusCompressionAggregate {
+  const aggregate = asRecord(value);
+  return {
+    events: readNumber(aggregate.events),
+    original_tokens: readNumber(aggregate.original_tokens),
+    compressed_tokens: readNumber(aggregate.compressed_tokens),
+    savings_tokens: readNumber(aggregate.savings_tokens),
+  };
+}
+
+function readCompression(value: unknown): StatusCompression | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const compression = asRecord(value);
+  return {
+    project: readCompressionAggregate(compression.project),
+    session: readCompressionAggregate(compression.session),
+  };
+}
+
 function formatFlag(enabled: boolean): string {
   return enabled ? "enabled" : "disabled";
 }
 
 function formatCount(value: number | null): string {
   return value == null ? "—" : value.toLocaleString("en-US");
+}
+
+export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
+  if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
+    return "Rebuilding (model changed)";
+  }
+  return status;
+}
+
+export function formatSemanticRefreshing(refreshingCount: number): string | null {
+  if (!Number.isFinite(refreshingCount) || refreshingCount <= 0) return null;
+  if (refreshingCount > 20) return "Ready (many files refreshing)";
+  return `Ready (${refreshingCount} file(s) refreshing)`;
 }
 
 export function formatBytes(bytes: number): string {
@@ -107,7 +163,6 @@ export function formatBytes(bytes: number): string {
 
 export function coerceAftStatus(response: Record<string, unknown>): AftStatusSnapshot {
   const features = asRecord(response.features);
-  const goOverlay = asRecord(response.go_overlay);
   const searchIndex = asRecord(response.search_index);
   const semanticIndex = asRecord(response.semantic_index);
   const semanticConfig = {
@@ -121,24 +176,20 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   return {
     version: readString(response.version, "unknown"),
     project_root: readNullableString(response.project_root),
-    go_overlay: {
-      backend: readString(goOverlay.backend, "unknown"),
-      state: readString(goOverlay.state, "unknown"),
-      provider_id: readNullableString(goOverlay.provider_id),
-      provider_version: readNullableString(goOverlay.provider_version),
-      schema_version: readOptionalNumber(goOverlay.schema_version),
-      feature_hash: readNullableString(goOverlay.feature_hash),
-      env_hash: readNullableString(goOverlay.env_hash),
-      source_fingerprint: readNullableString(goOverlay.source_fingerprint),
-      produced_at: readNullableString(goOverlay.produced_at),
-      last_error: readNullableString(goOverlay.last_error),
-    },
+    canonical_root: readNullableString(response.canonical_root),
+    cache_role: readString(response.cache_role, "not_initialized"),
+    degraded: readBoolean(response.degraded),
+    degraded_reasons: Array.isArray(response.degraded_reasons)
+      ? response.degraded_reasons.filter((r): r is string => typeof r === "string")
+      : [],
     features: {
       format_on_edit: readBoolean(features.format_on_edit),
       validate_on_edit: readString(features.validate_on_edit, "off"),
       restrict_to_project_root: readBoolean(features.restrict_to_project_root),
-      experimental_search_index: readBoolean(features.experimental_search_index),
-      experimental_semantic_search: readBoolean(features.experimental_semantic_search),
+      search_index: readBoolean(features.search_index ?? features.experimental_search_index),
+      semantic_search: readBoolean(
+        features.semantic_search ?? features.experimental_semantic_search,
+      ),
     },
     search_index: {
       status: readString(searchIndex.status, "unknown"),
@@ -153,6 +204,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       files: readOptionalNumber(semanticIndex.files),
       entries_done: readOptionalNumber(semanticIndex.entries_done),
       entries_total: readOptionalNumber(semanticIndex.entries_total),
+      refreshing_count: readNumber(semanticIndex.refreshing_count),
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
       error: readNullableString(semanticIndex.error),
@@ -174,20 +226,29 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       tracked_files: readNumber(session.tracked_files),
       checkpoints: readNumber(session.checkpoints),
     },
+    compression: readCompression(response.compression),
+    message: readString(response.message, ""),
   };
 }
 
+/**
+ * Plain-text status renderer used by the Desktop `sendIgnoredMessage` path,
+ * which can only show a plain string. The TUI dialog uses a custom JSX
+ * component in `tui/index.tsx` (see `StatusDialog`) so it can render with
+ * themed colors, proper flex columns, and right-aligned values instead of
+ * monospace padding.
+ */
 export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   const lines = [
     `AFT version: ${status.version}`,
     `Project root: ${status.project_root ?? "(not configured)"}`,
-    `Go overlay backend: ${status.go_overlay.backend}`,
-    `Go overlay state: ${status.go_overlay.state}`,
+    `Canonical root: ${status.canonical_root ?? "(not configured)"}`,
+    `Cache role: ${status.cache_role}`,
     "",
     "Enabled features",
     `- format_on_edit: ${formatFlag(status.features.format_on_edit)}`,
-    `- experimental_search_index: ${formatFlag(status.features.experimental_search_index)}`,
-    `- experimental_semantic_search: ${formatFlag(status.features.experimental_semantic_search)}`,
+    `- search_index: ${formatFlag(status.features.search_index)}`,
+    `- semantic_search: ${formatFlag(status.features.semantic_search)}`,
     "",
     "Search index",
     `- status: ${status.search_index.status}`,
@@ -195,16 +256,19 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${status.semantic_index.status}`,
-    `- entries: ${formatCount(status.semantic_index.entries)}`,
+    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- ${refreshing}`);
+  }
+  lines.push(`- entries: ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- backend: ${status.semantic_index.backend}`);
   }
   if (status.semantic_index.model) {
     lines.push(`- model: ${status.semantic_index.model}`);
   }
-
   if (status.semantic_index.dimension != null) {
     lines.push(`- dimension: ${formatCount(status.semantic_index.dimension)}`);
   }
@@ -232,6 +296,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- checkpoints: ${formatCount(status.session.checkpoints)}`,
     `- project checkpoints (all sessions): ${formatCount(status.checkpoints_total)}`,
   );
+
   if (status.semantic_index.stage) {
     lines.push("", "Semantic stage", status.semantic_index.stage);
   }
@@ -246,22 +311,6 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   if (status.semantic_index.error) {
     lines.push("", "Semantic error", status.semantic_index.error);
   }
-  if (status.go_overlay.provider_id || status.go_overlay.provider_version || status.go_overlay.schema_version != null) {
-    lines.push(
-      "",
-      "Go overlay metadata",
-      `- provider_id: ${status.go_overlay.provider_id ?? "(unknown)"}`,
-      `- provider_version: ${status.go_overlay.provider_version ?? "(unknown)"}`,
-      `- schema_version: ${formatCount(status.go_overlay.schema_version)}`,
-      `- feature_hash: ${status.go_overlay.feature_hash ?? "(unknown)"}`,
-      `- env_hash: ${status.go_overlay.env_hash ?? "(unknown)"}`,
-      `- source_fingerprint: ${status.go_overlay.source_fingerprint ?? "(unknown)"}`,
-      `- produced_at: ${status.go_overlay.produced_at ?? "(not ready)"}`,
-    );
-  }
-  if (status.go_overlay.last_error) {
-    lines.push("", "Go overlay error", status.go_overlay.last_error);
-  }
 
   return lines.join("\n");
 }
@@ -272,13 +321,13 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     "",
     `- **Version:** \`${status.version}\``,
     `- **Project root:** \`${status.project_root ?? "(not configured)"}\``,
-    `- **Go overlay backend:** \`${status.go_overlay.backend}\``,
-    `- **Go overlay state:** \`${status.go_overlay.state}\``,
+    `- **Canonical root:** \`${status.canonical_root ?? "(not configured)"}\``,
+    `- **Cache role:** \`${status.cache_role}\``,
     "",
     "### Enabled features",
     `- \`format_on_edit\`: ${formatFlag(status.features.format_on_edit)}`,
-    `- \`experimental_search_index\`: ${formatFlag(status.features.experimental_search_index)}`,
-    `- \`experimental_semantic_search\`: ${formatFlag(status.features.experimental_semantic_search)}`,
+    `- \`search_index\`: ${formatFlag(status.features.search_index)}`,
+    `- \`semantic_search\`: ${formatFlag(status.features.semantic_search)}`,
     "",
     "### Search index",
     `- **Status:** \`${status.search_index.status}\``,
@@ -286,9 +335,13 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${status.semantic_index.status}\``,
-    `- **Entries:** ${formatCount(status.semantic_index.entries)}`,
+    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
   ];
+  const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
+  if (refreshing) {
+    lines.push(`- **Refresh:** ${refreshing}`);
+  }
+  lines.push(`- **Entries:** ${formatCount(status.semantic_index.entries)}`);
   if (status.semantic_index.backend) {
     lines.push(`- **Backend:** ${status.semantic_index.backend}`);
   }
@@ -313,26 +366,6 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
 
   if (status.semantic_index.error) {
     lines.push(`- **Error:** ${status.semantic_index.error}`);
-  }
-  if (
-    status.go_overlay.provider_id ||
-    status.go_overlay.provider_version ||
-    status.go_overlay.schema_version != null
-  ) {
-    lines.push(
-      "",
-      "### Go overlay metadata",
-      `- **Provider id:** ${status.go_overlay.provider_id ?? "(unknown)"}`,
-      `- **Provider version:** ${status.go_overlay.provider_version ?? "(unknown)"}`,
-      `- **Schema version:** ${formatCount(status.go_overlay.schema_version)}`,
-      `- **Feature hash:** ${status.go_overlay.feature_hash ?? "(unknown)"}`,
-      `- **Env hash:** ${status.go_overlay.env_hash ?? "(unknown)"}`,
-      `- **Source fingerprint:** ${status.go_overlay.source_fingerprint ?? "(unknown)"}`,
-      `- **Produced at:** ${status.go_overlay.produced_at ?? "(not ready)"}`,
-    );
-  }
-  if (status.go_overlay.last_error) {
-    lines.push(`- **Go overlay error:** ${status.go_overlay.last_error}`);
   }
 
   lines.push(

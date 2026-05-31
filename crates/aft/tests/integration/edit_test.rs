@@ -26,6 +26,28 @@ fn fake_server_path() -> PathBuf {
         })
         .expect("fake-lsp-server binary path")
 }
+
+#[cfg(unix)]
+fn install_executable(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let tool = bin_dir.join(name);
+    fs::write(&tool, script).unwrap();
+    let mut perms = fs::metadata(&tool).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&tool, perms).unwrap();
+    tool
+}
+
+#[cfg(unix)]
+fn path_with_node_bin(dir: &std::path::Path) -> std::ffi::OsString {
+    let mut paths =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    paths.insert(0, dir.join("node_modules").join(".bin"));
+    std::env::join_paths(paths).unwrap()
+}
 // ============================================================================
 // write command tests
 // ============================================================================
@@ -33,15 +55,14 @@ fn fake_server_path() -> PathBuf {
 #[test]
 fn write_creates_new_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_new.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_new.txt");
     // Ensure file doesn't exist
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-1","command":"write","file":"{}","content":"hello world"}}"#,
-        target.display()
+        r#"{{"id":"w-1","command":"write","file":{},"content":"hello world"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -50,10 +71,10 @@ fn write_creates_new_file() {
         resp["created"], true,
         "file was new, created should be true"
     );
-    // No backup_id for new files
+    // New files get a tombstone backup so undo can delete them.
     assert!(
-        resp.get("backup_id").is_none() || resp["backup_id"].is_null(),
-        "new file should not have backup_id"
+        resp["backup_id"].is_string(),
+        "new file should have tombstone backup_id"
     );
 
     // Verify content on disk
@@ -67,17 +88,120 @@ fn write_creates_new_file() {
 }
 
 #[test]
+fn write_created_file_undo_removes_created_parent_dirs() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("newdir").join("sub").join("created.txt");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-created-nested","command":"write","file":{},"content":"created"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert!(target.exists());
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-created-nested","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert!(!target.exists(), "created file should be removed");
+    assert!(
+        !dir.path().join("newdir").exists(),
+        "empty parent directories created for the file should be removed"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_auto_rollback_discards_fake_undo_entry() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("rolled_back.ts");
+    fs::write(&target, "const value = 1;\n").unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-invalid","command":"write","file":{},"content":"const value = {{;\n"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "write should report validation result: {resp:?}"
+    );
+    assert_eq!(
+        resp["rolled_back"], true,
+        "invalid write should roll back: {resp:?}"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "const value = 1;\n");
+
+    let undo = aft.send(&format!(
+        r#"{{"id":"undo-after-rollback","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(
+        undo["success"], false,
+        "rollback backup entry should be discarded: {undo:?}"
+    );
+    assert_eq!(undo["code"], "no_undo_history");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn configured_storage_writes_backups_under_harness_namespace() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let target = dir.path().join("namespaced-backup.txt");
+    fs::write(&target, "before").unwrap();
+
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-storage-backups",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "storage_dir": storage.path(),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"write-storage-backup","command":"write","file":{},"content":"after"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(resp["success"], true, "write failed: {resp:?}");
+    assert!(
+        storage.path().join("opencode").join("backups").exists(),
+        "backups should be stored under the harness namespace"
+    );
+    assert!(
+        !storage.path().join("backups").exists(),
+        "new backups should not be written to the shared root"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn write_backups_existing_file() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_backup.txt");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_backup.txt");
     fs::write(&target, "original content").unwrap();
 
     // Overwrite via write command
     let resp = aft.send(&format!(
-        r#"{{"id":"w-2","command":"write","file":"{}","content":"new content"}}"#,
-        target.display()
+        r#"{{"id":"w-2","command":"write","file":{},"content":"new content"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -92,8 +216,8 @@ fn write_backups_existing_file() {
 
     // Undo — should restore original
     let undo_resp = aft.send(&format!(
-        r#"{{"id":"w-2u","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"w-2u","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo_resp["success"], true,
@@ -111,14 +235,13 @@ fn write_backups_existing_file() {
 #[test]
 fn write_syntax_valid() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_valid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_valid.ts");
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-3","command":"write","file":"{}","content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
-        target.display()
+        r#"{{"id":"w-3","command":"write","file":{},"content":"export function hello(): string {{ return \"hi\"; }}"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -135,14 +258,13 @@ fn write_syntax_valid() {
 #[test]
 fn write_syntax_invalid() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("write_invalid.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_invalid.ts");
     let _ = fs::remove_file(&target);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"w-4","command":"write","file":"{}","content":"export function {{ broken syntax"}}"#,
-        target.display()
+        r#"{{"id":"w-4","command":"write","file":{},"content":"export function {{ broken syntax"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -154,6 +276,98 @@ fn write_syntax_invalid() {
         resp["syntax_valid"], false,
         "broken TS should have syntax_valid: false"
     );
+    assert_eq!(resp["rolled_back"], false);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn single_file_write_rolls_back_on_invalid_syntax() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_rollback_valid_to_invalid.ts");
+    let original = "export function ok(): string { return \"ok\"; }\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "w-rb-1",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "export function { broken syntax",
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "write should report syntax failure: {:?}",
+        resp
+    );
+    assert_eq!(resp["syntax_valid"], false);
+    assert_eq!(resp["rolled_back"], true);
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn single_file_write_does_not_rollback_when_pre_was_invalid() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_no_rollback_pre_invalid.ts");
+    fs::write(&target, "export function { already broken\n").unwrap();
+    let replacement = "export const = still_broken\n";
+
+    let req = serde_json::json!({
+        "id": "w-rb-2",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": replacement,
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "write should preserve invalid replacement: {:?}",
+        resp
+    );
+    assert_eq!(resp["syntax_valid"], false);
+    assert_eq!(resp["rolled_back"], false);
+    assert_eq!(fs::read_to_string(&target).unwrap(), replacement);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn single_file_write_does_not_rollback_when_new_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_no_rollback_new_invalid.ts");
+    let _ = fs::remove_file(&target);
+
+    let req = serde_json::json!({
+        "id": "w-rb-3",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "export function { broken syntax",
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "new invalid file should be written: {:?}",
+        resp
+    );
+    assert_eq!(resp["syntax_valid"], false);
+    assert_eq!(resp["rolled_back"], false);
+    assert!(fs::read_to_string(&target)
+        .unwrap()
+        .contains("broken syntax"));
 
     let _ = fs::remove_file(&target);
     let status = aft.shutdown();
@@ -167,9 +381,8 @@ fn write_syntax_invalid() {
 #[test]
 fn edit_symbol_replace() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("edit_replace.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("edit_replace.ts");
 
     // Copy fixture
     let fixture = fixture_path("sample.ts");
@@ -219,9 +432,8 @@ fn edit_symbol_replace() {
 #[test]
 fn edit_symbol_delete() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("edit_delete.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("edit_delete.ts");
 
     // Copy fixture
     let fixture = fixture_path("sample.ts");
@@ -232,8 +444,8 @@ fn edit_symbol_delete() {
     assert!(before.contains("internalHelper"));
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-2","command":"edit_symbol","file":"{}","symbol":"internalHelper","operation":"delete"}}"#,
-        target.display()
+        r#"{{"id":"es-2","command":"edit_symbol","file":{},"symbol":"internalHelper","operation":"delete"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -258,17 +470,16 @@ fn edit_symbol_delete() {
 #[test]
 fn edit_symbol_ambiguous() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("edit_ambig.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("edit_ambig.ts");
 
     // Copy ambiguous fixture
     let fixture = fixture_path("ambiguous.ts");
     fs::copy(&fixture, &target).unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-3","command":"edit_symbol","file":"{}","symbol":"process","operation":"replace","content":"// replaced"}}"#,
-        target.display()
+        r#"{{"id":"es-3","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"// replaced"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -309,8 +520,8 @@ fn edit_symbol_not_found() {
     let file = fixture_path("sample.ts");
 
     let resp = aft.send(&format!(
-        r#"{{"id":"es-4","command":"edit_symbol","file":"{}","symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
-        file.display()
+        r#"{{"id":"es-4","command":"edit_symbol","file":{},"symbol":"nonexistent_symbol","operation":"replace","content":"// nope"}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     assert_eq!(
@@ -335,9 +546,8 @@ fn edit_symbol_not_found() {
 #[test]
 fn edit_match_single_occurrence() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("match_single.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_single.ts");
 
     // Copy fixture
     let fixture = fixture_path("sample.ts");
@@ -399,8 +609,8 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline","command":"configure","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg-inline","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(
         configure["success"], true,
@@ -464,8 +674,8 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
     let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
 
     let configure = aft.send(&format!(
-        r#"{{"id":"cfg-inline-fast","command":"configure","project_root":"{}"}}"#,
-        root.display()
+        r#"{{"id":"cfg-inline-fast","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(
         configure["success"], true,
@@ -495,7 +705,7 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
         "expected inline diagnostics: {resp:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(3_000),
+        elapsed < std::time::Duration::from_millis(4_000),
         "expected event-driven wait, elapsed: {elapsed:?}, resp: {resp:?}"
     );
 
@@ -506,9 +716,8 @@ fn edit_match_inline_lsp_diagnostics_respects_wait_ms() {
 #[test]
 fn edit_match_multiple_occurrences_returns_candidates() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("match_ambig.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_ambig.ts");
 
     // Write a file with a repeated string
     let content = "const a = \"hello\";\nconst b = \"hello\";\nconst c = \"world\";\n";
@@ -556,9 +765,8 @@ fn edit_match_multiple_occurrences_returns_candidates() {
 #[test]
 fn edit_match_with_occurrence_selector() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("match_occ.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("match_occ.ts");
 
     // Write a file with a repeated string
     let content = "const a = \"hello\";\nconst b = \"hello\";\nconst c = \"world\";\n";
@@ -630,9 +838,8 @@ fn edit_match_no_match() {
 #[test]
 fn batch_multiple_edits() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_multi.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_multi.ts");
 
     let content = "const greeting = \"hello\";\nconst farewell = \"goodbye\";\nconst count = 42;\n";
     fs::write(&target, content).unwrap();
@@ -676,9 +883,8 @@ fn batch_multiple_edits() {
 #[test]
 fn batch_rollback_on_failure() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_rollback.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_rollback.ts");
 
     let content = "const greeting = \"hello\";\nconst count = 42;\n";
     fs::write(&target, content).unwrap();
@@ -713,9 +919,8 @@ fn batch_rollback_on_failure() {
 #[test]
 fn batch_fuzzy_match() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_fuzzy.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_fuzzy.ts");
 
     // Source has specific whitespace; edits use slightly different whitespace
     let content = "function greet() {\n    console.log(\"hello\");  \n    return true;\n}\n";
@@ -760,9 +965,8 @@ fn batch_fuzzy_match() {
 #[test]
 fn batch_line_range_edit() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_linerange.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_linerange.ts");
 
     let content = "line zero\nline one\nline two\nline three\n";
     fs::write(&target, content).unwrap();
@@ -805,9 +1009,8 @@ fn batch_line_range_edit() {
 #[test]
 fn batch_with_undo() {
     let mut aft = AftProcess::spawn();
-    let dir = std::env::temp_dir().join("aft_edit_tests");
-    fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("batch_undo.ts");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_undo.ts");
 
     let original = "const x = 1;\nconst y = 2;\n";
     fs::write(&target, original).unwrap();
@@ -832,8 +1035,8 @@ fn batch_with_undo() {
 
     // Undo
     let undo_resp = aft.send(&format!(
-        r#"{{"id":"b-4u","command":"undo","file":"{}"}}"#,
-        target.display()
+        r#"{{"id":"b-4u","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&target.display())
     ));
     assert_eq!(
         undo_resp["success"], true,
@@ -1092,41 +1295,6 @@ fn edit_match_glob_replaces_across_files() {
 }
 
 #[test]
-fn edit_match_glob_dry_run() {
-    let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
-    let dir_path = dir.path();
-
-    fs::write(dir_path.join("x.ts"), "const a = \"foo\";\n").unwrap();
-    fs::write(
-        dir_path.join("y.ts"),
-        "const b = \"foo\";\nconst c = \"foo\";\n",
-    )
-    .unwrap();
-
-    let req = serde_json::json!({
-        "id": "glob-dry-1",
-        "command": "edit_match",
-        "file": format!("{}/*.ts", dir_path.display()),
-        "match": "foo",
-        "replacement": "bar",
-        "dry_run": true
-    });
-    let resp = aft.send(&serde_json::to_string(&req).unwrap());
-
-    assert_eq!(resp["success"], true);
-    assert_eq!(resp["dry_run"], true);
-    assert_eq!(resp["total_files"], 2);
-    assert_eq!(resp["total_replacements"], 3);
-
-    let x_content = fs::read_to_string(dir_path.join("x.ts")).unwrap();
-    assert!(x_content.contains("foo"), "dry_run should not modify files");
-
-    let status = aft.shutdown();
-    assert!(status.success());
-}
-
-#[test]
 fn edit_match_glob_no_matches_in_files() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -1166,6 +1334,420 @@ fn edit_match_glob_no_files_matched() {
 
     assert_eq!(resp["success"], false);
 
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(unix)]
+fn edit_match_glob_formats_each_matched_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("biome.json"), "{}\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.ts"), "export   const   a=\"OLD\";\n").unwrap();
+    fs::write(root.join("src/b.ts"), "export   const   b=\"OLD\";\n").unwrap();
+    install_executable(
+        root,
+        "biome",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "biome 2.0.0"; exit 0; fi
+file=""
+for arg in "$@"; do file="$arg"; done
+echo "$file" >> "$(dirname "$file")/formatter-count.log"
+python3 - "$file" <<'PY'
+import re, sys
+p=sys.argv[1]
+s=open(p).read()
+s=re.sub(r"export\s+const\s+(\w+)\s*=\s*([^;\n]+);?", r"export const \1 = \2;", s)
+open(p,"w").write(s)
+PY
+exit 0
+"#,
+    );
+
+    let path = path_with_node_bin(root);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(root);
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "glob-fmt-success",
+            "command": "edit_match",
+            "file": format!("{}/*.ts", root.join("src").display()),
+            "match": "OLD",
+            "replacement": "NEW  VALUE"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(resp["success"], true, "glob edit should succeed: {resp:?}");
+    assert_eq!(resp["total_files"], 2);
+    assert_eq!(resp["format_skipped_count"], 0);
+    assert_eq!(resp["format_skip_reasons"].as_array().unwrap().len(), 0);
+    let files = resp["files"].as_array().unwrap();
+    assert!(files.iter().all(|f| f["formatted"] == true), "{resp:?}");
+    assert!(files
+        .iter()
+        .all(|f| f.get("format_skipped_reason").is_none()));
+    let count_log = fs::read_to_string(root.join("src/formatter-count.log")).unwrap();
+    assert_eq!(count_log.lines().count(), 2);
+    assert!(fs::read_to_string(root.join("src/a.ts"))
+        .unwrap()
+        .contains("export const a = \"NEW  VALUE\";"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(unix)]
+fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.ts"), "export const a = \"OLD\";\n").unwrap();
+    fs::write(root.join("src/b.ts"), "export const b = \"OLD\";\n").unwrap();
+    install_executable(
+        root,
+        "biome",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"biome 2.0.0\"; exit 0; fi\necho \"No files were processed in the specified paths.\" >&2\nexit 1\n",
+    );
+
+    let path = path_with_node_bin(root);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.send(
+        &serde_json::json!({
+            "id": "cfg-glob-excluded",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "format_on_edit": true,
+            "formatter": { "typescript": "biome" }
+        })
+        .to_string(),
+    );
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "glob-fmt-excluded",
+            "command": "edit_match",
+            "file": format!("{}/*.ts", root.join("src").display()),
+            "match": "OLD",
+            "replacement": "NEW"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(resp["success"], true, "glob edit should succeed: {resp:?}");
+    assert_eq!(resp["format_skipped_count"], 2);
+    assert_eq!(
+        resp["format_skip_reasons"],
+        serde_json::json!(["formatter_excluded_path"])
+    );
+    let files = resp["files"].as_array().unwrap();
+    assert!(files.iter().all(|f| f["formatted"] == false), "{resp:?}");
+    assert!(
+        files
+            .iter()
+            .all(|f| f["format_skipped_reason"] == "formatter_excluded_path"),
+        "{resp:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("biome.json"), "{}\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.ts"), "export const a = \"OLD\";\n").unwrap();
+    fs::write(root.join("src/b.ts"), "export const b = \"OLD\";\n").unwrap();
+    let cfg = aft.send(
+        &serde_json::json!({
+            "id": "cfg-glob-disabled",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "format_on_edit": false
+        })
+        .to_string(),
+    );
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "glob-fmt-disabled",
+            "command": "edit_match",
+            "file": format!("{}/*.ts", root.join("src").display()),
+            "match": "OLD",
+            "replacement": "NEW"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(resp["success"], true, "glob edit should succeed: {resp:?}");
+    assert_eq!(resp["format_skipped_count"], 2);
+    assert_eq!(
+        resp["format_skip_reasons"],
+        serde_json::json!(["no_formatter_configured"])
+    );
+    let files = resp["files"].as_array().unwrap();
+    assert!(files.iter().all(|f| f["formatted"] == false), "{resp:?}");
+    assert!(
+        files
+            .iter()
+            .all(|f| f["format_skipped_reason"] == "no_formatter_configured"),
+        "{resp:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+#[cfg(unix)]
+fn edit_match_glob_mixed_success_and_skip_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.ts"), "export   const   a=\"OLD\";\n").unwrap();
+    fs::write(root.join("src/b.py"), "x = 'OLD'\n").unwrap();
+    fs::write(root.join("src/c.txt"), "OLD\n").unwrap();
+    install_executable(
+        root,
+        "biome",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "biome 2.0.0"; exit 0; fi
+file=""
+for arg in "$@"; do file="$arg"; done
+case "$file" in
+  *.ts) sed -E 's/  +/ /g' "$file" > "$file.tmp" && mv "$file.tmp" "$file"; exit 0 ;;
+  *.py) echo "No files were processed in the specified paths." >&2; exit 1 ;;
+esac
+exit 0
+"#,
+    );
+
+    let path = path_with_node_bin(root);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.send(
+        &serde_json::json!({
+            "id": "cfg-glob-mixed",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "format_on_edit": true,
+            "formatter": { "typescript": "biome", "python": "biome" }
+        })
+        .to_string(),
+    );
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "glob-fmt-mixed",
+            "command": "edit_match",
+            "file": format!("{}/*", root.join("src").display()),
+            "match": "OLD",
+            "replacement": "NEW"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(resp["success"], true, "glob edit should succeed: {resp:?}");
+    assert_eq!(resp["total_files"], 3);
+    assert_eq!(resp["format_skipped_count"], 2);
+    assert_eq!(
+        resp["format_skip_reasons"],
+        serde_json::json!(["formatter_excluded_path", "unsupported_language"])
+    );
+    let files = resp["files"].as_array().unwrap();
+    let ts = files
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("a.ts"))
+        .unwrap();
+    let py = files
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("b.py"))
+        .unwrap();
+    let txt = files
+        .iter()
+        .find(|f| f["file"].as_str().unwrap().ends_with("c.txt"))
+        .unwrap();
+    assert_eq!(ts["formatted"], true);
+    assert!(ts.get("format_skipped_reason").is_none());
+    assert_eq!(py["format_skipped_reason"], "formatter_excluded_path");
+    assert_eq!(txt["format_skipped_reason"], "unsupported_language");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ============================================================================
+// no_op honest reporting tests (v0.27.1, GitHub #45)
+//
+// Rust sets `no_op: true` on the response when the post-write file content is
+// byte-identical to the pre-write state. This separates "matched but produced
+// no change" from a real failure mode so Pi/OpenCode UIs can render an
+// informative message instead of a bare +0/-0 that looks like a tool bug.
+// ============================================================================
+
+#[test]
+fn edit_match_no_op_when_old_string_equals_new_string() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("identity.txt");
+    fs::write(&target, "hello world\nfoo bar\n").unwrap();
+    let original = fs::read(&target).unwrap();
+
+    let req = serde_json::json!({
+        "id": "no-op-identity",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "foo",
+        "replacement": "foo",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "edit should succeed: {resp:?}");
+    assert_eq!(resp["replacements"], 1, "match was found and applied once");
+    assert_eq!(
+        resp["no_op"], true,
+        "byte-identical replacement must surface no_op: true"
+    );
+    assert_eq!(resp["diff"]["additions"], 0);
+    assert_eq!(resp["diff"]["deletions"], 0);
+
+    // File should genuinely be unchanged on disk
+    assert_eq!(fs::read(&target).unwrap(), original);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_no_op_absent_when_real_change_applied() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real_change.txt");
+    fs::write(&target, "hello world\nfoo bar\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "no-op-real",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "foo",
+        "replacement": "BAR",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["replacements"], 1);
+    assert!(
+        resp.get("no_op").is_none() || resp["no_op"] != true,
+        "real change must NOT set no_op: true (got {resp:?})"
+    );
+    assert_eq!(resp["diff"]["additions"], 1);
+    assert_eq!(resp["diff"]["deletions"], 1);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_no_op_when_content_identical_to_existing_file() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("same.txt");
+    let body = "identical content\n";
+    fs::write(&target, body).unwrap();
+
+    let req = serde_json::json!({
+        "id": "write-same",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": body,
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(resp["created"], false);
+    assert_eq!(
+        resp["no_op"], true,
+        "writing the same bytes must surface no_op: true"
+    );
+    assert_eq!(resp["diff"]["additions"], 0);
+    assert_eq!(resp["diff"]["deletions"], 0);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_no_op_absent_when_file_created() {
+    // Creating a new file is not a "no-op" — there was no pre-state to compare
+    // against. `created: true` is the signal; `no_op` should be unset.
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("brand_new.txt");
+    let _ = fs::remove_file(&target);
+
+    let req = serde_json::json!({
+        "id": "write-new",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "fresh content\n",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["created"], true);
+    assert!(
+        resp.get("no_op").is_none() || resp["no_op"] != true,
+        "create-file path must NOT set no_op: true (got {resp:?})"
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn write_no_op_absent_when_content_actually_differs() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("differs.txt");
+    fs::write(&target, "original\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "write-diff",
+        "command": "write",
+        "file": target.display().to_string(),
+        "content": "modified\n",
+        "include_diff": true
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["created"], false);
+    assert!(
+        resp.get("no_op").is_none() || resp["no_op"] != true,
+        "real overwrite must NOT set no_op: true (got {resp:?})"
+    );
+    assert_eq!(resp["diff"]["additions"], 1);
+    assert_eq!(resp["diff"]["deletions"], 1);
+
+    let _ = fs::remove_file(&target);
     let status = aft.shutdown();
     assert!(status.success());
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
@@ -50,6 +51,14 @@ pub struct DiagnosticEntry {
     /// Optional resultId from a pull response. Sent back as `previousResultId`
     /// on the next pull request to enable `kind: "unchanged"` short-circuiting.
     pub result_id: Option<String>,
+    /// Document version this publish/pull was tagged against, when the
+    /// server provided one. Servers that participate in versioned text
+    /// document sync echo `version` on `publishDiagnostics`; we store it
+    /// so post-edit waiters can reject stale publishes deterministically
+    /// (`version == target_version`) instead of relying on epoch ordering
+    /// alone, which has a race when an old-version publish arrives after
+    /// the pre-edit drain. `None` = server didn't tag the publish.
+    pub version: Option<i32>,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -80,6 +89,9 @@ pub struct DiagnosticsStore {
     capacity: usize,
     /// Monotonic epoch counter. Incremented on every publish.
     next_epoch: u64,
+    /// Last time a server published/replaced diagnostics for a specific file.
+    /// Used as a per-file freshness proof for push-only servers.
+    last_publish_at_for_file: HashMap<(ServerKey, PathBuf), Instant>,
 }
 
 impl DiagnosticsStore {
@@ -93,6 +105,7 @@ impl DiagnosticsStore {
             order: Vec::new(),
             capacity,
             next_epoch: 0,
+            last_publish_at_for_file: HashMap::new(),
         }
     }
 
@@ -143,13 +156,31 @@ impl DiagnosticsStore {
         diagnostics: Vec<StoredDiagnostic>,
         result_id: Option<String>,
     ) {
+        self.publish_full(server, file, diagnostics, result_id, None);
+    }
+
+    /// Replace diagnostics with full provenance (resultId + document version).
+    /// `version` should be the LSP `version` field from `publishDiagnostics`
+    /// when the server provided one, or `None` otherwise.
+    pub fn publish_full(
+        &mut self,
+        server: ServerKey,
+        file: PathBuf,
+        diagnostics: Vec<StoredDiagnostic>,
+        result_id: Option<String>,
+        version: Option<i32>,
+    ) {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
         let entry = DiagnosticEntry {
             diagnostics,
             epoch: self.next_epoch,
             result_id,
+            version,
         };
+
+        self.last_publish_at_for_file
+            .insert(key.clone(), Instant::now());
 
         if self.entries.contains_key(&key) {
             self.entries.insert(key.clone(), entry);
@@ -207,6 +238,27 @@ impl DiagnosticsStore {
         self.entries.keys().any(|(_, f)| f == file)
     }
 
+    /// True if this exact server instance has reported (even an empty result)
+    /// for this exact file.
+    pub fn has_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
+        self.entries
+            .contains_key(&(server.clone(), file.to_path_buf()))
+    }
+
+    /// True if this exact server instance published/replaced diagnostics for
+    /// this exact file after `since`. This is intentionally per `(kind, root,
+    /// file)`; a publish for another file must not prove freshness here.
+    pub fn has_publish_for_file_after(
+        &self,
+        server: &ServerKey,
+        file: &Path,
+        since: Instant,
+    ) -> bool {
+        self.last_publish_at_for_file
+            .get(&(server.clone(), file.to_path_buf()))
+            .is_some_and(|published_at| *published_at >= since)
+    }
+
     /// Get all diagnostics for files under a directory.
     pub fn for_directory(&self, dir: &Path) -> Vec<&StoredDiagnostic> {
         self.entries
@@ -225,17 +277,36 @@ impl DiagnosticsStore {
     }
 
     /// Drop all entries for a server kind (e.g., on server crash/restart).
+    /// Prefer `clear_for_server` for real manager cleanup so peer roots of the
+    /// same kind are not wiped.
     pub fn clear_server(&mut self, server: ServerKind) {
         self.entries
             .retain(|(stored_key, _), _| stored_key.kind != server);
         self.order
             .retain(|(stored_key, _)| stored_key.kind != server);
+        self.last_publish_at_for_file
+            .retain(|(stored_key, _), _| stored_key.kind != server);
+    }
+
+    /// Drop one cached report for a specific server/file pair.
+    pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
+        let cache_key = (key.clone(), file.to_path_buf());
+        self.entries.remove(&cache_key);
+        self.order.retain(|entry_key| entry_key != &cache_key);
+        self.last_publish_at_for_file.remove(&cache_key);
     }
 
     /// Drop all entries for a specific server instance.
-    pub fn clear_server_instance(&mut self, key: &ServerKey) {
+    pub fn clear_for_server(&mut self, key: &ServerKey) {
         self.entries.retain(|(k, _), _| k != key);
         self.order.retain(|(k, _)| k != key);
+        self.last_publish_at_for_file.retain(|(k, _), _| k != key);
+    }
+
+    /// Backward-compatible alias for tests/callers that already used the
+    /// instance-scoped name.
+    pub fn clear_server_instance(&mut self, key: &ServerKey) {
+        self.clear_for_server(key);
     }
 
     /// Remove the least-recently-used entry, returning its key for telemetry.
@@ -245,6 +316,7 @@ impl DiagnosticsStore {
         }
         let evicted = self.order.remove(0);
         self.entries.remove(&evicted);
+        self.last_publish_at_for_file.remove(&evicted);
         Some(evicted)
     }
 
@@ -463,6 +535,37 @@ mod tests {
         assert_eq!(messages.len(), 2, "both servers' reports preserved");
         assert!(messages.iter().any(|m| m == &"pyright says X"));
         assert!(messages.iter().any(|m| m == &"ty says Y"));
+    }
+
+    #[test]
+    fn clear_for_server_file_removes_only_exact_entry() {
+        let file_a = PathBuf::from("/tmp/a.rs");
+        let file_b = PathBuf::from("/tmp/b.rs");
+        let mut store = DiagnosticsStore::new();
+        let rust_key = server_key(ServerKind::Rust);
+        let py_key = server_key(ServerKind::Python);
+
+        store.publish(
+            rust_key.clone(),
+            file_a.clone(),
+            vec![diag("/tmp/a.rs", 1, "rust a", DiagnosticSeverity::Error)],
+        );
+        store.publish(
+            rust_key.clone(),
+            file_b.clone(),
+            vec![diag("/tmp/b.rs", 1, "rust b", DiagnosticSeverity::Warning)],
+        );
+        store.publish(
+            py_key.clone(),
+            file_a.clone(),
+            vec![diag("/tmp/a.rs", 2, "py a", DiagnosticSeverity::Warning)],
+        );
+
+        store.clear_for_server_file(&rust_key, &file_a);
+
+        assert!(!store.has_report_for_server_file(&rust_key, &file_a));
+        assert!(store.has_report_for_server_file(&rust_key, &file_b));
+        assert!(store.has_report_for_server_file(&py_key, &file_a));
     }
 
     #[test]

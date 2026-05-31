@@ -2,7 +2,7 @@
 //!
 //! Uses temp-dir isolation (copy fixtures, mutate copies, verify results)
 //! to test the full inline pipeline: argument substitution, scope conflict
-//! detection, multiple-return rejection, dry-run mode, and error paths.
+//! detection, multiple-return rejection, and error paths.
 
 use crate::helpers::{fixture_path, AftProcess};
 
@@ -28,8 +28,8 @@ fn setup_inline_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(
         resp["success"], true,
@@ -42,6 +42,51 @@ fn configure(aft: &mut AftProcess, root: &str) {
 // Success path tests
 // ---------------------------------------------------------------------------
 
+/// Inline an exported TS function. After the v0.30.x parser fix that
+/// included the `export` keyword in symbol ranges (commit 57d48d9), the
+/// inline path was unable to descend from `export_statement` to the inner
+/// `function_declaration` and returned a `symbol_not_found` error.
+#[test]
+fn inline_symbol_exported_function() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("exported.ts");
+    std::fs::write(
+        &file,
+        "export function double(n: number): number {\n  return n * 2;\n}\n\nexport function useIt(x: number): number {\n  return double(x);\n}\n",
+    )
+    .expect("write test file");
+
+    let root = tmp.path().display().to_string();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"double","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+
+    assert_eq!(
+        resp["success"], true,
+        "inline of exported function should succeed: {:?}",
+        resp
+    );
+    assert_eq!(resp["symbol"], "double");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        !content.contains("double(x)"),
+        "call should be replaced:\n{}",
+        content
+    );
+    assert!(
+        content.contains("x * 2"),
+        "body should be substituted with argument:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
 /// Basic inline: TS helper function call replaced with body.
 #[test]
 fn inline_symbol_basic_ts() {
@@ -53,8 +98,8 @@ fn inline_symbol_basic_ts() {
 
     // Inline `add` at line 10 (const result = add(x, y))
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"add","call_site_line":11}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"add","call_site_line":11}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
@@ -87,8 +132,8 @@ fn inline_symbol_expression_body() {
 
     // Inline `double` at line 17 (const val = double(5)) — 0-indexed
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"double","call_site_line":18}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"double","call_site_line":18}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -120,8 +165,8 @@ fn inline_symbol_python() {
 
     // Inline `add` at line 9 (result = add(x, y)) — 0-indexed
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"add","call_site_line":10}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"add","call_site_line":10}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -142,36 +187,6 @@ fn inline_symbol_python() {
     aft.shutdown();
 }
 
-/// Dry-run: file unchanged.
-#[test]
-fn inline_symbol_dry_run() {
-    let (_tmp, root) = setup_inline_fixture();
-    let mut aft = AftProcess::spawn();
-    configure(&mut aft, &root);
-
-    let file = format!("{}/sample.ts", root);
-
-    // Snapshot before
-    let before = std::fs::read_to_string(&file).unwrap();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"add","call_site_line":11,"dry_run":true}}"#,
-        file
-    ));
-
-    assert_eq!(resp["success"], true, "dry_run should succeed: {:?}", resp);
-    assert_eq!(resp["dry_run"], true, "should flag dry_run");
-    assert!(resp["diff"].as_str().is_some(), "should have diff");
-    assert_eq!(resp["call_context"], "assignment");
-    assert!(resp["substitutions"].as_u64().unwrap() > 0);
-
-    // Verify file NOT modified
-    let after = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(before, after, "file should be unchanged after dry_run");
-
-    aft.shutdown();
-}
-
 // ---------------------------------------------------------------------------
 // Error path tests
 // ---------------------------------------------------------------------------
@@ -187,8 +202,8 @@ fn inline_symbol_multiple_returns() {
 
     // multiReturn has 2 return statements
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"multiReturn","call_site_line":9}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"multiReturn","call_site_line":9}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -212,8 +227,8 @@ fn inline_symbol_scope_conflict() {
 
     // compute() body declares `temp` and `result`, both exist at call site
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"inline_symbol","file":"{}","symbol":"compute","call_site_line":9}}"#,
-        file
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"compute","call_site_line":9}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -251,6 +266,292 @@ fn inline_symbol_scope_conflict() {
             s
         );
     }
+
+    aft.shutdown();
+}
+
+/// Inline preserves the original line indentation. Without the leading-
+/// whitespace expansion fix, the replacement text's indent prefix would be
+/// inserted AFTER the original indent on the line, doubling it (e.g. a
+/// 2-space-indented line became 4-space-indented).
+#[test]
+fn inline_symbol_preserves_call_site_indent() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("indent.ts");
+    std::fs::write(
+        &file,
+        "function helper(x: number): number {\n  return x * 2;\n}\n\nexport function main() {\n  const result = helper(5);\n  console.log(result);\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    // The replacement line must keep its original 2-space indent. If the
+    // bug regressed, this would be 4 spaces.
+    assert!(
+        content.contains("\n  const result = 5 * 2;\n"),
+        "expected 2-space indent on inlined line, got:\n{}",
+        content
+    );
+    assert!(
+        !content.contains("    const result"),
+        "indent should not be doubled, got:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// Parameter substitution should rewrite only references bound to the inlined
+/// function's parameters. Nested arrow parameters that shadow the same name must
+/// stay untouched.
+#[test]
+fn inline_symbol_does_not_substitute_shadowed_arrow_parameter() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("shadowed_arrow.ts");
+    std::fs::write(
+        &file,
+        "function f(x: number): number {\n  return x + items.map(x => x + 1)[0];\n}\n\nconst items = [1, 2];\n\nfunction main() {\n  const result = f(5);\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"f","call_site_line":8}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    let expected = "  const result = 5 + items.map(x => x + 1)[0];";
+    assert!(
+        content.contains(expected),
+        "outer `x` should be substituted while nested arrow `x` remains:\n{}",
+        content
+    );
+    assert!(
+        !content.contains("items.map(5 => 5 + 1)"),
+        "nested arrow parameter must not be substituted:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// `inline_symbol` should accept a target call_site_line that points at the
+/// first line of a multiline call (e.g. `helper(\n  a,\n  b,\n)`), rather than
+/// rejecting it as call_not_found.
+#[test]
+fn inline_symbol_matches_multiline_call_starting_on_target_line() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("multiline.ts");
+    std::fs::write(
+        &file,
+        "function helper(a: number, b: number): number {\n  return a + b;\n}\n\nexport function main() {\n  const result = helper(\n    1,\n    2,\n  );\n  console.log(result);\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"multiline","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":6}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "inline should match multiline call by start line: {:?}",
+        resp
+    );
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        !content.contains("helper(\n"),
+        "multiline call should be replaced:\n{}",
+        content
+    );
+    assert!(
+        content.contains("\n  const result = 1 + 2;\n"),
+        "expected inlined expression, got:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_preserves_nested_multiline_indentation() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("nested_indent.ts");
+    std::fs::write(
+        &file,
+        r#"function helper(items: number[]): void {
+  for (const item of items) {
+    if (item > 0) {
+      console.log(item);
+    }
+  }
+}
+
+const values = [1, 2];
+
+export function main() {
+  helper(values);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"nested-indent","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":12}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    let expected =
+        "  for (const item of values) {\n    if (item > 0) {\n      console.log(item);\n    }\n  }";
+    assert!(
+        content.contains(expected),
+        "nested relative indentation should be preserved:\n{content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_standalone_return_expression_becomes_expression_statement() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("standalone_return.ts");
+    std::fs::write(
+        &file,
+        r#"function helper(): number {
+  audit();
+  return sideEffect();
+}
+
+function audit(): void {}
+function sideEffect(): number { return 1; }
+
+export function main() {
+  helper();
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"standalone-return","command":"inline_symbol","file":{},"symbol":"helper","call_site_line":10}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("  audit();\n  sideEffect();"),
+        "return expression should be kept as an expression statement:\n{content}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_maps_destructured_default_and_rest_parameters() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("params.ts");
+    std::fs::write(
+        &file,
+        r#"type Point = { x: number; y: number };
+
+function describe({ x, y }: Point, [first, second]: number[], label = 'pt', ...rest: string[]): string {
+  return `${label}:${x + y}:${first + second}:${rest.join(',')}`;
+}
+
+const point = { x: 1, y: 2 };
+const pair = [3, 4];
+
+export function main() {
+  const result = describe(point, pair, 'p', 'a', 'b');
+  console.log(result);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"params","command":"inline_symbol","file":{},"symbol":"describe","call_site_line":11}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "inline should succeed: {resp:?}");
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("point.x + point.y"),
+        "object destructuring bindings should map to variable properties:\n{content}"
+    );
+    assert!(
+        content.contains("pair[0] + pair[1]"),
+        "array destructuring bindings should map to indexed accesses:\n{content}"
+    );
+    assert!(
+        content.contains("['a', 'b'].join(',')"),
+        "rest parameter should map to an array literal of remaining args:\n{content}"
+    );
+    assert!(
+        !content.contains("describe(point"),
+        "call should be replaced:\n{content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn inline_symbol_refuses_destructuring_from_non_variable_argument() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("params_mismatch.ts");
+    std::fs::write(
+        &file,
+        r#"type Point = { x: number; y: number };
+
+function sumPoint({ x, y }: Point): number {
+  return x + y;
+}
+
+export function main() {
+  const result = sumPoint({ x: 1, y: 2 });
+  console.log(result);
+}
+"#,
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"params-mismatch","command":"inline_symbol","file":{},"symbol":"sumPoint","call_site_line":8}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], false, "inline should fail: {resp:?}");
+    assert_eq!(resp["code"], "param_mismatch", "wrong error: {resp:?}");
 
     aft.shutdown();
 }

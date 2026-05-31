@@ -2,7 +2,7 @@
 //!
 //! Uses temp-dir isolation (copy fixtures, mutate copies, verify results)
 //! to test the full extract pipeline: free variable detection, return value
-//! inference, function generation, dry-run mode, and error paths.
+//! inference, function generation, and error paths.
 
 use crate::helpers::{fixture_path, AftProcess};
 
@@ -28,8 +28,8 @@ fn setup_extract_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(
         resp["success"], true,
@@ -55,8 +55,8 @@ fn extract_function_basic_ts() {
     // Extract lines 5-9 of processData (the body lines with filtered, mapped, result, console.log)
     // These use `items`, `prefix` from the enclosing function → free variables
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"doProcess","start_line":6,"end_line":10}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"doProcess","start_line":6,"end_line":10}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
@@ -98,8 +98,8 @@ fn extract_function_with_return_value() {
     // Extract lines 13-14 of simpleHelper (doubled and added)
     // `added` is used after the range (return added) → return value
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"computeValues","start_line":14,"end_line":16}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"computeValues","start_line":14,"end_line":16}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
@@ -131,6 +131,114 @@ fn extract_function_with_return_value() {
     aft.shutdown();
 }
 
+/// A plain lexical declaration inside a real function is not itself a function
+/// boundary. Free-variable detection must keep walking to `function f(a)` and
+/// pass `a` into the extracted helper.
+#[test]
+fn extract_function_plain_const_keeps_enclosing_function_scope() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("plain_const.ts");
+    std::fs::write(
+        &file,
+        "function f(a: number) {\n  const x = a + 1;\n  return x;\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"makeX","start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let params = resp["parameters"].as_array().expect("parameters array");
+    assert!(
+        params.iter().any(|param| param.as_str() == Some("a")),
+        "expected `a` to be detected as a free variable, got {:?}",
+        params
+    );
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("makeX(a)"),
+        "call site should pass `a` into extracted function:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// Extracted function bodies should strip only the common selected indent and
+/// preserve relative nesting inside the extracted range.
+#[test]
+fn extract_function_preserves_nested_body_indentation() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("nested_indent.ts");
+    std::fs::write(
+        &file,
+        "function f(items: Array<{ active: boolean; name: string }>) {\n  for (const item of items) {\n    if (item.active) {\n      console.log(item.name);\n    }\n  }\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"processItems","start_line":2,"end_line":7}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    let expected = "function processItems(items) {\n  for (const item of items) {\n    if (item.active) {\n      console.log(item.name);\n    }\n  }\n}";
+    assert!(
+        content.contains(expected),
+        "expected preserved relative indentation:\n--- expected ---\n{}\n--- actual ---\n{}",
+        expected,
+        content
+    );
+
+    aft.shutdown();
+}
+
+/// Return-variable call-site generation must preserve mutable declaration
+/// shape instead of always rewriting to `const`.
+#[test]
+fn extract_function_preserves_let_return_binding() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("let_return.ts");
+    std::fs::write(
+        &file,
+        "function f() {\n  let result = compute();\n  result += 1;\n  return result;\n}\n\nfunction compute() {\n  return 1;\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"computeInitial","start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains("let result = computeInitial();"),
+        "call site should preserve `let` binding:\n{}",
+        content
+    );
+    assert!(
+        !content.contains("const result = computeInitial();"),
+        "call site must not introduce const for a mutable result:\n{}",
+        content
+    );
+
+    aft.shutdown();
+}
+
 /// Python extract: verify correct `def` syntax.
 #[test]
 fn extract_function_python() {
@@ -142,8 +250,8 @@ fn extract_function_python() {
 
     // Extract lines 5-8 of process_data body
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"do_process","start_line":6,"end_line":10}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"do_process","start_line":6,"end_line":10}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(
@@ -171,39 +279,6 @@ fn extract_function_python() {
     aft.shutdown();
 }
 
-/// Dry-run: file unchanged, diff returned.
-#[test]
-fn extract_function_dry_run() {
-    let (_tmp, root) = setup_extract_fixture();
-    let mut aft = AftProcess::spawn();
-    configure(&mut aft, &root);
-
-    let file = format!("{}/sample.ts", root);
-
-    // Snapshot before
-    let before = std::fs::read_to_string(&file).unwrap();
-
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"preview","start_line":6,"end_line":10,"dry_run":true}}"#,
-        file
-    ));
-
-    assert_eq!(resp["success"], true, "dry_run should succeed: {:?}", resp);
-    assert_eq!(resp["dry_run"], true, "should flag dry_run");
-    assert!(resp["diff"].as_str().is_some(), "should have diff");
-    assert!(resp["parameters"].is_array(), "should have parameters");
-    assert!(
-        resp["return_type"].as_str().is_some(),
-        "should have return_type"
-    );
-
-    // Verify file NOT modified
-    let after = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(before, after, "file should be unchanged after dry_run");
-
-    aft.shutdown();
-}
-
 /// Unsupported language error: `.rs` file returns `unsupported_language`.
 #[test]
 fn extract_function_unsupported_language() {
@@ -216,8 +291,8 @@ fn extract_function_unsupported_language() {
     std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"foo","start_line":2,"end_line":3}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"foo","start_line":2,"end_line":3}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -237,8 +312,8 @@ fn extract_function_this_reference() {
 
     // Lines 4-7 of UserService.getUser contain `this.users`
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"extract_function","file":"{}","name":"extracted","start_line":5,"end_line":8}}"#,
-        file
+        r#"{{"id":"1","command":"extract_function","file":{},"name":"extracted","start_line":5,"end_line":8}}"#,
+        crate::helpers::json_string(&file)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);

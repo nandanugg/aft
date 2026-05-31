@@ -20,6 +20,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, target, decorator, syntax_valid?, backup_id? }`
 pub fn handle_add_decorator(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -155,16 +156,18 @@ pub fn handle_add_decorator(req: &RawRequest, ctx: &AppContext) -> Response {
         _ => target_info.first_decorator_start,
     };
 
-    // --- Auto-backup (skip for dry-run) ---
-    let backup_id = if !edit::is_dry_run(&req.params) {
-        match edit::auto_backup(ctx, req.session(), &path, "add_decorator: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
+    // --- Auto-backup ---
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "add_decorator: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
         }
-    } else {
-        None
     };
 
     // --- Insert ---
@@ -173,17 +176,6 @@ pub fn handle_add_decorator(req: &RawRequest, ctx: &AppContext) -> Response {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
 
     // --- Write, format, and validate ---
     let mut write_result =
@@ -195,7 +187,7 @@ pub fn handle_add_decorator(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("add_decorator: {}", file);

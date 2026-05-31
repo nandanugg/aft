@@ -3,7 +3,7 @@
 //! scope conflict detection.
 //!
 //! Follows the extract_function.rs pattern: validate → parse → compute →
-//! dry_run check → auto_backup → write_format_validate → respond.
+//! auto_backup → write_format_validate → respond.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,10 +23,11 @@ use crate::protocol::{RawRequest, Response};
 ///   - `file` (string, required) — target file path
 ///   - `symbol` (string, required) — name of the function to inline
 ///   - `call_site_line` (u32, required) — line where the call expression is (1-based)
-///   - `dry_run` (bool, optional) — if true, return diff without writing
 ///
 /// Returns on success:
-///   `{ file, symbol, call_context, substitutions, conflicts, syntax_valid, backup_id }`
+///   `{ file, symbol, call_context, substitutions, conflicts, syntax_valid?, backup_id }`
+///
+/// `syntax_valid` is absent when syntax validation could not run.
 ///
 /// Error codes:
 ///   - `unsupported_language` — file is not TS/JS/TSX/Python
@@ -35,6 +36,7 @@ use crate::protocol::{RawRequest, Response};
 ///   - `symbol_not_found` — function symbol not found in file
 ///   - `call_not_found` — no call expression found at the specified line
 pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -212,7 +214,11 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Extract function body and parameters ---
-    let (param_names, body_text) = extract_fn_params_and_body(&fn_node, &source, lang);
+    let (param_patterns, body_text) = extract_fn_params_and_body(&fn_node, &source, lang);
+    let param_names = param_patterns
+        .iter()
+        .flat_map(InlineParam::binding_names)
+        .collect::<Vec<_>>();
 
     // --- Find call expression at call_site_line ---
     let call_line_start = edit::line_col_to_byte(&source, call_site_line, 0);
@@ -249,12 +255,20 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Build param→arg map ---
     let args = extract_call_arguments(&call_node, &source, lang);
-    let mut param_to_arg: HashMap<String, String> = HashMap::new();
-    for (i, param) in param_names.iter().enumerate() {
-        if let Some(arg) = args.get(i) {
-            param_to_arg.insert(param.clone(), arg.clone());
+    let param_to_arg = match build_param_to_arg_map(&param_patterns, &args) {
+        Ok(map) => map,
+        Err(reason) => {
+            return Response::error_with_data(
+                &req.id,
+                "param_mismatch",
+                format!("inline_symbol: cannot inline '{}': {}", symbol, reason),
+                serde_json::json!({
+                    "symbol": symbol,
+                    "reason": reason,
+                }),
+            );
         }
-    }
+    };
 
     // --- Check scope conflicts (D103) ---
     let conflicts = detect_scope_conflicts(
@@ -299,6 +313,16 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let substitution_count = param_to_arg.len();
 
     // --- Build replacement text ---
+    //
+    // Indentation contract: `replacement_text` is built with `replacement_indent`
+    // ALREADY prepended to each line. To avoid the indent being doubled, we
+    // expand `replacement_node` backwards over leading whitespace to the start
+    // of its line so the replacement OVERWRITES the original indent rather than
+    // inserting AFTER it.
+    //
+    // Without this, a 2-space-indented `const result = helper(5);` produced
+    // `    const result = 5 * 2;` (4-space) because the original `  ` remained
+    // before the replacement's `  const ...`.
     let replacement_indent = get_line_indent(&source, call_site_line as usize);
     let replacement_text = build_inline_replacement(
         &substituted_body,
@@ -308,10 +332,21 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         assignment_var.as_deref(),
     );
 
+    // Expand replacement start backwards over horizontal whitespace to start
+    // of line. Stop at start-of-file or newline.
+    let replace_start = {
+        let bytes = source.as_bytes();
+        let mut s = replacement_node.start_byte();
+        while s > 0 && matches!(bytes[s - 1], b' ' | b'\t') {
+            s -= 1;
+        }
+        s
+    };
+
     // --- Compute new file content ---
     let new_source = match edit::replace_byte_range(
         &source,
-        replacement_node.start_byte(),
+        replace_start,
         replacement_node.end_byte(),
         &replacement_text,
     ) {
@@ -319,30 +354,13 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
 
-    // --- Dry-run check ---
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-                "symbol": symbol,
-                "call_context": call_context,
-                "substitutions": substitution_count,
-                "conflicts": [],
-            }),
-        );
-    }
-
     // --- Auto-backup before mutation ---
     let backup_id = match edit::auto_backup(
         ctx,
         req.session(),
         &path,
         &format!("inline_symbol: {}", symbol),
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -360,28 +378,24 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
-    log::debug!(
-        "[aft] inline_symbol: {} at {}:{}",
-        symbol,
-        file,
-        call_site_line
-    );
+    log::debug!("inline_symbol: {} at {}:{}", symbol, file, call_site_line);
 
     // --- Build response ---
-    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
-
     let mut result = serde_json::json!({
         "file": file,
         "symbol": symbol,
         "call_context": call_context,
         "substitutions": substitution_count,
         "conflicts": [],
-        "syntax_valid": syntax_valid,
         "formatted": write_result.formatted,
     });
+
+    if let Some(valid) = write_result.syntax_valid {
+        result["syntax_valid"] = serde_json::json!(valid);
+    }
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -440,6 +454,41 @@ fn find_node_at<'a>(
         return Some(*node);
     }
 
+    // If this is an export wrapper (TS/JS `export_statement`), look for the
+    // inner function/declaration inside. Symbol ranges for exported TS/JS
+    // functions point at the `export` keyword (see parser.rs), but the
+    // function_declaration child starts after `export `, so we need to walk
+    // into it explicitly rather than relying on a byte-pos containment check.
+    if node.kind() == "export_statement"
+        && node.start_byte() <= byte_pos
+        && byte_pos < node.end_byte()
+    {
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i as u32) {
+                if kinds.contains(&child.kind()) {
+                    return Some(child);
+                }
+                // Arrow-function case: `export const f = (...) => {...}` wraps
+                // a lexical_declaration with an arrow_function inside.
+                if kinds.contains(&"arrow_function") && child.kind() == "lexical_declaration" {
+                    let grand_count = child.child_count();
+                    for j in 0..grand_count {
+                        if let Some(grand) = child.child(j as u32) {
+                            if grand.kind() == "variable_declarator" {
+                                if let Some(value) = grand.child_by_field_name("value") {
+                                    if value.kind() == "arrow_function" {
+                                        return Some(value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i as u32) {
@@ -473,15 +522,53 @@ fn find_node_at<'a>(
     None
 }
 
-/// Extract parameter names and body text from a function node.
+#[derive(Debug, Clone)]
+enum InlineParam {
+    Simple {
+        name: String,
+        default_value: Option<String>,
+    },
+    Destructured {
+        bindings: Vec<DestructuredBinding>,
+    },
+    Rest {
+        name: String,
+    },
+    Unsupported {
+        description: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DestructuredBinding {
+    name: String,
+    access_path: String,
+}
+
+impl InlineParam {
+    fn binding_names(&self) -> Vec<String> {
+        match self {
+            InlineParam::Simple { name, .. } | InlineParam::Rest { name } => vec![name.clone()],
+            InlineParam::Destructured { bindings } => bindings
+                .iter()
+                .map(|binding| binding.name.clone())
+                .collect(),
+            InlineParam::Unsupported { .. } => Vec::new(),
+        }
+    }
+}
+
+/// Extract parameter patterns and body text from a function node.
 fn extract_fn_params_and_body(
     fn_node: &tree_sitter::Node,
     source: &str,
     lang: LangId,
-) -> (Vec<String>, String) {
-    let mut param_names = Vec::new();
+) -> (Vec<InlineParam>, String) {
+    let mut param_patterns = Vec::new();
 
-    // Collect parameter names
+    // Collect parameter bindings. TS/JS parameters may be identifiers, default
+    // wrappers, rest params, or destructuring patterns; keep enough structure to
+    // build safe substitutions once the call arguments are known.
     let params_node = fn_node.child_by_field_name("parameters");
     if let Some(params) = params_node {
         let child_count = params.child_count();
@@ -489,23 +576,18 @@ fn extract_fn_params_and_body(
             if let Some(child) = params.child(i as u32) {
                 match lang {
                     LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
-                        if child.kind() == "required_parameter"
-                            || child.kind() == "optional_parameter"
-                        {
-                            if let Some(pattern) = child.child_by_field_name("pattern") {
-                                if pattern.kind() == "identifier" {
-                                    param_names.push(node_text(source, &pattern).to_string());
-                                }
-                            }
-                        } else if child.kind() == "identifier" {
-                            param_names.push(node_text(source, &child).to_string());
+                        if let Some(param) = extract_ts_param_pattern(&child, source) {
+                            param_patterns.push(param);
                         }
                     }
                     LangId::Python => {
                         if child.kind() == "identifier" {
                             let name = node_text(source, &child).to_string();
                             if name != "self" {
-                                param_names.push(name);
+                                param_patterns.push(InlineParam::Simple {
+                                    name,
+                                    default_value: None,
+                                });
                             }
                         }
                     }
@@ -538,7 +620,271 @@ fn extract_fn_params_and_body(
         String::new()
     };
 
-    (param_names, body_text)
+    (param_patterns, body_text)
+}
+
+fn extract_ts_param_pattern(node: &tree_sitter::Node, source: &str) -> Option<InlineParam> {
+    match node.kind() {
+        "required_parameter" | "optional_parameter" => {
+            let raw = node_text(source, node).trim_start();
+            if raw.starts_with("...") {
+                return node
+                    .child_by_field_name("pattern")
+                    .and_then(|pattern| first_identifier_name(&pattern, source))
+                    .map(|name| InlineParam::Rest { name });
+            }
+
+            if let Some(default_value) = node.child_by_field_name("value") {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    if pattern.kind() == "identifier" {
+                        return Some(InlineParam::Simple {
+                            name: node_text(source, &pattern).to_string(),
+                            default_value: Some(
+                                node_text(source, &default_value).trim().to_string(),
+                            ),
+                        });
+                    }
+                }
+            }
+
+            node.child_by_field_name("pattern")
+                .and_then(|pattern| extract_ts_param_pattern(&pattern, source))
+        }
+        "identifier" => Some(InlineParam::Simple {
+            name: node_text(source, node).to_string(),
+            default_value: None,
+        }),
+        "assignment_pattern" => {
+            let left = node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("pattern"));
+            let right = node
+                .child_by_field_name("right")
+                .or_else(|| node.child_by_field_name("value"));
+            match (left, right) {
+                (Some(left), Some(right)) if left.kind() == "identifier" => {
+                    Some(InlineParam::Simple {
+                        name: node_text(source, &left).to_string(),
+                        default_value: Some(node_text(source, &right).trim().to_string()),
+                    })
+                }
+                (Some(left), _) => extract_ts_param_pattern(&left, source),
+                _ => Some(InlineParam::Unsupported {
+                    description: format!(
+                        "unsupported default parameter `{}`",
+                        node_text(source, node)
+                    ),
+                }),
+            }
+        }
+        "rest_pattern" => {
+            first_identifier_name(node, source).map(|name| InlineParam::Rest { name })
+        }
+        "object_pattern" | "array_pattern" => {
+            let mut bindings = Vec::new();
+            if collect_destructured_bindings(node, source, "", &mut bindings).is_some() {
+                Some(InlineParam::Destructured { bindings })
+            } else {
+                Some(InlineParam::Unsupported {
+                    description: format!(
+                        "unsupported destructured parameter `{}`",
+                        node_text(source, node)
+                    ),
+                })
+            }
+        }
+        "(" | ")" | "," => None,
+        _ if !node.is_named() => None,
+        _ => None,
+    }
+}
+
+fn first_identifier_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        return Some(node_text(source, node).to_string());
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i as u32) {
+            if let Some(name) = first_identifier_name(&child, source) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
+fn collect_destructured_bindings(
+    node: &tree_sitter::Node,
+    source: &str,
+    access_prefix: &str,
+    out: &mut Vec<DestructuredBinding>,
+) -> Option<()> {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            out.push(DestructuredBinding {
+                name: node_text(source, node).to_string(),
+                access_path: access_prefix.to_string(),
+            });
+            Some(())
+        }
+        "assignment_pattern" => {
+            let left = node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("pattern"))?;
+            collect_destructured_bindings(&left, source, access_prefix, out)
+        }
+        "object_pattern" => collect_object_pattern_bindings(node, source, access_prefix, out),
+        "array_pattern" => collect_array_pattern_bindings(node, source, access_prefix, out),
+        _ => None,
+    }
+}
+
+fn collect_object_pattern_bindings(
+    node: &tree_sitter::Node,
+    source: &str,
+    access_prefix: &str,
+    out: &mut Vec<DestructuredBinding>,
+) -> Option<()> {
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "{" | "}" | "," => {}
+            "shorthand_property_identifier_pattern" | "identifier" => {
+                let name = node_text(source, &child);
+                out.push(DestructuredBinding {
+                    name: name.to_string(),
+                    access_path: format!("{}.{name}", access_prefix),
+                });
+            }
+            "pair_pattern" | "pair" => {
+                let key = child.child_by_field_name("key")?;
+                let value = child
+                    .child_by_field_name("value")
+                    .or_else(|| child.child_by_field_name("pattern"))?;
+                let property = property_access_for_key(&key, source)?;
+                let nested_access = format!("{}{}", access_prefix, property);
+                collect_destructured_bindings(&value, source, &nested_access, out)?;
+            }
+            "object_assignment_pattern" => {
+                let name = first_identifier_name(&child, source)?;
+                out.push(DestructuredBinding {
+                    access_path: format!("{}.{name}", access_prefix),
+                    name,
+                });
+            }
+            "rest_pattern" => return None,
+            _ if child.is_named() => return None,
+            _ => {}
+        }
+    }
+
+    Some(())
+}
+
+fn collect_array_pattern_bindings(
+    node: &tree_sitter::Node,
+    source: &str,
+    access_prefix: &str,
+    out: &mut Vec<DestructuredBinding>,
+) -> Option<()> {
+    let mut element_index = 0usize;
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "[" | "]" | "," => {}
+            "rest_pattern" => return None,
+            _ if child.is_named() => {
+                let nested_access = format!("{}[{element_index}]", access_prefix);
+                collect_destructured_bindings(&child, source, &nested_access, out)?;
+                element_index += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Some(())
+}
+
+fn property_access_for_key(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let key = node_text(source, node).trim();
+    if is_simple_identifier(key) {
+        Some(format!(".{key}"))
+    } else {
+        None
+    }
+}
+
+fn build_param_to_arg_map(
+    params: &[InlineParam],
+    args: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let mut param_to_arg = HashMap::new();
+
+    for (i, param) in params.iter().enumerate() {
+        match param {
+            InlineParam::Simple {
+                name,
+                default_value,
+            } => {
+                if let Some(arg) = args.get(i) {
+                    param_to_arg.insert(name.clone(), arg.clone());
+                } else if let Some(default_value) = default_value {
+                    param_to_arg.insert(name.clone(), default_value.clone());
+                }
+            }
+            InlineParam::Destructured { bindings } => {
+                let Some(arg) = args.get(i) else {
+                    return Err(format!(
+                        "missing argument for destructured parameter {}",
+                        i + 1
+                    ));
+                };
+                if !is_simple_identifier(arg.trim()) {
+                    return Err(format!(
+                        "destructured parameter {} requires a simple variable argument, got `{}`",
+                        i + 1,
+                        arg.trim()
+                    ));
+                }
+                for binding in bindings {
+                    param_to_arg.insert(
+                        binding.name.clone(),
+                        format!("{}{}", arg.trim(), binding.access_path),
+                    );
+                }
+            }
+            InlineParam::Rest { name } => {
+                let rest_args = if i < args.len() { &args[i..] } else { &[] };
+                param_to_arg.insert(name.clone(), format!("[{}]", rest_args.join(", ")));
+            }
+            InlineParam::Unsupported { description } => return Err(description.clone()),
+        }
+    }
+
+    Ok(param_to_arg)
+}
+
+fn is_simple_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
 }
 
 /// Strip outer braces and de-indent a statement block.
@@ -607,7 +953,8 @@ fn find_call_recursive<'a>(
 
     if call_kinds.contains(&node.kind())
         && node.start_byte() >= start_byte
-        && node.end_byte() <= end_byte
+        && node.start_byte() < end_byte
+        && node.end_byte() <= source.len()
     {
         if let Some(callee_name) = crate::calls::extract_callee_name(node, source) {
             if callee_name == symbol {
@@ -787,8 +1134,22 @@ fn build_inline_replacement(
 
 /// Strip "return " prefix and trailing semicolon from a return statement.
 fn strip_return_prefix(line: &str) -> Option<&str> {
-    let trimmed = line.strip_prefix("return ")?;
-    Some(trimmed.trim_end_matches(';').trim())
+    parse_return_statement(line).and_then(|expr| expr)
+}
+
+fn parse_return_statement(line: &str) -> Option<Option<&str>> {
+    let trimmed = line.trim_start();
+    if trimmed == "return" || trimmed == "return;" {
+        return Some(None);
+    }
+
+    let expr = trimmed.strip_prefix("return ")?;
+    let expr = expr.trim_end_matches(';').trim();
+    if expr.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(expr))
+    }
 }
 
 /// Build a single assignment line.
@@ -812,37 +1173,48 @@ fn build_multiline_assignment(
     lang: LangId,
     assignment_var: Option<&str>,
 ) -> String {
+    let normalized = strip_common_indent(lines);
     let mut result = Vec::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for line in &normalized {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.is_empty() {
             result.push(String::new());
-        } else if let Some(expr) = strip_return_prefix(trimmed) {
-            // Convert return to assignment
+        } else if let Some(Some(expr)) = parse_return_statement(trimmed_start) {
+            // Convert return to assignment, preserving any relative nesting indent.
             if let Some(var) = assignment_var {
-                result.push(build_assignment_line(var, expr, indent, lang));
+                let line_indent = leading_whitespace(line);
+                let assignment_indent = format!("{}{}", indent, line_indent);
+                result.push(build_assignment_line(var, expr, &assignment_indent, lang));
             }
             // else: drop the return (void return in assignment context shouldn't happen)
+        } else if parse_return_statement(trimmed_start).is_some() {
+            // Bare return in assignment context has no value to assign.
         } else {
-            result.push(format!("{}{}", indent, trimmed));
+            result.push(format!("{}{}", indent, line));
         }
     }
     result.join("\n")
 }
 
-/// Build multi-line replacement for standalone context (strip returns).
+/// Build multi-line replacement for standalone context.
 fn build_multiline_standalone(lines: &[&str], indent: &str, lang: LangId) -> String {
-    let _ = lang;
+    let normalized = strip_common_indent(lines);
     let mut result = Vec::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for line in &normalized {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.is_empty() {
             result.push(String::new());
-        } else if let Some(_expr) = strip_return_prefix(trimmed) {
-            // In standalone context, drop the return entirely
-            // (the return value isn't used)
+        } else if let Some(return_expr) = parse_return_statement(trimmed_start) {
+            if let Some(expr) = return_expr {
+                let line_indent = leading_whitespace(line);
+                match lang {
+                    LangId::Python => result.push(format!("{}{}{}", indent, line_indent, expr)),
+                    _ => result.push(format!("{}{}{};", indent, line_indent, expr)),
+                }
+            }
+            // Bare `return;` has no side effects and is dropped.
         } else {
-            result.push(format!("{}{}", indent, trimmed));
+            result.push(format!("{}{}", indent, line));
         }
     }
     result.join("\n")
@@ -850,16 +1222,42 @@ fn build_multiline_standalone(lines: &[&str], indent: &str, lang: LangId) -> Str
 
 /// Build multi-line replacement with proper indentation (preserving all lines).
 fn build_multiline_replacement(lines: &[&str], indent: &str, _lang: LangId) -> String {
-    let mut result = Vec::new();
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            result.push(String::new());
-        } else {
-            result.push(format!("{}{}", indent, trimmed));
-        }
-    }
-    result.join("\n")
+    strip_common_indent(lines)
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", indent, line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_common_indent(lines: &[&str]) -> Vec<String> {
+    let common_indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| leading_whitespace(line).len())
+        .min()
+        .unwrap_or(0);
+
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                line.get(common_indent..).unwrap_or(line).to_string()
+            }
+        })
+        .collect()
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    &line[..line.len() - trimmed.len()]
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1415,6 @@ mod tests {
                 "file": fixture.display().to_string(),
                 "symbol": "compute",
                 "call_site_line": 9,
-                "dry_run": true,
             }),
         );
         let ctx = crate::context::AppContext::new(
@@ -1040,34 +1437,5 @@ mod tests {
             "should report at least one conflict: {:?}",
             conflicting
         );
-    }
-
-    // --- Dry-run inlining ---
-
-    #[test]
-    fn inline_symbol_dry_run_returns_diff() {
-        let fixture = fixture_path("sample.ts");
-
-        let req = make_request(
-            "7",
-            "inline_symbol",
-            serde_json::json!({
-                "file": fixture.display().to_string(),
-                "symbol": "add",
-                "call_site_line": 11,
-                "dry_run": true,
-            }),
-        );
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        let resp = handle_inline_symbol(&req, &ctx);
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["success"], true, "should succeed: {:?}", json);
-        assert_eq!(json["dry_run"], true);
-        assert!(json["diff"].as_str().is_some(), "should have diff");
-        assert_eq!(json["call_context"], "assignment");
-        assert!(json["substitutions"].as_u64().unwrap() > 0);
     }
 }

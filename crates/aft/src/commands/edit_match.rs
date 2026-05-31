@@ -1,10 +1,13 @@
 //! Handler for the `edit_match` command: content-based string matching with
 //! disambiguation for multiple occurrences.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
 use crate::edit::{self, validate_syntax};
+use crate::format;
+
 use crate::protocol::{RawRequest, Response};
 
 /// Handle an `edit_match` request.
@@ -15,18 +18,25 @@ use crate::protocol::{RawRequest, Response};
 ///   - `replacement` (string, required) — replacement content
 ///   - `occurrence` (integer, optional, 0-indexed) — select a specific occurrence (single-file only)
 ///   - `replace_all` (bool, optional) — replace all occurrences (default: false)
-///   - `dry_run` (bool, optional) — preview changes without writing
+///   - `op` (string, optional) — when `append`, appends `append_content`/`appendContent`
 ///
 /// When `file` is a glob pattern:
 ///   - Applies match/replace across all matching files
 ///   - `replace_all` is implicitly true
 ///   - `occurrence` is ignored
-///   - Returns: `{ ok, files: [{ file, replacements, ... }], total_replacements, total_files }`
+///   - Returns: `{ ok, files: [{ file, replacements, formatted, format_skipped_reason?, ... }], total_replacements, total_files, format_skipped_count, format_skip_reasons }`
 ///
 /// When `file` is a literal path:
 ///   - Original single-file behavior
-///   - Returns: `{ file, replacements: 1, syntax_valid, backup_id? }`
+///   - Returns: `{ file, replacements: 1, syntax_valid?, backup_id? }`
+///
+/// `syntax_valid` is absent when syntax validation could not run.
 pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
+    if req.params.get("op").and_then(|v| v.as_str()) == Some("append") {
+        return handle_append(req, ctx, &op_id);
+    }
+
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -74,11 +84,236 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Detect glob pattern
     if is_glob_pattern(file) {
-        return handle_glob_edit_match(req, ctx, file, match_str, replacement);
+        return handle_glob_edit_match(req, ctx, file, match_str, replacement, &op_id);
     }
 
     // Single-file path
-    handle_single_file_edit_match(req, ctx, file, match_str, replacement)
+    handle_single_file_edit_match(req, ctx, file, match_str, replacement, &op_id)
+}
+
+fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
+    let file = match req
+        .params
+        .get("file")
+        .or_else(|| req.params.get("filePath"))
+        .and_then(|v| v.as_str())
+    {
+        Some(f) => f,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "edit_match append: missing required param 'file'",
+            );
+        }
+    };
+
+    let append_content = match req
+        .params
+        .get("append_content")
+        .or_else(|| req.params.get("appendContent"))
+        .and_then(|v| v.as_str())
+    {
+        Some(content) => content,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "edit_match append: missing required param 'appendContent'",
+            );
+        }
+    };
+
+    let create_dirs = req
+        .params
+        .get("create_dirs")
+        .or_else(|| req.params.get("createDirs"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let path = match ctx.validate_path(&req.id, Path::new(file)) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+
+    if create_dirs {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    return Response::error(
+                        &req.id,
+                        "invalid_request",
+                        format!("edit_match append: failed to create directories: {}", error),
+                    );
+                }
+            }
+        }
+    }
+
+    let existed = path.exists();
+    let backup_id = if existed {
+        match edit::auto_backup(
+            ctx,
+            req.session(),
+            path.as_path(),
+            "edit_match: append",
+            Some(op_id),
+        ) {
+            Ok(id) => id,
+            Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+        }
+    } else {
+        match ctx.backup().borrow_mut().snapshot_op_tombstone(
+            req.session(),
+            op_id,
+            path.as_path(),
+            "edit_match append: file created by append",
+        ) {
+            Ok(id) => Some(id),
+            Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+        }
+    };
+
+    // Capture before-content for diff computation if requested. Only read it
+    // when the caller asked, since this allocates the whole file string.
+    let want_diff = edit::wants_diff(&req.params);
+    let before_content = if want_diff && existed {
+        std::fs::read_to_string(path.as_path()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut file_handle = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.as_path())
+    {
+        Ok(file_handle) => file_handle,
+        Err(error) => {
+            if !existed {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), op_id);
+            }
+            return Response::error(
+                &req.id,
+                "write_error",
+                format!("edit_match append: failed to open {}: {}", file, error),
+            );
+        }
+    };
+
+    if let Err(error) = file_handle.write_all(append_content.as_bytes()) {
+        if !existed {
+            ctx.backup()
+                .borrow_mut()
+                .discard_operation_entries(req.session(), op_id);
+        }
+        return Response::error(
+            &req.id,
+            "write_error",
+            format!("edit_match append: failed to write {}: {}", file, error),
+        );
+    }
+
+    #[cfg(unix)]
+    if !existed {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(path.as_path(), std::fs::Permissions::from_mode(0o644))
+        {
+            return Response::error(
+                &req.id,
+                "write_error",
+                format!(
+                    "edit_match append: failed to set permissions on {}: {}",
+                    file, error
+                ),
+            );
+        }
+    }
+
+    // Run the project formatter on the appended file. `auto_format` honors
+    // `config.format_on_edit` internally and returns `(false, None)` when
+    // disabled, so we can call it unconditionally. Bug #4 of the v0.18.3
+    // format_on_edit audit: append previously hardcoded `formatted: false,
+    // format_skipped_reason: None` and bypassed the formatter entirely.
+    // Agents that appended messy lines kept them messy with no signal.
+    let config = ctx.config();
+    let (formatted, format_skipped_reason) = format::auto_format(path.as_path(), &config);
+    drop(config);
+
+    // Re-read final content AFTER formatting so the LSP sees the formatted
+    // text (matches `write_format_validate` ordering: write → format → validate
+    // → notify LSP) and the diff in the response reflects what's actually
+    // on disk. Reading once and reusing for LSP + diff also avoids a TOCTOU
+    // window where the formatter could rewrite the file between reads.
+    let final_content = std::fs::read_to_string(path.as_path()).unwrap_or_default();
+
+    // Honor `diagnostics: true` like other write-style handlers (write,
+    // edit_match, edit_symbol). When false/absent, this still notifies the
+    // LSP layer that the file changed but doesn't wait for diagnostics.
+    let lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
+    let syntax_valid = match edit::validate_syntax(path.as_path()) {
+        Ok(result) => result,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
+
+    let mut result = serde_json::json!({
+        "ok": true,
+        "file": file,
+        "created": !existed,
+        "bytes_written": append_content.len(),
+        "syntax_valid": syntax_valid,
+        "formatted": formatted,
+    });
+
+    if let Some(reason) = &format_skipped_reason {
+        result["format_skipped_reason"] = serde_json::json!(reason);
+    }
+
+    if let Some(id) = backup_id {
+        result["backup_id"] = serde_json::json!(id);
+    }
+
+    // Honest reporting: when file content is byte-identical to the pre-append
+    // state (rare for append, but possible with empty appendContent or
+    // formatter-normalized whitespace), surface `no_op: true` so UIs can
+    // render a clear "matched but no net change" instead of bare +0/-0.
+    // See GitHub #45.
+    if existed && before_content == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
+    if want_diff {
+        // For new files, before-content is empty; compute_diff_info handles
+        // that correctly (additions = number of lines in append_content).
+        // Diff reflects post-format content because we re-read after format.
+        result["diff"] =
+            edit::compute_diff_for_response(&req.params, &before_content, &final_content);
+    }
+
+    // Reuse the standard WriteResult formatter so append's response carries
+    // the same `lsp_diagnostics`, `lsp_complete`, `lsp_pending_servers`, and
+    // `lsp_exited_servers` shape as `write` and `edit_match` find/replace.
+    if lsp_outcome.is_some() {
+        let write_result = edit::WriteResult {
+            syntax_valid,
+            formatted,
+            format_skipped_reason: format_skipped_reason.clone(),
+            validate_requested: false,
+            validation_errors: Vec::new(),
+            validate_skipped_reason: None,
+            // Append-mode does not currently snapshot pre-write validity for
+            // rollback (handled by the shared write pipeline only). Surface
+            // false until/unless append gains the same rollback flow.
+            rolled_back: false,
+            lsp_outcome,
+        };
+        write_result.append_lsp_diagnostics_to(&mut result);
+    }
+
+    Response::success(&req.id, result)
 }
 
 /// Returns true if the file path contains glob characters.
@@ -93,9 +328,8 @@ fn handle_glob_edit_match(
     pattern: &str,
     match_str: &str,
     replacement: &str,
+    op_id: &str,
 ) -> Response {
-    let dry_run = edit::is_dry_run(&req.params);
-
     // Resolve glob relative to project root (or cwd)
     let config = ctx.config();
     let root = config
@@ -103,11 +337,13 @@ fn handle_glob_edit_match(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     drop(config);
-    let full_pattern = if pattern.starts_with('/') {
+    let full_pattern = if is_absolute_glob_pattern(pattern) {
         pattern.to_string()
     } else {
-        format!("{}/{}", root.display(), pattern)
+        root.join(pattern).display().to_string()
     };
+    #[cfg(windows)]
+    let full_pattern = full_pattern.replace('\\', "/");
 
     let mut paths: Vec<std::path::PathBuf> = match glob::glob(&full_pattern) {
         Ok(entries) => entries
@@ -122,6 +358,10 @@ fn handle_glob_edit_match(
             );
         }
     };
+    #[cfg(windows)]
+    if paths.is_empty() {
+        paths = expand_windows_glob(&full_pattern);
+    }
     paths.sort();
 
     if paths.is_empty() {
@@ -136,12 +376,12 @@ fn handle_glob_edit_match(
     let mut file_results: Vec<serde_json::Value> = Vec::new();
     let mut total_replacements: usize = 0;
     let mut total_files: usize = 0;
-    let mut diffs: Vec<serde_json::Value> = Vec::new();
 
     // --- Phase 1: Bulk edit — backup + write all files (fast) ---
     struct PendingEdit {
         path: std::path::PathBuf,
         file_str: String,
+        original_source: String,
         new_source: String,
         count: usize,
     }
@@ -166,19 +406,6 @@ fn handle_glob_edit_match(
         let new_source = source.replace(match_str, replacement);
         let file_str = path.display().to_string();
 
-        if dry_run {
-            let dr = edit::dry_run_diff(&source, &new_source, &path);
-            diffs.push(serde_json::json!({
-                "file": file_str,
-                "replacements": count,
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-            }));
-            total_replacements += count;
-            total_files += 1;
-            continue;
-        }
-
         // Backup before mutation
         let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
             Ok(validated) => validated,
@@ -188,6 +415,7 @@ fn handle_glob_edit_match(
         pending.push(PendingEdit {
             path: validated_path,
             file_str,
+            original_source: source,
             new_source,
             count,
         });
@@ -195,7 +423,7 @@ fn handle_glob_edit_match(
         total_files += 1;
     }
 
-    if !dry_run && pending.is_empty() {
+    if pending.is_empty() {
         return Response::error(
             &req.id,
             "match_not_found",
@@ -206,10 +434,8 @@ fn handle_glob_edit_match(
         );
     }
 
-    let checkpoint_name = if dry_run {
-        None
-    } else {
-        let name = unique_glob_checkpoint_name();
+    let checkpoint_name = {
+        let name = unique_glob_checkpoint_name(&req.id);
         let files = pending
             .iter()
             .map(|edit| edit.path.clone())
@@ -226,115 +452,175 @@ fn handle_glob_edit_match(
         Some(name)
     };
 
-    if !dry_run {
-        let mut written_paths: Vec<PathBuf> = Vec::new();
+    for edit in &pending {
+        if let Err(e) = edit::auto_backup(
+            ctx,
+            req.session(),
+            &edit.path,
+            &format!("glob_edit_match: {}", match_str),
+            Some(op_id),
+        ) {
+            if let Some(name) = &checkpoint_name {
+                delete_glob_checkpoint(ctx, req.session(), name);
+            }
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    }
 
-        for edit in &pending {
-            if let Err(e) = edit::auto_backup(
-                ctx,
-                req.session(),
-                &edit.path,
-                &format!("glob_edit_match: {}", match_str),
-            ) {
+    // Write all changed files under a checkpoint-backed transaction. If any
+    // write fails, restore files already written so callers never observe a
+    // partially-applied glob edit.
+    let mut written_paths: Vec<PathBuf> = Vec::new();
+
+    for edit in &pending {
+        if let Err(e) = std::fs::write(&edit.path, &edit.new_source) {
+            let mut rollback_ok = true;
+            if let Some(name) = &checkpoint_name {
+                rollback_ok =
+                    restore_glob_checkpoint(ctx, req.session(), name, &written_paths).is_ok();
+                delete_glob_checkpoint(ctx, req.session(), name);
+            }
+            if let Err(rollback_error) = std::fs::write(&edit.path, &edit.original_source) {
+                crate::slog_warn!(
+                    "glob edit_match rollback: failed to restore attempted file {}: {}",
+                    edit.path.display(),
+                    rollback_error
+                );
+                rollback_ok = false;
+            }
+            if rollback_ok {
+                ctx.backup()
+                    .borrow_mut()
+                    .discard_operation_entries(req.session(), op_id);
+            }
+            return Response::error(
+                &req.id,
+                "write_error",
+                format!("failed to write {}: {}", edit.file_str, e),
+            );
+        }
+        written_paths.push(edit.path.clone());
+    }
+
+    // --- Phase 2: Format all changed files (after all writes are done) ---
+    //
+    // Atomicity rule for glob edit_match: if ANY file ends up syntax-invalid
+    // after the replacement+format pass, we restore the entire batch from the
+    // pre-edit checkpoint and return an error. The agent then sees a clear
+    // "no files changed because the replacement would have broken N file(s)"
+    // signal and can revise the replacement instead of being left with a
+    // partially-applied glob and a per-file `syntax_valid: false` they may
+    // miss. Single-file `edit_match` deliberately keeps the per-file syntax
+    // honesty (the agent has full visibility on one file); the multi-file
+    // glob path makes silent partial breakage too easy.
+    let mut syntax_failures: Vec<String> = Vec::new();
+    let mut format_skipped_count: usize = 0;
+    let mut format_skip_reasons = std::collections::BTreeSet::new();
+    for edit in &pending {
+        let file_str = edit.path.display().to_string();
+        let (formatted, format_skipped_reason) = format::auto_format(&edit.path, &config);
+        if let Some(reason) = &format_skipped_reason {
+            format_skipped_count += 1;
+            format_skip_reasons.insert(reason.clone());
+        }
+        let syntax_valid = match validate_syntax(&edit.path) {
+            Ok(valid) => valid,
+            Err(e) => {
                 if let Some(name) = &checkpoint_name {
+                    let paths = pending
+                        .iter()
+                        .map(|edit| edit.path.clone())
+                        .collect::<Vec<_>>();
+                    if restore_glob_checkpoint(ctx, req.session(), name, &paths).is_ok() {
+                        ctx.backup()
+                            .borrow_mut()
+                            .discard_operation_entries(req.session(), op_id);
+                    }
                     delete_glob_checkpoint(ctx, req.session(), name);
                 }
                 return Response::error(&req.id, e.code(), e.to_string());
             }
-        }
-
-        // Write all changed files under a checkpoint-backed transaction. If any
-        // write fails, restore files already written so callers never observe a
-        // partially-applied glob edit.
-        for edit in &pending {
-            if let Err(e) = std::fs::write(&edit.path, &edit.new_source) {
-                if let Some(name) = &checkpoint_name {
-                    restore_glob_checkpoint(ctx, req.session(), name, &written_paths);
-                    delete_glob_checkpoint(ctx, req.session(), name);
-                }
-                return Response::error(
-                    &req.id,
-                    "write_error",
-                    format!("failed to write {}: {}", edit.file_str, e),
-                );
-            }
-            written_paths.push(edit.path.clone());
-        }
-    }
-
-    // --- Phase 2: Format all changed files (after all writes are done) ---
-    for edit in &pending {
-        let file_str = edit.path.display().to_string();
-        let formatted = if !dry_run {
-            match edit::write_format_only(&edit.path, &config) {
-                Ok(formatted) => formatted,
-                Err(e) => {
-                    if let Some(name) = &checkpoint_name {
-                        let paths = pending
-                            .iter()
-                            .map(|edit| edit.path.clone())
-                            .collect::<Vec<_>>();
-                        restore_glob_checkpoint(ctx, req.session(), name, &paths);
-                        delete_glob_checkpoint(ctx, req.session(), name);
-                    }
-                    return Response::error(&req.id, e.code(), e.to_string());
-                }
-            }
-        } else {
-            false
         };
-        let syntax_valid = if !dry_run {
-            match validate_syntax(&edit.path) {
-                Ok(valid) => valid,
-                Err(e) => {
-                    if let Some(name) = &checkpoint_name {
-                        let paths = pending
-                            .iter()
-                            .map(|edit| edit.path.clone())
-                            .collect::<Vec<_>>();
-                        restore_glob_checkpoint(ctx, req.session(), name, &paths);
-                        delete_glob_checkpoint(ctx, req.session(), name);
-                    }
-                    return Response::error(&req.id, e.code(), e.to_string());
-                }
-            }
-        } else {
-            None
-        };
+
+        if syntax_valid == Some(false) {
+            syntax_failures.push(file_str.clone());
+        }
 
         if let Ok(final_content) = std::fs::read_to_string(&edit.path) {
             ctx.lsp_notify_file_changed(&edit.path, &final_content);
         }
 
-        file_results.push(serde_json::json!({
+        let mut file_result = serde_json::json!({
             "file": file_str,
             "replacements": edit.count,
             "formatted": formatted,
             "syntax_valid": syntax_valid,
-        }));
+        });
+        if let Some(reason) = format_skipped_reason {
+            file_result["format_skipped_reason"] = serde_json::json!(reason);
+        }
+        file_results.push(file_result);
     }
 
-    if dry_run {
-        if diffs.is_empty() {
-            return Response::error(
-                &req.id,
-                "match_not_found",
-                format!(
-                    "edit_match: '{}' not found in any files matching '{}'",
-                    match_str, pattern
-                ),
-            );
+    // If any file's post-edit content is syntax-invalid, roll the entire
+    // batch back to the pre-edit checkpoint. Don't leave the project in a
+    // partially-broken state across many files at once.
+    if !syntax_failures.is_empty() {
+        let mut rollback: Option<Result<(), String>> = None;
+        if let Some(name) = &checkpoint_name {
+            let paths = pending
+                .iter()
+                .map(|edit| edit.path.clone())
+                .collect::<Vec<_>>();
+            rollback = Some(restore_glob_checkpoint(ctx, req.session(), name, &paths));
+            delete_glob_checkpoint(ctx, req.session(), name);
+            // Re-notify LSP so any cached diagnostics for the rolled-back
+            // files reflect the restored content, not the broken edits.
+            for path in &paths {
+                if let Ok(restored) = std::fs::read_to_string(path) {
+                    ctx.lsp_notify_file_changed(path, &restored);
+                }
+            }
         }
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "files": diffs,
-                "total_replacements": total_replacements,
-                "total_files": total_files,
-            }),
-        );
+        let summary = if syntax_failures.len() <= 5 {
+            syntax_failures.join(", ")
+        } else {
+            format!(
+                "{} (+{} more)",
+                syntax_failures[..5].join(", "),
+                syntax_failures.len() - 5
+            )
+        };
+        if rollback.as_ref().map_or(true, |result| result.is_ok()) {
+            ctx.backup()
+                .borrow_mut()
+                .discard_operation_entries(req.session(), op_id);
+        }
+        return match rollback {
+            Some(Err(reason)) => Response::error_with_data(
+                &req.id,
+                "syntax_invalid",
+                format!(
+                    "edit_match (glob): replacement would leave {} of {} file(s) syntax-invalid; rollback FAILED: {}. Files may be in inconsistent state. Affected: {}",
+                    syntax_failures.len(),
+                    pending.len(),
+                    reason,
+                    summary
+                ),
+                serde_json::json!({ "rollback_succeeded": false }),
+            ),
+            _ => Response::error_with_data(
+                &req.id,
+                "syntax_invalid",
+                format!(
+                    "edit_match (glob): replacement would leave {} of {} file(s) syntax-invalid; rolled back. Affected: {}",
+                    syntax_failures.len(),
+                    pending.len(),
+                    summary
+                ),
+                serde_json::json!({ "rollback_succeeded": true }),
+            ),
+        };
     }
 
     if let Some(name) = &checkpoint_name {
@@ -342,10 +628,14 @@ fn handle_glob_edit_match(
     }
 
     log::debug!(
-        "[aft] edit_match (glob): {} replacements across {} files",
+        "edit_match (glob): {} replacements across {} files",
         total_replacements,
         total_files
     );
+
+    // Top-level format summary lets agents notice actionable glob formatting
+    // skips (for example formatter_excluded_path) without scanning every file.
+    let format_skip_reasons = format_skip_reasons.into_iter().collect::<Vec<_>>();
 
     Response::success(
         &req.id,
@@ -354,32 +644,191 @@ fn handle_glob_edit_match(
             "files": file_results,
             "total_replacements": total_replacements,
             "total_files": total_files,
+            "format_skipped_count": format_skipped_count,
+            "format_skip_reasons": format_skip_reasons,
         }),
     )
 }
 
-fn unique_glob_checkpoint_name() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("__edit_match_glob_{}__", nanos)
+#[cfg(windows)]
+fn is_absolute_glob_pattern(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
 }
 
-fn restore_glob_checkpoint(ctx: &AppContext, session: &str, name: &str, paths: &[PathBuf]) {
-    if paths.is_empty() {
-        return;
+#[cfg(not(windows))]
+fn is_absolute_glob_pattern(path: &str) -> bool {
+    Path::new(path).is_absolute()
+}
+
+#[cfg(windows)]
+fn expand_windows_glob(full_pattern: &str) -> Vec<PathBuf> {
+    let normalized = full_pattern.replace('\\', "/");
+    let Some(first_glob) = normalized.find(['*', '?', '[', '{']) else {
+        return Vec::new();
+    };
+    let Some(base_end) = normalized[..first_glob].rfind('/') else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(&normalized[..base_end]);
+    let rel_pattern = &normalized[base_end + 1..];
+    let Ok(pattern) = glob::Pattern::new(rel_pattern) else {
+        return Vec::new();
+    };
+    let options = glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+
+    ignore::WalkBuilder::new(&base)
+        .hidden(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .build()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.strip_prefix(&base)
+                .ok()
+                .map(|relative| relative.display().to_string().replace('\\', "/"))
+                .is_some_and(|relative| pattern.matches_with(&relative, options))
+        })
+        .collect()
+}
+
+fn unique_glob_checkpoint_name(request_id: &str) -> String {
+    unique_glob_checkpoint_name_with_timestamp(request_id, current_timestamp_nanos())
+}
+
+fn current_timestamp_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn unique_glob_checkpoint_name_with_timestamp(request_id: &str, timestamp_nanos: u128) -> String {
+    format!(
+        "__glob_edit_match_{}_{}",
+        sanitize_checkpoint_component(request_id),
+        timestamp_nanos
+    )
+}
+
+fn sanitize_checkpoint_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod checkpoint_name_tests {
+    use super::unique_glob_checkpoint_name_with_timestamp;
+
+    #[test]
+    fn glob_checkpoint_name_includes_request_id() {
+        let timestamp = 123_456;
+        let first = unique_glob_checkpoint_name_with_timestamp("request-a", timestamp);
+        let second = unique_glob_checkpoint_name_with_timestamp("request-b", timestamp);
+
+        assert_ne!(first, second);
+        assert_eq!(first, "__glob_edit_match_request-a_123456");
     }
-    if let Err(e) = ctx
+}
+
+fn restore_glob_checkpoint(
+    ctx: &AppContext,
+    session: &str,
+    name: &str,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    match ctx
         .checkpoint()
         .borrow()
         .restore_validated(session, name, paths)
     {
-        log::warn!(
-            "[aft] edit_match glob rollback: failed to restore checkpoint {}: {}",
-            name,
-            e
-        );
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::slog_warn!(
+                "edit_match glob rollback: failed to restore checkpoint {}: {}",
+                name,
+                e
+            );
+            Err(e.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::language::StubProvider;
+
+    use super::restore_glob_checkpoint;
+
+    #[test]
+    fn restore_glob_checkpoint_reports_failures() {
+        // Isolate the checkpoint store's lock-file dir per test by giving each
+        // run its own `AFT_CACHE_DIR`. The default storage_dir lives under
+        // `$HOME/.cache/aft` (or `$AFT_CACHE_DIR`), and under parallel
+        // `cargo test` with a shared HOME (CI containers, sandboxed runners),
+        // two tests can race on the same `checkpoints/<project>/checkpoint.lock`
+        // path and fail with `No such file or directory` during the
+        // `create_dir_all` + `try_acquire` sequence.
+        let cache = tempfile::tempdir().unwrap();
+        // SAFETY: tests run single-threaded inside this function and the env
+        // var is restored on drop; we only mutate process env briefly here.
+        unsafe {
+            std::env::set_var("AFT_CACHE_DIR", cache.path());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let a = root.join("a.ts");
+        let b = root.join("b.ts");
+        fs::write(&a, "const a = TARGET;\n").unwrap();
+
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let checkpoint_name = ctx
+            .checkpoint()
+            .borrow_mut()
+            .create(
+                "default",
+                "__edit_match_glob_missing_path__",
+                vec![a.clone()],
+                &ctx.backup().borrow(),
+            )
+            .unwrap()
+            .name;
+
+        let result = restore_glob_checkpoint(&ctx, "default", &checkpoint_name, &[a, b]);
+        ctx.checkpoint()
+            .borrow_mut()
+            .delete("default", &checkpoint_name);
+
+        // SAFETY: only one test in this module mutates this env var.
+        unsafe {
+            std::env::remove_var("AFT_CACHE_DIR");
+        }
+
+        assert!(result.unwrap_err().contains("file not found"));
     }
 }
 
@@ -402,6 +851,7 @@ fn handle_single_file_edit_match(
     file: &str,
     match_str: &str,
     replacement: &str,
+    op_id: &str,
 ) -> Response {
     let occurrence = req
         .params
@@ -449,7 +899,7 @@ fn handle_single_file_edit_match(
     // Log if fuzzy match was needed (not exact)
     if fuzzy_matches[0].pass > 1 {
         log::debug!(
-            "[aft] edit_match: fuzzy match (pass {}) for '{}' in {}",
+            "edit_match: fuzzy match (pass {}) for '{}' in {}",
             fuzzy_matches[0].pass,
             match_str,
             file
@@ -504,25 +954,22 @@ fn handle_single_file_edit_match(
         );
     }
 
-    // Auto-backup before mutation (skip for dry-run)
-    let backup_id = if !edit::is_dry_run(&req.params) {
-        let label = if replace_all {
-            format!(
-                "edit_match: {} (replace_all x{})",
-                match_str,
-                positions.len()
-            )
-        } else {
-            format!("edit_match: {}", match_str)
-        };
-        match edit::auto_backup(ctx, req.session(), path.as_path(), &label) {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        }
+    // Auto-backup before mutation
+    let label = if replace_all {
+        format!(
+            "edit_match: {} (replace_all x{})",
+            match_str,
+            positions.len()
+        )
     } else {
-        None
+        format!("edit_match: {}", match_str)
+    };
+    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label, Some(op_id))
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
     };
 
     // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len())
@@ -563,17 +1010,6 @@ fn handle_single_file_edit_match(
         )
     };
 
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, path.as_path());
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
-
     // Write, format, and validate via shared pipeline
     let mut write_result = match edit::write_format_validate(
         path.as_path(),
@@ -587,21 +1023,27 @@ fn handle_single_file_edit_match(
         }
     };
 
+    if write_result.rolled_back {
+        ctx.backup()
+            .borrow_mut()
+            .discard_operation_entries(req.session(), op_id);
+    }
+
     if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
-        write_result.lsp_diagnostics =
-            ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
     }
 
     log::debug!("edit_match: {} in {}", match_str, file);
 
-    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
-
     let mut result = serde_json::json!({
         "file": file,
         "replacements": count,
-        "syntax_valid": syntax_valid,
         "formatted": write_result.formatted,
     });
+
+    if let Some(valid) = write_result.syntax_valid {
+        result["syntax_valid"] = serde_json::json!(valid);
+    }
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -620,10 +1062,22 @@ fn handle_single_file_edit_match(
 
     write_result.append_lsp_diagnostics_to(&mut result);
 
-    // Include diff info if requested (for UI metadata)
+    // Compute final on-disk content once for both `no_op` detection and the
+    // optional diff metadata. We always emit `no_op: true` when the file
+    // content is byte-identical to the source — this happens when:
+    //   - agent passed `oldString === newString` (identity edit)
+    //   - a formatter normalized the agent's change back to the original
+    //   - the replacement matched what the file already contained
+    // The match was satisfied (replacements > 0) but no net change landed.
+    // Pi/OpenCode UIs use this to render "matched but no change" instead of
+    // a bare `+0/-0` that looks like a tool failure (see GitHub #45).
+    let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| new_source);
+    if source == final_content {
+        result["no_op"] = serde_json::json!(true);
+    }
+
     if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| new_source);
-        result["diff"] = edit::compute_diff_info(&source, &final_content);
+        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
     Response::success(&req.id, result)

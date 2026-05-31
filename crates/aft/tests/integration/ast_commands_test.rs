@@ -39,11 +39,17 @@ fn count_occurrences(text: &str, needle: &str) -> usize {
 }
 
 fn file_result<'a>(resp: &'a Value, suffix: &str) -> &'a Value {
+    // Windows reports paths with backslashes (`src\one.ts`); normalize for
+    // suffix matching so the test stays platform-agnostic.
     resp["files"]
         .as_array()
         .expect("files array")
         .iter()
-        .find(|entry| entry["file"].as_str().expect("file path").ends_with(suffix))
+        .find(|entry| {
+            let path = entry["file"].as_str().expect("file path");
+            let normalized = path.replace('\\', "/");
+            normalized.ends_with(suffix)
+        })
         .unwrap_or_else(|| panic!("missing file result for suffix {suffix}: {resp:?}"))
 }
 
@@ -176,6 +182,111 @@ fn ast_replace_replaces_all_matches_across_multiple_files() {
 }
 
 #[test]
+fn ast_replace_operation_undo_restores_all_touched_files() {
+    let project = setup_project(&[
+        ("src/one.ts", "console.log(alpha);\n"),
+        ("src/two.ts", "console.log(beta);\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-before-operation-undo",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "logger.info($ARG)",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+    assert_eq!(replace["success"], true, "replace: {replace:?}");
+    assert_eq!(
+        read_file(project.path(), "src/one.ts"),
+        "logger.info(alpha);\n"
+    );
+    assert_eq!(
+        read_file(project.path(), "src/two.ts"),
+        "logger.info(beta);\n"
+    );
+
+    let undo = send(
+        &mut aft,
+        json!({
+            "id": "undo-ast-operation",
+            "command": "undo",
+        }),
+    );
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert_eq!(undo["restored_count"], 2);
+    assert_eq!(
+        read_file(project.path(), "src/one.ts"),
+        "console.log(alpha);\n"
+    );
+    assert_eq!(
+        read_file(project.path(), "src/two.ts"),
+        "console.log(beta);\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn ast_replace_unwritable_target_fails_without_partial_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = setup_project(&[
+        ("src/a.ts", "console.log(alpha);\n"),
+        ("src/z.ts", "console.log(beta);\n"),
+    ]);
+    let read_only = project.path().join("src/z.ts");
+    let original_a = read_file(project.path(), "src/a.ts");
+    let original_z = read_file(project.path(), "src/z.ts");
+
+    let mut perms = fs::metadata(&read_only).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&read_only, perms).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-unwritable-target",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "logger.info($ARG)",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    let mut reset_perms = fs::metadata(&read_only).unwrap().permissions();
+    reset_perms.set_mode(0o644);
+    fs::set_permissions(&read_only, reset_perms).unwrap();
+
+    assert_eq!(
+        replace["success"], false,
+        "replace should fail: {replace:?}"
+    );
+    assert_eq!(replace["code"], "io_error");
+    assert_eq!(
+        replace["rolled_back"], true,
+        "rollback should be reported: {replace:?}"
+    );
+    assert_eq!(read_file(project.path(), "src/a.ts"), original_a);
+    assert_eq!(read_file(project.path(), "src/z.ts"), original_z);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn ast_replace_dry_run_reports_counts_without_writing_files() {
     let original = "console.log(first);\nconsole.log(second);\n";
     let project = setup_project(&[("sample.ts", original)]);
@@ -214,6 +325,124 @@ fn ast_replace_dry_run_reports_counts_without_writing_files() {
     assert_eq!(on_disk, original, "dry-run must not modify files on disk");
     assert_eq!(count_occurrences(&on_disk, "console.log("), 2);
     assert_eq!(count_occurrences(&on_disk, "logger.info("), 0);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_replace_real_run_rejects_invalid_rewrite_without_writing() {
+    let project = setup_project(&[
+        ("src/a.ts", "console.log(alpha);\n"),
+        ("src/b.ts", "console.log(beta);\n"),
+    ]);
+    let original_a = read_file(project.path(), "src/a.ts");
+    let original_b = read_file(project.path(), "src/b.ts");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-invalid-syntax-real-run",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "if (",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], false,
+        "invalid rewrite should fail: {replace:?}"
+    );
+    assert_eq!(replace["code"], "invalid_rewrite");
+    assert_eq!(replace["rolled_back"], true);
+    assert!(
+        replace["invalid_files"]
+            .as_array()
+            .expect("invalid files")
+            .iter()
+            .any(|file| file
+                .as_str()
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("src/a.ts")),
+        "invalid file list should include src/a.ts: {replace:?}"
+    );
+    assert_eq!(read_file(project.path(), "src/a.ts"), original_a);
+    assert_eq!(read_file(project.path(), "src/b.ts"), original_b);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_respects_explicit_node_modules_root() {
+    let project = setup_project(&[
+        ("node_modules/pkg/index.ts", "const inside = 1;\n"),
+        ("src/index.ts", "const outside = 2;\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "explicit-node-modules-search",
+            "command": "ast_search",
+            "pattern": "const $NAME = $VALUE",
+            "lang": "typescript",
+            "paths": ["node_modules"],
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "explicit root search should succeed: {search:?}"
+    );
+    assert_eq!(search["files_searched"], 1);
+    assert_eq!(search["total_matches"], 1);
+    assert!(search["matches"][0]["file"]
+        .as_str()
+        .expect("match file")
+        .replace('\\', "/")
+        .ends_with("node_modules/pkg/index.ts"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_php_full_file_uses_open_tag_grammar() {
+    let project = setup_project(&[(
+        "public/index.php",
+        "<h1>Before</h1>\n<?php\nfunction helper(): void {}\nhelper();\n?>\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "php-full-file-search",
+            "command": "ast_search",
+            "pattern": "function $NAME(): void {}",
+            "lang": "php",
+            "paths": ["public"],
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "PHP ast_search should succeed: {search:?}"
+    );
+    assert_eq!(
+        search["total_matches"], 1,
+        "PHP function should match: {search:?}"
+    );
+    assert_eq!(search["matches"][0]["meta_variables"]["$NAME"], "helper");
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -825,6 +1054,570 @@ fn ast_search_and_replace_support_csharp_patterns() {
     let updated = read_file(project.path(), "Sample.cs");
     assert!(updated.contains("public sealed class Worker"));
     assert!(!updated.contains("public class Worker"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_and_replace_support_solidity_patterns() {
+    // Solidity grammar quirk: tree-sitter-solidity parses `[a-zA-Z$_]` as
+    // valid identifier characters, so meta-vars stay as `$NAME` (no µ
+    // expansion). Patterns that work reliably are full function-declaration
+    // shapes; statement-only patterns (`require($COND, $MSG);`) match zero
+    // because the parser binds them at the wrong AST node level.
+    //
+    // The test uses a function-declaration pattern + a structural rewrite
+    // that's representative of real Solidity migration work (adding
+    // visibility qualifiers / modifiers like `virtual` or `nonReentrant`).
+    let project = setup_project(&[(
+        "contracts/Counter.sol",
+        "// SPDX-License-Identifier: MIT\n\
+         pragma solidity ^0.8.20;\n\
+         \n\
+         contract Counter {\n\
+             uint256 public count;\n\
+         \n\
+             function increment() public {\n\
+                 count += 1;\n\
+             }\n\
+         \n\
+             function decrement() public {\n\
+                 count -= 1;\n\
+             }\n\
+         }\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    // Search both `public` functions in one shot using a meta-var name + a
+    // variadic body. This is the canonical "find all functions of shape X"
+    // query agents reach for.
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "solidity-search",
+            "command": "ast_search",
+            "pattern": "function $NAME() public { $$$BODY }",
+            "lang": "solidity",
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "solidity ast_search should succeed: {search:?}"
+    );
+    assert_eq!(
+        search["total_matches"], 2,
+        "expected 2 public functions: {search:?}"
+    );
+
+    // Capture verification — meta-vars must propagate through the Solidity
+    // grammar like every other language. This is the regression guard for
+    // the v0.19.5 expando_char fix: before the fix, `$NAME` was rewritten
+    // to `µNAME` for Solidity, but `µ` is not in the Solidity identifier
+    // character set, so meta-vars never bound and total_matches was 0.
+    let names: Vec<&str> = search["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|m| {
+            m["meta_variables"]["$NAME"]
+                .as_str()
+                .expect("captured $NAME")
+        })
+        .collect();
+    assert!(
+        names.contains(&"increment"),
+        "captured names should include `increment`: {names:?}"
+    );
+    assert!(
+        names.contains(&"decrement"),
+        "captured names should include `decrement`: {names:?}"
+    );
+
+    // Replace path: add a modifier to a specific function. Real-world:
+    // agents bulk-add `virtual`, `nonReentrant`, `whenNotPaused`, etc.
+    // We use a literal pattern + rewrite to keep the rewrite template
+    // simple while still proving the replace pipeline produces valid
+    // Solidity output.
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "solidity-replace",
+            "command": "ast_replace",
+            "pattern": "function increment() public { count += 1; }",
+            "rewrite": "function increment() public virtual { count += 1; }",
+            "lang": "solidity",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], true,
+        "solidity ast_replace should succeed: {replace:?}"
+    );
+    assert_eq!(replace["total_replacements"], 1);
+
+    let updated = read_file(project.path(), "contracts/Counter.sol");
+    assert!(
+        updated.contains("function increment() public virtual { count += 1; }"),
+        "rewrite should add virtual modifier: {updated}"
+    );
+    // Other functions must be untouched.
+    assert!(
+        updated.contains("function decrement() public {"),
+        "decrement should be unchanged: {updated}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// Regression guard for the v0.18 perf fix.
+///
+/// Pre-fix, `ast_search` over ~150 files took ~23 seconds because
+/// `find_all(&str)` reparsed the pattern via tree-sitter on every file and
+/// the file loop was strictly serial. Post-fix (precompiled `Pattern` +
+/// rayon parallel iter), the same query completes in ~1 second.
+///
+/// We test against a 60-file synthetic Rust crate with a meta-variable
+/// member-access pattern (the worst-case shape that originally triggered
+/// the bug). Threshold of 5 seconds gives generous margin for slow CI
+/// runners while still catching ~5x regressions.
+#[test]
+fn ast_search_member_access_pattern_completes_in_reasonable_time() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    let body = r#"
+        pub fn handle(ctx: &Ctx, req: &Request) -> Response {
+            let cfg = ctx.config();
+            if cfg.search_index {
+                run_indexed(req)
+            } else {
+                run_direct(req)
+            }
+        }
+
+        struct Ctx;
+        struct Request;
+        struct Response;
+        impl Ctx {
+            fn config(&self) -> Config { Config { search_index: true } }
+        }
+        struct Config { search_index: bool }
+    "#;
+
+    for i in 0..60 {
+        files.push((format!("src/file_{i:03}.rs"), body.to_string()));
+    }
+
+    let owned: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let project = setup_project(&owned);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let start = std::time::Instant::now();
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "perf-search",
+            "method": "ast_search",
+            "pattern": "$X.search_index",
+            "lang": "rust",
+            "paths": ["src"],
+            "globs": ["*.rs"],
+            "context_lines": 2,
+        }),
+    );
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp["success"], true, "ast_search should succeed: {resp:?}");
+    assert_eq!(resp["files_searched"], 60);
+    assert_eq!(resp["files_with_matches"], 60);
+    // Each file has 1 occurrence of the field-access pattern.
+    assert_eq!(resp["total_matches"], 60);
+
+    assert!(
+        elapsed.as_secs_f64() < 5.0,
+        "ast_search regressed: {} files took {:.2}s (expected < 5s). \
+         If this fails, check that ast_search.rs still pre-compiles the pattern \
+         outside the file loop and uses rayon par_iter for the file walk.",
+        resp["files_searched"],
+        elapsed.as_secs_f64()
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// Regression guard for the same perf bug in `ast_replace`.
+#[test]
+fn ast_replace_member_access_pattern_completes_in_reasonable_time() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    let body = r#"
+        pub fn handle(ctx: &Ctx) -> bool {
+            ctx.experimental_search_index
+        }
+        struct Ctx { experimental_search_index: bool }
+    "#;
+
+    for i in 0..60 {
+        files.push((format!("src/file_{i:03}.rs"), body.to_string()));
+    }
+
+    let owned: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let project = setup_project(&owned);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let start = std::time::Instant::now();
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "perf-replace",
+            "method": "ast_replace",
+            "pattern": "$X.experimental_search_index",
+            "rewrite": "$X.search_index",
+            "lang": "rust",
+            "paths": ["src"],
+            "globs": ["*.rs"],
+            "dry_run": true,
+        }),
+    );
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        resp["success"], true,
+        "ast_replace should succeed: {resp:?}"
+    );
+    assert_eq!(resp["files_searched"], 60);
+    assert_eq!(resp["files_with_matches"], 60);
+    assert_eq!(resp["total_replacements"], 60);
+
+    assert!(
+        elapsed.as_secs_f64() < 5.0,
+        "ast_replace regressed: {} files took {:.2}s (expected < 5s). \
+         If this fails, check that ast_replace.rs still pre-compiles the pattern \
+         outside the file loop and uses rayon par_iter for the file walk.",
+        resp["files_searched"],
+        elapsed.as_secs_f64()
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ---------------------------------------------------------------------------
+// Anonymous-`$$$`-in-rewrite regression
+// ---------------------------------------------------------------------------
+//
+// ast-grep's rewrite template only recognizes NAMED variadics like `$$$BODY`.
+// Anonymous `$$$` is emitted as the literal string `$$$` in the output,
+// silently destroying captured content. Reported in user dogfooding session
+// when sync→async test conversion produced
+//   test('alpha', async () => { $$$ })
+// instead of preserving the test body.
+//
+// Fix: handle_ast_replace now rejects rewrites containing anonymous `$$$`
+// up front with `code: "invalid_rewrite"` and actionable guidance pointing
+// the agent at the named-variadic shape.
+
+#[test]
+fn ast_replace_rejects_anonymous_variadic_in_rewrite() {
+    let original = "test('alpha', () => { const v = foo(); expect(v).toBe(1); });\n".to_string();
+    let project = setup_project(&[("sample.ts", &original)]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "anon-variadic",
+            "command": "ast_replace",
+            "pattern": "test($NAME, () => { $$$ })",
+            "rewrite": "test($NAME, async () => { $$$ })",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        resp["success"], false,
+        "anonymous $$$ in rewrite must be rejected: {resp:?}"
+    );
+    assert_eq!(resp["code"], "invalid_rewrite");
+
+    let message = resp["message"].as_str().expect("error message string");
+    // Guidance must point the agent at the named-variadic shape so they
+    // can fix the pattern without guessing.
+    assert!(
+        message.contains("$$$BODY"),
+        "error message should suggest a named variadic like $$$BODY: {message}"
+    );
+
+    // Critical safety check: the file must NOT have been written, and
+    // must not contain a literal `$$$` from a half-applied rewrite.
+    let on_disk = read_file(project.path(), "sample.ts");
+    assert_eq!(
+        on_disk, original,
+        "rejected rewrite must not modify files on disk"
+    );
+    assert!(
+        !on_disk.contains("$$$"),
+        "file must not carry a literal `$$$` from a rejected rewrite"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_replace_accepts_named_variadic_in_rewrite() {
+    // Counterpart to the rejection test: the documented workaround MUST
+    // continue to work. If this regresses, the rejection guard is too
+    // aggressive and would break a working pattern.
+    let project = setup_project(&[("sample.ts", "test('alpha', () => { foo(); bar(); });\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "named-variadic",
+            "command": "ast_replace",
+            "pattern": "test($NAME, () => { $$$BODY })",
+            "rewrite": "test($NAME, async () => { $$$BODY })",
+            "lang": "typescript",
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "named variadic must work: {resp:?}");
+    assert_eq!(resp["total_replacements"], 1);
+
+    let on_disk = read_file(project.path(), "sample.ts");
+    assert!(
+        on_disk.contains("async () =>"),
+        "rewrite should add `async`: {on_disk}"
+    );
+    assert!(
+        on_disk.contains("foo()"),
+        "captured body must be preserved (no literal $$$): {on_disk}"
+    );
+    assert!(
+        on_disk.contains("bar()"),
+        "captured body must be preserved (no literal $$$): {on_disk}"
+    );
+    assert!(
+        !on_disk.contains("$$$"),
+        "no literal $$$ may leak into output: {on_disk}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// ---------------------------------------------------------------------------
+// Hint tests — verify pattern-mistake hints propagate through the bridge.
+// ---------------------------------------------------------------------------
+//
+// Today's bug: pipe-alternation patterns like
+//   `LangId::C | LangId::Cpp | LangId::Bash`
+// compile fine in ast-grep (no `invalid_pattern` error) but match zero AST
+// nodes against source that obviously contains the literal text. The agent
+// reads `total_matches: 0` as "no work to do" and silently misses every hit.
+//
+// These tests lock in the hint behavior so future agents see actionable
+// guidance instead of zero-result silence.
+
+#[test]
+fn ast_search_attaches_hint_for_rust_match_arm_pipe_alternation() {
+    let project = setup_project(&[(
+        "src/lib.rs",
+        "fn classify(v: u8) {\n    match v {\n        LangId::C | LangId::Cpp | LangId::Bash => {}\n        _ => {}\n    }\n}\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-pipe",
+            "command": "ast_search",
+            "pattern": "LangId::C | LangId::Cpp | LangId::Bash",
+            "lang": "rust",
+        }),
+    );
+
+    assert_eq!(
+        search["success"], true,
+        "search must succeed (zero-match, not error): {search:?}"
+    );
+    assert_eq!(
+        search["total_matches"], 0,
+        "the bug we're documenting: pipe-alternative compiles but matches zero"
+    );
+
+    // The fix: a hint must be attached so the agent knows why.
+    let hint = search["hint"]
+        .as_str()
+        .expect("zero-match pipe pattern must include a hint");
+    assert!(
+        hint.contains("|"),
+        "hint should call out the `|` operator: {hint}"
+    );
+    assert!(
+        hint.to_lowercase().contains("ast")
+            || hint.to_lowercase().contains("alternation")
+            || hint.to_lowercase().contains("alternative"),
+        "hint should explain the AST-vs-text distinction: {hint}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_attaches_hint_for_regex_alternation() {
+    let project = setup_project(&[(
+        "src/index.ts",
+        "// nothing matching here\nconst foo = 1;\nconst bar = 2;\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-regex-alt",
+            "command": "ast_search",
+            "pattern": "foo|bar|baz",
+            "lang": "typescript",
+        }),
+    );
+
+    assert_eq!(search["success"], true, "{search:?}");
+    assert_eq!(search["total_matches"], 0);
+    let hint = search["hint"]
+        .as_str()
+        .expect("regex-alternation pattern must include a hint");
+    assert!(
+        hint.contains("|")
+            && (hint.contains("ast")
+                || hint.contains("AST")
+                || hint.contains("alternation")
+                || hint.contains("alternative")),
+        "hint should explain the issue: {hint}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_no_hint_for_clean_zero_match() {
+    let project = setup_project(&[("src/index.ts", "const x = 1;\nconst y = 2;\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    // Legitimate AST pattern that simply doesn't match — no hint should
+    // be attached because there's no shape mistake to call out.
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-clean-zero",
+            "command": "ast_search",
+            "pattern": "console.log($MSG)",
+            "lang": "typescript",
+        }),
+    );
+
+    assert_eq!(search["success"], true, "{search:?}");
+    assert_eq!(search["total_matches"], 0);
+    assert!(
+        search.get("hint").is_none() || search["hint"].is_null(),
+        "clean zero-match must NOT attach a hint: {search:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_search_attaches_hint_for_python_def_trailing_colon() {
+    let project = setup_project(&[("module.py", "def add(a, b):\n    return a + b\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "search-py-colon",
+            "command": "ast_search",
+            "pattern": "def $FUNC($$$):",
+            "lang": "python",
+        }),
+    );
+
+    assert_eq!(search["success"], true, "{search:?}");
+    // The pattern doesn't match because `def $FUNC($$$):` lacks a body.
+    if search["total_matches"].as_u64().unwrap_or(99) == 0 {
+        let hint = search["hint"]
+            .as_str()
+            .expect("python def with trailing colon should include a hint");
+        assert!(
+            hint.to_lowercase().contains("body") || hint.to_lowercase().contains("colon"),
+            "hint should mention body/colon: {hint}"
+        );
+    }
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_replace_attaches_hint_when_pattern_silently_does_not_match() {
+    let project = setup_project(&[(
+        "src/lib.rs",
+        "fn classify(v: u8) {\n    match v {\n        LangId::C | LangId::Cpp => {}\n        _ => {}\n    }\n}\n",
+    )]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-silent",
+            "command": "ast_replace",
+            "pattern": "LangId::C | LangId::Cpp",
+            "rewrite": "LangId::Other",
+            "lang": "rust",
+            "dry_run": true,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], true,
+        "replace must succeed with zero matches, not error: {replace:?}"
+    );
+    assert_eq!(
+        replace["total_replacements"], 0,
+        "documenting the bug: pipe-alternative replaces zero"
+    );
+
+    let hint = replace["hint"]
+        .as_str()
+        .expect("zero-replacement pipe pattern must include a hint");
+    assert!(
+        hint.contains("|"),
+        "hint should call out the `|` operator: {hint}"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());

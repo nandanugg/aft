@@ -3,13 +3,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { BridgePool } from "../pool.js";
 import { aftPrefixedTools } from "../tools/hoisted.js";
-import { readingTools } from "../tools/reading.js";
+import { formatZoomBatchResult, readingTools } from "../tools/reading.js";
 import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
@@ -47,7 +48,7 @@ function createMockSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 
@@ -57,9 +58,13 @@ describe("Tool round-trips", () => {
 
   // Fresh pool per test — each test is independent
   const createBridge = () => {
-    pool = new BridgePool(BINARY_PATH, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    pool = new BridgePool(
+      BINARY_PATH,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
     return pool;
   };
 
@@ -78,7 +83,7 @@ describe("Tool round-trips", () => {
     createBridge();
     const tools = readingTools(createPluginContext(pool));
 
-    const text = await tools.aft_outline.execute({ filePath: FIXTURE_FILE }, sdkCtx);
+    const text = await tools.aft_outline.execute({ target: FIXTURE_FILE }, sdkCtx);
 
     // Output is now tree-formatted text, not JSON
     expect(typeof text).toBe("string");
@@ -97,6 +102,42 @@ describe("Tool round-trips", () => {
     expect(text).toContain("E fn"); // exported function
     expect(text).toContain("E cls"); // exported class
     expect(text).toContain("- fn"); // internal function (internalHelper)
+  });
+
+  test("batched zoom surfaces both successes and per-symbol failures", () => {
+    const batch = formatZoomBatchResult(
+      "src/sample.ts",
+      ["greet", "Missing"],
+      [
+        {
+          success: true,
+          name: "greet",
+          kind: "function",
+          range: { start_line: 1, end_line: 1, start_col: 0, end_col: 26 },
+          content: "export function greet() {}",
+          context_before: [],
+          context_after: [],
+          annotations: { calls_out: [], called_by: [] },
+        },
+        { success: false, message: "symbol not found" },
+      ],
+    );
+
+    expect(batch.complete).toBe(false);
+    expect(batch.symbols[0]?.name).toBe("greet");
+    expect(batch.symbols[0]?.success).toBe(true);
+    // Successful entries now contain plain-text formatted output (line-numbered,
+    // not JSON-escaped) routed through formatZoomText.
+    expect(batch.symbols[0]?.content).toContain("src/sample.ts:1-1 [function greet]");
+    expect(batch.symbols[0]?.content).toContain("1: export function greet() {}");
+    expect(batch.symbols[1]).toEqual({
+      name: "Missing",
+      success: false,
+      error: "symbol not found",
+    });
+    expect(batch.text).toContain("Incomplete zoom results");
+    expect(batch.text).toContain("export function greet() {}");
+    expect(batch.text).toContain('Symbol "Missing" not found: symbol not found');
   });
 
   test("write tool creates a temp file and returns syntax_valid", async () => {
@@ -214,43 +255,6 @@ describe("Tool round-trips", () => {
     expect(content).not.toContain("Goodbye");
   });
 
-  test("write dryRun returns diff without modifying file", async () => {
-    createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
-    sdkCtx = createMockSdkContext(tmpDir);
-
-    const filePath = resolve(tmpDir, "dryrun.ts");
-    const original = 'export function hello(): string {\n  return "hi";\n}\n';
-
-    // Write the original file first
-    await tools.aft_edit.execute({ mode: "write", file: filePath, content: original }, sdkCtx);
-
-    // Now dry-run a write with different content
-    const newContent = 'export function hello(): string {\n  return "world";\n}\n';
-    const resultStr = await tools.aft_edit.execute(
-      {
-        mode: "write",
-        file: filePath,
-        content: newContent,
-        dryRun: true,
-      },
-      sdkCtx,
-    );
-    const result = JSON.parse(resultStr);
-
-    expect(result.success).toBe(true);
-    expect(result.dry_run).toBe(true);
-    expect(typeof result.diff).toBe("string");
-    expect(result.diff).toContain("-");
-    expect(result.diff).toContain("+");
-    expect(result.syntax_valid).toBe(true);
-
-    // Verify file was NOT modified
-    const fileContent = await readFile(filePath, "utf-8");
-    expect(fileContent).toBe(original);
-  });
-
   test("transaction success applies multiple file writes", async () => {
     createBridge();
     const tools = aftPrefixedTools(createPluginContext(pool));
@@ -300,26 +304,93 @@ describe("Tool round-trips", () => {
 
     // Transaction: write valid content to existing file, then write broken syntax to new file
     const brokenFile = resolve(tmpDir, "broken.ts");
-    const resultStr = await editTools.aft_edit.execute(
-      {
-        mode: "transaction",
-        operations: [
-          { file: existingFile, command: "write", content: "export const x = 999;\n" },
-          { file: brokenFile, command: "write", content: "export const {{{broken = ;\n" },
-        ],
-      },
-      sdkCtx,
-    );
-    const result = JSON.parse(resultStr);
-
-    // Transaction should fail due to syntax error
-    expect(result.success).toBe(false);
-    expect(result.code).toBe("transaction_failed");
-    expect(Array.isArray(result.rolled_back)).toBe(true);
+    // Transaction should throw due to syntax error instead of reporting a
+    // successful tool call with `{ success: false }` payload.
+    await expect(
+      editTools.aft_edit.execute(
+        {
+          mode: "transaction",
+          operations: [
+            { file: existingFile, command: "write", content: "export const x = 999;\n" },
+            { file: brokenFile, command: "write", content: "export const {{{broken = ;\n" },
+          ],
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("syntax error");
 
     // Existing file should be restored to original content
     const restoredContent = await readFile(existingFile, "utf-8");
     expect(restoredContent).toBe(originalContent);
+  });
+
+  // ---------------------------------------------------------------------
+  // v0.17.2 footgun guards: edit must not silently overwrite a file when
+  // the caller passes nonsense params. The previous behavior was that
+  // `{ filePath, startLine, endLine, content }` (where startLine/endLine
+  // are not valid top-level params) would silently degrade to "content-only
+  // write" and overwrite the entire file. These tests lock in the new
+  // explicit-failure behavior.
+  // ---------------------------------------------------------------------
+  test("edit rejects top-level startLine/endLine with a helpful pointer to edits[]", async () => {
+    createBridge();
+    const tools = aftPrefixedTools(createPluginContext(pool));
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const filePath = resolve(tmpDir, "guarded.ts");
+    const original = "export const x = 1;\n";
+    await writeFile(filePath, original, "utf-8");
+
+    let err: Error | undefined;
+    try {
+      await tools.aft_edit.execute(
+        // No `mode` field, so this hits the modern (non-back-compat) path.
+        // startLine/endLine are not valid top-level params on edit.
+        { filePath, startLine: 1, endLine: 1, content: "export const x = 2;\n" },
+        sdkCtx,
+      );
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("startLine");
+    expect(err!.message).toContain("edits");
+
+    // File must be untouched — no silent overwrite.
+    const after = await readFile(filePath, "utf-8");
+    expect(after).toBe(original);
+  });
+
+  test("edit rejects content-only calls without an explicit edit mode", async () => {
+    createBridge();
+    const tools = aftPrefixedTools(createPluginContext(pool));
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const filePath = resolve(tmpDir, "no-fallback.ts");
+    const original = "export const y = 1;\n";
+    await writeFile(filePath, original, "utf-8");
+
+    let err: Error | undefined;
+    try {
+      await tools.aft_edit.execute(
+        // `content` alone (no oldString, no symbol, no edits, no operations,
+        // no legacy `mode: "write"`). Previously this silently overwrote the
+        // file. Now it must fail with a pointer to the write tool.
+        { filePath, content: "export const y = 2;\n" },
+        sdkCtx,
+      );
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("no edit mode resolved");
+    expect(err!.message).toContain("aft_write");
+
+    // File must be untouched.
+    const after = await readFile(filePath, "utf-8");
+    expect(after).toBe(original);
   });
 });
 
@@ -337,9 +408,13 @@ describe("move_symbol round-trip", () => {
   test(
     "aft_move_symbol moves a function and rewires consumer import",
     async () => {
-      pool = new BridgePool(BINARY_PATH, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      pool = new BridgePool(
+        BINARY_PATH,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       // Create temp project with source, consumer, and destination
       tmpDir = await mkdtemp(resolve(tmpdir(), "aft-move-"));
@@ -425,9 +500,13 @@ describe("extract_function round-trip", () => {
   test(
     "aft_extract_function extracts code range into a new function with parameters",
     async () => {
-      pool = new BridgePool(BINARY_PATH, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      pool = new BridgePool(
+        BINARY_PATH,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       tmpDir = await mkdtemp(resolve(tmpdir(), "aft-extract-"));
       sdkCtx = createMockSdkContext(tmpDir);
@@ -456,18 +535,17 @@ describe("extract_function round-trip", () => {
             name: "filterAndMap",
             startLine: 1,
             endLine: 4,
-            dryRun: true,
           },
           sdkCtx,
         ),
       );
 
       expect(result.success).toBe(true);
-      expect(result.dry_run).toBe(true);
       expect(Array.isArray(result.parameters)).toBe(true);
       expect(result.parameters.length).toBeGreaterThan(0);
       expect(result.return_type).toBeDefined();
-      expect(typeof result.diff).toBe("string");
+      const content = await readFile(filePath, "utf-8");
+      expect(content).toContain("function filterAndMap");
     },
     TEST_TIMEOUT_MS,
   );
@@ -487,9 +565,13 @@ describe("inline_symbol round-trip", () => {
   test(
     "aft_inline_symbol inlines a function call and returns substitution info",
     async () => {
-      pool = new BridgePool(BINARY_PATH, {
-        timeoutMs: TEST_TIMEOUT_MS,
-      });
+      pool = new BridgePool(
+        BINARY_PATH,
+        {
+          timeoutMs: TEST_TIMEOUT_MS,
+        },
+        { harness: "opencode" },
+      );
 
       tmpDir = await mkdtemp(resolve(tmpdir(), "aft-inline-"));
       sdkCtx = createMockSdkContext(tmpDir);

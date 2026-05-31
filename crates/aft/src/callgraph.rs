@@ -4,22 +4,24 @@
 //! using import chains. Supports depth-limited forward traversal with cycle
 //! detection.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 
-use serde::{Deserialize, Serialize};
-use tree_sitter::{Parser, Tree};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use rayon::prelude::*;
+use serde::Serialize;
+use serde_json::Value;
+use tree_sitter::{Node, Parser};
 
-use crate::calls::extract_calls_full;
+use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
-use crate::go_helper::{EdgeKind, HelperOutput};
 use crate::imports::{self, ImportBlock};
 use crate::language::LanguageProvider;
 use crate::parser::{detect_language, grammar_for, LangId};
-use crate::persistent_cache::{CacheManager, FileCacheOutcome, FileStat};
-use crate::symbols::SymbolKind;
+use crate::symbols::{Range, Symbol, SymbolKind};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -28,176 +30,102 @@ use crate::symbols::SymbolKind;
 type SharedPath = Arc<PathBuf>;
 type SharedStr = Arc<str>;
 type ReverseIndex = HashMap<PathBuf, HashMap<String, Vec<IndexedCallerSite>>>;
-/// Secondary index: nearby_string (dispatch key) → list of dispatch callee targets.
-/// Populated only for `EdgeKind::Dispatches` edges that carry a `nearby_string`.
-type DispatchIndex = HashMap<String, Vec<DispatchEntry>>;
+type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
+type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
+type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
 
-// ---------------------------------------------------------------------------
-// Implementation index (Tier 1.4)
-// ---------------------------------------------------------------------------
+static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// One concrete method implementation of an interface method.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConcreteImpl {
-    /// Method name (same as the interface method name by definition).
-    pub name: String,
-    /// File containing the concrete method (relative to project root).
-    pub file: String,
-    /// 1-based line number of the concrete method.
-    pub line: u32,
-    /// Receiver type string (e.g. `"*example.com/pkg.T"`).
-    pub receiver: String,
-    /// Full package import path.
-    pub pkg: String,
-}
+const TOP_LEVEL_SYMBOL: &str = "<top-level>";
+const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+const JS_TS_INDEX_FILES: &[&str] = &[
+    "index.ts",
+    "index.tsx",
+    "index.mts",
+    "index.cts",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+];
 
-/// A reference back to an interface that a concrete type satisfies.
-#[derive(Debug, Clone, Serialize)]
-pub struct InterfaceRef {
-    /// Interface type name.
-    pub symbol: String,
-    /// File containing the interface declaration (relative to project root).
-    pub file: String,
-}
-
-/// Index of interface → concrete implementations, and the reverse.
-///
-/// Built lazily from `implements` edges emitted by the Go helper.
-/// Memory budget: < 100KB typical (few hundred edges × ~200 bytes).
-#[derive(Debug, Default)]
-pub struct ImplementationIndex {
-    /// Forward: (interface_file, interface_symbol) → list of concrete implementations.
-    /// Each entry covers one (concrete_receiver, method) pair; multiple entries
-    /// with different receivers belong to different concrete types.
-    pub by_interface: HashMap<(PathBuf, String), Vec<ConcreteImpl>>,
-    /// Reverse: receiver string → list of interfaces it satisfies.
-    pub by_concrete: HashMap<String, Vec<InterfaceRef>>,
-}
-
-impl ImplementationIndex {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn insert(&mut self, iface_file: PathBuf, iface_symbol: String, concrete: ConcreteImpl) {
-        let iface_ref = InterfaceRef {
-            symbol: iface_symbol.clone(),
-            file: iface_file.to_string_lossy().into_owned(),
-        };
-        // Reverse index keyed on receiver type.
-        self.by_concrete
-            .entry(concrete.receiver.clone())
-            .or_default()
-            .push(iface_ref);
-        self.by_interface
-            .entry((iface_file, iface_symbol))
-            .or_default()
-            .push(concrete);
+fn symbol_identity(symbol: &Symbol) -> String {
+    if symbol.scope_chain.is_empty() {
+        symbol.name.clone()
+    } else {
+        format!("{}::{}", symbol.scope_chain.join("::"), symbol.name)
     }
 }
 
-/// One concrete type and all its implementing methods, as returned by
-/// `aft implementations`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConcreteTypeImpl {
-    /// Receiver type string (e.g. `"*pkg.T"`).
-    pub receiver: String,
-    /// Full package import path.
-    pub pkg: String,
-    /// Methods from this type that satisfy the interface.
-    pub methods: Vec<ConcreteMethodRef>,
+fn symbol_unqualified_name(symbol: &str) -> &str {
+    symbol.rsplit("::").next().unwrap_or(symbol)
 }
 
-/// A single concrete method reference within a ConcreteTypeImpl.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConcreteMethodRef {
-    /// Method name.
-    pub name: String,
-    /// File containing the method (relative to project root).
-    pub file: String,
-    /// 1-based line number.
-    pub line: u32,
+fn symbol_query_matches(symbol: &str, query: &str) -> bool {
+    symbol == query || symbol_unqualified_name(symbol) == query
 }
 
-/// Result of `aft implementations <file> <interface_symbol>`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ImplementationsResult {
-    /// The queried interface.
-    pub interface: InterfaceInfo,
-    /// Concrete types that implement this interface (excluding mocks by default).
-    pub implementations: Vec<ConcreteTypeImpl>,
+pub(crate) fn is_bare_callee(full_callee: &str, short_name: &str) -> bool {
+    full_callee == short_name || (!full_callee.contains('.') && !full_callee.contains("::"))
 }
 
-/// Interface metadata included in `ImplementationsResult`.
-#[derive(Debug, Clone, Serialize)]
-pub struct InterfaceInfo {
-    /// File containing the interface (relative to project root).
-    pub file: String,
-    /// Interface type name.
-    pub symbol: String,
-}
+fn symbol_query_candidates(file_data: &FileCallData, symbol_name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let qualified_query = symbol_name.contains("::");
 
-impl ImplementationsResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "implementations of {} ({})  total={}\n",
-            self.interface.symbol,
-            self.interface.file,
-            self.implementations.len(),
-        ));
-        if self.implementations.is_empty() {
-            out.push_str("  (no implementations found)\n");
+    let mut consider = |candidate: &str| {
+        let matches = if qualified_query {
+            candidate == symbol_name
         } else {
-            for impl_type in &self.implementations {
-                out.push_str(&format!("  {} ({}):\n", impl_type.receiver, impl_type.pkg));
-                for m in &impl_type.methods {
-                    out.push_str(&format!("    - {} ({}:{})\n", m.name, m.file, m.line));
-                }
-            }
+            candidate == symbol_name || symbol_unqualified_name(candidate) == symbol_name
+        };
+
+        if matches && seen.insert(candidate.to_string()) {
+            candidates.push(candidate.to_string());
         }
-        out
+    };
+
+    for candidate in file_data.symbol_metadata.keys() {
+        consider(candidate);
     }
+    for candidate in file_data.calls_by_symbol.keys() {
+        consider(candidate);
+    }
+    for candidate in &file_data.exported_symbols {
+        consider(candidate);
+    }
+
+    candidates.sort();
+    candidates
 }
 
-/// One entry in the dispatch secondary index: a callee registered under a
-/// particular dispatch key, plus the registration call site.
-#[derive(Debug, Clone, Serialize)]
-pub struct DispatchEntry {
-    /// The handler / callee being registered.
-    pub handler: DispatchCallee,
-    /// The call site that registers it (e.g. `asynq.HandleFunc(key, handler)`).
-    pub registered_by: DispatchRegistrar,
-    /// FQN of the function that received the function-value argument
-    /// (e.g. `"github.com/hibiken/asynq.(*ServeMux).HandleFunc"`).
-    /// Present only when the helper resolved the callee.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatched_via: Option<String>,
-}
-
-/// Callee side of a dispatch edge.
-#[derive(Debug, Clone, Serialize)]
-pub struct DispatchCallee {
-    /// File path relative to project root.
-    pub file: String,
-    /// Symbol name of the handler function.
-    pub symbol: String,
-}
-
-/// Registrar call site of a dispatch edge.
-#[derive(Debug, Clone, Serialize)]
-pub struct DispatchRegistrar {
-    /// File path relative to project root.
-    pub file: String,
-    /// Symbol that makes the registration call.
-    pub symbol: String,
-    /// 1-based line number.
-    pub line: u32,
+pub(crate) fn resolve_symbol_query_in_data(
+    file_data: &FileCallData,
+    file: &Path,
+    symbol_name: &str,
+) -> Result<String, AftError> {
+    let candidates = symbol_query_candidates(file_data, symbol_name);
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(AftError::SymbolNotFound {
+            name: symbol_name.to_string(),
+            file: file.display().to_string(),
+        }),
+        _ => Err(AftError::AmbiguousSymbol {
+            name: symbol_name.to_string(),
+            candidates,
+        }),
+    }
 }
 
 /// A single call site within a function body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CallSite {
     /// The short callee name (last segment, e.g. "foo" for `utils.foo()`).
     pub callee_name: String,
@@ -211,7 +139,7 @@ pub struct CallSite {
 }
 
 /// Per-symbol metadata for entry point detection (avoids re-parsing).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SymbolMeta {
     /// The kind of symbol (function, class, method, etc).
     pub kind: SymbolKind,
@@ -220,11 +148,15 @@ pub struct SymbolMeta {
     /// Function/method signature if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// 1-based start line of the symbol.
+    pub line: u32,
+    /// 0-based source range of the symbol.
+    pub range: Range,
 }
 
 /// Per-file call data: call sites grouped by containing symbol, plus
 /// exported symbol names and parsed imports.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FileCallData {
     /// Map from symbol name → list of call sites within that symbol's body.
     pub calls_by_symbol: HashMap<String, Vec<CallSite>>,
@@ -232,10 +164,36 @@ pub struct FileCallData {
     pub exported_symbols: Vec<String>,
     /// Per-symbol metadata (kind, exported, signature).
     pub symbol_metadata: HashMap<String, SymbolMeta>,
+    /// Real or synthetic symbol name for this file's default export.
+    pub default_export_symbol: Option<String>,
     /// Parsed import block for cross-file resolution.
     pub import_block: ImportBlock,
     /// Language of the file.
     pub lang: LangId,
+}
+
+impl FileCallData {
+    /// Look up metadata for an exported symbol name.
+    ///
+    /// `exported_symbols` stores bare names (e.g. `total_disk_bytes`), but
+    /// `symbol_metadata` is keyed by scoped identity (e.g.
+    /// `BackupStore::total_disk_bytes` for impl methods, via
+    /// [`symbol_identity`]). A bare-name `.get()` therefore misses scoped
+    /// symbols and forces callers into degraded `unknown`/line-1 fallbacks.
+    /// This resolves an exact key first, then falls back to the first entry
+    /// whose unqualified name matches — recovering correct kind and line for
+    /// methods. (Bare-name exports are already ambiguous across scopes, so
+    /// first-match is the best available signal; this only affects displayed
+    /// metadata, never liveness, which keys on the symbol name.)
+    pub fn symbol_metadata_for(&self, name: &str) -> Option<&SymbolMeta> {
+        if let Some(meta) = self.symbol_metadata.get(name) {
+            return Some(meta);
+        }
+        self.symbol_metadata
+            .iter()
+            .find(|(key, _)| symbol_unqualified_name(key) == name)
+            .map(|(_, meta)| meta)
+    }
 }
 
 /// Result of resolving a cross-file call edge.
@@ -245,6 +203,38 @@ pub enum EdgeResolution {
     Resolved { file: PathBuf, symbol: String },
     /// Could not resolve — callee name preserved for diagnostics.
     Unresolved { callee_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSymbol {
+    file: PathBuf,
+    symbol: String,
+}
+
+#[derive(Debug, Clone)]
+struct RustCrateInfo {
+    lib_name: String,
+    lib_root: Option<PathBuf>,
+    main_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct RustModuleBase {
+    src_dir: PathBuf,
+    root_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RustUseEntry {
+    module_path: String,
+    local_name: String,
+    kind: RustUseKind,
+}
+
+#[derive(Debug, Clone)]
+enum RustUseKind {
+    Item { imported_name: String },
+    Module,
 }
 
 /// A single caller site: who calls a given symbol and from where.
@@ -260,19 +250,6 @@ pub struct CallerSite {
     pub col: u32,
     /// Whether the edge was resolved via import chain.
     pub resolved: bool,
-    /// Edge kind from Go helper, if applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<EdgeKind>,
-    /// Dispatch key for `dispatches` edges.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nearby_string: Option<String>,
-    /// FQN of the function that received the function-value argument.
-    /// Present only on `dispatches` edges where the callee was resolved.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatched_via: Option<String>,
-    /// Control-flow context from the Go helper, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<crate::go_helper::CallContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -282,14 +259,6 @@ struct IndexedCallerSite {
     line: u32,
     col: u32,
     resolved: bool,
-    /// Edge kind from the Go helper, if applicable. `None` for tree-sitter edges.
-    kind: Option<EdgeKind>,
-    /// Dispatch key, present only on `EdgeKind::Dispatches` sites with a nearby_string.
-    nearby_string: Option<String>,
-    /// FQN of the receiving function for `dispatches` edges.
-    dispatched_via: Option<String>,
-    /// Control-flow context from the Go helper.
-    context: Option<crate::go_helper::CallContext>,
 }
 
 /// A group of callers from a single file.
@@ -322,6 +291,10 @@ pub struct CallersResult {
     pub total_callers: usize,
     /// Number of files scanned to build the reverse index.
     pub scanned_files: usize,
+    /// Whether recursive caller expansion stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of caller edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 /// A node in the forward call tree.
@@ -340,30 +313,10 @@ pub struct CallTreeNode {
     pub resolved: bool,
     /// Child calls (recursive).
     pub children: Vec<CallTreeNode>,
-}
-
-#[derive(Debug, Clone)]
-struct ForwardEdge {
-    target_file: PathBuf,
-    target_symbol: String,
-    target_receiver: Option<String>,
-    call_site_line: u32,
-    target_line: Option<u32>,
-    resolved: bool,
-}
-
-fn push_forward_edge(edges: &mut Vec<ForwardEdge>, edge: ForwardEdge) {
-    if let Some(existing) = edges.iter_mut().find(|candidate| {
-        candidate.target_file == edge.target_file
-            && candidate.target_symbol == edge.target_symbol
-            && candidate.target_receiver == edge.target_receiver
-    }) {
-        if !existing.resolved && edge.resolved {
-            *existing = edge;
-        }
-        return;
-    }
-    edges.push(edge);
+    /// Whether traversal below this node stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of child call edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,18 +335,6 @@ const MAIN_INIT_NAMES: &[&str] = &["main", "init", "setup", "bootstrap", "run"];
 pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangId) -> bool {
     // Exported standalone functions
     if exported && *kind == SymbolKind::Function {
-        return true;
-    }
-
-    // Exported methods on service-style structs are entry points in Go and
-    // Rust: they're invoked externally by HTTP routers, gRPC servers,
-    // trait objects, etc. Without this, trace_to on a helper function
-    // would hit an exported handler method and keep searching backward,
-    // never terminating (or truncating) because no "Function" ancestor
-    // exists. Scoping to Go/Rust avoids false positives for language
-    // conventions where class methods are typically internal (Python,
-    // TypeScript, Java, etc).
-    if exported && *kind == SymbolKind::Method && matches!(lang, LangId::Go | LangId::Rust) {
         return true;
     }
 
@@ -428,6 +369,17 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
+        | LangId::Solidity
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl
         | LangId::Html
         | LangId::Markdown => false,
     }
@@ -479,6 +431,38 @@ pub struct TraceToResult {
     pub truncated_paths: usize,
 }
 
+/// A single hop in a `trace_to_symbol` path.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolHop {
+    /// Symbol name at this hop.
+    pub symbol: String,
+    /// File path (relative to project root).
+    pub file: String,
+    /// 1-based definition line number.
+    pub line: u32,
+}
+
+/// Candidate target location for an ambiguous `trace_to_symbol` request.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolCandidate {
+    /// File path (relative to project root).
+    pub file: String,
+    /// 1-based definition line number.
+    pub line: u32,
+}
+
+/// Result of a `trace_to_symbol` query.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraceToSymbolResult {
+    /// Shortest path from the origin symbol to the target symbol, if found.
+    pub path: Option<Vec<TraceToSymbolHop>>,
+    /// Whether traversal was complete within the requested depth.
+    pub complete: bool,
+    /// Machine-readable explanation when `path` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Impact analysis types
 // ---------------------------------------------------------------------------
@@ -522,49 +506,10 @@ pub struct ImpactResult {
     pub affected_files: usize,
     /// Enriched caller details.
     pub callers: Vec<ImpactCaller>,
-}
-
-// ---------------------------------------------------------------------------
-// Dispatch edge query result types  (Tier 1.1/1.2/1.3)
-// ---------------------------------------------------------------------------
-
-/// Result of `aft dispatched_by <file> <symbol>`.
-#[derive(Debug, Clone, Serialize)]
-pub struct DispatchedByResult {
-    /// The queried symbol.
-    pub symbol: String,
-    /// The queried file (relative to project root).
-    pub file: String,
-    /// Call sites that pass this symbol as a function value.
-    pub dispatched_by: Vec<DispatchedBySite>,
-}
-
-/// A single call site that dispatches (registers) a handler.
-#[derive(Debug, Clone, Serialize)]
-pub struct DispatchedBySite {
-    /// The registration call site.
-    pub caller: DispatchRegistrar,
-    /// The dispatch key (nearby_string), if the call site has one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nearby_string: Option<String>,
-    /// FQN of the function that received the function-value argument
-    /// (e.g. `"github.com/hibiken/asynq.(*ServeMux).HandleFunc"`).
-    /// Present only when the helper resolved the callee.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatched_via: Option<String>,
-    /// Control-flow context at the registration call site (in_loop, in_defer, etc.).
-    /// Absent when the helper didn't emit context (e.g. pre-v3-context output, disabled feature flag).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<crate::go_helper::CallContext>,
-}
-
-/// Result of `aft dispatches <key>`.
-#[derive(Debug, Clone, Serialize)]
-pub struct DispatchesResult {
-    /// The key that was looked up.
-    pub key: String,
-    /// Handlers registered under this key.
-    pub handlers: Vec<DispatchEntry>,
+    /// Whether transitive impact expansion stopped at the requested depth.
+    pub depth_limited: bool,
+    /// Number of caller edges omitted because of the depth limit.
+    pub truncated: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -604,306 +549,15 @@ pub struct TraceDataResult {
     pub depth_limited: bool,
 }
 
-impl TraceDataResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "trace_data {} in {} ({})\n",
-            self.expression, self.origin_symbol, self.origin_file
-        ));
-        if self.hops.is_empty() {
-            out.push_str("  (no hops)\n");
-        } else {
-            for (i, hop) in self.hops.iter().enumerate() {
-                let approx = if hop.approximate { " approximate" } else { "" };
-                out.push_str(&format!(
-                    "  {}. {}.{}  {}:{}  {}{}\n",
-                    i + 1,
-                    hop.symbol,
-                    hop.variable,
-                    hop.file,
-                    hop.line,
-                    hop.flow_type,
-                    approx,
-                ));
-            }
-        }
-        if self.depth_limited {
-            out.push_str("depth limit reached\n");
-        }
-        out
-    }
-}
-
-impl TraceToResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "trace_to {} ({})  paths={} entries={} truncated={}{}\n",
-            self.target_symbol,
-            self.target_file,
-            self.total_paths,
-            self.entry_points_found,
-            self.truncated_paths,
-            if self.max_depth_reached {
-                " max_depth_reached"
-            } else {
-                ""
-            },
-        ));
-        if self.paths.is_empty() {
-            out.push_str("  (no paths)\n");
-        } else {
-            for (i, path) in self.paths.iter().enumerate() {
-                out.push_str(&format!("  path {}:\n", i + 1));
-                for hop in &path.hops {
-                    let entry = if hop.is_entry_point { " [entry]" } else { "" };
-                    out.push_str(&format!(
-                        "    {} ({}:{}){}\n",
-                        hop.symbol, hop.file, hop.line, entry
-                    ));
-                }
-            }
-        }
-        out
-    }
-}
-
-impl CallersResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "callers of {} ({})  total={} files={} scanned={}\n",
-            self.symbol,
-            self.file,
-            self.total_callers,
-            self.callers.len(),
-            self.scanned_files,
-        ));
-        if self.callers.is_empty() {
-            out.push_str("  (no callers)\n");
-        } else {
-            for group in &self.callers {
-                out.push_str(&format!("  {} ({}):\n", group.file, group.callers.len()));
-                for c in &group.callers {
-                    out.push_str(&format!("    - {}:{}\n", c.symbol, c.line));
-                }
-            }
-        }
-        out
-    }
-}
-
-impl ImpactResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        let sig = self.signature.as_deref().unwrap_or("");
-        out.push_str(&format!(
-            "impact {} ({})  affected={} files={}\n",
-            self.symbol, self.file, self.total_affected, self.affected_files,
-        ));
-        if !sig.is_empty() {
-            out.push_str(&format!("  signature: {}\n", sig));
-        }
-        if !self.parameters.is_empty() {
-            out.push_str(&format!("  parameters: {}\n", self.parameters.join(", ")));
-        }
-        if self.callers.is_empty() {
-            out.push_str("  (no callers)\n");
-        } else {
-            for c in &self.callers {
-                let entry = if c.is_entry_point { " [entry]" } else { "" };
-                out.push_str(&format!(
-                    "  - {} ({}:{}){}\n",
-                    c.caller_symbol, c.caller_file, c.line, entry
-                ));
-                if let Some(expr) = &c.call_expression {
-                    out.push_str(&format!("      {}\n", expr));
-                }
-            }
-        }
-        out
-    }
-}
-
-impl DispatchedByResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "dispatched_by {} ({})  total={}\n",
-            self.symbol,
-            self.file,
-            self.dispatched_by.len(),
-        ));
-        if self.dispatched_by.is_empty() {
-            out.push_str("  (no dispatch registrations found)\n");
-        } else {
-            for site in &self.dispatched_by {
-                let key = site
-                    .nearby_string
-                    .as_deref()
-                    .map(|s| format!(" key={}", s))
-                    .unwrap_or_default();
-                let via = site
-                    .dispatched_via
-                    .as_deref()
-                    .map(|s| format!(" via {}", s))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "  - {} ({}:{}){}{}\n",
-                    site.caller.symbol, site.caller.file, site.caller.line, key, via
-                ));
-            }
-        }
-        out
-    }
-}
-
-impl DispatchesResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "dispatches key={} total={}\n",
-            self.key,
-            self.handlers.len(),
-        ));
-        if self.handlers.is_empty() {
-            out.push_str("  (no handlers found for this key)\n");
-        } else {
-            for h in &self.handlers {
-                let via = h
-                    .dispatched_via
-                    .as_deref()
-                    .map(|s| format!(" via {}", s))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "  - {} ({})  registered by {} ({}:{}){}\n",
-                    h.handler.symbol,
-                    h.handler.file,
-                    h.registered_by.symbol,
-                    h.registered_by.file,
-                    h.registered_by.line,
-                    via,
-                ));
-            }
-        }
-        out
-    }
-}
-
-/// Result of `aft writers <file> <var_symbol>`.
-/// Lists all cross-package write sites for a package-level variable.
-#[derive(Debug, Clone, Serialize)]
-pub struct WritersResult {
-    /// The queried variable name.
-    pub variable: String,
-    /// The queried file (relative to project root).
-    pub file: String,
-    /// Write sites — each entry is a function that writes to the variable.
-    pub writers: Vec<WriterSite>,
-}
-
-/// A single write site for a package-level variable.
-#[derive(Debug, Clone, Serialize)]
-pub struct WriterSite {
-    /// File containing the writer function.
-    pub file: String,
-    /// Name of the function that performs the write.
-    pub symbol: String,
-    /// 1-based line number of the store instruction.
-    pub line: u32,
-}
-
-impl WritersResult {
-    /// Compact LLM-friendly rendering.
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
-            "writers {} ({})  total={}\n",
-            self.variable,
-            self.file,
-            self.writers.len(),
-        ));
-        if self.writers.is_empty() {
-            out.push_str("  (no cross-package writers found)\n");
-        } else {
-            for w in &self.writers {
-                out.push_str(&format!("  - {} ({}:{})\n", w.symbol, w.file, w.line));
-            }
-        }
-        out
-    }
-}
-
-impl CallTreeNode {
-    /// Compact LLM-friendly rendering (indented tree).
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        self.render_into(&mut out, 0);
-        out
-    }
-
-    fn render_into(&self, out: &mut String, depth: usize) {
-        let indent = "  ".repeat(depth);
-        let unresolved = if self.resolved { "" } else { " [unresolved]" };
-        let sig = self
-            .signature
-            .as_deref()
-            .map(|s| format!("  {}", s))
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "{}- {} ({}:{}){}{}\n",
-            indent, self.name, self.file, self.line, unresolved, sig
-        ));
-        for child in &self.children {
-            child.render_into(out, depth + 1);
-        }
-    }
-}
-
 /// Extract parameter names from a function signature string.
 ///
 /// Strips language-specific receivers (`self`, `&self`, `&mut self` for Rust,
 /// `self` for Python) and type annotations / default values. Returns just
 /// the parameter names.
 pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
-    // Go methods look like `func (recv Type) Name(params) ret`. The first
-    // parenthesised block is the receiver — skip it so we find the real
-    // parameter list. Other languages have no receiver block, so start from
-    // the first `(` as usual.
-    let scan_from = if lang == LangId::Go {
-        let trimmed = signature.trim_start();
-        let offset = signature.len() - trimmed.len();
-        if let Some(rest) = trimmed.strip_prefix("func ") {
-            let rest = rest.trim_start();
-            if rest.starts_with('(') {
-                // Walk the receiver parens to find its matching close.
-                if let Some(close) = first_top_level(&rest[1..], ')') {
-                    // Absolute index of the char after the receiver's ')'.
-                    let receiver_abs_end = offset + (trimmed.len() - rest.len()) + 1 + close + 1;
-                    receiver_abs_end
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
     // Find the parameter list between parentheses
-    let start = match signature[scan_from..].find('(') {
-        Some(i) => scan_from + i + 1,
+    let start = match signature.find('(') {
+        Some(i) => i + 1,
         None => return Vec::new(),
     };
     let end = match signature[start..].find(')') {
@@ -1044,11 +698,6 @@ fn extract_param_name(param: &str, lang: LangId) -> String {
 ///
 /// Files are parsed and analyzed on first access, then cached. The graph
 /// can resolve cross-file call edges using the import engine.
-///
-/// Persistent caching is handled via [`CacheManager`]: call data is keyed on
-/// `(mtime, size)` per file and survives across process restarts. On warm
-/// runs (no file changes) the entire reverse index may be loaded from the
-/// merged-graph cache, making queries near-instant.
 pub struct CallGraph {
     /// Cached per-file call data.
     data: HashMap<PathBuf, FileCallData>,
@@ -1059,80 +708,18 @@ pub struct CallGraph {
     /// Reverse index: target_file → target_symbol → callers.
     /// Built lazily on first `callers_of` call, cleared on `invalidate_file`.
     reverse_index: Option<ReverseIndex>,
-    /// Secondary dispatch index: nearby_string key → list of dispatch entries.
-    /// Built alongside `reverse_index`. Powers `aft dispatches <key>`.
-    dispatch_index: Option<DispatchIndex>,
-    /// Implementation index: interface → concrete implementations.
-    /// Built lazily from `implements` edges in the Go helper output (Tier 1.4).
-    implementation_index: Option<ImplementationIndex>,
-    /// Resolved Go call edges from the optional `aft-go-helper`. Injected
-    /// into the reverse index at build time. Snapshot from configure time —
-    /// remains valid until the next configure call.
-    go_helper: Option<HelperOutput>,
-    /// Directory where per-file parse results are cached to disk. `None`
-    /// disables disk caching (tests that don't want pollution, or
-    /// missing cache config). Populated via `set_parse_cache_dir`.
-    parse_cache_dir: Option<PathBuf>,
-    /// Whether to include dispatches/goroutine/defer edges from the Go helper.
-    /// Default `true`. Set via `Config::enable_dispatch_edges` or
-    /// `AFT_DISABLE_DISPATCH_EDGES=1`. When `false`, those edge kinds are
-    /// dropped on index build.
-    pub enable_dispatch_edges: bool,
-    /// Whether to build the ImplementationIndex from `implements` edges.
-    /// Default `true`. Set via `Config::enable_implementation_edges` or
-    /// `AFT_DISABLE_IMPLEMENTATION_EDGES=1`. When `false`, the index is not built.
-    pub enable_implementation_edges: bool,
-    /// Whether to include writes edges from the Go helper.
-    /// Default `true`. Set via `Config::enable_writes_edges` or
-    /// `AFT_DISABLE_WRITES_EDGES=1`. When `false`, writes edges are dropped.
-    pub enable_writes_edges: bool,
-    /// On-disk persistent cache manager (Tier 2). Tracks parse, helper,
-    /// and merged-graph caches per project. Disabled when `no_cache` is
-    /// passed to `CallGraph::new`.
-    cache: CacheManager,
 }
 
 impl CallGraph {
     /// Create a new call graph for a project.
-    ///
-    /// `no_cache` forces a cache-less run (equivalent to `AFT_DISABLE_CACHE=1`).
-    pub fn new(project_root: PathBuf, no_cache: bool) -> Self {
-        let cache = CacheManager::new(project_root.clone(), no_cache);
+    pub fn new(project_root: PathBuf) -> Self {
+        clear_workspace_package_cache();
         Self {
             data: HashMap::new(),
             project_root,
             project_files: None,
             reverse_index: None,
-            dispatch_index: None,
-            implementation_index: None,
-            go_helper: None,
-            parse_cache_dir: None,
-            enable_dispatch_edges: std::env::var("AFT_DISABLE_DISPATCH_EDGES")
-                .map(|v| v != "1")
-                .unwrap_or(true),
-            enable_implementation_edges: std::env::var("AFT_DISABLE_IMPLEMENTATION_EDGES")
-                .map(|v| v != "1")
-                .unwrap_or(true),
-            enable_writes_edges: std::env::var("AFT_DISABLE_WRITES_EDGES")
-                .map(|v| v != "1")
-                .unwrap_or(true),
-            cache,
         }
-    }
-
-    /// Install Go helper output. Invalidates the reverse index so the
-    /// next `callers_of` call rebuilds it with the new edges included.
-    pub fn set_go_helper(&mut self, data: HelperOutput) {
-        self.go_helper = Some(data);
-        self.reverse_index = None;
-        self.dispatch_index = None;
-        self.implementation_index = None;
-    }
-
-    /// Enable on-disk parse-result caching. Subsequent `build_file`
-    /// calls check the cache first and skip re-parsing unchanged files.
-    pub fn set_parse_cache_dir(&mut self, dir: PathBuf) {
-        self.parse_cache_dir = Some(dir);
     }
 
     /// Get the project root directory.
@@ -1140,25 +727,37 @@ impl CallGraph {
         &self.project_root
     }
 
-    fn resolve_cross_file_edge_with_exports<F>(
+    fn resolve_cross_file_edge_with_exports<F, D>(
         full_callee: &str,
         short_name: &str,
         caller_file: &Path,
         import_block: &ImportBlock,
-        // True when the caller's own file defines a symbol with this short
-        // name. Used as a last-resort fallback: if no import resolves the
-        // callee but the file defines it locally, point the edge at the
-        // same file. Covers Go bare package-level calls (foo() where foo
-        // is in the same package/file), Python/JS module-local calls, and
-        // same-file methods invoked via a receiver (s.foo() where foo is
-        // defined in this file).
-        caller_file_defines_callee: bool,
         mut file_exports_symbol: F,
+        mut file_default_export_symbol: D,
     ) -> EdgeResolution
     where
         F: FnMut(&Path, &str) -> bool,
+        D: FnMut(&Path) -> Option<String>,
     {
         let caller_dir = caller_file.parent().unwrap_or(Path::new("."));
+
+        // Rust uses `::` module paths rather than JS/TS specifiers. Keep this
+        // branch gated to `.rs` callers so the existing JS/TS resolver below
+        // remains unchanged.
+        if is_rust_source_file(caller_file) {
+            if let Some(target) = resolve_rust_cross_file_edge(
+                full_callee,
+                short_name,
+                caller_file,
+                import_block,
+                &mut file_exports_symbol,
+            ) {
+                return EdgeResolution::Resolved {
+                    file: target.file,
+                    symbol: target.symbol,
+                };
+            }
+        }
 
         // Check namespace imports: "utils.foo" where utils is a namespace import
         if full_callee.contains('.') {
@@ -1172,10 +771,17 @@ impl CallGraph {
                         if let Some(resolved_path) =
                             resolve_module_path(caller_dir, &imp.module_path)
                         {
-                            return EdgeResolution::Resolved {
-                                file: resolved_path,
-                                symbol: member.to_owned(),
-                            };
+                            if let Some(target) = resolve_reexported_symbol(
+                                &resolved_path,
+                                member,
+                                &mut file_exports_symbol,
+                                &mut file_default_export_symbol,
+                            ) {
+                                return EdgeResolution::Resolved {
+                                    file: target.file,
+                                    symbol: target.symbol,
+                                };
+                            }
                         }
                     }
                 }
@@ -1187,10 +793,19 @@ impl CallGraph {
             // Direct named import: import { foo } from './utils'
             if imp.names.iter().any(|name| name == short_name) {
                 if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                    // The name in the import is the original name from the source module
-                    return EdgeResolution::Resolved {
+                    let target = resolve_reexported_symbol(
+                        &resolved_path,
+                        short_name,
+                        &mut file_exports_symbol,
+                        &mut file_default_export_symbol,
+                    )
+                    .unwrap_or(ResolvedSymbol {
                         file: resolved_path,
                         symbol: short_name.to_owned(),
+                    });
+                    return EdgeResolution::Resolved {
+                        file: target.file,
+                        symbol: target.symbol,
                     };
                 }
             }
@@ -1198,9 +813,20 @@ impl CallGraph {
             // Default import: import foo from './utils'
             if imp.default_import.as_deref() == Some(short_name) {
                 if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
-                    return EdgeResolution::Resolved {
+                    let target = resolve_reexported_symbol(
+                        &resolved_path,
+                        "default",
+                        &mut file_exports_symbol,
+                        &mut file_default_export_symbol,
+                    )
+                    .unwrap_or_else(|| ResolvedSymbol {
+                        symbol: file_default_export_symbol(&resolved_path)
+                            .unwrap_or_else(|| synthetic_default_symbol(&resolved_path)),
                         file: resolved_path,
-                        symbol: "default".to_owned(),
+                    });
+                    return EdgeResolution::Resolved {
+                        file: target.file,
+                        symbol: target.symbol,
                     };
                 }
             }
@@ -1213,9 +839,19 @@ impl CallGraph {
         if let Some((original_name, resolved_path)) =
             resolve_aliased_import(short_name, import_block, caller_dir)
         {
-            return EdgeResolution::Resolved {
+            let target = resolve_reexported_symbol(
+                &resolved_path,
+                &original_name,
+                &mut file_exports_symbol,
+                &mut file_default_export_symbol,
+            )
+            .unwrap_or(ResolvedSymbol {
                 file: resolved_path,
                 symbol: original_name,
+            });
+            return EdgeResolution::Resolved {
+                file: target.file,
+                symbol: target.symbol,
             };
         }
 
@@ -1243,54 +879,29 @@ impl CallGraph {
             }
         }
 
-        // Same-file fallback. Import-based resolution didn't find a match,
-        // so if the caller's own file defines the symbol, point there.
-        // Without this, languages that permit calling package-local symbols
-        // without imports (Go, Python module-level, JS/TS in-file) show
-        // those edges as unresolved even though both ends live in the same
-        // file. See caller_file_defines_callee for the full rationale.
-        if caller_file_defines_callee {
-            return EdgeResolution::Resolved {
-                file: caller_file.to_path_buf(),
-                symbol: short_name.to_owned(),
-            };
-        }
-
         EdgeResolution::Unresolved {
             callee_name: short_name.to_owned(),
         }
     }
 
     /// Get or build the call data for a file.
-    ///
-    /// Uses the Tier 2 persistent cache (keyed on mtime+size): on a warm run,
-    /// returns the cached parse without touching tree-sitter. On miss, parses
-    /// fresh and writes back to the cache. The Tier 2 `CacheManager` supersedes
-    /// the earlier per-file `parse_cache` module; `parse_cache_dir` is retained
-    /// on the struct for compatibility with older call sites but is not the
-    /// active cache path.
     pub fn build_file(&mut self, path: &Path) -> Result<&FileCallData, AftError> {
         let canon = self.canonicalize(path)?;
 
         if !self.data.contains_key(&canon) {
-            // Try the persistent parse cache first (Tier 2).
-            match self.cache.get_file(&canon) {
-                FileCacheOutcome::Hit(cached_data) => {
-                    log::debug!("[cache] parse-cache hit: {}", canon.display());
-                    self.data.insert(canon.clone(), cached_data);
-                }
-                FileCacheOutcome::Miss => {
-                    let file_data = build_file_data(&canon)?;
-                    // Write back to persistent cache.
-                    if let Some(stat) = FileStat::from_path(&canon) {
-                        self.cache.put_file(&canon, stat, &file_data);
-                    }
-                    self.data.insert(canon.clone(), file_data);
-                }
-            }
+            let file_data = build_file_data(&canon)?;
+            self.data.insert(canon.clone(), file_data);
         }
 
         Ok(&self.data[&canon])
+    }
+
+    /// Resolve a user-provided symbol query to the unique scoped symbol identity
+    /// used internally by the call graph.
+    pub fn resolve_symbol_query(&mut self, file: &Path, symbol: &str) -> Result<String, AftError> {
+        let canon = self.canonicalize(file)?;
+        let file_data = self.build_file(&canon)?;
+        resolve_symbol_query_in_data(file_data, &canon, symbol)
     }
 
     /// Resolve a cross-file call edge.
@@ -1304,21 +915,14 @@ impl CallGraph {
         caller_file: &Path,
         import_block: &ImportBlock,
     ) -> EdgeResolution {
-        // Look up whether the caller's own file defines a symbol with the
-        // short name. The immutable borrow from self.data must end before
-        // we call file_exports_symbol (which takes &mut self), so evaluate
-        // this up-front into a bool.
-        let caller_defines = self
-            .lookup_file_data(caller_file)
-            .map(|d| d.symbol_metadata.contains_key(short_name))
-            .unwrap_or(false);
+        let graph = RefCell::new(self);
         Self::resolve_cross_file_edge_with_exports(
             full_callee,
             short_name,
             caller_file,
             import_block,
-            caller_defines,
-            |path, symbol_name| self.file_exports_symbol(path, symbol_name),
+            |path, symbol_name| graph.borrow_mut().file_exports_symbol(path, symbol_name),
+            |path| graph.borrow_mut().file_default_export_symbol(path),
         )
     }
 
@@ -1330,59 +934,21 @@ impl CallGraph {
         }
     }
 
+    fn file_default_export_symbol(&mut self, path: &Path) -> Option<String> {
+        self.build_file(path)
+            .ok()
+            .and_then(|data| data.default_export_symbol.clone())
+    }
+
     fn file_exports_symbol_cached(&self, path: &Path, symbol_name: &str) -> bool {
         self.lookup_file_data(path)
             .map(|data| data.exported_symbols.iter().any(|name| name == symbol_name))
             .unwrap_or(false)
     }
 
-    /// Find a Go sibling file (same directory) that defines the given
-    /// symbol. Go permits cross-file same-package calls without imports,
-    /// so this is the fallback when the normal import-based resolver
-    /// returns Unresolved and the caller's own file doesn't define the
-    /// symbol either. Builds file data on demand for sibling files.
-    ///
-    /// Returns None if caller_file isn't Go, has no parent, or no sibling
-    /// defines the symbol.
-    fn go_sibling_definer(&mut self, caller_file: &Path, symbol: &str) -> Option<PathBuf> {
-        if caller_file.extension().and_then(|e| e.to_str()) != Some("go") {
-            return None;
-        }
-        let dir = caller_file.parent()?;
-
-        // Snapshot the directory listing first so we don't hold a borrow
-        // on the filesystem iterator while mutating self via build_file.
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("go") {
-                    continue;
-                }
-                let same = std::fs::canonicalize(&path)
-                    .ok()
-                    .map(|c| {
-                        std::fs::canonicalize(caller_file)
-                            .ok()
-                            .map(|cc| cc == c)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if same {
-                    continue;
-                }
-                candidates.push(path);
-            }
-        }
-
-        for path in candidates {
-            if let Ok(data) = self.build_file(&path) {
-                if data.symbol_metadata.contains_key(symbol) {
-                    return Some(path);
-                }
-            }
-        }
-        None
+    fn file_default_export_symbol_cached(&self, path: &Path) -> Option<String> {
+        self.lookup_file_data(path)
+            .and_then(|data| data.default_export_symbol.clone())
     }
 
     /// Depth-limited forward call tree traversal.
@@ -1395,8 +961,13 @@ impl CallGraph {
         symbol: &str,
         max_depth: usize,
     ) -> Result<CallTreeNode, AftError> {
+        let canon = self.canonicalize(file)?;
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
         let mut visited = HashSet::new();
-        self.forward_tree_inner(file, symbol, max_depth, 0, &mut visited)
+        self.forward_tree_inner(&canon, &resolved_symbol, max_depth, 0, &mut visited)
     }
 
     fn forward_tree_inner(
@@ -1412,7 +983,10 @@ impl CallGraph {
 
         // Cycle detection
         if visited.contains(&visit_key) {
-            let (line, signature) = get_symbol_meta(&canon, symbol);
+            let (line, signature) = self
+                .lookup_file_data(&canon)
+                .map(|data| get_symbol_meta_from_data(data, symbol))
+                .unwrap_or_else(|| get_symbol_meta(&canon, symbol));
             return Ok(CallTreeNode {
                 name: symbol.to_string(),
                 file: self.relative_path(&canon),
@@ -1420,96 +994,106 @@ impl CallGraph {
                 signature,
                 resolved: true,
                 children: vec![], // cycle — stop recursion
+                depth_limited: false,
+                truncated: 0,
             });
         }
 
         visited.insert(visit_key.clone());
 
-        // Build file data
-        let file_data = build_file_data(&canon)?;
-        let import_block = file_data.import_block.clone();
-        let _lang = file_data.lang;
+        let (import_block, call_sites, sym_line, sym_signature) = {
+            let file_data = self.build_file(&canon)?;
+            let meta = get_symbol_meta_from_data(file_data, symbol);
 
-        // Get call sites for this symbol
-        let call_sites = file_data
-            .calls_by_symbol
-            .get(symbol)
-            .cloned()
-            .unwrap_or_default();
-
-        // Get symbol metadata (line, signature)
-        let (sym_line, sym_signature) = get_symbol_meta(&canon, symbol);
-
-        // Cache file data
-        self.data.insert(canon.clone(), file_data);
+            (
+                file_data.import_block.clone(),
+                file_data
+                    .calls_by_symbol
+                    .get(symbol)
+                    .cloned()
+                    .unwrap_or_default(),
+                meta.0,
+                meta.1,
+            )
+        };
 
         // Build children
         let mut children = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
 
         if current_depth < max_depth {
-            for edge in self.merged_forward_edges(&canon, symbol, &call_sites, &import_block) {
-                let helper_receiver_ambiguous = edge.target_receiver.as_deref().is_some_and(|_| {
-                    symbol_has_multiple_receiver_variants(&edge.target_file, &edge.target_symbol)
-                });
-                if helper_receiver_ambiguous {
-                    let receiver = edge.target_receiver.as_deref().unwrap_or_default();
-                    let (line, signature) = get_symbol_meta_for_receiver(
-                        &edge.target_file,
-                        &edge.target_symbol,
-                        receiver,
-                    );
-                    children.push(CallTreeNode {
-                        name: format!("{} ({})", edge.target_symbol, receiver_short_name(receiver)),
-                        file: self.relative_path(&edge.target_file),
-                        line: if line != 0 {
-                            line
-                        } else {
-                            edge.target_line.unwrap_or(edge.call_site_line)
-                        },
-                        signature,
-                        resolved: true,
-                        children: vec![],
-                    });
-                    continue;
-                }
-                if edge.resolved {
-                    match self.forward_tree_inner(
-                        &edge.target_file,
-                        &edge.target_symbol,
-                        max_depth,
-                        current_depth + 1,
-                        visited,
-                    ) {
-                        Ok(mut child) => {
-                            if edge.target_file == canon {
-                                child.line = edge.call_site_line;
-                            } else if let Some(line) = edge.target_line {
-                                child.line = line;
+            for call_site in &call_sites {
+                let edge = self.resolve_cross_file_edge(
+                    &call_site.full_callee,
+                    &call_site.callee_name,
+                    &canon,
+                    &import_block,
+                );
+
+                match edge {
+                    EdgeResolution::Resolved {
+                        file: ref target_file,
+                        ref symbol,
+                    } => {
+                        match self.forward_tree_inner(
+                            target_file,
+                            symbol,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                        ) {
+                            Ok(child) => {
+                                depth_limited |= child.depth_limited;
+                                truncated += child.truncated;
+                                children.push(child);
                             }
-                            children.push(child);
-                        }
-                        Err(_) => {
-                            children.push(CallTreeNode {
-                                name: edge.target_symbol,
-                                file: self.relative_path(&edge.target_file),
-                                line: edge.target_line.unwrap_or(edge.call_site_line),
-                                signature: None,
-                                resolved: false,
-                                children: vec![],
-                            });
+                            Err(_) => {
+                                // Target file can't be parsed — mark as unresolved leaf
+                                children.push(CallTreeNode {
+                                    name: call_site.callee_name.clone(),
+                                    file: self.relative_path(target_file),
+                                    line: call_site.line,
+                                    signature: None,
+                                    resolved: false,
+                                    children: vec![],
+                                    depth_limited: false,
+                                    truncated: 0,
+                                });
+                            }
                         }
                     }
-                } else {
-                    children.push(CallTreeNode {
-                        name: edge.target_symbol,
-                        file: self.relative_path(&edge.target_file),
-                        line: edge.call_site_line,
-                        signature: None,
-                        resolved: false,
-                        children: vec![],
-                    });
+                    EdgeResolution::Unresolved { callee_name } => {
+                        if let Some(local_child) = self.resolve_local_call_tree_child(
+                            &canon,
+                            symbol,
+                            call_site,
+                            &callee_name,
+                            max_depth,
+                            current_depth,
+                            visited,
+                        )? {
+                            depth_limited |= local_child.depth_limited;
+                            truncated += local_child.truncated;
+                            children.push(local_child);
+                            continue;
+                        }
+                        children.push(CallTreeNode {
+                            name: callee_name,
+                            file: self.relative_path(&canon),
+                            line: call_site.line,
+                            signature: None,
+                            resolved: false,
+                            children: vec![],
+                            depth_limited: false,
+                            truncated: 0,
+                        });
+                    }
                 }
             }
+        } else if !call_sites.is_empty() {
+            depth_limited = true;
+            truncated = call_sites.len();
         }
 
         visited.remove(&visit_key);
@@ -1521,7 +1105,51 @@ impl CallGraph {
             signature: sym_signature,
             resolved: true,
             children,
+            depth_limited,
+            truncated,
         })
+    }
+
+    fn resolve_local_call_tree_child(
+        &mut self,
+        canon: &Path,
+        current_symbol: &str,
+        call_site: &CallSite,
+        callee_name: &str,
+        max_depth: usize,
+        current_depth: usize,
+        visited: &mut HashSet<(PathBuf, String)>,
+    ) -> Result<Option<CallTreeNode>, AftError> {
+        if !is_bare_callee(&call_site.full_callee, callee_name) {
+            return Ok(None);
+        }
+
+        let target_symbol = match self
+            .lookup_file_data(canon)
+            .and_then(|data| resolve_symbol_query_in_data(data, canon, callee_name).ok())
+        {
+            Some(symbol) => symbol,
+            None => return Ok(None),
+        };
+
+        if target_symbol == current_symbol {
+            return Ok(None);
+        }
+
+        match self.forward_tree_inner(canon, &target_symbol, max_depth, current_depth + 1, visited)
+        {
+            Ok(child) => Ok(Some(child)),
+            Err(_) => Ok(Some(CallTreeNode {
+                name: target_symbol,
+                file: self.relative_path(canon),
+                line: call_site.line,
+                signature: None,
+                resolved: false,
+                children: vec![],
+                depth_limited: false,
+                truncated: 0,
+            })),
+        }
     }
 
     /// Get all project files (lazily discovered).
@@ -1561,22 +1189,9 @@ impl CallGraph {
             .count()
     }
 
-    /// Build the reverse index by scanning all project files.
-    ///
-    /// For each file, builds the call data (if not cached), then for each
-    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
-    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
-    ///
-    /// After building, flushes the parse-index cache to disk and saves the
-    /// merged-graph cache so that subsequent warm runs skip this work entirely.
-    ///
-    /// Returns `ProjectTooLarge` without doing any work when the project's
-    /// source-file count exceeds `max_files`; the bound check is lazy (early
-    /// short-circuit on the directory walker) so huge roots don't pay the
-    /// full walk cost.
-    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
-        let start = std::time::Instant::now();
-
+    /// Build call data for all project files, failing fast when the configured
+    /// source-file cap is exceeded.
+    fn ensure_project_files_built(&mut self, max_files: usize) -> Result<(), AftError> {
         // Bounded count first — never populate project_files on oversized roots.
         // `walk_project_files(...).take(max_files + 1)` is lazy (Walk is an
         // iterator), so this costs at most (max_files + 1) directory entries
@@ -1591,71 +1206,36 @@ impl CallGraph {
 
         // TODO(v0.16): rust-side deadline for graceful timeout recovery
         // (unbounded walks remain a soft cliff for users who raise the cap).
-        // Discover all project files first
+        // Discover all project files first.
         let all_files = self.project_files().to_vec();
 
-        // Build file data for all project files (cache-aware).
-        // For large projects on a cold cache this is the dominant cost of the
-        // first CLI query. Progress lines go to stderr so the CLI wrapper can
-        // surface them — silence at 3s looks like a hang even though real
-        // work is happening.
-        log::info!("building call graph: {} files", all_files.len());
-        for (i, f) in all_files.iter().enumerate() {
-            let _ = self.build_file(f);
-            // Periodic heartbeat for long runs (>~500 files). Every 250
-            // files keeps overhead low while staying visible to the user.
-            if all_files.len() > 500 && i > 0 && i % 250 == 0 {
-                log::info!("  parsed {}/{} files", i, all_files.len());
-            }
+        // Build file data for all project files.
+        let uncached_files: Vec<PathBuf> = all_files
+            .iter()
+            .filter(|f| self.lookup_file_data(f).is_none())
+            .cloned()
+            .collect();
+
+        let computed: Vec<(PathBuf, FileCallData)> = uncached_files
+            .par_iter()
+            .filter_map(|f| build_file_data(f).ok().map(|data| (f.clone(), data)))
+            .collect();
+
+        for (file, data) in computed {
+            self.data.insert(file, data);
         }
-        log::info!(
-            "  parsed {}/{} files in {:.1}s",
-            all_files.len(),
-            all_files.len(),
-            start.elapsed().as_secs_f32()
-        );
 
-        // Go same-package symbol index: for every Go file, map each symbol
-        // it defines to the file that defines it, keyed by parent
-        // directory. Go allows calls between files in the same package
-        // without an explicit import, so the regular import-based
-        // resolver returns Unresolved for cross-file same-package calls
-        // (e.g. payment/sandbox.go calling prepareChargePaymentResponse
-        // defined in payment/service.go). This lookup covers those.
-        //
-        // Go enforces one package per directory, so dedup across a
-        // directory doesn't need a package-name check — any .go file in
-        // the same dir is in the same package.
-        let go_pkg_symbols: HashMap<PathBuf, HashMap<String, PathBuf>> = {
-            let mut map: HashMap<PathBuf, HashMap<String, PathBuf>> = HashMap::new();
-            for f in &all_files {
-                if f.extension().and_then(|e| e.to_str()) != Some("go") {
-                    continue;
-                }
-                let canon = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone());
-                let dir = match canon.parent() {
-                    Some(d) => d.to_path_buf(),
-                    None => continue,
-                };
-                let data = match self.data.get(f).or_else(|| self.data.get(&canon)) {
-                    Some(d) => d,
-                    None => continue,
-                };
-                let bucket = map.entry(dir).or_default();
-                for sym in data.symbol_metadata.keys() {
-                    // First-writer-wins: if two files in the same package
-                    // define the same symbol name (shouldn't happen in
-                    // valid Go, but can happen mid-refactor), keep the
-                    // first. The Go compiler would reject this anyway.
-                    bucket.entry(sym.clone()).or_insert_with(|| canon.clone());
-                }
-            }
-            map
-        };
+        Ok(())
+    }
 
-        // Flush parse index before building the merged graph (the merged-graph
-        // header embeds a digest of the parse index CBOR).
-        self.cache.flush_parse_index();
+    /// Build the reverse index by scanning all project files.
+    ///
+    /// For each file, builds the call data (if not cached), then for each
+    /// (symbol, call_sites) pair, resolves cross-file edges and inserts
+    /// into the reverse map: `(target_file, target_symbol) → Vec<CallerSite>`.
+    fn build_reverse_index(&mut self, max_files: usize) -> Result<(), AftError> {
+        self.ensure_project_files_built(max_files)?;
+        let all_files = self.project_files().to_vec();
 
         // Now build the reverse map
         let mut reverse: ReverseIndex = HashMap::new();
@@ -1678,39 +1258,37 @@ impl CallGraph {
                 let caller_symbol: SharedStr = Arc::from(symbol_name.as_str());
 
                 for call_site in call_sites {
-                    let caller_defines = file_data
-                        .symbol_metadata
-                        .contains_key(&call_site.callee_name);
                     let edge = Self::resolve_cross_file_edge_with_exports(
                         &call_site.full_callee,
                         &call_site.callee_name,
                         canon_caller.as_ref(),
                         &file_data.import_block,
-                        caller_defines,
                         |path, symbol_name| self.file_exports_symbol_cached(path, symbol_name),
+                        |path| self.file_default_export_symbol_cached(path),
                     );
 
                     let (target_file, target_symbol, resolved) = match edge {
                         EdgeResolution::Resolved { file, symbol } => (file, symbol, true),
                         EdgeResolution::Unresolved { callee_name } => {
-                            // Go same-package fallback: if the caller is a
-                            // Go file and a sibling in the same directory
-                            // defines this symbol, resolve there.
-                            let resolved_sibling = if file_data.lang == LangId::Go {
-                                canon_caller.parent().and_then(|dir| {
-                                    go_pkg_symbols
-                                        .get(dir)
-                                        .and_then(|syms| syms.get(&callee_name))
-                                })
-                            } else {
-                                None
-                            };
-                            match resolved_sibling {
-                                Some(sibling) => (sibling.clone(), callee_name, true),
-                                None => (canon_caller.as_ref().clone(), callee_name, false),
+                            if !is_bare_callee(&call_site.full_callee, &callee_name) {
+                                continue;
                             }
+
+                            let Ok(target_symbol) = resolve_symbol_query_in_data(
+                                file_data,
+                                canon_caller.as_ref(),
+                                &callee_name,
+                            ) else {
+                                continue;
+                            };
+
+                            (canon_caller.as_ref().clone(), target_symbol, false)
                         }
                     };
+
+                    if target_file == *canon_caller.as_ref() && target_symbol == *symbol_name {
+                        continue;
+                    }
 
                     reverse
                         .entry(target_file)
@@ -1723,254 +1301,13 @@ impl CallGraph {
                             line: call_site.line,
                             col: 0,
                             resolved,
-                            kind: None,
-                            nearby_string: None,
-                            dispatched_via: None,
-                            context: None,
                         });
                 }
             }
         }
 
-        // Inject type-resolved edges from the Go helper. These cover
-        // interface dispatch and concrete-method disambiguation that
-        // tree-sitter alone cannot resolve.
-        // Helper paths are relative to project_root; canonicalize to
-        // match the keys used by the tree-sitter side.
-        // Note: if a Go file is edited after configure, the helper data
-        // may be stale. A new configure re-runs the helper and resets
-        // this field.
-        let mut dispatch: DispatchIndex = HashMap::new();
-        let mut impl_index = ImplementationIndex::new();
-        let enable_dispatch = self.enable_dispatch_edges;
-        let enable_implements = self.enable_implementation_edges;
-        let enable_writes = self.enable_writes_edges;
-        if let Some(helper) = &self.go_helper {
-            for edge in &helper.edges {
-                if edge.caller.symbol.is_empty() || edge.callee.symbol.is_empty() {
-                    continue;
-                }
-
-                // implements edges are handled separately — they populate the
-                // ImplementationIndex, not the reverse call index.
-                if edge.kind == EdgeKind::Implements {
-                    if !enable_implements {
-                        continue;
-                    }
-                    // caller.file = interface file, caller.symbol = interface type name.
-                    // callee = concrete implementation.
-                    let iface_abs = self.project_root.join(&edge.caller.file);
-                    let iface_canon = std::fs::canonicalize(&iface_abs).unwrap_or(iface_abs);
-                    let iface_rel = iface_canon
-                        .strip_prefix(&self.project_root)
-                        .unwrap_or(&iface_canon)
-                        .to_string_lossy()
-                        .into_owned();
-
-                    let concrete_abs = self.project_root.join(&edge.callee.file);
-                    let concrete_rel = std::fs::canonicalize(&concrete_abs)
-                        .unwrap_or(concrete_abs)
-                        .strip_prefix(&self.project_root)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| edge.callee.file.clone());
-
-                    impl_index.insert(
-                        iface_canon,
-                        edge.caller.symbol.clone(),
-                        ConcreteImpl {
-                            name: edge.callee.symbol.clone(),
-                            file: concrete_rel,
-                            line: edge.callee.line,
-                            receiver: edge.callee.receiver.clone(),
-                            pkg: edge.callee.pkg.clone(),
-                        },
-                    );
-                    // Store the interface file relative path for InterfaceRef rendering.
-                    // The insert() already stores the full path as the key; update
-                    // the InterfaceRef file to use the relative path.
-                    // This is handled inside ImplementationIndex::insert — the
-                    // InterfaceRef.file is set from iface_file.to_string_lossy()
-                    // which is the canonicalized abs path. We want relative here.
-                    // Fix: update the last-pushed InterfaceRef.
-                    if let Some(refs) = impl_index.by_concrete.get_mut(&edge.callee.receiver) {
-                        if let Some(last) = refs.last_mut() {
-                            last.file = iface_rel;
-                        }
-                    }
-                    continue;
-                }
-
-                // Feature flag: drop dispatches/goroutine/defer kinds when disabled.
-                let is_dispatch_kind = matches!(
-                    edge.kind,
-                    EdgeKind::Dispatches | EdgeKind::Goroutine | EdgeKind::Defer
-                );
-                if is_dispatch_kind && !enable_dispatch {
-                    continue;
-                }
-
-                // Feature flag: drop writes edges when disabled.
-                if edge.kind == EdgeKind::Writes && !enable_writes {
-                    continue;
-                }
-
-                let caller_abs = self.project_root.join(&edge.caller.file);
-                let callee_abs = self.project_root.join(&edge.callee.file);
-
-                let canon_caller =
-                    Arc::new(std::fs::canonicalize(&caller_abs).unwrap_or(caller_abs));
-                let canon_callee = std::fs::canonicalize(&callee_abs).unwrap_or(callee_abs.clone());
-
-                let caller_sym: SharedStr = Arc::from(edge.caller.symbol.as_str());
-
-                reverse
-                    .entry(canon_callee)
-                    .or_default()
-                    .entry(edge.callee.symbol.clone())
-                    .or_default()
-                    .push(IndexedCallerSite {
-                        caller_file: Arc::clone(&canon_caller),
-                        caller_symbol: caller_sym,
-                        line: edge.caller.line,
-                        col: 0,
-                        resolved: true,
-                        kind: Some(edge.kind),
-                        nearby_string: edge.nearby_string.clone(),
-                        dispatched_via: edge.dispatched_via.clone(),
-                        context: edge.context.clone(),
-                    });
-
-                // Secondary dispatch key index: only for dispatches edges with a nearby_string.
-                if edge.kind == EdgeKind::Dispatches {
-                    if let Some(ref key) = edge.nearby_string {
-                        let callee_rel = self
-                            .project_root
-                            .join(&edge.callee.file)
-                            .strip_prefix(&self.project_root)
-                            .ok()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| edge.callee.file.clone());
-                        let caller_rel = self
-                            .project_root
-                            .join(&edge.caller.file)
-                            .strip_prefix(&self.project_root)
-                            .ok()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| edge.caller.file.clone());
-                        dispatch
-                            .entry(key.clone())
-                            .or_default()
-                            .push(DispatchEntry {
-                                handler: DispatchCallee {
-                                    file: callee_rel,
-                                    symbol: edge.callee.symbol.clone(),
-                                },
-                                registered_by: DispatchRegistrar {
-                                    file: caller_rel,
-                                    symbol: edge.caller.symbol.clone(),
-                                    line: edge.caller.line,
-                                },
-                                dispatched_via: edge.dispatched_via.clone(),
-                            });
-                    }
-                }
-            }
-        }
-
-        // Tier 2: save the merged graph to disk for future warm runs.
-        // Convert the internal IndexedCallerSite to the public CallerSite for storage.
-        let serialisable: HashMap<PathBuf, HashMap<String, Vec<CallerSite>>> = reverse
-            .iter()
-            .map(|(target, sym_map)| {
-                let inner = sym_map
-                    .iter()
-                    .map(|(sym, sites)| {
-                        let caller_sites: Vec<CallerSite> = sites
-                            .iter()
-                            .map(|s| CallerSite {
-                                caller_file: s.caller_file.as_ref().clone(),
-                                caller_symbol: s.caller_symbol.to_string(),
-                                line: s.line,
-                                col: s.col,
-                                resolved: s.resolved,
-                                kind: s.kind,
-                                nearby_string: s.nearby_string.clone(),
-                                dispatched_via: s.dispatched_via.clone(),
-                                context: s.context.clone(),
-                            })
-                            .collect();
-                        (sym.clone(), caller_sites)
-                    })
-                    .collect();
-                (target.clone(), inner)
-            })
-            .collect();
-        self.cache.save_merged_graph(&serialisable);
-
         self.reverse_index = Some(reverse);
-        self.dispatch_index = Some(dispatch);
-        self.implementation_index = Some(impl_index);
         Ok(())
-    }
-
-    /// Try to restore the reverse index from the on-disk merged graph.
-    ///
-    /// Returns `true` if a valid cached graph was loaded (warm path).
-    fn try_load_merged_graph(&mut self) -> bool {
-        let Some(graph) = self.cache.load_merged_graph() else {
-            return false;
-        };
-
-        log::info!("[cache] loaded merged-graph from disk (warm run)");
-
-        // Also populate `self.data` from the parse-index so that other queries
-        // (symbol resolution, imports) work without re-parsing.
-        // We load only what the reverse index references.
-        if let Some(cache_dir) = self.cache.cache_dir() {
-            if let Some(parse_index) = crate::persistent_cache::read_parse_index(cache_dir) {
-                for (rel, (stat, ser_data)) in parse_index.entries {
-                    let abs_path = self.project_root.join(&rel);
-                    // Only load if the file on disk matches the cached stat
-                    if let Some(current) = FileStat::from_path(&abs_path) {
-                        if current == stat {
-                            let data = crate::callgraph::FileCallData::from(ser_data);
-                            self.data.insert(abs_path, data);
-                        }
-                    }
-                }
-            }
-        }
-
-        let reverse_flat = self.cache.restore_reverse_index(graph);
-
-        // Convert the flat CallerSite map into the internal IndexedCallerSite ReverseIndex
-        let mut reverse: ReverseIndex = HashMap::new();
-        for (target_path, sym_map) in reverse_flat {
-            let inner = sym_map
-                .into_iter()
-                .map(|(sym, callers)| {
-                    let indexed: Vec<IndexedCallerSite> = callers
-                        .into_iter()
-                        .map(|c| IndexedCallerSite {
-                            caller_file: Arc::new(c.caller_file),
-                            caller_symbol: Arc::from(c.caller_symbol.as_str()),
-                            line: c.line,
-                            col: c.col,
-                            resolved: c.resolved,
-                            kind: c.kind,
-                            nearby_string: c.nearby_string,
-                            dispatched_via: c.dispatched_via,
-                            context: c.context,
-                        })
-                        .collect();
-                    (sym, indexed)
-                })
-                .collect();
-            reverse.insert(target_path, inner);
-        }
-
-        self.reverse_index = Some(reverse);
-        true
     }
 
     fn reverse_sites(&self, file: &Path, symbol: &str) -> Option<&[IndexedCallerSite]> {
@@ -1979,329 +1316,6 @@ impl CallGraph {
             .get(file)?
             .get(symbol)
             .map(Vec::as_slice)
-    }
-
-    fn merged_forward_edges(
-        &mut self,
-        caller_file: &Path,
-        caller_symbol: &str,
-        call_sites: &[CallSite],
-        import_block: &ImportBlock,
-    ) -> Vec<ForwardEdge> {
-        let canon_caller =
-            std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.to_path_buf());
-        let mut edges = Vec::new();
-
-        for call_site in call_sites {
-            let edge = self.resolve_cross_file_edge(
-                &call_site.full_callee,
-                &call_site.callee_name,
-                &canon_caller,
-                import_block,
-            );
-
-            let merged = match edge {
-                EdgeResolution::Resolved { file, symbol } => ForwardEdge {
-                    target_file: file,
-                    target_symbol: symbol,
-                    target_receiver: None,
-                    call_site_line: call_site.line,
-                    target_line: None,
-                    resolved: true,
-                },
-                EdgeResolution::Unresolved { callee_name } => {
-                    match self.go_sibling_definer(&canon_caller, &callee_name) {
-                        Some(sibling) => ForwardEdge {
-                            target_file: sibling,
-                            target_symbol: callee_name,
-                            target_receiver: None,
-                            call_site_line: call_site.line,
-                            target_line: None,
-                            resolved: true,
-                        },
-                        None => ForwardEdge {
-                            target_file: canon_caller.clone(),
-                            target_symbol: callee_name,
-                            target_receiver: None,
-                            call_site_line: call_site.line,
-                            target_line: None,
-                            resolved: false,
-                        },
-                    }
-                }
-            };
-            push_forward_edge(&mut edges, merged);
-        }
-
-        let helper_edges = self.helper_forward_sites(&canon_caller, caller_symbol);
-        if !helper_edges.is_empty() {
-            let helper_targets: HashSet<(PathBuf, String)> = helper_edges
-                .iter()
-                .filter(|edge| edge.target_receiver.is_some())
-                .map(|edge| (edge.target_file.clone(), edge.target_symbol.clone()))
-                .collect();
-            edges.retain(|edge| {
-                !helper_targets.contains(&(edge.target_file.clone(), edge.target_symbol.clone()))
-            });
-        }
-
-        for edge in helper_edges {
-            push_forward_edge(&mut edges, edge);
-        }
-
-        edges
-    }
-
-    fn helper_forward_sites(&self, caller_file: &Path, caller_symbol: &str) -> Vec<ForwardEdge> {
-        let Some(helper) = &self.go_helper else {
-            return Vec::new();
-        };
-
-        let canon_caller =
-            std::fs::canonicalize(caller_file).unwrap_or_else(|_| caller_file.to_path_buf());
-        let mut sites = Vec::new();
-
-        for edge in &helper.edges {
-            if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Writes) {
-                continue;
-            }
-            if edge.caller.symbol != caller_symbol {
-                continue;
-            }
-
-            let edge_caller_abs = self.project_root.join(&edge.caller.file);
-            let edge_caller = std::fs::canonicalize(&edge_caller_abs).unwrap_or(edge_caller_abs);
-            if edge_caller != canon_caller {
-                continue;
-            }
-
-            let target_abs = self.project_root.join(&edge.callee.file);
-            let target_file = std::fs::canonicalize(&target_abs).unwrap_or(target_abs);
-            sites.push(ForwardEdge {
-                target_file,
-                target_symbol: edge.callee.symbol.clone(),
-                target_receiver: (!edge.callee.receiver.is_empty())
-                    .then(|| edge.callee.receiver.clone()),
-                call_site_line: edge.caller.line,
-                target_line: (edge.callee.line != 0).then_some(edge.callee.line),
-                resolved: true,
-            });
-        }
-
-        sites
-    }
-
-    /// Ensure the dispatch index is built. Mirrors `build_reverse_index` laziness.
-    fn ensure_dispatch_index(&mut self, max_files: usize) -> Result<(), AftError> {
-        // Warm-load (`try_load_merged_graph`) only populates `reverse_index`,
-        // leaving `dispatch_index` None. So gate on `dispatch_index` itself,
-        // not `reverse_index`, to force a full build when needed.
-        if self.dispatch_index.is_none() {
-            // Discard any warm-loaded reverse_index so build_reverse_index
-            // runs end-to-end and populates all three indexes from helper data.
-            self.reverse_index = None;
-            self.build_reverse_index(max_files)?;
-        }
-        Ok(())
-    }
-
-    /// Ensure the implementation index is built.
-    fn ensure_implementation_index(&mut self, max_files: usize) -> Result<(), AftError> {
-        // Same rationale as `ensure_dispatch_index` above.
-        if self.implementation_index.is_none() {
-            self.reverse_index = None;
-            self.build_reverse_index(max_files)?;
-        }
-        Ok(())
-    }
-
-    /// Look up all concrete types that implement the interface declared in `file`
-    /// with type name `interface_symbol`.
-    ///
-    /// By default, excludes implementations whose receiver contains `Mock`
-    /// or whose file path is under a `mocks/` directory. Pass
-    /// `include_mocks = true` to override.
-    pub fn implementations_of(
-        &mut self,
-        file: &Path,
-        interface_symbol: &str,
-        include_mocks: bool,
-        max_files: usize,
-    ) -> Result<ImplementationsResult, AftError> {
-        let canon = self.canonicalize(file)?;
-        self.ensure_implementation_index(max_files)?;
-
-        let iface_rel = self.relative_path(&canon);
-
-        let key = (canon, interface_symbol.to_string());
-        let raw = self
-            .implementation_index
-            .as_ref()
-            .and_then(|idx| idx.by_interface.get(&key))
-            .cloned()
-            .unwrap_or_default();
-
-        // Group by (receiver, pkg) and sort within each group for determinism.
-        use std::collections::BTreeMap;
-        let mut by_recv: BTreeMap<(String, String), Vec<ConcreteMethodRef>> = BTreeMap::new();
-        for ci in &raw {
-            // Mock filter.
-            if !include_mocks {
-                if ci.receiver.contains("Mock") || ci.file.contains("/mocks/") {
-                    continue;
-                }
-            }
-            by_recv
-                .entry((ci.receiver.clone(), ci.pkg.clone()))
-                .or_default()
-                .push(ConcreteMethodRef {
-                    name: ci.name.clone(),
-                    file: ci.file.clone(),
-                    line: ci.line,
-                });
-        }
-
-        let implementations: Vec<ConcreteTypeImpl> = by_recv
-            .into_iter()
-            .map(|((receiver, pkg), mut methods)| {
-                methods.sort_by(|a, b| a.name.cmp(&b.name));
-                ConcreteTypeImpl {
-                    receiver,
-                    pkg,
-                    methods,
-                }
-            })
-            .collect();
-
-        Ok(ImplementationsResult {
-            interface: InterfaceInfo {
-                file: iface_rel,
-                symbol: interface_symbol.to_string(),
-            },
-            implementations,
-        })
-    }
-
-    /// Exact-match lookup in the dispatch secondary index.
-    /// Returns all dispatch entries whose `nearby_string` equals `key`.
-    pub fn find_by_dispatch_key(&mut self, key: &str, max_files: usize) -> Vec<DispatchEntry> {
-        if let Err(e) = self.ensure_dispatch_index(max_files) {
-            log::warn!("find_by_dispatch_key: dispatch index unavailable: {}", e);
-            return vec![];
-        }
-        self.dispatch_index
-            .as_ref()
-            .and_then(|di| di.get(key))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Prefix-match lookup in the dispatch secondary index.
-    /// Returns all dispatch entries whose `nearby_string` starts with `prefix`.
-    pub fn find_by_dispatch_key_prefix(
-        &mut self,
-        prefix: &str,
-        max_files: usize,
-    ) -> Vec<(String, Vec<DispatchEntry>)> {
-        if let Err(e) = self.ensure_dispatch_index(max_files) {
-            log::warn!(
-                "find_by_dispatch_key_prefix: dispatch index unavailable: {}",
-                e
-            );
-            return vec![];
-        }
-        let Some(di) = self.dispatch_index.as_ref() else {
-            return vec![];
-        };
-        di.iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
-    /// Find all dispatch call sites that pass `symbol` (from `file`) as a function value.
-    /// Equivalent to `callers_of` filtered to `kind == Dispatches`.
-    pub fn dispatched_by(
-        &mut self,
-        file: &Path,
-        symbol: &str,
-        max_files: usize,
-    ) -> Result<DispatchedByResult, AftError> {
-        let canon = self.canonicalize(file)?;
-        self.build_file(&canon)?;
-
-        // dispatched_by needs dispatch-kind edges to be present in the reverse
-        // index. warm-load via try_load_merged_graph populates reverse_index
-        // but the current cache serialization drops per-site `kind`, so we
-        // must rebuild to recover dispatch-kind metadata. Route through
-        // ensure_dispatch_index, which forces a rebuild when dispatch_index
-        // is missing.
-        self.ensure_dispatch_index(max_files)?;
-
-        let target_rel = self.relative_path(&canon);
-
-        let sites = self
-            .reverse_sites(&canon, symbol)
-            .unwrap_or(&[])
-            .iter()
-            .filter(|s| s.kind == Some(EdgeKind::Dispatches))
-            .map(|s| DispatchedBySite {
-                caller: DispatchRegistrar {
-                    file: self.relative_path(s.caller_file.as_ref()),
-                    symbol: s.caller_symbol.to_string(),
-                    line: s.line,
-                },
-                nearby_string: s.nearby_string.clone(),
-                dispatched_via: s.dispatched_via.clone(),
-                context: s.context.clone(),
-            })
-            .collect::<Vec<_>>();
-
-        Ok(DispatchedByResult {
-            symbol: symbol.to_string(),
-            file: target_rel,
-            dispatched_by: sites,
-        })
-    }
-
-    /// Find all cross-package write sites for a package-level variable.
-    /// This is the backend for `aft writers <file> <var>`.
-    /// Returns only edges with `kind == Writes` — same-package writes are
-    /// filtered at the helper side (filter-at-source contract).
-    pub fn writers_of(
-        &mut self,
-        file: &Path,
-        symbol: &str,
-        max_files: usize,
-    ) -> Result<WritersResult, AftError> {
-        let canon = self.canonicalize(file)?;
-        self.build_file(&canon)?;
-
-        if self.reverse_index.is_none() {
-            if !self.try_load_merged_graph() {
-                self.build_reverse_index(max_files)?;
-            }
-        }
-
-        let target_rel = self.relative_path(&canon);
-
-        let sites = self
-            .reverse_sites(&canon, symbol)
-            .unwrap_or(&[])
-            .iter()
-            .filter(|s| s.kind == Some(EdgeKind::Writes))
-            .map(|s| WriterSite {
-                file: self.relative_path(s.caller_file.as_ref()),
-                symbol: s.caller_symbol.to_string(),
-                line: s.line,
-            })
-            .collect::<Vec<_>>();
-
-        Ok(WritersResult {
-            variable: symbol.to_string(),
-            file: target_rel,
-            writers: sites,
-        })
     }
 
     /// Get callers of a symbol in a file, grouped by calling file.
@@ -2318,15 +1332,15 @@ impl CallGraph {
     ) -> Result<CallersResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built (may already be cached)
-        self.build_file(&canon)?;
+        // Ensure file is built (may already be cached) and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
-        // Build the reverse index if not cached.
-        // First try the warm path: load from the merged-graph disk cache.
+        // Build the reverse index if not cached
         if self.reverse_index.is_none() {
-            if !self.try_load_merged_graph() {
-                self.build_reverse_index(max_files)?;
-            }
+            self.build_reverse_index(max_files)?;
         }
 
         let scanned_files = self.project_files.as_ref().map(|f| f.len()).unwrap_or(0);
@@ -2334,24 +1348,21 @@ impl CallGraph {
 
         let mut visited = HashSet::new();
         let mut all_sites: Vec<CallerSite> = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
         self.collect_callers_recursive(
             &canon,
-            symbol,
+            &resolved_symbol,
             effective_depth,
             0,
             &mut visited,
             &mut all_sites,
+            &mut depth_limited,
+            &mut truncated,
         );
 
-        // Deduplicate by (caller_file, caller_symbol, line). Prefer
-        // resolved edges over unresolved ones so that when the Go helper
-        // and tree-sitter both record the same call site, the
-        // type-accurate version wins and no duplicate appears in output.
-        all_sites.sort_unstable_by_key(|s| if s.resolved { 0u8 } else { 1u8 });
-        let mut seen: HashSet<(PathBuf, String, u32)> = HashSet::new();
-        all_sites.retain(|s| seen.insert((s.caller_file.clone(), s.caller_symbol.clone(), s.line)));
-
         // Group by file
+
         let mut groups_map: HashMap<PathBuf, Vec<CallerEntry>> = HashMap::new();
         let total_callers = all_sites.len();
         for site in all_sites {
@@ -2382,91 +1393,14 @@ impl CallGraph {
         callers.sort_by(|a, b| a.file.cmp(&b.file));
 
         Ok(CallersResult {
-            symbol: symbol.to_string(),
+            symbol: resolved_symbol,
             file: self.relative_path(&canon),
             callers,
             total_callers,
             scanned_files,
+            depth_limited,
+            truncated,
         })
-    }
-
-    /// Like `callers_of` but also includes concrete types from the
-    /// ImplementationIndex when the queried symbol is an interface method.
-    ///
-    /// Used by `aft callers --via-interface`. The concrete implementors are
-    /// appended as additional `CallerGroup` entries so the result is a
-    /// superset of the regular `callers_of` result.
-    pub fn callers_of_via_interface(
-        &mut self,
-        file: &Path,
-        symbol: &str,
-        depth: usize,
-        include_mocks: bool,
-        max_files: usize,
-    ) -> Result<CallersResult, AftError> {
-        // Get regular callers first.
-        let mut result = self.callers_of(file, symbol, depth, max_files)?;
-
-        // Try to find implementations of the interface named by `symbol`.
-        // The symbol in `callers_of` context is the interface *method* name,
-        // but the ImplementationIndex is keyed by the interface *type* name.
-        // We search the implementation index for any interface type whose
-        // concrete implementations include a method named `symbol`.
-        //
-        // Alternatively: the user could be querying any symbol, not necessarily
-        // an interface method. We check the implementation index and append if
-        // anything is found.
-        let canon = self.canonicalize(file)?;
-        self.ensure_implementation_index(max_files)?;
-
-        let impl_data = self
-            .implementation_index
-            .as_ref()
-            .map(|idx| {
-                // Find all entries where the interface file matches and look for
-                // methods named `symbol`. Since we key by interface type name,
-                // we need to scan entries where the interface file = canon.
-                let mut rows: Vec<(String, ConcreteImpl)> = Vec::new();
-                for ((iface_file, iface_sym), impls) in &idx.by_interface {
-                    if *iface_file != canon {
-                        continue;
-                    }
-                    for ci in impls {
-                        if ci.name == symbol {
-                            if !include_mocks
-                                && (ci.receiver.contains("Mock") || ci.file.contains("/mocks/"))
-                            {
-                                continue;
-                            }
-                            rows.push((iface_sym.clone(), ci.clone()));
-                        }
-                    }
-                }
-                rows
-            })
-            .unwrap_or_default();
-
-        // Group additional implementations by their concrete file and append
-        // as extra CallerGroups so they appear alongside regular callers.
-        use std::collections::BTreeMap;
-        let mut extra: BTreeMap<String, Vec<CallerEntry>> = BTreeMap::new();
-        for (_iface_sym, ci) in impl_data {
-            extra.entry(ci.file.clone()).or_default().push(CallerEntry {
-                symbol: format!("{} (implements)", ci.receiver),
-                line: ci.line,
-            });
-        }
-
-        let extra_total: usize = extra.values().map(|v| v.len()).sum();
-        for (file, entries) in extra {
-            result.callers.push(CallerGroup {
-                file,
-                callers: entries,
-            });
-        }
-        result.total_callers += extra_total;
-
-        Ok(result)
     }
 
     /// Trace backward from a symbol to all entry points.
@@ -2483,8 +1417,11 @@ impl CallGraph {
     ) -> Result<TraceToResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built
-        self.build_file(&canon)?;
+        // Ensure file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -2503,14 +1440,22 @@ impl CallGraph {
         }
 
         // Get line/signature for the target symbol
-        let (target_line, target_sig) = get_symbol_meta(&canon, symbol);
+        let (target_line, target_sig) = self
+            .lookup_file_data(&canon)
+            .map(|data| get_symbol_meta_from_data(data, &resolved_symbol))
+            .unwrap_or_else(|| get_symbol_meta(&canon, &resolved_symbol));
 
         // Check if target itself is an entry point
         let target_is_entry = self
             .lookup_file_data(&canon)
             .and_then(|fd| {
-                let meta = fd.symbol_metadata.get(symbol)?;
-                Some(is_entry_point(symbol, &meta.kind, meta.exported, fd.lang))
+                let meta = fd.symbol_metadata.get(&resolved_symbol)?;
+                Some(is_entry_point(
+                    &resolved_symbol,
+                    &meta.kind,
+                    meta.exported,
+                    fd.lang,
+                ))
             })
             .unwrap_or(false);
 
@@ -2524,7 +1469,7 @@ impl CallGraph {
         // Initial path starts at the target
         let initial: Vec<PathElem> = vec![(
             Arc::new(canon.clone()),
-            Arc::from(symbol),
+            Arc::from(resolved_symbol.as_str()),
             target_line,
             target_sig,
         )];
@@ -2575,8 +1520,12 @@ impl CallGraph {
                 has_new_path = true;
 
                 // Get caller's metadata
-                let (caller_line, caller_sig) =
-                    get_symbol_meta(site.caller_file.as_ref(), site.caller_symbol.as_ref());
+                let (caller_line, caller_sig) = self
+                    .lookup_file_data(site.caller_file.as_ref())
+                    .map(|data| get_symbol_meta_from_data(data, site.caller_symbol.as_ref()))
+                    .unwrap_or_else(|| {
+                        get_symbol_meta(site.caller_file.as_ref(), site.caller_symbol.as_ref())
+                    });
 
                 let mut new_path = path.clone();
                 new_path.push((
@@ -2655,24 +1604,6 @@ impl CallGraph {
             })
             .collect();
 
-        // Deduplicate paths by their (file, symbol) chain. Multiple call
-        // sites on the same chain (e.g. one test function calling the
-        // target 20 times on different lines) produce 20 paths with
-        // identical symbol sequences but differing line numbers — useless
-        // for the "how does execution reach X" question trace_to answers.
-        // Keep the first occurrence so the reported line is meaningful.
-        {
-            let mut seen: HashSet<Vec<(String, String)>> = HashSet::new();
-            paths.retain(|p| {
-                let key: Vec<(String, String)> = p
-                    .hops
-                    .iter()
-                    .map(|h| (h.file.clone(), h.symbol.clone()))
-                    .collect();
-                seen.insert(key)
-            });
-        }
-
         // Sort paths for deterministic output (by entry point name, then path length)
         paths.sort_by(|a, b| {
             let a_entry = a.hops.first().map(|h| h.symbol.as_str()).unwrap_or("");
@@ -2680,21 +1611,21 @@ impl CallGraph {
             a_entry.cmp(b_entry).then(a.hops.len().cmp(&b.hops.len()))
         });
 
-        // Count distinct entry points
-        let mut entry_point_names: HashSet<String> = HashSet::new();
+        // Count distinct entry points by identity, not just display name.
+        let mut entry_points: HashSet<(String, String)> = HashSet::new();
         for p in &paths {
             if let Some(first) = p.hops.first() {
                 if first.is_entry_point {
-                    entry_point_names.insert(first.symbol.clone());
+                    entry_points.insert((first.file.clone(), first.symbol.clone()));
                 }
             }
         }
 
         let total_paths = paths.len();
-        let entry_points_found = entry_point_names.len();
+        let entry_points_found = entry_points.len();
 
         Ok(TraceToResult {
-            target_symbol: symbol.to_string(),
+            target_symbol: resolved_symbol,
             target_file: target_rel,
             paths,
             total_paths,
@@ -2702,6 +1633,253 @@ impl CallGraph {
             max_depth_reached,
             truncated_paths,
         })
+    }
+
+    /// Find all files that define a symbol matching a `trace_to_symbol` target query.
+    ///
+    /// The result is de-duplicated by file because `toFile` is only required
+    /// when a target symbol name exists in multiple files.
+    pub fn trace_to_symbol_candidates(
+        &mut self,
+        to_symbol: &str,
+        max_files: usize,
+    ) -> Result<Vec<TraceToSymbolCandidate>, AftError> {
+        self.ensure_project_files_built(max_files)?;
+
+        let mut candidates_by_file: HashMap<PathBuf, u32> = HashMap::new();
+        let all_files = self.project_files().to_vec();
+
+        for file in all_files {
+            let canon = self.canonicalize(&file)?;
+            let Some(file_data) = self
+                .lookup_file_data(&canon)
+                .or_else(|| self.lookup_file_data(&file))
+            else {
+                continue;
+            };
+
+            let symbol_candidates = symbol_query_candidates(file_data, to_symbol);
+            if symbol_candidates.is_empty() {
+                continue;
+            }
+
+            let line = symbol_candidates
+                .iter()
+                .filter_map(|symbol| file_data.symbol_metadata.get(symbol).map(|meta| meta.line))
+                .min()
+                .unwrap_or(1);
+
+            candidates_by_file
+                .entry(canon)
+                .and_modify(|existing| *existing = (*existing).min(line))
+                .or_insert(line);
+        }
+
+        let mut candidates: Vec<TraceToSymbolCandidate> = candidates_by_file
+            .into_iter()
+            .map(|(file, line)| TraceToSymbolCandidate {
+                file: self.relative_path(&file),
+                line,
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        Ok(candidates)
+    }
+
+    /// Find the shortest forward call path from one symbol to another symbol.
+    ///
+    /// Performs breadth-first traversal over resolved call edges. A global
+    /// `(file, symbol)` visited set keeps cycles finite while preserving BFS's
+    /// shortest-path guarantee.
+    pub fn trace_to_symbol(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+        max_files: usize,
+    ) -> Result<TraceToSymbolResult, AftError> {
+        let canon = self.canonicalize(file)?;
+
+        // Ensure the origin file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
+
+        self.ensure_project_files_built(max_files)?;
+
+        let target_file = to_file.map(|path| self.canonicalize(path)).transpose()?;
+        let effective_max = if max_depth == 0 {
+            10
+        } else {
+            max_depth.min(16)
+        };
+
+        let start_hop = self.trace_to_symbol_hop(&canon, &resolved_symbol);
+        if Self::trace_to_symbol_matches_target(&canon, &resolved_symbol, to_symbol, &target_file) {
+            return Ok(TraceToSymbolResult {
+                path: Some(vec![start_hop]),
+                complete: true,
+                reason: None,
+            });
+        }
+
+        let mut queue: VecDeque<(PathBuf, String, Vec<TraceToSymbolHop>, usize)> = VecDeque::new();
+        queue.push_back((canon.clone(), resolved_symbol.clone(), vec![start_hop], 0));
+
+        let mut visited: HashSet<(PathBuf, String)> = HashSet::new();
+        visited.insert((canon, resolved_symbol));
+        let mut max_depth_exhausted = false;
+
+        while let Some((current_file, current_symbol, path, depth)) = queue.pop_front() {
+            let callees = self.forward_resolved_callees(&current_file, &current_symbol)?;
+
+            if depth >= effective_max {
+                if callees
+                    .iter()
+                    .any(|(file, symbol)| !visited.contains(&(file.clone(), symbol.clone())))
+                {
+                    max_depth_exhausted = true;
+                }
+                continue;
+            }
+
+            for (callee_file, callee_symbol) in callees {
+                let visit_key = (callee_file.clone(), callee_symbol.clone());
+                if !visited.insert(visit_key) {
+                    continue;
+                }
+
+                let mut next_path = path.clone();
+                next_path.push(self.trace_to_symbol_hop(&callee_file, &callee_symbol));
+
+                if Self::trace_to_symbol_matches_target(
+                    &callee_file,
+                    &callee_symbol,
+                    to_symbol,
+                    &target_file,
+                ) {
+                    return Ok(TraceToSymbolResult {
+                        path: Some(next_path),
+                        complete: true,
+                        reason: None,
+                    });
+                }
+
+                queue.push_back((callee_file, callee_symbol, next_path, depth + 1));
+            }
+        }
+
+        if max_depth_exhausted {
+            Ok(TraceToSymbolResult {
+                path: None,
+                complete: false,
+                reason: Some("max_depth_exhausted".to_string()),
+            })
+        } else {
+            Ok(TraceToSymbolResult {
+                path: None,
+                complete: true,
+                reason: Some("no_path_found".to_string()),
+            })
+        }
+    }
+
+    fn trace_to_symbol_matches_target(
+        file: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: &Option<PathBuf>,
+    ) -> bool {
+        if !symbol_query_matches(symbol, to_symbol) {
+            return false;
+        }
+
+        if let Some(target_file) = to_file {
+            file == target_file
+        } else {
+            true
+        }
+    }
+
+    fn trace_to_symbol_hop(&self, file: &Path, symbol: &str) -> TraceToSymbolHop {
+        let (line, _) = self
+            .lookup_file_data(file)
+            .map(|data| get_symbol_meta_from_data(data, symbol))
+            .unwrap_or_else(|| get_symbol_meta(file, symbol));
+
+        TraceToSymbolHop {
+            symbol: symbol.to_string(),
+            file: self.relative_path(file),
+            line,
+        }
+    }
+
+    fn forward_resolved_callees(
+        &mut self,
+        file: &Path,
+        symbol: &str,
+    ) -> Result<Vec<(PathBuf, String)>, AftError> {
+        let canon = self.canonicalize(file)?;
+        let (import_block, call_sites) = {
+            let file_data = self.build_file(&canon)?;
+            (
+                file_data.import_block.clone(),
+                file_data
+                    .calls_by_symbol
+                    .get(symbol)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+
+        let mut callees = Vec::new();
+        for call_site in call_sites {
+            let edge = self.resolve_cross_file_edge(
+                &call_site.full_callee,
+                &call_site.callee_name,
+                &canon,
+                &import_block,
+            );
+
+            match edge {
+                EdgeResolution::Resolved {
+                    file: target_file,
+                    symbol: target_symbol,
+                } => {
+                    let target_canon = self.canonicalize(&target_file)?;
+                    if self.build_file(&target_canon).is_err() {
+                        continue;
+                    }
+
+                    let resolved_target_symbol = self
+                        .lookup_file_data(&target_canon)
+                        .and_then(|data| {
+                            resolve_symbol_query_in_data(data, &target_canon, &target_symbol).ok()
+                        })
+                        .unwrap_or(target_symbol);
+
+                    callees.push((target_canon, resolved_target_symbol));
+                }
+                EdgeResolution::Unresolved { callee_name } => {
+                    if !is_bare_callee(&call_site.full_callee, &callee_name) {
+                        continue;
+                    }
+
+                    let local_symbol = self.lookup_file_data(&canon).and_then(|data| {
+                        resolve_symbol_query_in_data(data, &canon, &callee_name).ok()
+                    });
+
+                    if let Some(local_symbol) = local_symbol {
+                        callees.push((canon.clone(), local_symbol));
+                    }
+                }
+            }
+        }
+
+        Ok(callees)
     }
 
     /// Impact analysis: enriched callers query.
@@ -2718,8 +1896,11 @@ impl CallGraph {
     ) -> Result<ImpactResult, AftError> {
         let canon = self.canonicalize(file)?;
 
-        // Ensure file is built
-        self.build_file(&canon)?;
+        // Ensure file is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Build the reverse index if not cached
         if self.reverse_index.is_none() {
@@ -2738,7 +1919,7 @@ impl CallGraph {
                     })
                 }
             };
-            let meta = file_data.symbol_metadata.get(symbol);
+            let meta = file_data.symbol_metadata.get(&resolved_symbol);
             let sig = meta.and_then(|m| m.signature.clone());
             let lang = file_data.lang;
             let params = sig
@@ -2751,13 +1932,17 @@ impl CallGraph {
         // Collect all caller sites (transitive)
         let mut visited = HashSet::new();
         let mut all_sites: Vec<CallerSite> = Vec::new();
+        let mut depth_limited = false;
+        let mut truncated = 0;
         self.collect_callers_recursive(
             &canon,
-            symbol,
+            &resolved_symbol,
             effective_depth,
             0,
             &mut visited,
             &mut all_sites,
+            &mut depth_limited,
+            &mut truncated,
         );
 
         // Deduplicate sites by (file, symbol, line)
@@ -2826,13 +2011,15 @@ impl CallGraph {
         let affected_files = affected_file_set.len();
 
         Ok(ImpactResult {
-            symbol: symbol.to_string(),
+            symbol: resolved_symbol,
             file: self.relative_path(&canon),
             signature: target_signature,
             parameters: target_parameters,
             total_affected,
             affected_files,
             callers,
+            depth_limited,
+            truncated,
         })
     }
 
@@ -2857,32 +2044,11 @@ impl CallGraph {
         let canon = self.canonicalize(file)?;
         let rel_file = self.relative_path(&canon);
 
-        // Ensure file data is built
-        self.build_file(&canon)?;
-
-        // Verify symbol exists
-        {
-            let fd = match self.data.get(&canon) {
-                Some(d) => d,
-                None => {
-                    return Err(AftError::InvalidRequest {
-                        message: "file data missing after build".to_string(),
-                    })
-                }
-            };
-            let has_symbol = fd.calls_by_symbol.contains_key(symbol)
-                || fd.exported_symbols.iter().any(|name| name == symbol)
-                || fd.symbol_metadata.contains_key(symbol);
-            if !has_symbol {
-                return Err(AftError::InvalidRequest {
-                    message: format!(
-                        "trace_data: symbol '{}' not found in {}",
-                        symbol,
-                        file.display()
-                    ),
-                });
-            }
-        }
+        // Ensure file data is built and resolve scoped identity.
+        let resolved_symbol = {
+            let file_data = self.build_file(&canon)?;
+            resolve_symbol_query_in_data(file_data, &canon, symbol)?
+        };
 
         // Bounded count: short-circuits at `max_files + 1` so oversized roots
         // reject in microseconds instead of paying the full walk/collect cost.
@@ -2900,7 +2066,7 @@ impl CallGraph {
 
         self.trace_data_inner(
             &canon,
-            symbol,
+            &resolved_symbol,
             expression,
             max_depth,
             0,
@@ -2912,7 +2078,7 @@ impl CallGraph {
         Ok(TraceDataResult {
             expression: expression.to_string(),
             origin_file: rel_file,
-            origin_symbol: symbol.to_string(),
+            origin_symbol: resolved_symbol,
             hops,
             depth_limited,
         })
@@ -2962,26 +2128,26 @@ impl CallGraph {
         };
 
         // Find the symbol's AST node range
-        let symbols = list_symbols_from_tree(&source, &tree, lang, file);
-        let sym_info = match symbols.iter().find(|s| s.name == symbol) {
+        let symbols = match crate::parser::extract_symbols_from_tree(&source, &tree, lang) {
+            Ok(symbols) => symbols,
+            Err(_) => return,
+        };
+        let sym_info = match symbols
+            .iter()
+            .find(|s| symbol_identity(s) == symbol || s.name == symbol)
+        {
             Some(s) => s,
             None => return,
         };
 
-        let body_start = line_col_to_byte(&source, sym_info.start_line, sym_info.start_col);
-        let body_end = line_col_to_byte(&source, sym_info.end_line, sym_info.end_col);
+        let body_start =
+            line_col_to_byte(&source, sym_info.range.start_line, sym_info.range.start_col);
+        let body_end = line_col_to_byte(&source, sym_info.range.end_line, sym_info.range.end_col);
 
         let root = tree.root_node();
 
-        // Find the symbol's function/method-declaration node. The symbol's
-        // reported range may include leading doc comments that are siblings of
-        // the function node — in that case a simple covers-range lookup falls
-        // back to the source_file root and the walker leaks into unrelated
-        // functions. Prefer a name-matched declaration whose range is inside
-        // the reported range; fall back to covering-range if nothing matches.
-        let body_node = find_function_decl_node(root, &source, body_start, body_end, symbol)
-            .or_else(|| find_node_covering_range(root, body_start, body_end));
-        let body_node = match body_node {
+        // Find the symbol's body node (the function/method definition node)
+        let body_node = match find_node_covering_range(root, body_start, body_end) {
             Some(n) => n,
             None => return,
         };
@@ -3034,7 +2200,6 @@ impl CallGraph {
                 | "assignment_expression"
                 | "augmented_assignment_expression"
                 | "assignment"
-                | "assignment_statement"
                 | "let_declaration"
                 | "short_var_declaration"
         );
@@ -3043,13 +2208,19 @@ impl CallGraph {
             if let Some((new_name, init_text, line, is_approx)) =
                 self.extract_assignment_info(node, source, lang, tracked_names)
             {
-                // If the LHS is a destructuring pattern, we can't attribute the
-                // flow to a single name — emit an approximate hop carrying the
-                // pattern text and stop tracking through this branch.
-                let is_destructuring_pattern =
-                    new_name.starts_with('{') || new_name.starts_with('[');
-
-                if is_destructuring_pattern {
+                // The RHS references a tracked name — add assignment hop
+                if !is_approx {
+                    hops.push(DataFlowHop {
+                        file: rel_file.to_string(),
+                        symbol: symbol.to_string(),
+                        variable: new_name.clone(),
+                        line,
+                        flow_type: "assignment".to_string(),
+                        approximate: false,
+                    });
+                    tracked_names.push(new_name);
+                } else {
+                    // Destructuring or pattern — approximate
                     hops.push(DataFlowHop {
                         file: rel_file.to_string(),
                         symbol: symbol.to_string(),
@@ -3058,37 +2229,9 @@ impl CallGraph {
                         flow_type: "assignment".to_string(),
                         approximate: true,
                     });
+                    // Don't track further through this branch
                     return;
                 }
-
-                // LHS is a field/index write (e.g. `m.Field = x` or `a[i] = x`).
-                // Emit a distinct `field_write` hop. Don't extend tracked_names
-                // with the compound path — downstream tracking treats names as
-                // bare identifiers, and "m.Field" would produce noisy matches.
-                let is_field_write =
-                    new_name.contains('.') || new_name.contains('[') || new_name.starts_with('*');
-
-                if is_field_write {
-                    hops.push(DataFlowHop {
-                        file: rel_file.to_string(),
-                        symbol: symbol.to_string(),
-                        variable: new_name,
-                        line,
-                        flow_type: "field_write".to_string(),
-                        approximate: is_approx,
-                    });
-                    return;
-                }
-
-                hops.push(DataFlowHop {
-                    file: rel_file.to_string(),
-                    symbol: symbol.to_string(),
-                    variable: new_name.clone(),
-                    line,
-                    flow_type: "assignment".to_string(),
-                    approximate: is_approx,
-                });
-                tracked_names.push(new_name);
             }
         }
 
@@ -3138,12 +2281,7 @@ impl CallGraph {
     }
 
     /// Check if an assignment/declaration node assigns from a tracked name.
-    /// Returns `(new_name, init_text, line, is_approximate)`.
-    ///
-    /// Uses [`classify_expr_text`] so all assignment forms uniformly handle:
-    /// direct identifier matches, reference/deref prefixes (`&x`/`*x`),
-    /// field/index accesses (`x.F`/`x[i]`), and composite literals containing
-    /// a tracked value (`Foo{F: x}`).
+    /// Returns (new_name, init_text, line, is_approximate).
     fn extract_assignment_info(
         &self,
         node: tree_sitter::Node,
@@ -3162,16 +2300,22 @@ impl CallGraph {
                 let name_text = node_text(name_node, source);
                 let value_text = node_text(value_node, source);
 
+                // Check if name is a destructuring pattern
                 if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                    // Check if value references a tracked name
                     if tracked_names.iter().any(|t| value_text.contains(t)) {
                         return Some((name_text.clone(), name_text, line, true));
                     }
                     return None;
                 }
 
-                if let Some((_matched, kind)) = classify_expr_text(&value_text, tracked_names) {
-                    let is_approx = matches!(kind, ExprMatch::Derived);
-                    return Some((name_text, value_text, line, is_approx));
+                // Check if value references any tracked name
+                if tracked_names.iter().any(|t| {
+                    value_text == *t
+                        || value_text.starts_with(&format!("{}.", t))
+                        || value_text.starts_with(&format!("{}[", t))
+                }) {
+                    return Some((name_text, value_text, line, false));
                 }
                 None
             }
@@ -3182,9 +2326,8 @@ impl CallGraph {
                 let left_text = node_text(left, source);
                 let right_text = node_text(right, source);
 
-                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
-                    let is_approx = matches!(kind, ExprMatch::Derived);
-                    return Some((left_text, right_text, line, is_approx));
+                if tracked_names.iter().any(|t| right_text == *t) {
+                    return Some((left_text, right_text, line, false));
                 }
                 None
             }
@@ -3195,22 +2338,8 @@ impl CallGraph {
                 let left_text = node_text(left, source);
                 let right_text = node_text(right, source);
 
-                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
-                    let is_approx = matches!(kind, ExprMatch::Derived);
-                    return Some((left_text, right_text, line, is_approx));
-                }
-                None
-            }
-            "assignment_statement" => {
-                // Go: x = <expr>  (tree-sitter-go wraps both sides in expression_list).
-                let left = node.child_by_field_name("left")?;
-                let right = node.child_by_field_name("right")?;
-                let left_text = node_text(left, source);
-                let right_text = node_text(right, source);
-
-                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
-                    let is_approx = matches!(kind, ExprMatch::Derived);
-                    return Some((left_text, right_text, line, is_approx));
+                if tracked_names.iter().any(|t| right_text == *t) {
+                    return Some((left_text, right_text, line, false));
                 }
                 None
             }
@@ -3225,9 +2354,8 @@ impl CallGraph {
                 let left_text = node_text(left, source);
                 let right_text = node_text(right, source);
 
-                if let Some((_matched, kind)) = classify_expr_text(&right_text, tracked_names) {
-                    let is_approx = matches!(kind, ExprMatch::Derived);
-                    return Some((left_text, right_text, line, is_approx));
+                if tracked_names.iter().any(|t| right_text == *t) {
+                    return Some((left_text, right_text, line, false));
                 }
                 None
             }
@@ -3235,27 +2363,14 @@ impl CallGraph {
         }
     }
 
-    /// Check if a call expression uses a tracked name (as an argument or as a
-    /// method receiver), and if so resolve the callee and recurse into its body
-    /// tracking the parameter name.
-    ///
-    /// Handles:
-    /// - Generalized arg matching via [`classify_expr_text`]: `x`, `&x`, `*x`
-    ///   are `Direct`; `x.F`, `x[i]`, `Foo{F: x}` are `Derived` (approximate).
-    /// - Method receivers: `x.Method(...)` where `x` is tracked binds to the
-    ///   method's receiver param (via [`extract_receiver_name`]).
-    /// - Known-writer intrinsics ([`known_writer_spec`]): e.g.
-    ///   `json.Unmarshal(data, &out)` — when the input arg is tracked, the
-    ///   pointer output arg is added as a new tracked name via a `writer` hop.
-    ///
-    /// `tracked_names` is mutable so known-writer outputs propagate to later
-    /// siblings in the same function body.
+    /// Check if a call expression uses a tracked name as an argument, and if so,
+    /// resolve the callee and recurse into its body tracking the parameter name.
     #[allow(clippy::too_many_arguments)]
     fn check_call_for_data_flow(
         &mut self,
         node: tree_sitter::Node,
         source: &str,
-        tracked_names: &mut Vec<String>,
+        tracked_names: &[String],
         file: &Path,
         _symbol: &str,
         rel_file: &str,
@@ -3266,7 +2381,70 @@ impl CallGraph {
         depth_limited: &mut bool,
         visited: &mut HashSet<(PathBuf, String, String)>,
     ) {
-        // Extract callee names (full = "pkg.Name" or "x.Method", short = "Method").
+        // Find the arguments node
+        let args_node = find_child_by_kind(node, "arguments")
+            .or_else(|| find_child_by_kind(node, "argument_list"));
+
+        let args_node = match args_node {
+            Some(n) => n,
+            None => return,
+        };
+
+        // Collect argument texts and find which position a tracked name appears at
+        let mut arg_positions: Vec<(usize, String)> = Vec::new(); // (position, tracked_name)
+        let mut arg_idx = 0;
+
+        let mut cursor = args_node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                let child_kind = child.kind();
+
+                // Skip punctuation (parentheses, commas)
+                if child_kind == "(" || child_kind == ")" || child_kind == "," {
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                    continue;
+                }
+
+                let arg_text = node_text(child, source);
+
+                // Check for spread element — approximate
+                if child_kind == "spread_element" || child_kind == "dictionary_splat" {
+                    if tracked_names.iter().any(|t| arg_text.contains(t)) {
+                        hops.push(DataFlowHop {
+                            file: rel_file.to_string(),
+                            symbol: _symbol.to_string(),
+                            variable: arg_text,
+                            line: child.start_position().row as u32 + 1,
+                            flow_type: "parameter".to_string(),
+                            approximate: true,
+                        });
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                    arg_idx += 1;
+                    continue;
+                }
+
+                if tracked_names.iter().any(|t| arg_text == *t) {
+                    arg_positions.push((arg_idx, arg_text));
+                }
+
+                arg_idx += 1;
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+
+        if arg_positions.is_empty() {
+            return;
+        }
+
+        // Resolve the callee
         let (full_callee, short_callee) = extract_callee_names(node, source);
         let full_callee = match full_callee {
             Some(f) => f,
@@ -3277,139 +2455,7 @@ impl CallGraph {
             None => return,
         };
 
-        // Detect method-call receiver: if the callee is a selector/member
-        // expression (`<base>.Method`) and `<base>` references a tracked name.
-        let receiver_match: Option<ExprMatch> =
-            node.child_by_field_name("function").and_then(|fn_node| {
-                let k = fn_node.kind();
-                if matches!(
-                    k,
-                    "selector_expression" | "member_expression" | "field_expression" | "attribute"
-                ) {
-                    let base = fn_node
-                        .child_by_field_name("operand")
-                        .or_else(|| fn_node.child_by_field_name("object"))
-                        .or_else(|| fn_node.child_by_field_name("value"));
-                    base.and_then(|b| {
-                        let text = node_text(b, source);
-                        classify_expr_text(&text, tracked_names).map(|(_, k)| k)
-                    })
-                } else {
-                    None
-                }
-            });
-
-        // Find the arguments node.
-        let args_node = find_child_by_kind(node, "arguments")
-            .or_else(|| find_child_by_kind(node, "argument_list"));
-
-        // Collect arg matches via classifier: (position, arg_text, match_kind).
-        let mut arg_matches: Vec<(usize, String, ExprMatch)> = Vec::new();
-
-        if let Some(args_node) = args_node {
-            let mut arg_idx = 0;
-            let mut cursor = args_node.walk();
-            if cursor.goto_first_child() {
-                loop {
-                    let child = cursor.node();
-                    let child_kind = child.kind();
-
-                    if child_kind == "(" || child_kind == ")" || child_kind == "," {
-                        if !cursor.goto_next_sibling() {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    let arg_text = node_text(child, source);
-
-                    // Spread / splat — approximate, no param binding (position
-                    // mapping is ambiguous).
-                    if child_kind == "spread_element" || child_kind == "dictionary_splat" {
-                        if tracked_names.iter().any(|t| arg_text.contains(t.as_str())) {
-                            hops.push(DataFlowHop {
-                                file: rel_file.to_string(),
-                                symbol: _symbol.to_string(),
-                                variable: arg_text.clone(),
-                                line: child.start_position().row as u32 + 1,
-                                flow_type: "parameter".to_string(),
-                                approximate: true,
-                            });
-                        }
-                        arg_idx += 1;
-                        if !cursor.goto_next_sibling() {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    if let Some((_matched, kind)) = classify_expr_text(&arg_text, tracked_names) {
-                        arg_matches.push((arg_idx, arg_text.clone(), kind));
-                    }
-
-                    arg_idx += 1;
-                    if !cursor.goto_next_sibling() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if arg_matches.is_empty() && receiver_match.is_none() {
-            return;
-        }
-
-        // Known-writer intrinsic: e.g. json.Unmarshal(data, &out). If a tracked
-        // name appears at an input position, mark pointer output args as new
-        // tracked names and emit "writer" hops. Skip parameter-hop recursion
-        // since the intrinsic's body isn't meaningful for the tracker.
-        if let Some((input_positions, output_positions)) = known_writer_spec(&full_callee) {
-            let tracked_at_input = arg_matches
-                .iter()
-                .any(|(pos, _, _)| input_positions.contains(pos));
-            if tracked_at_input {
-                if let Some(args_node) = args_node {
-                    let mut oarg_idx = 0;
-                    let mut oc = args_node.walk();
-                    if oc.goto_first_child() {
-                        loop {
-                            let child = oc.node();
-                            let ck = child.kind();
-                            if ck == "(" || ck == ")" || ck == "," {
-                                if !oc.goto_next_sibling() {
-                                    break;
-                                }
-                                continue;
-                            }
-                            if output_positions.contains(&oarg_idx) {
-                                let txt = node_text(child, source);
-                                let stripped = strip_ref_deref_prefix(&txt).trim().to_string();
-                                if !stripped.is_empty()
-                                    && !tracked_names.iter().any(|t| t == &stripped)
-                                {
-                                    hops.push(DataFlowHop {
-                                        file: rel_file.to_string(),
-                                        symbol: _symbol.to_string(),
-                                        variable: stripped.clone(),
-                                        line: node.start_position().row as u32 + 1,
-                                        flow_type: "writer".to_string(),
-                                        approximate: true,
-                                    });
-                                    tracked_names.push(stripped);
-                                }
-                            }
-                            oarg_idx += 1;
-                            if !oc.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Resolve the callee (cross-file via imports, else same-file lookup).
+        // Try to resolve cross-file edge
         let import_block = {
             match self.data.get(file) {
                 Some(fd) => fd.import_block.clone(),
@@ -3419,8 +2465,7 @@ impl CallGraph {
 
         let edge = self.resolve_cross_file_edge(&full_callee, &short_callee, file, &import_block);
 
-        // Unify resolution into (target_file, target_symbol, params, target_lang).
-        let resolved: Option<(PathBuf, String, Vec<String>, LangId)> = match edge {
+        match edge {
             EdgeResolution::Resolved {
                 file: target_file,
                 symbol: target_symbol,
@@ -3429,6 +2474,8 @@ impl CallGraph {
                     *depth_limited = true;
                     return;
                 }
+
+                // Build target file to get parameter info
                 if let Err(e) = self.build_file(&target_file) {
                     log::debug!(
                         "callgraph: skipping target file {}: {}",
@@ -3436,123 +2483,114 @@ impl CallGraph {
                         e
                     );
                 }
-                match self.data.get(&target_file) {
-                    Some(fd) => {
-                        let meta = fd.symbol_metadata.get(&target_symbol);
+                let (params, target_line) = {
+                    match self.lookup_file_data(&target_file) {
+                        Some(fd) => {
+                            let meta = fd.symbol_metadata.get(&target_symbol);
+                            let sig = meta.and_then(|m| m.signature.clone());
+                            let params = sig
+                                .as_deref()
+                                .map(|s| extract_parameters(s, fd.lang))
+                                .unwrap_or_default();
+                            let line = meta.map(|m| m.line).unwrap_or(1);
+                            (params, line)
+                        }
+                        None => return,
+                    }
+                };
+
+                let target_rel = self.relative_path(&target_file);
+
+                for (pos, _tracked) in &arg_positions {
+                    if let Some(param_name) = params.get(*pos) {
+                        // Add parameter hop
+                        hops.push(DataFlowHop {
+                            file: target_rel.clone(),
+                            symbol: target_symbol.clone(),
+                            variable: param_name.clone(),
+                            line: target_line,
+                            flow_type: "parameter".to_string(),
+                            approximate: false,
+                        });
+
+                        // Recurse into callee's body tracking the parameter name
+                        self.trace_data_inner(
+                            &target_file.clone(),
+                            &target_symbol.clone(),
+                            param_name,
+                            max_depth,
+                            current_depth + 1,
+                            hops,
+                            depth_limited,
+                            visited,
+                        );
+                    }
+                }
+            }
+            EdgeResolution::Unresolved { callee_name } => {
+                let local_symbol = if is_bare_callee(&full_callee, &callee_name) {
+                    self.data
+                        .get(file)
+                        .and_then(|fd| resolve_symbol_query_in_data(fd, file, &callee_name).ok())
+                } else {
+                    None
+                };
+
+                if let Some(local_symbol) = local_symbol {
+                    // Same-file bare call — get param info
+                    let (params, target_line) = {
+                        let Some(fd) = self.data.get(file) else {
+                            return;
+                        };
+                        let meta = fd.symbol_metadata.get(&local_symbol);
                         let sig = meta.and_then(|m| m.signature.clone());
                         let params = sig
                             .as_deref()
                             .map(|s| extract_parameters(s, fd.lang))
                             .unwrap_or_default();
-                        Some((target_file, target_symbol, params, fd.lang))
+                        let line = meta.map(|m| m.line).unwrap_or(1);
+                        (params, line)
+                    };
+
+                    let file_rel = self.relative_path(file);
+
+                    for (pos, _tracked) in &arg_positions {
+                        if let Some(param_name) = params.get(*pos) {
+                            hops.push(DataFlowHop {
+                                file: file_rel.clone(),
+                                symbol: local_symbol.clone(),
+                                variable: param_name.clone(),
+                                line: target_line,
+                                flow_type: "parameter".to_string(),
+                                approximate: false,
+                            });
+
+                            // Recurse into same-file function
+                            self.trace_data_inner(
+                                file,
+                                &local_symbol,
+                                param_name,
+                                max_depth,
+                                current_depth + 1,
+                                hops,
+                                depth_limited,
+                                visited,
+                            );
+                        }
                     }
-                    None => None,
-                }
-            }
-            EdgeResolution::Unresolved { callee_name } => {
-                let has_local = self
-                    .data
-                    .get(file)
-                    .map(|fd| {
-                        fd.calls_by_symbol.contains_key(&callee_name)
-                            || fd.symbol_metadata.contains_key(&callee_name)
-                    })
-                    .unwrap_or(false);
-                if !has_local {
-                    // Truly unresolved — approximate arg hops, no receiver
-                    // binding (we don't know the target), no recursion.
-                    for (_pos, arg_text, _kind) in &arg_matches {
+                } else {
+                    // Truly unresolved — approximate hop
+                    for (_pos, tracked) in &arg_positions {
                         hops.push(DataFlowHop {
                             file: self.relative_path(file),
                             symbol: callee_name.clone(),
-                            variable: arg_text.clone(),
+                            variable: tracked.clone(),
                             line: node.start_position().row as u32 + 1,
                             flow_type: "parameter".to_string(),
                             approximate: true,
                         });
                     }
-                    return;
                 }
-                if current_depth + 1 > max_depth {
-                    *depth_limited = true;
-                    return;
-                }
-                match self.data.get(file) {
-                    Some(fd) => {
-                        let meta = fd.symbol_metadata.get(&callee_name);
-                        let sig = meta.and_then(|m| m.signature.clone());
-                        let params = sig
-                            .as_deref()
-                            .map(|s| extract_parameters(s, fd.lang))
-                            .unwrap_or_default();
-                        Some((file.to_path_buf(), callee_name, params, fd.lang))
-                    }
-                    None => None,
-                }
-            }
-        };
-
-        let (target_file, target_symbol, params, target_lang) = match resolved {
-            Some(t) => t,
-            None => return,
-        };
-
-        let target_rel = self.relative_path(&target_file);
-
-        // Receiver hop: bind tracked base to the method's receiver param name.
-        if let Some(recv_kind) = receiver_match {
-            let target_sig = self
-                .data
-                .get(&target_file)
-                .and_then(|fd| fd.symbol_metadata.get(&target_symbol))
-                .and_then(|m| m.signature.clone());
-            if let Some(sig) = target_sig {
-                if let Some(recv_name) = extract_receiver_name(&sig, target_lang) {
-                    let is_approx = matches!(recv_kind, ExprMatch::Derived);
-                    hops.push(DataFlowHop {
-                        file: target_rel.clone(),
-                        symbol: target_symbol.clone(),
-                        variable: recv_name.clone(),
-                        line: get_symbol_meta(&target_file, &target_symbol).0,
-                        flow_type: "parameter".to_string(),
-                        approximate: is_approx,
-                    });
-                    self.trace_data_inner(
-                        &target_file.clone(),
-                        &target_symbol.clone(),
-                        &recv_name,
-                        max_depth,
-                        current_depth + 1,
-                        hops,
-                        depth_limited,
-                        visited,
-                    );
-                }
-            }
-        }
-
-        // Explicit-arg parameter hops (approximate iff the arg match was Derived).
-        for (pos, _arg_text, kind) in &arg_matches {
-            if let Some(param_name) = params.get(*pos) {
-                let is_approx = matches!(kind, ExprMatch::Derived);
-                hops.push(DataFlowHop {
-                    file: target_rel.clone(),
-                    symbol: target_symbol.clone(),
-                    variable: param_name.clone(),
-                    line: get_symbol_meta(&target_file, &target_symbol).0,
-                    flow_type: "parameter".to_string(),
-                    approximate: is_approx,
-                });
-                self.trace_data_inner(
-                    &target_file.clone(),
-                    &target_symbol.clone(),
-                    param_name,
-                    max_depth,
-                    current_depth + 1,
-                    hops,
-                    depth_limited,
-                    visited,
-                );
             }
         }
     }
@@ -3575,14 +2613,25 @@ impl CallGraph {
         current_depth: usize,
         visited: &mut HashSet<(PathBuf, SharedStr)>,
         result: &mut Vec<CallerSite>,
+        depth_limited: &mut bool,
+        truncated: &mut usize,
     ) {
-        if current_depth >= max_depth {
-            return;
-        }
-
         // Canonicalize for consistent reverse index lookup
         let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
         let key_symbol: SharedStr = Arc::from(symbol);
+
+        if current_depth >= max_depth {
+            let omitted = self
+                .reverse_sites(&canon, key_symbol.as_ref())
+                .map(|sites| sites.len())
+                .unwrap_or(0);
+            if omitted > 0 {
+                *depth_limited = true;
+                *truncated += omitted;
+            }
+            return;
+        }
+
         if !visited.insert((canon.clone(), Arc::clone(&key_symbol))) {
             return; // cycle detection
         }
@@ -3595,10 +2644,6 @@ impl CallGraph {
                     line: site.line,
                     col: site.col,
                     resolved: site.resolved,
-                    kind: site.kind,
-                    nearby_string: site.nearby_string.clone(),
-                    dispatched_via: site.dispatched_via.clone(),
-                    context: site.context.clone(),
                 });
                 // Recurse: find callers of the caller
                 if current_depth + 1 < max_depth {
@@ -3609,7 +2654,18 @@ impl CallGraph {
                         current_depth + 1,
                         visited,
                         result,
+                        depth_limited,
+                        truncated,
                     );
+                } else {
+                    let omitted = self
+                        .reverse_sites(site.caller_file.as_ref(), site.caller_symbol.as_ref())
+                        .map(|sites| sites.len())
+                        .unwrap_or(0);
+                    if omitted > 0 {
+                        *depth_limited = true;
+                        *truncated += omitted;
+                    }
                 }
             }
         }
@@ -3620,23 +2676,16 @@ impl CallGraph {
     /// Called by the file watcher when a file changes on disk. The reverse
     /// index is rebuilt lazily on the next `callers_of` call.
     pub fn invalidate_file(&mut self, path: &Path) {
-        // Remove from in-memory data cache (try both as-is and canonicalized)
+        // Remove from data cache (try both as-is and canonicalized)
         self.data.remove(path);
         if let Ok(canon) = self.canonicalize(path) {
             self.data.remove(&canon);
-            // Remove from persistent parse cache (also invalidates merged-graph.cbor).
-            self.cache.remove_file(&canon);
         }
-        // Also invalidate the merged graph unconditionally — even if the file
-        // was not in the parse cache (e.g. newly added file), the merged graph
-        // is stale because the set of callers may have changed.
-        self.cache.invalidate_merged_graph();
         // Clear the reverse index — it's stale
         self.reverse_index = None;
-        self.dispatch_index = None;
-        self.implementation_index = None;
         // Clear project_files cache for create/remove events
         self.project_files = None;
+        clear_workspace_package_cache();
     }
 
     /// Return a path relative to the project root, or the absolute path if
@@ -3715,21 +2764,20 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
     let import_block = imports::parse_imports(&source, &tree, lang);
 
     // Get symbols (for call site extraction and export detection)
-    let symbols = list_symbols_from_tree(&source, &tree, lang, path);
+    let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
 
     // Build calls_by_symbol
     let mut calls_by_symbol: HashMap<String, Vec<CallSite>> = HashMap::new();
     let root = tree.root_node();
 
     for sym in &symbols {
-        let byte_start = line_col_to_byte(&source, sym.start_line, sym.start_col);
-        let byte_end = line_col_to_byte(&source, sym.end_line, sym.end_col);
+        let byte_start = line_col_to_byte(&source, sym.range.start_line, sym.range.start_col);
+        let byte_end = line_col_to_byte(&source, sym.range.end_line, sym.range.end_col);
 
         let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
 
         let sites: Vec<CallSite> = raw_calls
             .into_iter()
-            .filter(|(_, short, _)| *short != sym.name) // exclude self-references
             .map(|(full, short, line)| CallSite {
                 callee_name: short,
                 full_callee: full,
@@ -3740,88 +2788,280 @@ fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
             .collect();
 
         if !sites.is_empty() {
-            calls_by_symbol.insert(sym.name.clone(), sites);
+            calls_by_symbol.insert(symbol_identity(sym), sites);
+        }
+    }
+
+    let symbol_ranges: Vec<(usize, usize)> = symbols
+        .iter()
+        .map(|sym| {
+            (
+                line_col_to_byte(&source, sym.range.start_line, sym.range.start_col),
+                line_col_to_byte(&source, sym.range.end_line, sym.range.end_col),
+            )
+        })
+        .collect();
+
+    let top_level_sites: Vec<CallSite> =
+        collect_calls_full_with_ranges(root, &source, 0, source.len(), lang)
+            .into_iter()
+            .filter(|site| {
+                !symbol_ranges
+                    .iter()
+                    .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
+            })
+            .map(|site| CallSite {
+                callee_name: site.short,
+                full_callee: site.full,
+                line: site.line,
+                byte_start: site.byte_start,
+                byte_end: site.byte_end,
+            })
+            .collect();
+
+    if !top_level_sites.is_empty() {
+        calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
+    }
+
+    let default_export = find_default_export(&source, root, path, lang);
+
+    if let Some(default_export) = &default_export {
+        if default_export.synthetic {
+            let byte_start = default_export.node.byte_range().start;
+            let byte_end = default_export.node.byte_range().end;
+            let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
+            let sites: Vec<CallSite> = raw_calls
+                .into_iter()
+                .filter(|(_, short, _)| *short != default_export.symbol)
+                .map(|(full, short, line)| CallSite {
+                    callee_name: short,
+                    full_callee: full,
+                    line,
+                    byte_start,
+                    byte_end,
+                })
+                .collect();
+            if !sites.is_empty() {
+                calls_by_symbol.insert(default_export.symbol.clone(), sites);
+            }
         }
     }
 
     // Collect exported symbol names
-    let exported_symbols: Vec<String> = symbols
+    let mut exported_symbols: Vec<String> = symbols
         .iter()
         .filter(|s| s.exported)
         .map(|s| s.name.clone())
         .collect();
+    if let Some(default_export) = &default_export {
+        if !exported_symbols
+            .iter()
+            .any(|name| name == &default_export.symbol)
+        {
+            exported_symbols.push(default_export.symbol.clone());
+        }
+    }
 
     // Build per-symbol metadata for entry point detection
-    let symbol_metadata: HashMap<String, SymbolMeta> = symbols
+    let mut symbol_metadata: HashMap<String, SymbolMeta> = symbols
         .iter()
         .map(|s| {
             (
-                s.name.clone(),
+                symbol_identity(s),
                 SymbolMeta {
                     kind: s.kind.clone(),
                     exported: s.exported,
                     signature: s.signature.clone(),
+                    line: s.range.start_line + 1,
+                    range: s.range.clone(),
                 },
             )
         })
         .collect();
+    if let Some(default_export) = &default_export {
+        symbol_metadata
+            .entry(default_export.symbol.clone())
+            .or_insert_with(|| SymbolMeta {
+                kind: default_export.kind.clone(),
+                exported: true,
+                signature: Some(first_line_signature(&source, &default_export.node)),
+                line: default_export.node.start_position().row as u32 + 1,
+                range: crate::parser::node_range(&default_export.node),
+            });
+    }
+    if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL) {
+        symbol_metadata
+            .entry(TOP_LEVEL_SYMBOL.to_string())
+            .or_insert(SymbolMeta {
+                kind: SymbolKind::Function,
+                exported: false,
+                signature: None,
+                line: 1,
+                range: Range {
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 0,
+                    end_col: 0,
+                },
+            });
+    }
 
     Ok(FileCallData {
         calls_by_symbol,
         exported_symbols,
         symbol_metadata,
+        default_export_symbol: default_export.map(|export| export.symbol),
         import_block,
         lang,
     })
 }
 
-/// Minimal symbol info needed for call graph construction.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct SymbolInfo {
-    name: String,
+#[derive(Debug, Clone)]
+struct DefaultExport<'tree> {
+    symbol: String,
+    synthetic: bool,
     kind: SymbolKind,
-    start_line: u32,
-    start_col: u32,
-    end_line: u32,
-    end_col: u32,
-    exported: bool,
-    signature: Option<String>,
+    node: Node<'tree>,
 }
 
-/// Extract symbols from a parsed tree without going through the full
-/// FileParser/AppContext machinery.
-fn list_symbols_from_tree(
-    _source: &str,
-    _tree: &Tree,
-    _lang: LangId,
+fn find_default_export<'tree>(
+    source: &str,
+    root: Node<'tree>,
     path: &Path,
-) -> Vec<SymbolInfo> {
-    // Use the parser module's symbol listing via a temporary FileParser
-    let mut file_parser = crate::parser::FileParser::new();
-    match file_parser.parse(path) {
-        Ok(_) => {}
-        Err(_) => return vec![],
+    lang: LangId,
+) -> Option<DefaultExport<'tree>> {
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        return None;
+    }
+    find_default_export_inner(source, root, path)
+}
+
+fn find_default_export_inner<'tree>(
+    source: &str,
+    node: Node<'tree>,
+    path: &Path,
+) -> Option<DefaultExport<'tree>> {
+    if node.kind() == "export_statement" {
+        if let Some(default_export) = default_export_from_statement(source, node, path) {
+            return Some(default_export);
+        }
     }
 
-    // Use the tree-sitter provider to list symbols
-    let provider = crate::parser::TreeSitterProvider::new();
-    match provider.list_symbols(path) {
-        Ok(symbols) => symbols
-            .into_iter()
-            .map(|s| SymbolInfo {
-                name: s.name,
-                kind: s.kind,
-                start_line: s.range.start_line,
-                start_col: s.range.start_col,
-                end_line: s.range.end_line,
-                end_col: s.range.end_col,
-                exported: s.exported,
-                signature: s.signature,
-            })
-            .collect(),
-        Err(_) => vec![],
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
     }
+
+    loop {
+        let child = cursor.node();
+        if let Some(default_export) = find_default_export_inner(source, child, path) {
+            return Some(default_export);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn default_export_from_statement<'tree>(
+    source: &str,
+    node: Node<'tree>,
+    path: &Path,
+) -> Option<DefaultExport<'tree>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    let mut saw_default = false;
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            "default" => saw_default = true,
+            "function_declaration" | "generator_function_declaration" | "class_declaration"
+                if saw_default =>
+            {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    return Some(DefaultExport {
+                        symbol: source[name_node.byte_range()].to_string(),
+                        synthetic: false,
+                        kind: default_export_kind(&child),
+                        node: child,
+                    });
+                }
+                return Some(DefaultExport {
+                    symbol: synthetic_default_symbol(path),
+                    synthetic: true,
+                    kind: default_export_kind(&child),
+                    node: child,
+                });
+            }
+            "arrow_function"
+            | "function"
+            | "function_expression"
+            | "class"
+            | "class_expression"
+                if saw_default =>
+            {
+                return Some(DefaultExport {
+                    symbol: synthetic_default_symbol(path),
+                    synthetic: true,
+                    kind: default_export_kind(&child),
+                    node: child,
+                });
+            }
+            "identifier" | "type_identifier" | "property_identifier" if saw_default => {
+                return Some(DefaultExport {
+                    symbol: source[child.byte_range()].to_string(),
+                    synthetic: false,
+                    kind: SymbolKind::Function,
+                    node: child,
+                });
+            }
+            _ => {}
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn default_export_kind(node: &Node) -> SymbolKind {
+    if node.kind().contains("class") {
+        SymbolKind::Class
+    } else {
+        SymbolKind::Function
+    }
+}
+
+fn synthetic_default_symbol(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    format!("<default:{file_name}>")
+}
+
+fn first_line_signature(source: &str, node: &Node) -> String {
+    let text = &source[node.byte_range()];
+    let first_line = text.lines().next().unwrap_or(text);
+    first_line
+        .trim_end()
+        .trim_end_matches('{')
+        .trim_end()
+        .to_string()
+}
+
+fn get_symbol_meta_from_data(file_data: &FileCallData, symbol_name: &str) -> (u32, Option<String>) {
+    file_data
+        .symbol_metadata
+        .get(symbol_name)
+        .map(|meta| (meta.line, meta.signature.clone()))
+        .unwrap_or((1, None))
 }
 
 /// Get symbol metadata (line, signature) from a file.
@@ -3830,63 +3070,13 @@ fn get_symbol_meta(path: &Path, symbol_name: &str) -> (u32, Option<String>) {
     match provider.list_symbols(path) {
         Ok(symbols) => {
             for s in &symbols {
-                if s.name == symbol_name {
+                if symbol_identity(s) == symbol_name || s.name == symbol_name {
                     return (s.range.start_line + 1, s.signature.clone());
                 }
             }
             (1, None)
         }
         Err(_) => (1, None),
-    }
-}
-
-fn receiver_short_name(receiver: &str) -> String {
-    let (is_pointer, trimmed) = match receiver.strip_prefix('*') {
-        Some(rest) => (true, rest),
-        None => (false, receiver),
-    };
-    let short = trimmed.rsplit('.').next().unwrap_or(trimmed);
-    if is_pointer {
-        format!("*{}", short)
-    } else {
-        short.to_string()
-    }
-}
-
-fn signature_matches_receiver(signature: &str, receiver: &str) -> bool {
-    let short = receiver_short_name(receiver);
-    let bare = short.trim_start_matches('*');
-    signature.contains(&format!("({})", bare)) || signature.contains(&format!("(*{})", bare))
-}
-
-fn get_symbol_meta_for_receiver(
-    path: &Path,
-    symbol_name: &str,
-    receiver: &str,
-) -> (u32, Option<String>) {
-    let provider = crate::parser::TreeSitterProvider::new();
-    match provider.list_symbols(path) {
-        Ok(symbols) => {
-            for s in &symbols {
-                if s.name == symbol_name
-                    && s.signature
-                        .as_deref()
-                        .is_some_and(|sig| signature_matches_receiver(sig, receiver))
-                {
-                    return (s.range.start_line + 1, s.signature.clone());
-                }
-            }
-            get_symbol_meta(path, symbol_name)
-        }
-        Err(_) => get_symbol_meta(path, symbol_name),
-    }
-}
-
-fn symbol_has_multiple_receiver_variants(path: &Path, symbol_name: &str) -> bool {
-    let provider = crate::parser::TreeSitterProvider::new();
-    match provider.list_symbols(path) {
-        Ok(symbols) => symbols.iter().filter(|s| s.name == symbol_name).count() > 1,
-        Err(_) => false,
     }
 }
 
@@ -3933,69 +3123,6 @@ fn find_node_covering_range(
     best
 }
 
-/// Find a function/method declaration node by name within a byte range.
-///
-/// The symbol-range reported by [`list_symbols_from_tree`] may include
-/// preceding doc comments that are siblings (not ancestors) of the function
-/// node. A plain covers-range lookup would fail to narrow past the source
-/// file. This helper descends the tree looking for a declaration node whose
-/// `name` field matches `symbol_name` and whose byte range is contained in
-/// `[start, end]`.
-fn find_function_decl_node<'a>(
-    root: tree_sitter::Node<'a>,
-    source: &str,
-    start: usize,
-    end: usize,
-    symbol_name: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    fn is_function_decl_kind(kind: &str) -> bool {
-        matches!(
-            kind,
-            "function_declaration"
-                | "method_declaration"
-                | "function_definition"
-                | "function_item"
-                | "method_definition"
-        )
-    }
-
-    fn node_name_matches(node: tree_sitter::Node, source: &str, name: &str) -> bool {
-        if let Some(n) = node.child_by_field_name("name") {
-            return node_text(n, source) == name;
-        }
-        false
-    }
-
-    fn dfs<'a>(
-        node: tree_sitter::Node<'a>,
-        source: &str,
-        start: usize,
-        end: usize,
-        name: &str,
-    ) -> Option<tree_sitter::Node<'a>> {
-        if node.end_byte() < start || node.start_byte() > end {
-            return None;
-        }
-        if is_function_decl_kind(node.kind()) && node_name_matches(node, source, name) {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        if cursor.goto_first_child() {
-            loop {
-                if let Some(found) = dfs(cursor.node(), source, start, end, name) {
-                    return Some(found);
-                }
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-        None
-    }
-
-    dfs(root, source, start, end, symbol_name)
-}
-
 /// Find a direct child node by kind name.
 fn find_child_by_kind<'a>(
     node: tree_sitter::Node<'a>,
@@ -4013,6 +3140,83 @@ fn find_child_by_kind<'a>(
         }
     }
     None
+}
+
+#[derive(Debug, Clone)]
+struct CallSiteWithRange {
+    full: String,
+    short: String,
+    line: u32,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+fn collect_calls_full_with_ranges(
+    root: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    lang: LangId,
+) -> Vec<CallSiteWithRange> {
+    let mut results = Vec::new();
+    let call_kinds = call_node_kinds(lang);
+    collect_calls_full_with_ranges_inner(
+        root,
+        source,
+        byte_start,
+        byte_end,
+        &call_kinds,
+        &mut results,
+    );
+    results
+}
+
+fn collect_calls_full_with_ranges_inner(
+    node: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    call_kinds: &[&str],
+    results: &mut Vec<CallSiteWithRange>,
+) {
+    let node_start = node.start_byte();
+    let node_end = node.end_byte();
+
+    if node_end <= byte_start || node_start >= byte_end {
+        return;
+    }
+
+    if call_kinds.contains(&node.kind()) && node_start >= byte_start && node_end <= byte_end {
+        if let (Some(full), Some(short)) = (
+            extract_full_callee(&node, source),
+            extract_callee_name(&node, source),
+        ) {
+            results.push(CallSiteWithRange {
+                full,
+                short,
+                line: node.start_position().row as u32 + 1,
+                byte_start: node_start,
+                byte_end: node_end,
+            });
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_calls_full_with_ranges_inner(
+                cursor.node(),
+                source,
+                byte_start,
+                byte_end,
+                call_kinds,
+                results,
+            );
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
 }
 
 /// Extract full and short callee names from a call_expression node.
@@ -4034,216 +3238,6 @@ fn extract_callee_names(node: tree_sitter::Node, source: &str) -> (Option<String
 }
 
 // ---------------------------------------------------------------------------
-// Data flow classifier — how an expression references a tracked name
-// ---------------------------------------------------------------------------
-
-/// How an expression relates to a tracked name.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ExprMatch {
-    /// Same logical value: `x`, `&x`, `*x`, `&mut x`. Flow is non-approximate.
-    Direct,
-    /// Wraps or extracts from the tracked value: `x.F`, `x[i]`, `Foo{F: x}`.
-    /// Flow is approximate because we know the value participates but don't
-    /// track which piece.
-    Derived,
-}
-
-/// Classify whether an expression text references any tracked name.
-/// Covers:
-///   - exact identifier (Direct)
-///   - reference / pointer prefix: `&x`, `*x`, `&mut x` (Direct — same value)
-///   - field / index access: `x.F`, `x[i]`, `(&x).F` (Derived)
-///   - composite / struct / object literal with a tracked name as a value
-///     (Derived — wrapped)
-///
-/// Returns `Some((matched_tracked_name, kind))` on match, `None` otherwise.
-pub(crate) fn classify_expr_text(
-    expr_text: &str,
-    tracked: &[String],
-) -> Option<(String, ExprMatch)> {
-    if tracked.is_empty() {
-        return None;
-    }
-    let t_expr = expr_text.trim();
-    let stripped = strip_ref_deref_prefix(t_expr);
-
-    // Direct: exact identifier (optionally behind &, *, &mut).
-    for t in tracked {
-        if t_expr == t.as_str() || stripped == t.as_str() {
-            return Some((t.clone(), ExprMatch::Direct));
-        }
-    }
-    // Derived: field / index access on a tracked name.
-    for t in tracked {
-        let dot = format!("{}.", t);
-        let idx = format!("{}[", t);
-        if t_expr.starts_with(&dot)
-            || t_expr.starts_with(&idx)
-            || stripped.starts_with(&dot)
-            || stripped.starts_with(&idx)
-        {
-            return Some((t.clone(), ExprMatch::Derived));
-        }
-    }
-    // Derived: composite literal containing a tracked value.
-    if let (Some(open), Some(close)) = (t_expr.find('{'), t_expr.rfind('}')) {
-        if open < close {
-            let body = &t_expr[open + 1..close];
-            if let Some(name) = literal_body_first_tracked(body, tracked) {
-                return Some((name, ExprMatch::Derived));
-            }
-        }
-    }
-    None
-}
-
-/// Strip a single `&` or `*` prefix, plus an optional `mut ` (Rust).
-fn strip_ref_deref_prefix(s: &str) -> &str {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix('&') {
-        let rest = rest.trim_start();
-        return rest
-            .strip_prefix("mut ")
-            .map(|r| r.trim_start())
-            .unwrap_or(rest);
-    }
-    if let Some(rest) = s.strip_prefix('*') {
-        return rest.trim_start();
-    }
-    s
-}
-
-/// Scan a brace-body (content between `{` and `}`) looking for a tracked name
-/// appearing as a value (not a key). Handles `key: value` and bare positional
-/// entries. Nesting-aware via a depth counter.
-fn literal_body_first_tracked(body: &str, tracked: &[String]) -> Option<String> {
-    for part in split_top_level(body, ',') {
-        let value_str = match first_top_level(&part, ':') {
-            Some(colon) => part[colon + 1..].to_string(),
-            None => part,
-        };
-        let v = strip_ref_deref_prefix(value_str.trim());
-        for t in tracked {
-            if v == t.as_str() {
-                return Some(t.clone());
-            }
-            let dot = format!("{}.", t);
-            let idx = format!("{}[", t);
-            if v.starts_with(&dot) || v.starts_with(&idx) {
-                return Some(t.clone());
-            }
-        }
-    }
-    None
-}
-
-fn split_top_level(s: &str, sep: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth: i32 = 0;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            ch if ch == sep && depth == 0 => {
-                out.push(s[start..i].to_string());
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    if start < s.len() {
-        out.push(s[start..].to_string());
-    }
-    out
-}
-
-fn first_top_level(s: &str, sep: char) -> Option<usize> {
-    let mut depth: i32 = 0;
-    for (i, c) in s.char_indices() {
-        if c == sep && depth == 0 {
-            return Some(i);
-        }
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Method receiver name extraction
-// ---------------------------------------------------------------------------
-
-/// Extract the receiver parameter name from a method signature.
-///
-/// - Go: `func (u *User) Method(...)` → `Some("u")`
-/// - Rust: `fn method(&self, ...)` / `fn method(&mut self, ...)` / `fn method(self, ...)` → `Some("self")`
-/// - Other languages or non-methods: `None`
-pub(crate) fn extract_receiver_name(signature: &str, lang: LangId) -> Option<String> {
-    let sig = signature.trim();
-    match lang {
-        LangId::Go => {
-            // Expect: "func (recv Type) Name(...)"
-            let rest = sig.strip_prefix("func ")?.trim_start();
-            if !rest.starts_with('(') {
-                return None;
-            }
-            let close = first_top_level(&rest[1..], ')')?;
-            let recv_text = &rest[1..1 + close];
-            // recv_text is like "u *User" or "u User" or "User" (anonymous recv)
-            let parts: Vec<&str> = recv_text.split_whitespace().collect();
-            if parts.len() >= 2 {
-                Some(parts[0].to_string())
-            } else {
-                None
-            }
-        }
-        LangId::Rust => {
-            let paren_pos = sig.find('(')?;
-            let after = &sig[paren_pos + 1..];
-            let close = first_top_level(after, ')')?;
-            let params = &after[..close];
-            let first = params.split(',').next()?.trim();
-            let normalized = first
-                .trim_start_matches('&')
-                .trim_start()
-                .trim_start_matches("mut ")
-                .trim();
-            if normalized == "self"
-                || normalized.starts_with("self:")
-                || normalized.starts_with("self ")
-            {
-                Some("self".to_string())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Known-writer intrinsics — functions that write an input into a pointer arg
-// ---------------------------------------------------------------------------
-
-/// For a known writer function, returns `(input_positions, output_positions)`
-/// where data at `input_positions` flows into pointer args at
-/// `output_positions`.
-///
-/// Example: `json.Unmarshal(data, &out)` → input=\[0\], output=\[1\].
-pub(crate) fn known_writer_spec(full_callee: &str) -> Option<(Vec<usize>, Vec<usize>)> {
-    match full_callee {
-        // Go: Unmarshal-family — (data, &out)
-        "json.Unmarshal" | "yaml.Unmarshal" | "xml.Unmarshal" | "toml.Unmarshal"
-        | "proto.Unmarshal" | "bson.Unmarshal" | "msgpack.Unmarshal" => Some((vec![0], vec![1])),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Module path resolution
 // ---------------------------------------------------------------------------
 
@@ -4251,22 +3245,37 @@ pub(crate) fn known_writer_spec(full_callee: &str) -> Option<(Vec<usize>, Vec<us
 ///
 /// Tries common file extensions for TypeScript/JavaScript projects.
 pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
-    // Only handle relative imports
-    if !module_path.starts_with('.') {
+    if module_path.starts_with('.') {
+        return resolve_relative_module_path(from_dir, module_path);
+    }
+
+    if module_path.starts_with('/') {
         return None;
     }
 
+    if let Some(path) = resolve_tsconfig_path(from_dir, module_path) {
+        return Some(path);
+    }
+
+    resolve_workspace_module_path(from_dir, module_path)
+}
+
+fn resolve_relative_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
     let base = from_dir.join(module_path);
+    resolve_file_like_path(&base)
+}
+
+fn resolve_file_like_path(base: &Path) -> Option<PathBuf> {
+    let base = base.to_path_buf();
 
     // Try exact path first
     if base.is_file() {
         return Some(std::fs::canonicalize(&base).unwrap_or(base));
     }
 
-    // Try common extensions
-    let extensions = [".ts", ".tsx", ".js", ".jsx"];
-    for ext in &extensions {
-        let with_ext = base.with_extension(ext.trim_start_matches('.'));
+    // Try common extensions, including ESM/CJS TypeScript pairs used by workspaces.
+    for ext in JS_TS_EXTENSIONS {
+        let with_ext = base.with_extension(ext);
         if with_ext.is_file() {
             return Some(std::fs::canonicalize(&with_ext).unwrap_or(with_ext));
         }
@@ -4282,10 +3291,1237 @@ pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<
     None
 }
 
+fn resolve_workspace_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    let (package_name, subpath) = split_package_import(module_path)?;
+    let package_root = find_package_root_for_import(from_dir, &package_name)?;
+    resolve_package_entry(&package_root, &subpath)
+}
+
+fn is_rust_source_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+}
+
+fn resolve_rust_cross_file_edge<F>(
+    full_callee: &str,
+    short_name: &str,
+    caller_file: &Path,
+    import_block: &ImportBlock,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if let Some(target) = resolve_rust_qualified_call(caller_file, full_callee, file_exports_symbol)
+    {
+        return Some(target);
+    }
+
+    resolve_rust_imported_call(
+        caller_file,
+        full_callee,
+        short_name,
+        import_block,
+        file_exports_symbol,
+    )
+}
+
+fn resolve_rust_qualified_call<F>(
+    caller_file: &Path,
+    full_callee: &str,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if !full_callee.contains("::") {
+        return None;
+    }
+
+    let segments = rust_path_segments(full_callee)?;
+    resolve_rust_call_segments(caller_file, &segments, file_exports_symbol)
+}
+
+fn resolve_rust_imported_call<F>(
+    caller_file: &Path,
+    full_callee: &str,
+    short_name: &str,
+    import_block: &ImportBlock,
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    let call_segments = rust_path_segments(full_callee).unwrap_or_default();
+    let bare_call_name = if call_segments.len() <= 1 {
+        call_segments
+            .first()
+            .map(String::as_str)
+            .unwrap_or(short_name)
+    } else {
+        short_name
+    };
+
+    for imp in &import_block.imports {
+        for entry in rust_use_entries(imp) {
+            match &entry.kind {
+                RustUseKind::Item { imported_name } if call_segments.len() <= 1 => {
+                    if entry.local_name != bare_call_name {
+                        continue;
+                    }
+                    let Some(file) = resolve_rust_module_path(caller_file, &entry.module_path)
+                    else {
+                        continue;
+                    };
+                    if file_exports_symbol(&file, imported_name) {
+                        return Some(ResolvedSymbol {
+                            file,
+                            symbol: imported_name.clone(),
+                        });
+                    }
+                }
+                RustUseKind::Module if call_segments.len() >= 2 => {
+                    if call_segments.first().map(String::as_str) != Some(entry.local_name.as_str())
+                    {
+                        continue;
+                    }
+                    let symbol = call_segments.last()?.clone();
+                    let mut module_path = entry.module_path.clone();
+                    for segment in &call_segments[1..call_segments.len().saturating_sub(1)] {
+                        module_path.push_str("::");
+                        module_path.push_str(segment);
+                    }
+                    let Some(file) = resolve_rust_module_path(caller_file, &module_path) else {
+                        continue;
+                    };
+                    if file_exports_symbol(&file, &symbol) {
+                        return Some(ResolvedSymbol { file, symbol });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_rust_call_segments<F>(
+    caller_file: &Path,
+    segments: &[String],
+    file_exports_symbol: &mut F,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+{
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let symbol = segments.last()?.clone();
+    let module_path = segments[..segments.len() - 1].join("::");
+    let file = resolve_rust_module_path(caller_file, &module_path)?;
+    if file_exports_symbol(&file, &symbol) {
+        Some(ResolvedSymbol { file, symbol })
+    } else {
+        None
+    }
+}
+
+fn resolve_rust_module_path(caller_file: &Path, module_path: &str) -> Option<PathBuf> {
+    let segments = rust_path_segments(module_path)?;
+    let first = segments.first()?.as_str();
+
+    match first {
+        "std" | "core" | "alloc" => None,
+        "crate" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            resolve_rust_module_segments(&base, &segments[1..])
+        }
+        "self" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            if segments.len() == 1 {
+                return Some(canonicalize_path(caller_file));
+            }
+            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            target_segments.extend(segments[1..].iter().cloned());
+            resolve_rust_module_segments(&base, &target_segments)
+        }
+        "super" => {
+            let crate_root = find_rust_crate_root(caller_file)?;
+            let crate_info = rust_crate_info(&crate_root)?;
+            let base = rust_module_base_for_caller(&crate_info, caller_file)?;
+            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            target_segments.pop();
+            target_segments.extend(segments[1..].iter().cloned());
+            resolve_rust_module_segments(&base, &target_segments)
+        }
+        crate_name => {
+            let caller_dir = caller_file.parent().unwrap_or_else(|| Path::new("."));
+            let workspace_crates = rust_workspace_crates(caller_dir)?;
+            let crate_info = workspace_crates.get(crate_name)?;
+            let base = rust_lib_module_base(crate_info)?;
+            resolve_rust_module_segments(&base, &segments[1..])
+        }
+    }
+}
+
+fn rust_use_entries(imp: &imports::ImportStatement) -> Vec<RustUseEntry> {
+    let Some(body) = rust_use_body(&imp.raw_text) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    expand_rust_use_tree(body, &mut entries);
+    entries
+}
+
+fn rust_use_body(raw: &str) -> Option<&str> {
+    let use_pos = raw.find("use ")?;
+    let body = raw[use_pos + 4..].trim();
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+    (!body.is_empty()).then_some(body)
+}
+
+fn expand_rust_use_tree(path: &str, entries: &mut Vec<RustUseEntry>) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+
+    if let Some((prefix, inner)) = split_rust_use_braces(path) {
+        let prefix = prefix.trim().trim_end_matches("::").trim();
+        for part in split_top_level_commas(inner) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part == "self" {
+                if let Some(local_name) = rust_last_path_segment(prefix) {
+                    entries.push(RustUseEntry {
+                        module_path: prefix.to_string(),
+                        local_name,
+                        kind: RustUseKind::Module,
+                    });
+                }
+                continue;
+            }
+            let combined = if prefix.is_empty() {
+                part.to_string()
+            } else {
+                format!("{prefix}::{part}")
+            };
+            expand_rust_use_tree(&combined, entries);
+        }
+        return;
+    }
+
+    add_rust_use_leaf(path, entries);
+}
+
+fn split_rust_use_braces(path: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (idx, ch) in path.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let start = start?;
+                    if !path[idx + ch.len_utf8()..].trim().is_empty() {
+                        return None;
+                    }
+                    return Some((&path[..start], &path[start + 1..idx]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&value[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+fn add_rust_use_leaf(path: &str, entries: &mut Vec<RustUseEntry>) {
+    let (path, alias) = split_rust_alias(path);
+    let Some(segments) = rust_path_segments(path) else {
+        return;
+    };
+    if segments.is_empty() || segments.last().map(String::as_str) == Some("*") {
+        return;
+    }
+
+    let imported_name = segments.last().cloned().unwrap_or_default();
+    let local_name = alias.unwrap_or(&imported_name).to_string();
+    if segments.len() >= 2 {
+        entries.push(RustUseEntry {
+            module_path: segments[..segments.len() - 1].join("::"),
+            local_name: local_name.clone(),
+            kind: RustUseKind::Item {
+                imported_name: imported_name.clone(),
+            },
+        });
+    }
+
+    entries.push(RustUseEntry {
+        module_path: segments.join("::"),
+        local_name,
+        kind: RustUseKind::Module,
+    });
+}
+
+fn split_rust_alias(path: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = path.rfind(" as ") {
+        let original = path[..idx].trim();
+        let alias = path[idx + 4..].trim();
+        if !original.is_empty() && !alias.is_empty() {
+            return (original, Some(alias));
+        }
+    }
+    (path.trim(), None)
+}
+
+fn rust_path_segments(path: &str) -> Option<Vec<String>> {
+    let path = path.trim().trim_end_matches(';').trim();
+    if path.is_empty() || path.contains('{') || path.contains('}') {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    for raw_segment in path.split("::") {
+        let segment = raw_segment.trim();
+        if segment.is_empty() || segment == "*" || segment.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let segment = segment.strip_prefix("r#").unwrap_or(segment);
+        if segment
+            .chars()
+            .any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        {
+            return None;
+        }
+        segments.push(segment.to_string());
+    }
+
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn rust_last_path_segment(path: &str) -> Option<String> {
+    rust_path_segments(path)?.last().cloned()
+}
+
+fn find_rust_crate_root(from: &Path) -> Option<PathBuf> {
+    let mut current = if from.is_file() {
+        from.parent()
+    } else {
+        Some(from)
+    };
+    while let Some(dir) = current {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(canonicalize_path(dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
+    let root = canonicalize_path(crate_root);
+    if let Some(cached) = RUST_CRATE_INFO_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&root).cloned())
+    {
+        return cached;
+    }
+
+    let resolved = read_rust_crate_info(&root);
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.insert(root, resolved.clone());
+    }
+    resolved
+}
+
+fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
+    let cargo = rust_manifest_value(&crate_root.join("Cargo.toml"))?;
+    let package = cargo.get("package")?;
+    let package_name = package.get("name")?.as_str()?;
+    let lib_name = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(|name| name.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| package_name.replace('-', "_"));
+
+    let lib_root = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("path"))
+        .and_then(|path| path.as_str())
+        .map(|path| crate_root.join(path))
+        .unwrap_or_else(|| crate_root.join("src/lib.rs"));
+    let lib_root = lib_root.is_file().then(|| canonicalize_path(&lib_root));
+
+    let main_root = crate_root.join("src/main.rs");
+    let main_root = main_root.is_file().then(|| canonicalize_path(&main_root));
+
+    Some(RustCrateInfo {
+        lib_name,
+        lib_root,
+        main_root,
+    })
+}
+
+fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
+    let source = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&source).ok()
+}
+
+fn rust_module_base_for_caller(
+    crate_info: &RustCrateInfo,
+    caller_file: &Path,
+) -> Option<RustModuleBase> {
+    let caller = canonicalize_path(caller_file);
+    if crate_info.main_root.as_ref() == Some(&caller) {
+        return rust_main_module_base(crate_info);
+    }
+    rust_lib_module_base(crate_info).or_else(|| rust_main_module_base(crate_info))
+}
+
+fn rust_lib_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
+    let root_file = crate_info.lib_root.clone()?;
+    let src_dir = root_file.parent()?.to_path_buf();
+    Some(RustModuleBase { src_dir, root_file })
+}
+
+fn rust_main_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
+    let root_file = crate_info.main_root.clone()?;
+    let src_dir = root_file.parent()?.to_path_buf();
+    Some(RustModuleBase { src_dir, root_file })
+}
+
+fn resolve_rust_module_segments(base: &RustModuleBase, segments: &[String]) -> Option<PathBuf> {
+    if segments.is_empty() {
+        return Some(base.root_file.clone());
+    }
+
+    let module_base = segments
+        .iter()
+        .fold(base.src_dir.clone(), |path, segment| path.join(segment));
+    let file_path = module_base.with_extension("rs");
+    if file_path.is_file() {
+        return Some(canonicalize_path(&file_path));
+    }
+
+    let mod_path = module_base.join("mod.rs");
+    if mod_path.is_file() {
+        return Some(canonicalize_path(&mod_path));
+    }
+
+    None
+}
+
+fn rust_module_segments_for_file(src_dir: &Path, file: &Path) -> Option<Vec<String>> {
+    let src_dir = canonicalize_path(src_dir);
+    let file = canonicalize_path(file);
+    let rel = file.strip_prefix(&src_dir).ok()?;
+    let mut parts: Vec<String> = rel
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let last = parts.pop()?;
+    if last == "lib.rs" || last == "main.rs" {
+        return Some(Vec::new());
+    }
+    if last == "mod.rs" {
+        return Some(parts);
+    }
+    let stem = Path::new(&last).file_stem()?.to_str()?.to_string();
+    parts.push(stem);
+    Some(parts)
+}
+
+fn rust_workspace_crates(from_dir: &Path) -> Option<HashMap<String, RustCrateInfo>> {
+    let workspace_root =
+        find_rust_workspace_root(from_dir).or_else(|| find_rust_crate_root(from_dir))?;
+    let workspace_root = canonicalize_path(&workspace_root);
+
+    if let Some(cached) = RUST_WORKSPACE_CRATE_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(&workspace_root).cloned())
+    {
+        return Some(cached);
+    }
+
+    let mut crates = HashMap::new();
+    for member in rust_workspace_member_dirs(&workspace_root) {
+        if let Some(info) = rust_crate_info(&member) {
+            if info.lib_root.is_some() {
+                crates.insert(info.lib_name.clone(), info);
+            }
+        }
+    }
+    if let Some(info) = rust_crate_info(&workspace_root) {
+        if info.lib_root.is_some() {
+            crates.insert(info.lib_name.clone(), info);
+        }
+    }
+
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.insert(workspace_root, crates.clone());
+    }
+    Some(crates)
+}
+
+fn find_rust_workspace_root(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        let cargo = dir.join("Cargo.toml");
+        if rust_manifest_value(&cargo)
+            .and_then(|value| value.get("workspace").cloned())
+            .is_some()
+        {
+            return Some(canonicalize_path(dir));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn rust_workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(cargo) = rust_manifest_value(&workspace_root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Some(members) = cargo
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|members| members.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut dirs = Vec::new();
+    for member in members.iter().filter_map(|member| member.as_str()) {
+        dirs.extend(expand_rust_workspace_member(workspace_root, member));
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn expand_rust_workspace_member(workspace_root: &Path, member: &str) -> Vec<PathBuf> {
+    let member = member.trim();
+    if member.is_empty() {
+        return Vec::new();
+    }
+
+    if member.contains('*') || member.contains('?') || member.contains('[') {
+        let pattern = workspace_root.join(member).to_string_lossy().to_string();
+        return glob::glob(&pattern)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|path| path.join("Cargo.toml").is_file())
+            .map(|path| canonicalize_path(&path))
+            .collect();
+    }
+
+    let path = workspace_root.join(member);
+    if path.join("Cargo.toml").is_file() {
+        vec![canonicalize_path(&path)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn canonicalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolve_tsconfig_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    let tsconfig_dir = find_tsconfig_dir(from_dir)?;
+    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"))?;
+    let compiler_options = tsconfig.get("compilerOptions")?;
+    let paths = compiler_options.get("paths")?.as_object()?;
+    let base_url = compiler_options
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let base_dir = tsconfig_dir.join(base_url);
+
+    for (alias, targets) in paths {
+        let Some(capture) = ts_path_capture(alias, module_path) else {
+            continue;
+        };
+        let Some(targets) = targets.as_array() else {
+            continue;
+        };
+        for target in targets.iter().filter_map(Value::as_str) {
+            let target = if target.contains('*') {
+                target.replace('*', capture)
+            } else {
+                target.to_string()
+            };
+            if let Some(path) = resolve_file_like_path(&base_dir.join(target)) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn find_tsconfig_dir(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        if dir.join("tsconfig.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
+    if let Some(star_index) = alias.find('*') {
+        let (prefix, suffix_with_star) = alias.split_at(star_index);
+        let suffix = &suffix_with_star[1..];
+        if module_path.starts_with(prefix) && module_path.ends_with(suffix) {
+            return Some(&module_path[prefix.len()..module_path.len() - suffix.len()]);
+        }
+        return None;
+    }
+
+    (alias == module_path).then_some("")
+}
+
+fn split_package_import(module_path: &str) -> Option<(String, Option<String>)> {
+    let mut parts = module_path.split('/');
+    let first = parts.next()?;
+    if first.is_empty() {
+        return None;
+    }
+
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        if second.is_empty() {
+            return None;
+        }
+        let package_name = format!("{first}/{second}");
+        let subpath = parts.collect::<Vec<_>>().join("/");
+        let subpath = (!subpath.is_empty()).then_some(subpath);
+        Some((package_name, subpath))
+    } else {
+        let package_name = first.to_string();
+        let subpath = parts.collect::<Vec<_>>().join("/");
+        let subpath = (!subpath.is_empty()).then_some(subpath);
+        Some((package_name, subpath))
+    }
+}
+
+fn find_package_root_for_import(from_dir: &Path, package_name: &str) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        if package_json_name(dir).as_deref() == Some(package_name) {
+            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        current = dir.parent();
+    }
+
+    find_workspace_root(from_dir)
+        .and_then(|workspace_root| resolve_workspace_package(&workspace_root, package_name))
+}
+
+fn find_workspace_root(from_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(from_dir);
+    while let Some(dir) = current {
+        if is_workspace_root(dir) {
+            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn is_workspace_root(dir: &Path) -> bool {
+    package_json_value(dir)
+        .map(|value| !workspace_patterns(&value).is_empty())
+        .unwrap_or(false)
+        || !pnpm_workspace_patterns(dir).is_empty()
+}
+
+fn clear_workspace_package_cache() {
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.clear();
+    }
+}
+
+fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Option<PathBuf> {
+    let workspace_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let cache_key = (workspace_root.clone(), package_name.to_string());
+
+    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return cached.clone();
+        }
+    }
+
+    let resolved = workspace_member_dirs(&workspace_root)
+        .into_iter()
+        .find(|dir| package_json_name(dir).as_deref() == Some(package_name))
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
+
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.insert(cache_key, resolved.clone());
+    }
+
+    resolved
+}
+
+fn workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut patterns = package_json_value(workspace_root)
+        .map(|package_json| workspace_patterns(&package_json))
+        .unwrap_or_default();
+    patterns.extend(pnpm_workspace_patterns(workspace_root));
+
+    expand_workspace_patterns(workspace_root, &patterns)
+}
+
+fn workspace_patterns(package_json: &Value) -> Vec<String> {
+    match package_json.get("workspaces") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(non_empty_workspace_pattern)
+            .collect(),
+        Some(Value::Object(map)) => map
+            .get("packages")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(non_empty_workspace_pattern)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn non_empty_workspace_pattern(value: &Value) -> Option<String> {
+    let pattern = value.as_str()?.trim();
+    (!pattern.is_empty()).then(|| pattern.to_string())
+}
+
+fn pnpm_workspace_patterns(workspace_root: &Path) -> Vec<String> {
+    let Ok(source) = std::fs::read_to_string(workspace_root.join("pnpm-workspace.yaml")) else {
+        return Vec::new();
+    };
+
+    let mut patterns = Vec::new();
+    let mut in_packages = false;
+    for line in source.lines() {
+        let without_comment = line.split('#').next().unwrap_or("").trim_end();
+        let trimmed = without_comment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "packages:" {
+            in_packages = true;
+            continue;
+        }
+        if !trimmed.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
+            in_packages = false;
+        }
+        if in_packages {
+            if let Some(pattern) = trimmed.strip_prefix('-') {
+                let pattern = pattern.trim().trim_matches('"').trim_matches('\'');
+                if !pattern.is_empty() {
+                    patterns.push(pattern.to_string());
+                }
+            }
+        }
+    }
+    patterns
+}
+
+fn expand_workspace_patterns(workspace_root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let positive_patterns: Vec<&str> = patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty() && !pattern.starts_with('!'))
+        .collect();
+    if positive_patterns.is_empty() {
+        return Vec::new();
+    }
+
+    let positives = build_glob_set(&positive_patterns);
+    let negative_patterns: Vec<&str> = patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter_map(|pattern| pattern.strip_prefix('!'))
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .collect();
+    let negatives = build_glob_set(&negative_patterns);
+
+    let mut members = Vec::new();
+    collect_workspace_member_dirs(
+        workspace_root,
+        workspace_root,
+        &positives,
+        &negatives,
+        &mut members,
+    );
+    members
+}
+
+fn build_glob_set(patterns: &[&str]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        if let Ok(glob) = Glob::new(pattern) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+}
+
+fn collect_workspace_member_dirs(
+    workspace_root: &Path,
+    dir: &Path,
+    positives: &GlobSet,
+    negatives: &GlobSet,
+    members: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "node_modules" | ".git" | "target" | "dist" | "build"
+        ) {
+            continue;
+        }
+
+        if path.join("package.json").is_file() {
+            if let Ok(rel) = path.strip_prefix(workspace_root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if positives.is_match(&rel) && !negatives.is_match(&rel) {
+                    members.push(path.clone());
+                }
+            }
+        }
+
+        collect_workspace_member_dirs(workspace_root, &path, positives, negatives, members);
+    }
+}
+
+fn package_json_value(dir: &Path) -> Option<Value> {
+    package_json_like_value(&dir.join("package.json"))
+}
+
+fn package_json_like_value(path: &Path) -> Option<Value> {
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+fn package_json_name(dir: &Path) -> Option<String> {
+    package_json_value(dir)?
+        .get("name")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_package_entry(package_root: &Path, subpath: &Option<String>) -> Option<PathBuf> {
+    let package_json = package_json_value(package_root).unwrap_or(Value::Null);
+
+    if let Some(exports) = package_json.get("exports") {
+        if let Some(target) = export_target_for_subpath(exports, subpath.as_deref()) {
+            if let Some(path) = resolve_package_target(package_root, &target) {
+                return Some(path);
+            }
+        }
+    }
+
+    if subpath.is_none() {
+        for field in ["module", "main"] {
+            if let Some(target) = package_json.get(field).and_then(Value::as_str) {
+                if let Some(path) = resolve_package_target(package_root, target) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    resolve_package_fallback(package_root, subpath.as_deref())
+}
+
+fn export_target_for_subpath(exports: &Value, subpath: Option<&str>) -> Option<String> {
+    let key = subpath
+        .map(|value| format!("./{value}"))
+        .unwrap_or_else(|| ".".to_string());
+
+    match exports {
+        Value::String(target) if key == "." => Some(target.clone()),
+        Value::Object(map) => {
+            if let Some(target) = map.get(&key).and_then(export_condition_target) {
+                return Some(target);
+            }
+
+            if let Some(target) = wildcard_export_target(map, &key) {
+                return Some(target);
+            }
+
+            if key == "." && !map.contains_key(".") && !map.keys().any(|k| k.starts_with("./")) {
+                return export_condition_target(exports);
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn wildcard_export_target(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    for (pattern, target) in map {
+        let Some(star_index) = pattern.find('*') else {
+            continue;
+        };
+        let (prefix, suffix_with_star) = pattern.split_at(star_index);
+        let suffix = &suffix_with_star[1..];
+        if !key.starts_with(prefix) || !key.ends_with(suffix) {
+            continue;
+        }
+        let matched = &key[prefix.len()..key.len() - suffix.len()];
+        if let Some(target_pattern) = export_condition_target(target) {
+            return Some(target_pattern.replace('*', matched));
+        }
+    }
+    None
+}
+
+fn export_condition_target(value: &Value) -> Option<String> {
+    match value {
+        Value::String(target) => Some(target.clone()),
+        Value::Object(map) => ["source", "import", "module", "default", "types"]
+            .into_iter()
+            .find_map(|field| map.get(field).and_then(export_condition_target)),
+        _ => None,
+    }
+}
+
+fn resolve_package_target(package_root: &Path, target: &str) -> Option<PathBuf> {
+    let target = target.strip_prefix("./").unwrap_or(target);
+    // Prefer source over compiled bundle when both exist: the callgraph
+    // walks source files and cannot extract symbols from a built JS bundle.
+    if let Some(src_relative) = target.strip_prefix("dist/") {
+        if let Some(path) = resolve_file_like_path(&package_root.join("src").join(src_relative)) {
+            return Some(path);
+        }
+    }
+
+    resolve_file_like_path(&package_root.join(target))
+}
+
+fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Option<PathBuf> {
+    match subpath {
+        Some(subpath) => resolve_file_like_path(&package_root.join(subpath))
+            .or_else(|| resolve_file_like_path(&package_root.join("src").join(subpath))),
+        None => resolve_file_like_path(&package_root.join("src").join("index"))
+            .or_else(|| resolve_file_like_path(&package_root.join("index"))),
+    }
+}
+
+pub(crate) fn resolve_reexported_symbol_target<F, D>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+) -> Option<(PathBuf, String)>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    resolve_reexported_symbol(
+        file,
+        symbol_name,
+        file_exports_symbol,
+        file_default_export_symbol,
+    )
+    .map(|target| (target.file, target.symbol))
+}
+
+fn resolve_reexported_symbol<F, D>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    let mut visited = HashSet::new();
+    resolve_reexported_symbol_inner(
+        file,
+        symbol_name,
+        file_exports_symbol,
+        file_default_export_symbol,
+        &mut visited,
+    )
+}
+
+fn resolve_reexported_symbol_inner<F, D>(
+    file: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    if !visited.insert((canon.clone(), symbol_name.to_string())) {
+        return None;
+    }
+
+    let source = std::fs::read_to_string(&canon).ok()?;
+    let lang = detect_language(&canon)?;
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        if symbol_name == "default" {
+            return file_default_export_symbol(&canon).map(|symbol| ResolvedSymbol {
+                file: canon,
+                symbol,
+            });
+        }
+        return file_exports_symbol(&canon, symbol_name).then(|| ResolvedSymbol {
+            file: canon,
+            symbol: symbol_name.to_string(),
+        });
+    }
+
+    let grammar = grammar_for(lang);
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(&source, None)?;
+    let from_dir = canon.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut cursor = tree.root_node().walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "export_statement" {
+            if let Some(target) = resolve_reexport_statement(
+                &source,
+                node,
+                from_dir,
+                symbol_name,
+                file_exports_symbol,
+                file_default_export_symbol,
+                visited,
+            ) {
+                return Some(target);
+            }
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    if symbol_name == "default" {
+        if let Some(symbol) = file_default_export_symbol(&canon) {
+            return Some(ResolvedSymbol {
+                file: canon,
+                symbol,
+            });
+        }
+    }
+
+    if let Some(symbol) = resolve_local_export_alias(&source, &canon, symbol_name) {
+        return Some(ResolvedSymbol {
+            file: canon,
+            symbol,
+        });
+    }
+
+    if file_exports_symbol(&canon, symbol_name) {
+        let symbol = symbol_name.to_string();
+        return Some(ResolvedSymbol {
+            file: canon,
+            symbol,
+        });
+    }
+
+    None
+}
+
+fn resolve_reexport_statement<F, D>(
+    source: &str,
+    node: tree_sitter::Node,
+    from_dir: &Path,
+    symbol_name: &str,
+    file_exports_symbol: &mut F,
+    file_default_export_symbol: &mut D,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<ResolvedSymbol>
+where
+    F: FnMut(&Path, &str) -> bool,
+    D: FnMut(&Path) -> Option<String>,
+{
+    let source_node = node
+        .child_by_field_name("source")
+        .or_else(|| find_child_by_kind(node, "string"))?;
+    let module_path = string_literal_content(source, source_node)?;
+    let target_file = resolve_module_path(from_dir, &module_path)?;
+    let raw_export = node_text(node, source);
+
+    if let Some(source_symbol) = reexport_clause_source_symbol(&raw_export, symbol_name) {
+        return resolve_reexported_symbol_inner(
+            &target_file,
+            &source_symbol,
+            file_exports_symbol,
+            file_default_export_symbol,
+            visited,
+        )
+        .or(Some(ResolvedSymbol {
+            file: target_file,
+            symbol: source_symbol,
+        }));
+    }
+
+    if raw_export.contains('*') {
+        return resolve_reexported_symbol_inner(
+            &target_file,
+            symbol_name,
+            file_exports_symbol,
+            file_default_export_symbol,
+            visited,
+        );
+    }
+
+    None
+}
+
+fn resolve_local_export_alias(source: &str, file: &Path, requested_export: &str) -> Option<String> {
+    let lang = detect_language(file)?;
+    let grammar = grammar_for(lang);
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+
+    let mut cursor = tree.root_node().walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let node = cursor.node();
+        if node.kind() == "export_statement" && node.child_by_field_name("source").is_none() {
+            let raw_export = node_text(node, source);
+            if let Some(source_symbol) =
+                reexport_clause_source_symbol(&raw_export, requested_export)
+            {
+                return Some(source_symbol);
+            }
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn reexport_clause_source_symbol(raw_export: &str, requested_export: &str) -> Option<String> {
+    let start = raw_export.find('{')? + 1;
+    let end = raw_export[start..].find('}')? + start;
+    for specifier in raw_export[start..end].split(',') {
+        let specifier = specifier.trim();
+        if specifier.is_empty() {
+            continue;
+        }
+        let specifier = specifier.strip_prefix("type ").unwrap_or(specifier).trim();
+        if let Some((imported, exported)) = specifier.split_once(" as ") {
+            if exported.trim() == requested_export {
+                return Some(imported.trim().to_string());
+            }
+        } else if specifier == requested_export {
+            return Some(requested_export.to_string());
+        }
+    }
+    None
+}
+
+fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<String> {
+    let raw = source[node.byte_range()].trim();
+    let quote = raw.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    raw.strip_prefix(quote)
+        .and_then(|value| value.strip_suffix(quote))
+        .map(ToOwned::to_owned)
+}
+
 /// Find an index file in a directory.
 fn find_index_file(dir: &Path) -> Option<PathBuf> {
-    let candidates = ["index.ts", "index.tsx", "index.js", "index.jsx"];
-    for name in &candidates {
+    for name in JS_TS_INDEX_FILES {
         let p = dir.join(name);
         if p.is_file() {
             return Some(std::fs::canonicalize(&p).unwrap_or(p));
@@ -4377,6 +4613,50 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn symbol_metadata_for_recovers_scoped_method_by_bare_name() {
+        // exported_symbols carries the bare name; symbol_metadata is keyed by
+        // scoped identity (impl method). A plain .get(bare) misses and would
+        // force the degraded unknown/line-1 fallback. symbol_metadata_for must
+        // recover the scoped entry via unqualified-name match.
+        let mut symbol_metadata = HashMap::new();
+        symbol_metadata.insert(
+            "BackupStore::total_disk_bytes".to_string(),
+            SymbolMeta {
+                kind: SymbolKind::Method,
+                exported: true,
+                signature: None,
+                line: 703,
+                range: Range {
+                    start_line: 702,
+                    start_col: 0,
+                    end_line: 705,
+                    end_col: 0,
+                },
+            },
+        );
+        let file_data = FileCallData {
+            calls_by_symbol: HashMap::new(),
+            exported_symbols: vec!["total_disk_bytes".to_string()],
+            symbol_metadata,
+            default_export_symbol: None,
+            import_block: ImportBlock::empty(),
+            lang: LangId::Rust,
+        };
+
+        let meta = file_data
+            .symbol_metadata_for("total_disk_bytes")
+            .expect("scoped method recovered by bare name");
+        assert_eq!(meta.kind, SymbolKind::Method);
+        assert_eq!(
+            meta.line, 703,
+            "real declaration line, not the line-1 fallback"
+        );
+
+        // A genuinely-absent symbol still returns None (no false recovery).
+        assert!(file_data.symbol_metadata_for("does_not_exist").is_none());
+    }
 
     /// Create a temp directory with TypeScript files for testing.
     fn setup_ts_project() -> TempDir {
@@ -4506,7 +4786,7 @@ export function funcB() {
     #[test]
     fn callgraph_single_file_call_extraction() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let file_data = graph.build_file(&dir.path().join("main.ts")).unwrap();
         let main_calls = &file_data.calls_by_symbol["main"];
@@ -4532,7 +4812,7 @@ export function funcB() {
     #[test]
     fn callgraph_file_data_has_exports() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let file_data = graph.build_file(&dir.path().join("utils.ts")).unwrap();
         assert!(
@@ -4552,7 +4832,7 @@ export function funcB() {
     #[test]
     fn callgraph_resolve_direct_import() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4577,7 +4857,7 @@ export function funcB() {
     #[test]
     fn callgraph_resolve_namespace_import() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4602,7 +4882,7 @@ export function funcB() {
     #[test]
     fn callgraph_resolve_aliased_import() {
         let dir = setup_alias_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4627,7 +4907,7 @@ export function funcB() {
     #[test]
     fn callgraph_unresolved_edge_marked() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let main_path = dir.path().join("main.ts");
         let file_data = graph.build_file(&main_path).unwrap();
@@ -4649,7 +4929,7 @@ export function funcB() {
     #[test]
     fn callgraph_cycle_detection_stops() {
         let dir = setup_cycle_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // This should NOT infinite loop
         let tree = graph
@@ -4665,12 +4945,7 @@ export function funcB() {
             if node.children.is_empty() {
                 1
             } else {
-                1 + node
-                    .children
-                    .iter()
-                    .map(|c| count_depth(c))
-                    .max()
-                    .unwrap_or(0)
+                1 + node.children.iter().map(count_depth).max().unwrap_or(0)
             }
         }
 
@@ -4687,7 +4962,7 @@ export function funcB() {
     #[test]
     fn callgraph_depth_limit_truncates() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // main → helper → double, main → compute
         // With depth 1, we should see direct callees but not their children
@@ -4696,6 +4971,11 @@ export function funcB() {
             .unwrap();
 
         assert_eq!(tree.name, "main");
+        assert!(tree.depth_limited, "depth limit should be reported");
+        assert!(
+            tree.truncated > 0,
+            "truncated edge count should be reported"
+        );
 
         // At depth 1, children should exist (direct calls) but their children should be empty
         for child in &tree.children {
@@ -4711,7 +4991,7 @@ export function funcB() {
     #[test]
     fn callgraph_depth_zero_no_children() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let tree = graph
             .forward_tree(&dir.path().join("main.ts"), "main", 0)
@@ -4729,7 +5009,7 @@ export function funcB() {
     #[test]
     fn callgraph_forward_tree_cross_file() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // main → helper (in utils.ts) → double (in helpers.ts)
         let tree = graph
@@ -4831,6 +5111,19 @@ export function funcB() {
         let dir = TempDir::new().unwrap();
 
         fs::write(dir.path().join("main.ts"), "export function main() {}").unwrap();
+        fs::write(dir.path().join("module.mts"), "export function esm() {}").unwrap();
+        fs::write(dir.path().join("common.cts"), "export function cjs() {}").unwrap();
+        fs::write(
+            dir.path().join("runtime.mjs"),
+            "export function runtime() {}",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("legacy.cjs"),
+            "exports.legacy = function() {};",
+        )
+        .unwrap();
+        fs::write(dir.path().join("types.pyi"), "def typed() -> None: ...").unwrap();
         fs::write(dir.path().join("readme.md"), "# Hello").unwrap();
         fs::write(dir.path().join("data.json"), "{}").unwrap();
 
@@ -4841,13 +5134,26 @@ export function funcB() {
             .collect();
 
         assert!(file_names.contains(&"main.ts".to_string()));
+        for modern_ext_file in [
+            "module.mts",
+            "common.cts",
+            "runtime.mjs",
+            "legacy.cjs",
+            "types.pyi",
+        ] {
+            assert!(
+                file_names.contains(&modern_ext_file.to_string()),
+                "walker should include {modern_ext_file}, got: {:?}",
+                file_names
+            );
+        }
         assert!(
             file_names.contains(&"readme.md".to_string()),
             "Markdown is now a supported source language"
         );
         assert!(
-            !file_names.contains(&"data.json".to_string()),
-            "Should not include non-source files"
+            file_names.contains(&"data.json".to_string()),
+            "JSON is now a supported source language"
         );
     }
 
@@ -4877,7 +5183,7 @@ export function funcB() {
     #[test]
     fn callgraph_callers_of_direct() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // helpers.ts:double is called by utils.ts:helper
         let result = graph
@@ -4908,7 +5214,7 @@ export function funcB() {
     #[test]
     fn callgraph_callers_of_no_callers() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // main.ts:main is the entry point — nothing calls it
         let result = graph
@@ -4923,7 +5229,7 @@ export function funcB() {
     #[test]
     fn callgraph_callers_recursive_depth() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // helpers.ts:double is called by utils.ts:helper
         // utils.ts:helper is called by main.ts:main
@@ -4950,7 +5256,7 @@ export function funcB() {
     #[test]
     fn callgraph_invalidate_file_clears_reverse_index() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // Build callers to populate the reverse index
         let _ = graph
@@ -5127,7 +5433,7 @@ export function funcB() {
     #[test]
     fn callgraph_symbol_metadata_populated() {
         let dir = setup_ts_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let file_data = graph.build_file(&dir.path().join("utils.ts")).unwrap();
         assert!(
@@ -5233,7 +5539,7 @@ function testValidation() {
     #[test]
     fn trace_to_multi_path() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         let result = graph
             .trace_to(
@@ -5281,7 +5587,7 @@ function testValidation() {
     #[test]
     fn trace_to_single_path() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // validate is called from processData, testValidation
         // processData is called from main, handleRequest
@@ -5301,7 +5607,7 @@ function testValidation() {
     #[test]
     fn trace_to_cycle_detection() {
         let dir = setup_cycle_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // funcA ↔ funcB cycle — should terminate
         let result = graph
@@ -5315,7 +5621,7 @@ function testValidation() {
     #[test]
     fn trace_to_depth_limit() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // With max_depth=1, should not be able to reach entry points that are 3+ hops away
         let result = graph
@@ -5348,7 +5654,7 @@ function testValidation() {
     #[test]
     fn trace_to_entry_point_target() {
         let dir = setup_trace_project();
-        let mut graph = CallGraph::new(dir.path().to_path_buf(), true);
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
 
         // main is itself an entry point — should return a single trivial path
         let result = graph
@@ -5366,6 +5672,250 @@ function testValidation() {
         assert!(
             trivial.is_some(),
             "should have a trivial path with just the entry point itself"
+        );
+    }
+
+    #[test]
+    fn namespace_import_follows_barrel_reexport_and_rejects_private_member() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            r#"import * as lib from './index';
+
+export function main() {
+    lib.helper();
+    lib.hidden();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "export { helper } from './utils';\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("utils.ts"),
+            r#"export function helper() {}
+function hidden() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let main_path = dir.path().join("main.ts");
+        let import_block = graph.build_file(&main_path).unwrap().import_block.clone();
+
+        let helper =
+            graph.resolve_cross_file_edge("lib.helper", "helper", &main_path, &import_block);
+        match helper {
+            EdgeResolution::Resolved { file, symbol } => {
+                assert!(
+                    file.ends_with("utils.ts"),
+                    "helper should resolve through barrel: {file:?}"
+                );
+                assert_eq!(symbol, "helper");
+            }
+            other => panic!("expected helper to resolve through barrel, got {other:?}"),
+        }
+
+        let hidden =
+            graph.resolve_cross_file_edge("lib.hidden", "hidden", &main_path, &import_block);
+        assert_eq!(
+            hidden,
+            EdgeResolution::Unresolved {
+                callee_name: "hidden".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_package_resolution_prefers_modern_ts_source_extensions() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let package_dir = dir.path().join("packages/lib");
+        fs::create_dir_all(package_dir.join("src")).unwrap();
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"@scope/lib","exports":{".":"./dist/index.mjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            package_dir.join("src/index.mts"),
+            "export function helper() {}\n",
+        )
+        .unwrap();
+        fs::write(package_dir.join("dist/index.mjs"), "export{};\n").unwrap();
+
+        let resolved = resolve_module_path(dir.path(), "@scope/lib").unwrap();
+        assert!(
+            resolved.ends_with("src/index.mts"),
+            "dist/index.mjs should map to src/index.mts, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_member_calls_do_not_become_same_file_callers() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            r#"function caller() {
+    db.connect();
+}
+
+function connect() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let result = graph
+            .callers_of(&dir.path().join("main.ts"), "connect", 1, usize::MAX)
+            .unwrap();
+
+        assert_eq!(
+            result.total_callers, 0,
+            "db.connect() must not call local connect"
+        );
+    }
+
+    #[test]
+    fn same_named_methods_use_scoped_symbol_identity() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("classes.ts"),
+            r#"class A {
+    run() { helperA(); }
+}
+
+class B {
+    run() { helperB(); }
+}
+
+function helperA() {}
+function helperB() {}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let path = dir.path().join("classes.ts");
+        let data = graph.build_file(&path).unwrap();
+
+        assert!(
+            data.symbol_metadata.contains_key("A::run"),
+            "A::run metadata missing"
+        );
+        assert!(
+            data.symbol_metadata.contains_key("B::run"),
+            "B::run metadata missing"
+        );
+        assert!(
+            data.calls_by_symbol["A::run"]
+                .iter()
+                .any(|call| call.callee_name == "helperA"),
+            "A::run calls should not be overwritten"
+        );
+        assert!(
+            data.calls_by_symbol["B::run"]
+                .iter()
+                .any(|call| call.callee_name == "helperB"),
+            "B::run calls should not be overwritten"
+        );
+
+        assert!(matches!(
+            graph.resolve_symbol_query(&path, "run"),
+            Err(AftError::AmbiguousSymbol { .. })
+        ));
+        assert_eq!(
+            graph.resolve_symbol_query(&path, "A::run").unwrap(),
+            "A::run"
+        );
+    }
+
+    #[test]
+    fn trace_to_counts_same_named_entry_points_by_file_and_symbol() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("web")).unwrap();
+        fs::create_dir_all(dir.path().join("cli")).unwrap();
+        fs::write(
+            dir.path().join("target.ts"),
+            r#"export function target() {
+    leaf();
+}
+
+function leaf() {}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("web/main.ts"),
+            r#"import { target } from '../target';
+
+export function main() {
+    target();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("cli/main.ts"),
+            r#"import { target } from '../target';
+
+export function main() {
+    target();
+}
+"#,
+        )
+        .unwrap();
+
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+        let result = graph
+            .trace_to(&dir.path().join("target.ts"), "leaf", 10, usize::MAX)
+            .unwrap();
+
+        assert_eq!(
+            result.total_paths, 3,
+            "target plus two main entry paths expected"
+        );
+        assert_eq!(
+            result.entry_points_found, 3,
+            "same-named main entry points in different files must both count"
+        );
+    }
+
+    #[test]
+    fn callers_and_impact_report_depth_truncation() {
+        let dir = setup_ts_project();
+        let mut graph = CallGraph::new(dir.path().to_path_buf());
+
+        let callers = graph
+            .callers_of(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
+            .unwrap();
+        assert!(
+            callers.depth_limited,
+            "callers should report omitted transitive callers"
+        );
+        assert!(
+            callers.truncated > 0,
+            "callers should report truncated edge count"
+        );
+
+        let impact = graph
+            .impact(&dir.path().join("helpers.ts"), "double", 1, usize::MAX)
+            .unwrap();
+        assert!(
+            impact.depth_limited,
+            "impact should report omitted transitive callers"
+        );
+        assert!(
+            impact.truncated > 0,
+            "impact should report truncated edge count"
         );
     }
 
@@ -5465,26 +6015,6 @@ function testValidation() {
     }
 
     #[test]
-    fn extract_parameters_go_method_skips_receiver() {
-        // Go method: receiver block is the first `(...)`, actual params come second.
-        let params = extract_parameters(
-            "func (s *concreteSvc) concreteMethod(x int, y string) int",
-            LangId::Go,
-        );
-        assert_eq!(params, vec!["x", "y"]);
-    }
-
-    #[test]
-    fn extract_parameters_go_method_no_params() {
-        let params = extract_parameters("func (s *svc) noParams() int", LangId::Go);
-        assert!(
-            params.is_empty(),
-            "no params should yield empty, got {:?}",
-            params
-        );
-    }
-
-    #[test]
     fn extract_parameters_empty() {
         let params = extract_parameters("function noArgs(): void", LangId::TypeScript);
         assert!(
@@ -5503,1087 +6033,5 @@ function testValidation() {
     fn extract_parameters_javascript() {
         let params = extract_parameters("function handleClick(event, target)", LangId::JavaScript);
         assert_eq!(params, vec!["event", "target"]);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Go helper injection tests
-    // ---------------------------------------------------------------------------
-
-    use crate::go_helper::{EdgeKind, HelperCallee, HelperCaller, HelperEdge, HelperOutput};
-
-    const GO_RESOLUTION_FIXTURE: &str = r#"package callgraph
-
-func barePkgTarget(x int) int {
-	return x + 1
-}
-
-func barePkgCaller(x int) int {
-	return barePkgTarget(x)
-}
-
-type concreteSvc struct{}
-
-func (s *concreteSvc) concreteMethod(x int) int {
-	return x * 2
-}
-
-func concreteMethodCaller(x int) int {
-	s := &concreteSvc{}
-	return s.concreteMethod(x)
-}
-
-type Doer interface {
-	Do(x int) int
-}
-
-type doerA struct{}
-
-func (a *doerA) Do(x int) int { return x + 10 }
-
-type doerB struct{}
-
-func (b *doerB) Do(x int) int { return x + 100 }
-
-func interfaceCaller(d Doer, x int) int {
-	return d.Do(x)
-}
-"#;
-
-    fn make_go_helper_output(fixture_file: &str, root: &str) -> HelperOutput {
-        HelperOutput {
-            version: crate::go_helper::HELPER_SCHEMA_VERSION,
-            root: root.to_string(),
-            edges: vec![
-                // static: barePkgCaller → barePkgTarget (line 8)
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 8,
-                        symbol: "barePkgCaller".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "barePkgTarget".to_string(),
-                        receiver: String::new(),
-                        pkg: String::new(),
-                    },
-                    kind: EdgeKind::Static,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // concrete: concreteMethodCaller → concreteMethod (line 19)
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 19,
-                        symbol: "concreteMethodCaller".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "concreteMethod".to_string(),
-                        receiver: "*pkg.concreteSvc".to_string(),
-                        pkg: "pkg".to_string(),
-                    },
-                    kind: EdgeKind::Concrete,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // interface dispatch: interfaceCaller → doerA.Do (line 35)
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 35,
-                        symbol: "interfaceCaller".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "Do".to_string(),
-                        receiver: "*pkg.doerA".to_string(),
-                        pkg: "pkg".to_string(),
-                    },
-                    kind: EdgeKind::Interface,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // interface dispatch: interfaceCaller → doerB.Do (line 35)
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 35,
-                        symbol: "interfaceCaller".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "Do".to_string(),
-                        receiver: "*pkg.doerB".to_string(),
-                        pkg: "pkg".to_string(),
-                    },
-                    kind: EdgeKind::Interface,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-            ],
-            skipped: vec![],
-            returns: vec![],
-        }
-    }
-
-    fn setup_go_project() -> TempDir {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("go_resolution.go"), GO_RESOLUTION_FIXTURE).unwrap();
-        dir
-    }
-
-    #[test]
-    fn go_helper_interface_dispatch_deduplication() {
-        let dir = setup_go_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("go_resolution.go");
-        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.callers_of(&go_file, "Do", 1, usize::MAX).unwrap();
-
-        // Two helper edges → interfaceCaller:42 (doerA) and interfaceCaller:42 (doerB).
-        // After dedup by (file, symbol, line), only 1 caller site should survive.
-        assert_eq!(
-            result.total_callers, 1,
-            "interface dispatch: two callee edges for same call site should dedup to 1 caller"
-        );
-        assert_eq!(result.callers[0].callers[0].symbol, "interfaceCaller");
-        assert_eq!(result.callers[0].callers[0].line, 35);
-    }
-
-    #[test]
-    fn go_helper_concrete_method_resolution() {
-        let dir = setup_go_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("go_resolution.go");
-        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.callers_of(&go_file, "concreteMethod", 1, usize::MAX).unwrap();
-        assert_eq!(result.total_callers, 1);
-        assert_eq!(result.callers[0].callers[0].symbol, "concreteMethodCaller");
-        assert_eq!(result.callers[0].callers[0].line, 19);
-    }
-
-    #[test]
-    fn go_helper_static_call_resolution() {
-        let dir = setup_go_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("go_resolution.go");
-        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.callers_of(&go_file, "barePkgTarget", 1, usize::MAX).unwrap();
-        assert_eq!(result.total_callers, 1);
-        assert_eq!(result.callers[0].callers[0].symbol, "barePkgCaller");
-        assert_eq!(result.callers[0].callers[0].line, 8);
-    }
-
-    #[test]
-    fn go_helper_set_invalidates_reverse_index() {
-        let dir = setup_go_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("go_resolution.go");
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-
-        // First query: no helper data, tree-sitter only.
-        let result_before = cg.callers_of(&go_file, "Do", 1, usize::MAX).unwrap();
-        let count_before = result_before.total_callers;
-
-        // Now inject helper; should invalidate the reverse index.
-        let helper_out = make_go_helper_output("go_resolution.go", &root.to_string_lossy());
-        cg.set_go_helper(helper_out);
-
-        // Second query: reverse index rebuilt, helper edges included then deduped.
-        let result_after = cg.callers_of(&go_file, "Do", 1, usize::MAX).unwrap();
-
-        // Regardless of what tree-sitter found, after helper injection and
-        // deduplication the count must be exactly 1 (interfaceCaller:42).
-        assert_eq!(result_after.total_callers, 1);
-        // Tree-sitter count shouldn't have grown by more than the helper added.
-        // (It may equal before if tree-sitter already found it, or 1 if it didn't.)
-        assert!(
-            result_after.total_callers <= count_before + 2,
-            "helper should not multiply callers unexpectedly: before={count_before} after={}",
-            result_after.total_callers
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Tier 1.1/1.2/1.3: dispatch_index and new commands
-    // ---------------------------------------------------------------------------
-
-    fn make_dispatch_helper_output(fixture_file: &str, root: &str) -> HelperOutput {
-        HelperOutput {
-            version: crate::go_helper::HELPER_SCHEMA_VERSION,
-            root: root.to_string(),
-            edges: vec![
-                // dispatches edge with nearby_string (asynq-style registration)
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 10,
-                        symbol: "startAsyncQueueServer".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "HandleMerchantTask".to_string(),
-                        receiver: String::new(),
-                        pkg: "example.com/fixture".to_string(),
-                    },
-                    kind: EdgeKind::Dispatches,
-                    nearby_string: Some("TypeMerchantTask".to_string()),
-                    dispatched_via: Some(
-                        "github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string(),
-                    ),
-                    context: None,
-                },
-                // dispatches edge with no nearby_string
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 15,
-                        symbol: "startAsyncQueueServer".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "HandleGenericTask".to_string(),
-                        receiver: String::new(),
-                        pkg: "example.com/fixture".to_string(),
-                    },
-                    kind: EdgeKind::Dispatches,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // goroutine edge
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 20,
-                        symbol: "startWorker".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "workerLoop".to_string(),
-                        receiver: String::new(),
-                        pkg: "example.com/fixture".to_string(),
-                    },
-                    kind: EdgeKind::Goroutine,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // defer edge
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: fixture_file.to_string(),
-                        line: 25,
-                        symbol: "processRequest".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: fixture_file.to_string(),
-                        line: 0,
-                        symbol: "cleanup".to_string(),
-                        receiver: String::new(),
-                        pkg: "example.com/fixture".to_string(),
-                    },
-                    kind: EdgeKind::Defer,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-            ],
-            skipped: vec![],
-            returns: vec![],
-        }
-    }
-
-    const DISPATCH_FIXTURE: &str = r#"package fixture
-
-func HandleMerchantTask() error { return nil }
-func HandleGenericTask() error  { return nil }
-func workerLoop()                {}
-func cleanup()                   {}
-
-func startAsyncQueueServer() {
-    // would call mux.HandleFunc("TypeMerchantTask", HandleMerchantTask)
-}
-
-func startWorker() {
-    // would call go workerLoop()
-}
-
-func processRequest() {
-    // would call defer cleanup()
-}
-"#;
-
-    fn setup_dispatch_project() -> TempDir {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("handler.go"), DISPATCH_FIXTURE).unwrap();
-        dir
-    }
-
-    #[test]
-    fn dispatched_by_finds_dispatch_sites() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
-        assert_eq!(result.symbol, "HandleMerchantTask");
-        assert_eq!(result.dispatched_by.len(), 1);
-        assert_eq!(
-            result.dispatched_by[0].caller.symbol,
-            "startAsyncQueueServer"
-        );
-        assert_eq!(
-            result.dispatched_by[0].nearby_string,
-            Some("TypeMerchantTask".to_string())
-        );
-    }
-
-    #[test]
-    fn dispatched_by_no_results_for_non_dispatch() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        // workerLoop is registered via goroutine (not dispatches), so dispatched_by should be empty.
-        let result = cg.dispatched_by(&go_file, "workerLoop", usize::MAX).unwrap();
-        assert_eq!(
-            result.dispatched_by.len(),
-            0,
-            "goroutine edges should not appear in dispatched_by"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Feature: dispatched_via propagation through dispatched_by / dispatches
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn dispatched_by_includes_dispatched_via() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
-        assert_eq!(result.dispatched_by.len(), 1);
-        assert_eq!(
-            result.dispatched_by[0].dispatched_via,
-            Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
-            "dispatched_by site should include dispatched_via"
-        );
-    }
-
-    #[test]
-    fn dispatched_by_text_renderer_includes_via() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
-        let text = result.render_text();
-        assert!(
-            text.contains("via github.com/hibiken/asynq.(*ServeMux).HandleFunc"),
-            "text renderer should include 'via <fqn>': {text}"
-        );
-    }
-
-    #[test]
-    fn find_by_dispatch_key_includes_dispatched_via() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let entries = cg.find_by_dispatch_key("TypeMerchantTask", usize::MAX);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].dispatched_via,
-            Some("github.com/hibiken/asynq.(*ServeMux).HandleFunc".to_string()),
-            "dispatch entry should include dispatched_via"
-        );
-    }
-
-    #[test]
-    fn dispatched_via_none_when_not_in_helper() {
-        // An edge with no dispatched_via in the helper should have None in the result.
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        // HandleGenericTask has dispatched_via = None in make_dispatch_helper_output.
-        let result = cg.dispatched_by(&go_file, "HandleGenericTask", usize::MAX).unwrap();
-        assert_eq!(result.dispatched_by.len(), 1);
-        assert_eq!(
-            result.dispatched_by[0].dispatched_via, None,
-            "dispatch site with no dispatched_via should return None"
-        );
-    }
-
-    #[test]
-    fn find_by_dispatch_key_exact_match() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let entries = cg.find_by_dispatch_key("TypeMerchantTask", usize::MAX);
-        assert_eq!(
-            entries.len(),
-            1,
-            "should find exactly one handler for TypeMerchantTask"
-        );
-        assert_eq!(entries[0].handler.symbol, "HandleMerchantTask");
-        assert_eq!(entries[0].registered_by.symbol, "startAsyncQueueServer");
-        assert_eq!(entries[0].registered_by.line, 10);
-    }
-
-    #[test]
-    fn find_by_dispatch_key_prefix_match() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let results = cg.find_by_dispatch_key_prefix("Type", usize::MAX);
-        assert_eq!(
-            results.len(),
-            1,
-            "should find TypeMerchantTask with prefix 'Type'"
-        );
-        assert_eq!(results[0].0, "TypeMerchantTask");
-    }
-
-    #[test]
-    fn find_by_dispatch_key_not_found() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let entries = cg.find_by_dispatch_key("TypeNonExistent", usize::MAX);
-        assert!(entries.is_empty(), "should find nothing for unknown key");
-    }
-
-    #[test]
-    fn find_by_dispatch_key_special_chars() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        // Test that special chars in key don't panic.
-        let helper_out = HelperOutput {
-            version: crate::go_helper::HELPER_SCHEMA_VERSION,
-            root: root.to_string_lossy().into_owned(),
-            edges: vec![HelperEdge {
-                caller: HelperCaller {
-                    file: "handler.go".to_string(),
-                    line: 1,
-                    symbol: "register".to_string(),
-                },
-                callee: HelperCallee {
-                    file: "handler.go".to_string(),
-                    line: 0,
-                    symbol: "handler".to_string(),
-                    receiver: String::new(),
-                    pkg: String::new(),
-                },
-                kind: EdgeKind::Dispatches,
-                nearby_string: Some("/api/v1?foo=bar&baz=.*+[".to_string()),
-                dispatched_via: None,
-                context: None,
-            }],
-            skipped: vec![],
-            returns: vec![],
-        };
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        // Should not panic on special chars.
-        let entries = cg.find_by_dispatch_key("/api/v1?foo=bar&baz=.*+[", usize::MAX);
-        assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
-    fn dispatch_edges_disabled_by_flag() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.enable_dispatch_edges = false; // disable flag
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        // No dispatch edges in reverse index.
-        let result = cg.dispatched_by(&go_file, "HandleMerchantTask", usize::MAX).unwrap();
-        assert_eq!(
-            result.dispatched_by.len(),
-            0,
-            "dispatch edges should be absent when flag is false"
-        );
-
-        // Dispatch index should also be empty.
-        let entries = cg.find_by_dispatch_key("TypeMerchantTask", usize::MAX);
-        assert!(
-            entries.is_empty(),
-            "dispatch index should be empty when flag is false"
-        );
-    }
-
-    #[test]
-    fn goroutine_and_defer_appear_in_callers() {
-        let dir = setup_dispatch_project();
-        let root = dir.path().to_path_buf();
-        let go_file = root.join("handler.go");
-        let helper_out = make_dispatch_helper_output("handler.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&go_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        // workerLoop is started via goroutine — should appear in callers_of
-        let callers = cg.callers_of(&go_file, "workerLoop", 1, usize::MAX).unwrap();
-        assert!(
-            callers.total_callers >= 1,
-            "workerLoop should have at least one caller (goroutine)"
-        );
-
-        // cleanup is deferred — should appear in callers_of
-        let callers = cg.callers_of(&go_file, "cleanup", 1, usize::MAX).unwrap();
-        assert!(
-            callers.total_callers >= 1,
-            "cleanup should have at least one caller (defer)"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Tier 1.4: ImplementationIndex and implementations_of
-    // ---------------------------------------------------------------------------
-
-    /// Build a HelperOutput with `implements` edges for testing.
-    fn make_impl_helper_output(iface_file: &str, concrete_file: &str, root: &str) -> HelperOutput {
-        HelperOutput {
-            version: crate::go_helper::HELPER_SCHEMA_VERSION,
-            root: root.to_string(),
-            edges: vec![
-                // Create method implementation.
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: iface_file.to_string(),
-                        line: 5,
-                        symbol: "Storer".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: concrete_file.to_string(),
-                        line: 0,
-                        symbol: "Create".to_string(),
-                        receiver: "*store.storeImpl".to_string(),
-                        pkg: "example.com/store".to_string(),
-                    },
-                    kind: EdgeKind::Implements,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // Delete method implementation.
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: iface_file.to_string(),
-                        line: 6,
-                        symbol: "Storer".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: concrete_file.to_string(),
-                        line: 0,
-                        symbol: "Delete".to_string(),
-                        receiver: "*store.storeImpl".to_string(),
-                        pkg: "example.com/store".to_string(),
-                    },
-                    kind: EdgeKind::Implements,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                // Mock implementation (excluded by default).
-                HelperEdge {
-                    caller: HelperCaller {
-                        file: iface_file.to_string(),
-                        line: 5,
-                        symbol: "Storer".to_string(),
-                    },
-                    callee: HelperCallee {
-                        file: "mocks/storer.go".to_string(),
-                        line: 0,
-                        symbol: "Create".to_string(),
-                        receiver: "*mocks.MockStorer".to_string(),
-                        pkg: "example.com/mocks".to_string(),
-                    },
-                    kind: EdgeKind::Implements,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-            ],
-            skipped: vec![],
-            returns: vec![],
-        }
-    }
-
-    const IFACE_FIXTURE: &str = r#"package domain
-
-// Storer is the persistence interface.
-type Storer interface {
-    Create(name string) error
-    Delete(id int) error
-}
-"#;
-
-    const STORE_FIXTURE: &str = r#"package store
-
-type storeImpl struct{}
-func (s *storeImpl) Create(name string) error { return nil }
-func (s *storeImpl) Delete(id int) error      { return nil }
-"#;
-
-    fn setup_impl_project() -> TempDir {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("iface.go"), IFACE_FIXTURE).unwrap();
-        fs::write(dir.path().join("store.go"), STORE_FIXTURE).unwrap();
-        dir
-    }
-
-    #[test]
-    fn implementations_of_finds_concrete_types() {
-        let dir = setup_impl_project();
-        let root = dir.path().to_path_buf();
-        let iface_file = root.join("iface.go");
-        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&iface_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.implementations_of(&iface_file, "Storer", false, usize::MAX).unwrap();
-        assert_eq!(result.interface.symbol, "Storer");
-        // storeImpl should be there (mocks excluded by default).
-        assert_eq!(
-            result.implementations.len(),
-            1,
-            "should find exactly one non-mock implementation"
-        );
-        let impl_type = &result.implementations[0];
-        assert_eq!(impl_type.receiver, "*store.storeImpl");
-        assert_eq!(impl_type.pkg, "example.com/store");
-        // Both methods should appear.
-        assert_eq!(
-            impl_type.methods.len(),
-            2,
-            "should find Create and Delete methods"
-        );
-        let method_names: Vec<&str> = impl_type.methods.iter().map(|m| m.name.as_str()).collect();
-        assert!(method_names.contains(&"Create"), "Create should be listed");
-        assert!(method_names.contains(&"Delete"), "Delete should be listed");
-    }
-
-    #[test]
-    fn implementations_of_include_mocks() {
-        let dir = setup_impl_project();
-        let root = dir.path().to_path_buf();
-        let iface_file = root.join("iface.go");
-        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&iface_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.implementations_of(&iface_file, "Storer", true, usize::MAX).unwrap();
-        // With include_mocks=true, MockStorer should also appear.
-        assert_eq!(
-            result.implementations.len(),
-            2,
-            "should find 2 implementations with mocks"
-        );
-        let receivers: Vec<&str> = result
-            .implementations
-            .iter()
-            .map(|i| i.receiver.as_str())
-            .collect();
-        assert!(
-            receivers.contains(&"*store.storeImpl"),
-            "storeImpl should be present"
-        );
-        assert!(
-            receivers.contains(&"*mocks.MockStorer"),
-            "MockStorer should be present with include_mocks=true"
-        );
-    }
-
-    #[test]
-    fn implementations_of_not_found() {
-        let dir = setup_impl_project();
-        let root = dir.path().to_path_buf();
-        let iface_file = root.join("iface.go");
-        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&iface_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg
-            .implementations_of(&iface_file, "NonExistentInterface", false, usize::MAX)
-            .unwrap();
-        assert!(
-            result.implementations.is_empty(),
-            "should return empty for unknown interface"
-        );
-    }
-
-    #[test]
-    fn implements_edges_disabled_by_flag() {
-        let dir = setup_impl_project();
-        let root = dir.path().to_path_buf();
-        let iface_file = root.join("iface.go");
-        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.enable_implementation_edges = false;
-        cg.build_file(&iface_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        let result = cg.implementations_of(&iface_file, "Storer", true, usize::MAX).unwrap();
-        assert!(
-            result.implementations.is_empty(),
-            "implementation index should be empty when flag is false"
-        );
-    }
-
-    #[test]
-    fn implements_edges_dont_pollute_callers() {
-        // Implements edges must NOT appear in the reverse call index.
-        let dir = setup_impl_project();
-        let root = dir.path().to_path_buf();
-        let iface_file = root.join("iface.go");
-        let helper_out = make_impl_helper_output("iface.go", "store.go", &root.to_string_lossy());
-
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.build_file(&iface_file).unwrap();
-        cg.set_go_helper(helper_out);
-
-        // Querying callers_of "Create" in iface.go should find no implements edges
-        // (those would be wrong — Create is never "called" by the interface declaration).
-        let callers = cg.callers_of(&iface_file, "Storer", 1, usize::MAX).unwrap();
-        for group in &callers.callers {
-            for entry in &group.callers {
-                assert!(
-                    !entry.symbol.contains("storeImpl"),
-                    "implements edges must not appear as callers: {:?}",
-                    entry
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn edge_kind_implements_roundtrips() {
-        // Verify EdgeKind::Implements serializes/deserializes correctly.
-        let edge = HelperEdge {
-            caller: HelperCaller {
-                file: "iface.go".to_string(),
-                line: 5,
-                symbol: "Storer".to_string(),
-            },
-            callee: HelperCallee {
-                file: "store.go".to_string(),
-                line: 0,
-                symbol: "Create".to_string(),
-                receiver: "*store.storeImpl".to_string(),
-                pkg: "example.com/store".to_string(),
-            },
-            kind: EdgeKind::Implements,
-            nearby_string: None,
-            dispatched_via: None,
-            context: None,
-        };
-
-        let json = serde_json::to_string(&edge).unwrap();
-        assert!(
-            json.contains("\"implements\""),
-            "should serialize as 'implements'"
-        );
-
-        let parsed: HelperEdge = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.kind, EdgeKind::Implements);
-    }
-
-    #[test]
-    fn old_output_without_implements_parses_unchanged() {
-        // Verify backwards compatibility: JSON without implements edges parses fine.
-        let json = r#"{
-            "version": 1,
-            "root": "/tmp/test",
-            "edges": [
-                {
-                    "caller": {"file": "a.go", "line": 10, "symbol": "foo"},
-                    "callee": {"file": "b.go", "symbol": "bar", "receiver": "*pkg.T", "pkg": "pkg"},
-                    "kind": "interface"
-                }
-            ]
-        }"#;
-
-        let out: crate::go_helper::HelperOutput = serde_json::from_str(json).unwrap();
-        assert_eq!(out.edges.len(), 1);
-        assert_eq!(out.edges[0].kind, EdgeKind::Interface);
-    }
-
-    #[test]
-    fn forward_tree_uses_go_helper_edges_for_dynamic_calls() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("go.mod"),
-            "module example.com/test\n\ngo 1.22\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("main.go"),
-            r#"package main
-
-type Doer interface {
-    Do(x int) int
-}
-
-type impl struct{}
-
-func (i *impl) Do(x int) int {
-    return helper(x)
-}
-
-func helper(x int) int {
-    return x + 1
-}
-
-func run(d Doer, x int) int {
-    return d.Do(x)
-}
-"#,
-        )
-        .unwrap();
-
-        let root = dir.path().to_path_buf();
-        let file = root.join("main.go");
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.set_go_helper(crate::go_helper::HelperOutput {
-            version: crate::go_helper::HELPER_SCHEMA_VERSION,
-            root: root.to_string_lossy().into_owned(),
-            edges: vec![crate::go_helper::HelperEdge {
-                caller: crate::go_helper::HelperCaller {
-                    file: "main.go".to_string(),
-                    line: 16,
-                    symbol: "run".to_string(),
-                },
-                callee: crate::go_helper::HelperCallee {
-                    file: "main.go".to_string(),
-                    line: 8,
-                    symbol: "Do".to_string(),
-                    receiver: "*example.com/test.impl".to_string(),
-                    pkg: "example.com/test".to_string(),
-                },
-                kind: EdgeKind::Interface,
-                nearby_string: None,
-                dispatched_via: None,
-                context: None,
-            }],
-            skipped: vec![],
-            returns: vec![],
-        });
-
-        let tree = cg.forward_tree(&file, "run", 3).unwrap();
-        let do_child = tree
-            .children
-            .iter()
-            .find(|child| child.name == "Do" && child.resolved)
-            .expect("run should include helper-resolved Do child");
-        assert!(
-            do_child.children.iter().any(|child| child.name == "helper"),
-            "helper-resolved Do child should keep walking the tree: {:?}",
-            do_child.children
-        );
-    }
-
-    #[test]
-    fn forward_tree_preserves_multiple_helper_receivers_in_same_file() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("go.mod"),
-            "module example.com/test\n\ngo 1.22\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("main.go"),
-            r#"package main
-
-type Doer interface {
-    Do(x int) int
-}
-
-type alpha struct{}
-
-func (alpha) Do(x int) int {
-    return x + 1
-}
-
-type beta struct{}
-
-func (beta) Do(x int) int {
-    return x + 2
-}
-
-func run(d Doer, x int) int {
-    return d.Do(x)
-}
-"#,
-        )
-        .unwrap();
-
-        let root = dir.path().to_path_buf();
-        let file = root.join("main.go");
-        let mut cg = CallGraph::new(root.clone(), true);
-        cg.set_go_helper(crate::go_helper::HelperOutput {
-            version: crate::go_helper::HELPER_SCHEMA_VERSION,
-            root: root.to_string_lossy().into_owned(),
-            edges: vec![
-                crate::go_helper::HelperEdge {
-                    caller: crate::go_helper::HelperCaller {
-                        file: "main.go".to_string(),
-                        line: 17,
-                        symbol: "run".to_string(),
-                    },
-                    callee: crate::go_helper::HelperCallee {
-                        file: "main.go".to_string(),
-                        line: 8,
-                        symbol: "Do".to_string(),
-                        receiver: "example.com/test.alpha".to_string(),
-                        pkg: "example.com/test".to_string(),
-                    },
-                    kind: EdgeKind::Interface,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-                crate::go_helper::HelperEdge {
-                    caller: crate::go_helper::HelperCaller {
-                        file: "main.go".to_string(),
-                        line: 17,
-                        symbol: "run".to_string(),
-                    },
-                    callee: crate::go_helper::HelperCallee {
-                        file: "main.go".to_string(),
-                        line: 13,
-                        symbol: "Do".to_string(),
-                        receiver: "example.com/test.beta".to_string(),
-                        pkg: "example.com/test".to_string(),
-                    },
-                    kind: EdgeKind::Interface,
-                    nearby_string: None,
-                    dispatched_via: None,
-                    context: None,
-                },
-            ],
-            skipped: vec![],
-            returns: vec![],
-        });
-
-        let tree = cg.forward_tree(&file, "run", 2).unwrap();
-        assert!(
-            tree.children
-                .iter()
-                .any(|child| child.name == "Do (alpha)" && child.resolved),
-            "run should keep alpha receiver variant visible: {:?}",
-            tree.children
-        );
-        assert!(
-            tree.children
-                .iter()
-                .any(|child| child.name == "Do (beta)" && child.resolved),
-            "run should keep beta receiver variant visible: {:?}",
-            tree.children
-        );
-        assert!(
-            tree.children.iter().all(|child| child.name != "Do"),
-            "run should not keep the generic unresolved Do edge once helper receiver variants exist: {:?}",
-            tree.children
-        );
     }
 }

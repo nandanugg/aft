@@ -26,6 +26,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, scope, position, syntax_valid?, backup_id? }`
 pub fn handle_add_member(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -178,16 +179,18 @@ pub fn handle_add_member(req: &RawRequest, ctx: &AppContext) -> Response {
         lang,
     );
 
-    // --- Auto-backup (skip for dry-run) ---
-    let backup_id = if !edit::is_dry_run(&req.params) {
-        match edit::auto_backup(ctx, req.session(), &path, "add_member: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
+    // --- Auto-backup ---
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "add_member: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
         }
-    } else {
-        None
     };
 
     // --- Insert ---
@@ -196,17 +199,6 @@ pub fn handle_add_member(req: &RawRequest, ctx: &AppContext) -> Response {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
 
     // --- Write, format, and validate ---
     let mut write_result =
@@ -218,7 +210,7 @@ pub fn handle_add_member(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("add_member: {}", file);
@@ -463,6 +455,17 @@ fn find_scope_container(
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
+        | LangId::Solidity
+        | LangId::Vue
+        | LangId::Json
+        | LangId::Scala
+        | LangId::Java
+        | LangId::Ruby
+        | LangId::Kotlin
+        | LangId::Swift
+        | LangId::Php
+        | LangId::Lua
+        | LangId::Perl
         | LangId::Html
         | LangId::Markdown => {}
     }
@@ -479,8 +482,19 @@ fn extract_impl_name(node: &Node, source: &str) -> Option<String> {
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
+            if child.kind() == "type_identifier" {
                 type_names.push(node_text(source, &child).to_string());
+            } else if child.kind() == "generic_type" {
+                // `impl<T> Config<T>` parses the implemented type as a
+                // `generic_type` whose full text is "Config<T>". Descend to its
+                // base `type_identifier` ("Config") so the impl matches a scope
+                // requested as "Config" — otherwise the bare-name struct (whose
+                // type_identifier is "Config") wins the fallback and the method
+                // gets inserted into the struct's field list (invalid Rust).
+                let base = find_child_by_kind(&child, "type_identifier")
+                    .map(|id| node_text(source, &id).to_string())
+                    .unwrap_or_else(|| node_text(source, &child).to_string());
+                type_names.push(base);
             }
             if !cursor.goto_next_sibling() {
                 break;

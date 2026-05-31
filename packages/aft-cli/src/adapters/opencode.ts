@@ -1,10 +1,11 @@
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
-import { getTmpLogPath } from "../lib/paths.js";
+import { getCortexKitStorageRoot, getTmpLogPath } from "../lib/paths.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import type {
   HarnessAdapter,
@@ -33,12 +34,66 @@ function getOpenCodeCacheDir(): string {
   return join(homedir(), ".cache", "opencode");
 }
 
+/**
+ * Convert a plugin entry string to a filesystem path if it represents one.
+ *
+ * Plugin entries may be:
+ * - npm package names: `@cortexkit/aft-opencode` (returns null)
+ * - npm package@version: `@cortexkit/aft-opencode@latest` (returns null)
+ * - file URLs: `file:///path/to/dir` (returns the resolved path)
+ * - absolute Unix paths: `/Users/x/work/aft` (returns as-is)
+ * - absolute Windows paths: `F:\path\to\plugin` or `C:/path/to/plugin` (returns as-is)
+ */
+function pathFromEntry(entry: string): string | null {
+  if (entry.startsWith("file://")) {
+    try {
+      return fileURLToPath(entry);
+    } catch {
+      return null;
+    }
+  }
+  if (entry.startsWith("/") || /^[A-Za-z]:[/\\]/.test(entry)) return entry;
+  return null;
+}
+
+/**
+ * Verify a path entry resolves to our actual plugin package by reading its
+ * package.json and checking the name field. Required because the previous
+ * substring-based heuristic (`includes("/opencode-plugin")`) produced false
+ * positives for unrelated third-party plugins whose paths happened to contain
+ * "opencode-plugin" — for example a user with
+ * `file:///F:/hackingtool-plugin/opencode-plugin` in their config would have
+ * AFT report itself as registered when it wasn't.
+ */
+function pathPointsToOurPlugin(entry: string): boolean {
+  const fsPath = pathFromEntry(entry);
+  if (!fsPath) return false;
+  try {
+    if (!existsSync(fsPath)) return false;
+    let searchDir = statSync(fsPath).isDirectory() ? fsPath : dirname(fsPath);
+    let pkgJsonPath: string | null = null;
+    while (true) {
+      const candidate = join(searchDir, "package.json");
+      if (existsSync(candidate)) {
+        pkgJsonPath = candidate;
+        break;
+      }
+      const parent = dirname(searchDir);
+      if (parent === searchDir || searchDir === parse(searchDir).root) break;
+      searchDir = parent;
+    }
+    if (!pkgJsonPath) return false;
+    const parsed = JSON.parse(readFileSync(pkgJsonPath, "utf-8")) as { name?: unknown };
+    return parsed.name === PLUGIN_NAME;
+  } catch {
+    return false;
+  }
+}
+
 function matchesPluginEntry(entry: string): boolean {
   if (entry === PLUGIN_NAME) return true;
   if (entry.startsWith(`${PLUGIN_NAME}@`)) return true;
-  if (entry.includes("/opencode-plugin")) return true;
-  if (entry.includes("/aft-opencode")) return true;
-  return false;
+  return pathPointsToOurPlugin(entry);
 }
 
 export class OpenCodeAdapter implements HarnessAdapter {
@@ -113,7 +168,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       };
     }
 
-    const plugins = Array.isArray(value.plugin) ? [...value.plugin] : [];
+    const plugins = Array.isArray(value.plugin) ? value.plugin : [];
     const already = plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
     if (already) {
       return {
@@ -125,8 +180,10 @@ export class OpenCodeAdapter implements HarnessAdapter {
     }
 
     plugins.push(PLUGIN_ENTRY);
-    const updated = { ...value, plugin: plugins };
-    writeJsoncFile(configPath, updated, paths.harnessConfigFormat);
+    // Mutate in place so comment-json keeps symbol-keyed comment metadata on
+    // the parsed object. Spreading into a fresh literal drops JSONC comments.
+    value.plugin = plugins;
+    writeJsoncFile(configPath, value, paths.harnessConfigFormat);
     return {
       ok: true,
       action: "added",
@@ -162,8 +219,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
   }
 
   getStorageDir(): string {
-    const xdg = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-    return join(xdg, "opencode", "storage", "plugin", "aft");
+    return getCortexKitStorageRoot();
   }
 
   getLogFile(): string {

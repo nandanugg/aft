@@ -90,4 +90,38 @@ describe("formatDiffForPi", () => {
     expect(diff).not.toContain("L0");
     expect(diff).not.toContain("L4");
   });
+
+  test("handles empty before/after content without undefined line crashes", () => {
+    const added = formatDiffForPi("", "first\nsecond\n", 1);
+    const removed = formatDiffForPi("first\nsecond\n", "", 1);
+
+    expect(added.firstChangedLine).toBe(1);
+    expect(added.diff).toBe(["+1 first", "+2 second"].join("\n"));
+    expect(removed.firstChangedLine).toBe(1);
+    expect(removed.diff).toBe(["-1 first", "-2 second"].join("\n"));
+  });
+
+  test("preserves the first changed line across multiple distant hunks", () => {
+    const before = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"].join("\n");
+    const after = ["A", "b", "c", "d", "e", "f", "g", "h", "i", "J"].join("\n");
+
+    const { diff, firstChangedLine } = formatDiffForPi(before, after, 1);
+
+    expect(firstChangedLine).toBe(1);
+    expect(diff).toContain("- 1 a");
+    expect(diff).toContain("+ 1 A");
+    expect(diff).toContain("-10 j");
+    expect(diff).toContain("+10 J");
+    expect(diff).toContain("...");
+  });
+
+  test("does not invent a blank changed line for no-newline-at-end edits", () => {
+    const withTrailingNewline = "line\n";
+    const withoutTrailingNewline = "line";
+
+    const { diff } = formatDiffForPi(withTrailingNewline, withoutTrailingNewline);
+
+    expect(diff).not.toContain("undefined");
+    expect(diff).not.toContain("NaN");
+  });
 });

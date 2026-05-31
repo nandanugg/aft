@@ -3,8 +3,8 @@
  * Both go through Rust so backups and checkpoint rollback work the same way.
  */
 
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
 import {
@@ -17,12 +17,25 @@ import {
 } from "./render-helpers.js";
 
 const DeleteParams = Type.Object({
-  filePath: Type.String({ description: "Path to file to delete" }),
+  files: Type.Array(Type.String(), {
+    description: "Paths to delete (one or more). May include directories when recursive=true.",
+    minItems: 1,
+  }),
+  recursive: Type.Optional(
+    Type.Boolean({
+      description:
+        "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+    }),
+  ),
 });
 
 const MoveParams = Type.Object({
-  filePath: Type.String({ description: "Source file path to move" }),
-  destination: Type.String({ description: "Destination file path" }),
+  filePath: Type.String({
+    description: "Source file path to move (absolute or relative to project root)",
+  }),
+  destination: Type.String({
+    description: "Destination file path (absolute or relative to project root)",
+  }),
 });
 
 export interface FsSurface {
@@ -38,12 +51,12 @@ export function renderFsCall(
   context: RenderContextLike,
 ) {
   if (toolName === "aft_delete") {
-    return renderToolCall(
-      "delete",
-      accentPath(theme, (args as Static<typeof DeleteParams>).filePath),
-      theme,
-      context,
-    );
+    const files = (args as Static<typeof DeleteParams>).files;
+    const summary =
+      files.length === 1
+        ? accentPath(theme, files[0])
+        : `${theme.fg("accent", String(files.length))} ${theme.fg("muted", "files")}`;
+    return renderToolCall("delete", summary, theme, context);
   }
 
   const moveArgs = args as Static<typeof MoveParams>;
@@ -68,11 +81,27 @@ export function renderFsResult(
   }
 
   if (toolName === "aft_delete") {
-    const filePath = shortenPath((args as Static<typeof DeleteParams>).filePath);
-    return renderSections(
-      [`${theme.fg("success", "✓ deleted")} ${theme.fg("accent", filePath)}`],
-      context,
-    );
+    const files = (args as Static<typeof DeleteParams>).files;
+    const data = (result?.details ?? {}) as {
+      deleted?: string[];
+      skipped_files?: Array<{ file: string; reason: string }>;
+      complete?: boolean;
+    };
+    const deletedPaths = data.deleted ?? files;
+    const skipped = data.skipped_files ?? [];
+    const lines: string[] = [];
+    for (const entry of deletedPaths) {
+      lines.push(`${theme.fg("success", "✓ deleted")} ${theme.fg("accent", shortenPath(entry))}`);
+    }
+    for (const entry of skipped) {
+      lines.push(
+        `${theme.fg("error", "✗ skipped")} ${theme.fg("accent", shortenPath(entry.file))} ${theme.fg("muted", `(${entry.reason})`)}`,
+      );
+    }
+    if (lines.length === 0) {
+      lines.push(theme.fg("muted", "(no files deleted)"));
+    }
+    return renderSections([lines.join("\n")], context);
   }
 
   const moveArgs = args as Static<typeof MoveParams>;
@@ -91,7 +120,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
       name: "aft_delete",
       label: "delete",
       description:
-        "Delete a file with backup. The file content is backed up before deletion — use `aft_safety undo` to recover.",
+        "Delete one or more files (or directories) with backup. Each file is backed up before deletion — use `aft_safety undo` to recover any of them. " +
+        "For directories, every file inside is individually backed up before removal. Directory deletion requires recursive: true. " +
+        "Returns { success, complete, deleted, skipped_files }: partial success is allowed; files that fail are reported in skipped_files.",
       parameters: DeleteParams,
       async execute(
         _toolCallId: string,
@@ -101,8 +132,39 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(bridge, "delete_file", { file: params.filePath }, extCtx);
-        return textResult(`Deleted ${params.filePath}`, response);
+        // Single batched call so every file shares one op_id; one
+        // `aft_safety undo` then restores the whole delete atomically.
+        const response = await callBridge(
+          bridge,
+          "delete_file",
+          {
+            files: params.files,
+            recursive: params.recursive === true,
+          },
+          extCtx,
+        );
+        const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
+        const skipped =
+          (response.skipped_files as Array<{ file: string; reason: string }> | undefined) ?? [];
+        const deleted = deletedEntries.map((entry) => entry.file);
+        // Refuse a fully-failed batch with an error so renderers don't show
+        // "completed" for nothing-actually-deleted.
+        if (deleted.length === 0 && skipped.length > 0) {
+          throw new Error(
+            `delete failed for all ${skipped.length} file(s):\n` +
+              skipped.map((entry) => `  ${entry.file}: ${entry.reason}`).join("\n"),
+          );
+        }
+        const summary =
+          deleted.length === 1 && skipped.length === 0
+            ? `Deleted ${deleted[0]}`
+            : `Deleted ${deleted.length}/${params.files.length} file(s)`;
+        return textResult(summary, {
+          success: true,
+          complete: skipped.length === 0,
+          deleted,
+          skipped_files: skipped,
+        });
       },
       renderCall(args, theme, context) {
         return renderFsCall("aft_delete", args, theme, context);

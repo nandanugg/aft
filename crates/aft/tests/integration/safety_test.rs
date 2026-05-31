@@ -30,14 +30,14 @@ fn test_checkpoint_create_restore_cycle() {
 
     // Snapshot both files (populates backup store + tracked files)
     let resp = aft.send(&format!(
-        r#"{{"id":"snap-a","command":"snapshot","file":"{}"}}"#,
-        file_a.display()
+        r#"{{"id":"snap-a","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file_a.display())
     ));
     assert_eq!(resp["success"], true, "snapshot a: {:?}", resp);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"snap-b","command":"snapshot","file":"{}"}}"#,
-        file_b.display()
+        r#"{{"id":"snap-b","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file_b.display())
     ));
     assert_eq!(resp["success"], true, "snapshot b: {:?}", resp);
 
@@ -73,6 +73,7 @@ fn test_checkpoint_create_restore_cycle() {
 
     let status = aft.shutdown();
     assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -86,8 +87,8 @@ fn test_undo_restores_previous_version() {
 
     // Snapshot the original
     let resp = aft.send(&format!(
-        r#"{{"id":"snap-1","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"snap-1","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true);
 
@@ -97,8 +98,8 @@ fn test_undo_restores_previous_version() {
 
     // Undo → should restore version-1
     let resp = aft.send(&format!(
-        r#"{{"id":"undo-1","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-1","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "undo: {:?}", resp);
     assert!(resp["backup_id"].is_string());
@@ -136,18 +137,433 @@ fn test_undo_restores_file_after_edit_command() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello rust\n");
 
     let undo = aft.send(&format!(
-        r#"{{"id":"undo-after-edit","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-after-edit","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello world\n");
 
     let history = aft.send(&format!(
-        r#"{{"id":"history-after-undo","command":"edit_history","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"history-after-undo","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(history["success"], true);
     assert!(history["entries"].as_array().unwrap().is_empty());
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn test_operation_undo_restores_multiple_deleted_files() {
+    let dir = temp_dir("operation_undo_delete_many");
+    let file_a = dir.join("a.txt");
+    let file_b = dir.join("b.txt");
+
+    fs::write(&file_a, "original-a").unwrap();
+    fs::write(&file_b, "original-b").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-many",
+        "command": "delete_file",
+        "files": [file_a.display().to_string(), file_b.display().to_string()],
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], true, "delete: {delete_resp:?}");
+    assert!(!file_a.exists());
+    assert!(!file_b.exists());
+
+    let undo = aft.send(r#"{"id":"undo-operation","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert_eq!(undo["restored_count"], 2);
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "original-b");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_after_write_created_file_deletes_it() {
+    let dir = temp_dir("undo_write_created_file");
+    let file = dir.join("created.txt");
+    let mut aft = AftProcess::spawn();
+
+    let write = serde_json::json!({
+        "id": "write-created",
+        "command": "write",
+        "file": file.display().to_string(),
+        "content": "new file\n",
+    });
+    let write_resp = aft.send(&serde_json::to_string(&write).unwrap());
+    assert_eq!(write_resp["success"], true, "write: {write_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "new file\n");
+
+    let undo = aft.send(r#"{"id":"undo-write-created","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(!file.exists(), "created file should be removed by undo");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_after_append_created_file_deletes_it() {
+    let dir = temp_dir("undo_append_created_file");
+    let file = dir.join("created-by-append.txt");
+    let mut aft = AftProcess::spawn();
+
+    let append = serde_json::json!({
+        "id": "append-created",
+        "command": "edit_match",
+        "op": "append",
+        "file": file.display().to_string(),
+        "appendContent": "appended\n",
+    });
+    let append_resp = aft.send(&serde_json::to_string(&append).unwrap());
+    assert_eq!(append_resp["success"], true, "append: {append_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "appended\n");
+
+    let undo = aft.send(r#"{"id":"undo-append-created","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(
+        !file.exists(),
+        "created append file should be removed by undo"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_after_transaction_created_file_deletes_it() {
+    let dir = temp_dir("undo_transaction_created_file");
+    let file = dir.join("created-by-transaction.txt");
+    let mut aft = AftProcess::spawn();
+
+    let tx = serde_json::json!({
+        "id": "transaction-created",
+        "command": "transaction",
+        "operations": [{
+            "command": "write",
+            "file": file.display().to_string(),
+            "content": "created in tx\n",
+        }],
+    });
+    let tx_resp = aft.send(&serde_json::to_string(&tx).unwrap());
+    assert_eq!(tx_resp["success"], true, "transaction: {tx_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "created in tx\n");
+
+    let undo = aft.send(r#"{"id":"undo-transaction-created","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(
+        !file.exists(),
+        "transaction-created file should be removed by undo"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_file_delete_is_rejected_without_project_restriction() {
+    let dir = temp_dir("delete_single_symlink_unrestricted");
+    let target = dir.join("target.txt");
+    let symlink = dir.join("target-link.txt");
+
+    fs::write(&target, "target content").unwrap();
+    std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-single-symlink-unrestricted",
+        "command": "delete_file",
+        "file": symlink.display().to_string(),
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "invalid_request");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to delete symlink"),
+        "message should explain symlink rejection: {resp:?}"
+    );
+    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_file_delete_is_rejected_with_project_restriction() {
+    let dir = temp_dir("delete_single_symlink_restricted");
+    let target = dir.join("target.txt");
+    let symlink = dir.join("target-link.txt");
+
+    fs::write(&target, "target content").unwrap();
+    std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let configure = serde_json::json!({
+        "id": "cfg-delete-single-symlink",
+        "command": "configure",
+            "harness": "opencode",
+        "project_root": dir.display().to_string(),
+        "restrict_to_project_root": true,
+    });
+    let cfg = aft.send(&serde_json::to_string(&configure).unwrap());
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+
+    let delete = serde_json::json!({
+        "id": "delete-single-symlink-restricted",
+        "command": "delete_file",
+        "file": symlink.display().to_string(),
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "invalid_request");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to delete symlink"),
+        "message should explain symlink rejection: {resp:?}"
+    );
+    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_to_outside_file_blocks_recursive_delete() {
+    let dir = temp_dir("delete_recursive_blocks_file_symlink");
+    let target_dir = temp_dir("delete_recursive_blocks_file_symlink_target");
+    let real_file = dir.join("real.txt");
+    let outside_file = target_dir.join("outside.txt");
+    let symlink = dir.join("outside-link.txt");
+
+    fs::write(&real_file, "inside").unwrap();
+    fs::write(&outside_file, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-file-symlink-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains(&symlink.display().to_string()),
+        "message should mention symlink path: {resp:?}"
+    );
+    assert!(dir.exists(), "directory should remain intact");
+    assert!(real_file.exists(), "regular file should remain intact");
+    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_to_directory_blocks_recursive_delete() {
+    let dir = temp_dir("delete_recursive_blocks_dir_symlink");
+    let target_dir = temp_dir("delete_recursive_blocks_dir_symlink_target");
+    let real_file = dir.join("real.txt");
+    let symlink = dir.join("outside-dir-link");
+
+    fs::write(&real_file, "inside").unwrap();
+    fs::write(target_dir.join("outside.txt"), "outside").unwrap();
+    std::os::unix::fs::symlink(&target_dir, &symlink).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-dir-symlink-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains(&symlink.display().to_string()),
+        "message should mention symlink path: {resp:?}"
+    );
+    assert!(dir.exists(), "directory should remain intact");
+    assert!(real_file.exists(), "regular file should remain intact");
+    assert!(symlink.exists(), "symlink should remain intact");
+    assert!(
+        target_dir.join("outside.txt").exists(),
+        "symlink target should remain intact"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn empty_subdir_blocks_recursive_delete() {
+    let dir = temp_dir("delete_recursive_blocks_empty_subdir");
+    let content_file = dir.join("with_content.txt");
+    let empty_subdir = dir.join("empty_subdir");
+
+    fs::write(&content_file, "content").unwrap();
+    fs::create_dir(&empty_subdir).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-empty-subdir-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains(&empty_subdir.display().to_string()),
+        "message should mention empty directory path: {resp:?}"
+    );
+    assert!(dir.exists(), "directory should remain intact");
+    assert_eq!(fs::read_to_string(&content_file).unwrap(), "content");
+    assert!(
+        empty_subdir.exists(),
+        "empty subdirectory should remain intact"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_socket_blocks_recursive_delete() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("aft_sock_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let content_file = dir.join("with_content.txt");
+    let socket_path = dir.join("socket.sock");
+    fs::write(&content_file, "content").unwrap();
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-socket-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains(&socket_path.display().to_string()),
+        "message should mention socket path: {resp:?}"
+    );
+    assert!(dir.exists(), "directory should remain intact");
+    assert_eq!(fs::read_to_string(&content_file).unwrap(), "content");
+    assert!(socket_path.exists(), "socket should remain intact");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    drop(_listener);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_link_blocks_recursive_delete() {
+    let dir = temp_dir("delete_recursive_blocks_hard_link");
+    let file = dir.join("file.txt");
+    let link = dir.join("file-hardlink.txt");
+    fs::write(&file, "content").unwrap();
+    fs::hard_link(&file, &link).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-hardlink-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "unsupported_directory_contents");
+    assert!(dir.exists(), "directory should remain intact");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "content");
+    assert_eq!(fs::read_to_string(&link).unwrap(), "content");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn regular_tree_with_files_works_after_validation() {
+    let dir = temp_dir("delete_recursive_regular_tree");
+    let nested = dir.join("nested");
+    let file_a = dir.join("a.txt");
+    let file_b = nested.join("b.txt");
+
+    fs::create_dir(&nested).unwrap();
+    fs::write(&file_a, "root file").unwrap();
+    fs::write(&file_b, "nested file").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-regular-tree",
+        "command": "delete_file",
+        "file": dir.display().to_string(),
+        "recursive": true,
+    });
+    let delete_resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    assert_eq!(delete_resp["success"], true, "delete: {delete_resp:?}");
+    assert_eq!(delete_resp["is_directory"], true);
+    assert_eq!(delete_resp["files_deleted"], 2);
+    assert!(!dir.exists(), "directory should be removed");
+
+    let undo = aft.send(r#"{"id":"undo-regular-tree","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert_eq!(undo["restored_count"], 2);
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "root file");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "nested file");
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -164,28 +580,28 @@ fn test_edit_history_returns_stack() {
 
     // Snapshot v1
     aft.send(&format!(
-        r#"{{"id":"s1","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"s1","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     // Modify and snapshot v2
     fs::write(&file, "v2").unwrap();
     aft.send(&format!(
-        r#"{{"id":"s2","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"s2","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     // Modify and snapshot v3
     fs::write(&file, "v3").unwrap();
     aft.send(&format!(
-        r#"{{"id":"s3","command":"snapshot","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"s3","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
 
     // Query edit history
     let resp = aft.send(&format!(
-        r#"{{"id":"hist","command":"edit_history","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"hist","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], true, "edit_history: {:?}", resp);
 
@@ -216,16 +632,16 @@ fn test_list_checkpoints() {
 
     // Create checkpoint with 1 file
     let resp = aft.send(&format!(
-        r#"{{"id":"cp1","command":"checkpoint","name":"first","files":["{}"]}}"#,
-        file_a.display()
+        r#"{{"id":"cp1","command":"checkpoint","name":"first","files":[{}]}}"#,
+        crate::helpers::json_string(&file_a.display())
     ));
     assert_eq!(resp["success"], true);
 
     // Create checkpoint with 2 files
     let resp = aft.send(&format!(
-        r#"{{"id":"cp2","command":"checkpoint","name":"second","files":["{}","{}"]}}"#,
-        file_a.display(),
-        file_b.display()
+        r#"{{"id":"cp2","command":"checkpoint","name":"second","files":[{},{}]}}"#,
+        crate::helpers::json_string(&file_a.display()),
+        crate::helpers::json_string(&file_b.display())
     ));
     assert_eq!(resp["success"], true);
 
@@ -263,8 +679,8 @@ fn test_undo_no_history_error() {
 
     // Undo with no prior snapshots → error
     let resp = aft.send(&format!(
-        r#"{{"id":"undo-err","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-err","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(resp["success"], false, "undo should fail: {:?}", resp);
     assert_eq!(resp["code"], "no_undo_history");
@@ -320,8 +736,8 @@ fn test_checkpoint_overwrite() {
 
     // Create checkpoint "reusable" with file_a
     let resp = aft.send(&format!(
-        r#"{{"id":"ow1","command":"checkpoint","name":"reusable","files":["{}"]}}"#,
-        file_a.display()
+        r#"{{"id":"ow1","command":"checkpoint","name":"reusable","files":[{}]}}"#,
+        crate::helpers::json_string(&file_a.display())
     ));
     assert_eq!(resp["success"], true);
     assert_eq!(resp["file_count"], 1);
@@ -332,9 +748,9 @@ fn test_checkpoint_overwrite() {
 
     // Overwrite checkpoint "reusable" with both files (different content now)
     let resp = aft.send(&format!(
-        r#"{{"id":"ow2","command":"checkpoint","name":"reusable","files":["{}","{}"]}}"#,
-        file_a.display(),
-        file_b.display()
+        r#"{{"id":"ow2","command":"checkpoint","name":"reusable","files":[{},{}]}}"#,
+        crate::helpers::json_string(&file_a.display()),
+        crate::helpers::json_string(&file_b.display())
     ));
     assert_eq!(resp["success"], true);
     assert_eq!(resp["file_count"], 2);
@@ -381,8 +797,8 @@ fn test_edit_history_caps_at_twenty_entries_per_file() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "v21");
 
     let history = aft.send(&format!(
-        r#"{{"id":"hist-cap","command":"edit_history","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"hist-cap","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(history["success"], true, "history failed: {:?}", history);
 
@@ -396,16 +812,16 @@ fn test_edit_history_caps_at_twenty_entries_per_file() {
 
     for expected in (1..=20).rev() {
         let undo = aft.send(&format!(
-            r#"{{"id":"undo-{expected}","command":"undo","file":"{}"}}"#,
-            file.display()
+            r#"{{"id":"undo-{expected}","command":"undo","file":{}}}"#,
+            crate::helpers::json_string(&file.display())
         ));
         assert_eq!(undo["success"], true, "undo {expected} failed: {undo:?}");
         assert_eq!(fs::read_to_string(&file).unwrap(), format!("v{expected}"));
     }
 
     let no_more_history = aft.send(&format!(
-        r#"{{"id":"undo-empty","command":"undo","file":"{}"}}"#,
-        file.display()
+        r#"{{"id":"undo-empty","command":"undo","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
     ));
     assert_eq!(no_more_history["success"], false);
     assert_eq!(no_more_history["code"], "no_undo_history");

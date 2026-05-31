@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -28,14 +28,37 @@ fn configure(aft: &mut AftProcess, root: &Path) {
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg-index","command":"configure","project_root":"{}","experimental_search_index":true}}"#,
-        root.display()
+        r#"{{"id":"cfg-index","command":"configure","harness":"opencode","project_root":{},"search_index":true}}"#,
+        crate::helpers::json_string(&root.display())
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 }
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
     aft.send(&serde_json::to_string(&request).expect("serialize request"))
+}
+
+fn wait_for_index_ready<F>(aft: &mut AftProcess, mut request: F) -> Value
+where
+    F: FnMut() -> Value,
+{
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_response = None;
+
+    while Instant::now() < deadline {
+        let response = send(aft, request());
+        if response["index_status"] == "Ready" {
+            return response;
+        }
+
+        last_response = Some(response);
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "search index should become ready within 10s; last response: {:?}",
+        last_response
+    );
 }
 
 #[test]
@@ -107,7 +130,34 @@ fn grep_fallback_returns_relative_paths_and_counts() {
     assert!(matches[0]["column"].as_u64().unwrap_or(0) >= 1);
     // Files are returned as absolute paths
     let file_path = matches[0]["file"].as_str().expect("file path");
+    let file_path = file_path.replace('\\', "/");
     assert!(file_path.contains("src/one.rs") || file_path.contains("src/two.rs"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_reports_empty_scope_separately() {
+    let project = setup_project(&[]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-empty-scope",
+            "command": "grep",
+            "pattern": "anything",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["no_files_matched_scope"], true);
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -151,6 +201,32 @@ fn glob_fallback_respects_gitignore_and_returns_absolute_paths() {
 }
 
 #[test]
+fn glob_reports_empty_scope_separately() {
+    let project = setup_project(&[]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "glob-empty-scope",
+            "command": "glob",
+            "pattern": "**/*.rs",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "glob should succeed: {response:?}"
+    );
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["no_files_matched_scope"], true);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn grep_uses_index_when_configured() {
     let project = setup_project(&[
         ("src/search.rs", "fn search() { println!(\"needle\"); }\n"),
@@ -159,27 +235,14 @@ fn grep_uses_index_when_configured() {
     let mut aft = AftProcess::spawn();
     configure_with_index(&mut aft, project.path());
 
-    let mut ready_response = None;
-    for _ in 0..20 {
-        let response = send(
-            &mut aft,
-            json!({
-                "id": "grep-indexed",
-                "command": "grep",
-                "pattern": "needle",
-                "include": ["src/**/*.rs"],
-            }),
-        );
-
-        if response["index_status"] == "Ready" {
-            ready_response = Some(response);
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let response = ready_response.expect("search index should become ready");
+    let response = wait_for_index_ready(&mut aft, || {
+        json!({
+            "id": "grep-indexed",
+            "command": "grep",
+            "pattern": "needle",
+            "include": ["src/**/*.rs"],
+        })
+    });
     assert_eq!(
         response["success"], true,
         "indexed grep should succeed: {response:?}"
@@ -219,7 +282,10 @@ fn grep_text_uses_relative_paths_and_compact_format() {
         response["success"], true,
         "grep should succeed: {response:?}"
     );
-    let text = response["text"].as_str().expect("grep text");
+    let text = response["text"]
+        .as_str()
+        .expect("grep text")
+        .replace('\\', "/");
     // New format: relative paths, no decorators, line:text format
     assert!(text.contains("src/one.rs\n"));
     assert!(text.contains("src/two.rs\n"));
@@ -256,7 +322,10 @@ fn glob_text_uses_relative_paths() {
         response["success"], true,
         "glob should succeed: {response:?}"
     );
-    let text = response["text"].as_str().expect("glob text");
+    let text = response["text"]
+        .as_str()
+        .expect("glob text")
+        .replace('\\', "/");
     // Relative paths in text
     assert!(text.contains("src/keep.rs") || text.contains("src/other.rs"));
     // No absolute paths
@@ -321,26 +390,13 @@ fn grep_indexed_supports_line_anchors() {
     let mut aft = AftProcess::spawn();
     configure_with_index(&mut aft, project.path());
 
-    let mut ready_response = None;
-    for _ in 0..20 {
-        let response = send(
-            &mut aft,
-            json!({
-                "id": "grep-anchor-indexed",
-                "command": "grep",
-                "pattern": "^## ",
-            }),
-        );
-
-        if response["index_status"] == "Ready" {
-            ready_response = Some(response);
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    let response = ready_response.expect("search index should become ready");
+    let response = wait_for_index_ready(&mut aft, || {
+        json!({
+            "id": "grep-anchor-indexed",
+            "command": "grep",
+            "pattern": "^## ",
+        })
+    });
     assert_eq!(
         response["success"], true,
         "indexed grep should succeed: {response:?}"
@@ -348,6 +404,32 @@ fn grep_indexed_supports_line_anchors() {
     assert_eq!(response["index_status"], "Ready");
     assert_eq!(response["total_matches"], 3);
     assert_eq!(response["files_with_matches"], 2);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn grep_treats_leading_dash_pattern_as_literal() {
+    let project = setup_project(&[("notes.txt", "-foo\nbar\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-leading-dash",
+            "command": "grep",
+            "pattern": "-foo",
+            "path": project.path(),
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "grep should succeed: {response:?}"
+    );
+    assert_eq!(response["total_matches"], 1, "response: {response:?}");
 
     let status = aft.shutdown();
     assert!(status.success());

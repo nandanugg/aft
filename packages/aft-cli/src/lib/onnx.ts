@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, resolve, win32 } from "node:path";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
 
@@ -29,17 +29,74 @@ export function getManualInstallHint(): string {
   return "ONNX Runtime must be installed manually for this platform";
 }
 
+function pathEnvValue(): string {
+  return process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
+}
+
+function pathEntriesForPlatform(): string[] {
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  return pathEnvValue()
+    .split(delimiter)
+    .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+    .filter((entry) => {
+      if (!entry || entry === "." || entry.includes("\0")) return false;
+      return isAbsolute(entry) || win32.isAbsolute(entry);
+    });
+}
+
+function directoryContainsLibrary(dir: string, libName: string): boolean {
+  try {
+    const entries = readdirSync(dir);
+    if (process.platform === "win32") {
+      const expected = libName.toLowerCase();
+      return entries.some((entry) => entry.toLowerCase() === expected);
+    }
+    return entries.includes(libName);
+  } catch {
+    return false;
+  }
+}
+
 export function findSystemOnnxRuntime(): string | null {
   const libName = getOnnxLibraryName();
-  const searchPaths =
-    process.platform === "darwin"
-      ? ["/opt/homebrew/lib", "/usr/local/lib"]
-      : process.platform === "linux"
-        ? ["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/local/lib"]
-        : [];
+  const searchPaths: string[] = [];
 
-  for (const path of searchPaths) {
-    if (existsSync(join(path, libName))) return path;
+  if (process.platform === "darwin") {
+    searchPaths.push("/opt/homebrew/lib", "/usr/local/lib");
+  } else if (process.platform === "linux") {
+    searchPaths.push(
+      "/usr/lib",
+      "/usr/lib/x86_64-linux-gnu",
+      "/usr/lib/aarch64-linux-gnu",
+      "/usr/local/lib",
+    );
+  } else if (process.platform === "win32") {
+    // Start with absolute PATH entries (via pathEntriesForPlatform) to
+    // discover Scoop/manual-zip installs, then add common install paths.
+    searchPaths.push(...pathEntriesForPlatform());
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+    searchPaths.push(
+      join(programFiles, "onnxruntime", "lib"),
+      join(programFiles, "Microsoft ONNX Runtime", "lib"),
+      join(programFiles, "Microsoft Machine Learning", "lib"),
+      join(programFilesX86, "onnxruntime", "lib"),
+    );
+  }
+
+  // Deduplicate paths.
+  // On case-insensitive filesystems (Windows, macOS) normalize casing for
+  // comparison; on Linux the raw path casing is the authority.
+  const normalizeCase = process.platform === "win32" || process.platform === "darwin";
+  const seen = new Set<string>();
+  for (const dir of searchPaths) {
+    let key = resolve(dir).replace(/[/\\]+$/, "");
+    if (normalizeCase) key = key.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // Doctor only probes for presence here; the plugin's actual load path uses
+    // the hardened bridge resolver in packages/aft-bridge/src/onnx-runtime.ts.
+    if (directoryContainsLibrary(dir, libName)) return dir;
   }
   return null;
 }

@@ -13,10 +13,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { resolveBashConfig } from "../config.js";
 import { storeToolMetadata } from "../metadata-store.js";
 import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
-import { callBridge } from "./_shared.js";
+import { callBridge, optionalInt } from "./_shared.js";
+import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash.js";
+import { createBashWatchTool } from "./bash_watch.js";
+import { createBashWriteTool } from "./bash_write.js";
+import {
+  assertExternalDirectoryPermission,
+  permissionDeniedResponse,
+  runAsk,
+} from "./permissions.js";
 
 /** Extract callID from plugin context (exists on object but not in TS type). */
 function getCallID(ctx: unknown): string | undefined {
@@ -27,6 +36,57 @@ function getCallID(ctx: unknown): string | undefined {
 /** Get relative path matching opencode's format — the desktop UI parses it to extract filename + dir. */
 function relativeToWorktree(fp: string, worktree: string): string {
   return path.relative(worktree, fp);
+}
+
+/**
+ * Build the navigation footer for a `read` response.
+ *
+ * Two cases (kept aligned with the Pi plugin's helper of the same name):
+ *
+ *   A. Agent did NOT specify a range
+ *      → if the response is clamped (Rust's default limit / byte cap
+ *        kicked in), emit a hint footer so they know more exists and
+ *        how to get it. Otherwise no footer (the response IS the file).
+ *
+ *   B. Agent EXPLICITLY supplied startLine/endLine OR offset/limit
+ *      → no footer. The agent picked the range, so:
+ *         - they already have the math
+ *         - if the range was clamped vs. what they asked for, they can
+ *           see that from `content` length vs. their requested range
+ *         - telling them "use startLine/endLine to read other sections"
+ *           right after they used those exact params is patronizing
+ *           and burns tokens (the user's exact dogfooding complaint
+ *           when this returned the hint for read({130, 190}) on a
+ *           191-line file).
+ *
+ * `data.truncated` from Rust means "response is a slice of the file" — TRUE
+ * even when the slice matches what the agent asked for. So we cannot key
+ * the hint off that flag alone; we also need to know whether the agent
+ * picked the range.
+ *
+ * Earlier drafts emitted a compact `(Lines X-Y of Z)` when the agent
+ * picked a range AND `endLine < totalLines`, on the theory that this
+ * meant their range was clamped. But that condition fires whenever the
+ * agent's chosen range happens not to extend to EOF (the user's exact
+ * complaint case: they asked 130-190 of 191 → end_line(190) < total(191)
+ * → spurious compact footer). Removed.
+ */
+function formatReadFooter(agentSpecifiedRange: boolean, data: Record<string, unknown>): string {
+  // CASE B: agent picked the range. No footer at all. They have the math.
+  if (agentSpecifiedRange) return "";
+
+  if (!data.truncated) return "";
+
+  const startLine = data.start_line as number | undefined;
+  const endLine = data.end_line as number | undefined;
+  const totalLines = data.total_lines as number | undefined;
+  if (startLine === undefined || endLine === undefined || totalLines === undefined) {
+    return "";
+  }
+
+  // CASE A: agent did not pick a range, response was clamped — hint is
+  // useful, tell them how to read more.
+  return `\n(Showing lines ${startLine}-${endLine} of ${totalLines}. Use startLine/endLine to read other sections.)`;
 }
 
 /** Test-only export. Production code uses buildUnifiedDiff directly. */
@@ -48,14 +108,20 @@ export const _buildUnifiedDiffForTest = (fp: string, before: string, after: stri
  * each other are merged into a single hunk).
  */
 function buildUnifiedDiff(fp: string, before: string, after: string): string {
-  // Skip diff for very large files to avoid blocking the event loop
-  const SIZE_CAP = 100 * 1024; // 100KB
-  if (before.length > SIZE_CAP || after.length > SIZE_CAP) {
-    return `Index: ${fp}\n(diff skipped: file exceeds ${SIZE_CAP / 1024}KB)\n`;
-  }
-
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
+
+  // LCS is O(n*m) in lines; a 5000x5000 matrix uses ~100 MB and ~250 ms,
+  // which we accept for normal source files. Above that we skip diff
+  // generation rather than block the plugin event loop on a single edit.
+  // Byte-size gating misses the real cost (a 100 KB minified bundle is one
+  // line; a 30 KB markdown file with 1500 lines is the expensive case).
+  const LINE_CAP = 5000;
+  if (beforeLines.length > LINE_CAP || afterLines.length > LINE_CAP) {
+    const limit = Math.max(beforeLines.length, afterLines.length);
+    return `Index: ${fp}\n(diff skipped: file has ${limit} lines, above ${LINE_CAP}-line diff cap)\n`;
+  }
+
   const ops = diffLines(beforeLines, afterLines);
 
   // No changes → empty diff (caller decides whether to render the header).
@@ -276,6 +342,12 @@ function inferBeforeStart(ops: DiffOp[], from: number, beforeLen: number): numbe
 }
 
 const z = tool.schema;
+const DIAGNOSTICS_PARAM_DESCRIPTION =
+  "When true, wait up to 3 seconds for fresh LSP diagnostics on the edited file and include them in the result. Defaults to the configured `lsp.diagnostics_on_edit` value (false unless configured); per-call true/false overrides. Use aft_inspect to check diagnostics across a batch of edits or before tests/commits.";
+
+function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
+  return ctx.config.lsp?.diagnostics_on_edit ?? false;
+}
 
 // ---------------------------------------------------------------------------
 // Tool descriptions focus on behavior, modes, and return values.
@@ -299,8 +371,7 @@ Examples:
   Read lines 50-100: { "filePath": "src/app.ts", "startLine": 50, "endLine": 100 }
   Read 30 lines from line 200: { "filePath": "src/app.ts", "offset": 200, "limit": 30 }
   List directory: { "filePath": "src/" }
-
-Returns: Line-numbered file content string. For directories: newline-joined sorted entries. For binary files: size/message string.`;
+`;
 
 /**
  * Creates the simple read tool. Registers as "read" when hoisted, "aft_read" when not.
@@ -312,15 +383,18 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       filePath: z
         .string()
         .describe("Path to file or directory (absolute or relative to project root)"),
-      startLine: z.number().optional().describe("1-based line to start reading from"),
-      endLine: z.number().optional().describe("1-based line to stop reading at (inclusive)"),
-      limit: z.number().optional().describe("Max lines to return (default: 2000)"),
-      offset: z
-        .number()
-        .optional()
-        .describe(
-          "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
-        ),
+      startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "1-based line to start reading from",
+      ),
+      endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "1-based line to stop reading at (inclusive)",
+      ),
+      limit: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "Max lines to return (default: 2000)",
+      ),
+      offset: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
+        "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+      ),
     },
     execute: async (args, context): Promise<string> => {
       const file = args.filePath as string;
@@ -328,13 +402,28 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       // Resolve relative paths
       const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
 
+      // External-directory check first (mirrors opencode-native ordering in
+      // tool/read.ts:175). Out-of-project paths prompt the user via the
+      // separate `external_directory` permission rule.
+      {
+        const denial = await assertExternalDirectoryPermission(context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
+      }
+
       // Permission check
-      await context.ask({
-        permission: "read",
-        patterns: [filePath],
-        always: ["*"],
-        metadata: {},
-      });
+      try {
+        await runAsk(
+          context.ask({
+            permission: "read",
+            patterns: [filePath],
+            always: ["*"],
+            metadata: {},
+          }),
+        );
+      } catch (error) {
+        if (error instanceof Error && error.message) return permissionDeniedResponse(error.message);
+        return permissionDeniedResponse("Permission denied.");
+      }
 
       // Image/PDF detection — return metadata for UI preview
       const ext = path.extname(filePath).toLowerCase();
@@ -437,10 +526,14 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       }
       let output = data.content as string;
 
-      // Add navigation hint if truncated
-      if (data.truncated) {
-        output += `\n(Showing lines ${data.start_line}-${data.end_line} of ${data.total_lines}. Use startLine/endLine to read other sections.)`;
-      }
+      // Three-case footer: see formatReadFooter() doc.
+      const agentSpecifiedRange =
+        args.startLine !== undefined ||
+        args.endLine !== undefined ||
+        args.offset !== undefined ||
+        args.limit !== undefined;
+      const footer = formatReadFooter(agentSpecifiedRange, data);
+      if (footer) output += footer;
 
       return output;
     },
@@ -456,17 +549,18 @@ function getWriteDescription(editToolName: string): string {
 
 Automatically creates parent directories. Backs up existing files before overwriting.
 If the project has a formatter configured (biome, prettier, rustfmt, etc.), the file
-is auto-formatted after writing. Returns inline LSP diagnostics when available.
+is auto-formatted after writing. Edits return as soon as the write completes unless
+the configured \`lsp.diagnostics_on_edit\` default or a per-call \`diagnostics: true\`
+asks for legacy sync-wait behavior. Call \`aft_inspect\` afterward to check
+diagnostics across a batch of edits.
 
 **Behavior:**
 - Creates parent directories automatically (no need to mkdir first)
 - Existing files are backed up before overwriting (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured (biome.json, .prettierrc, etc.)
-- Returns LSP error-level diagnostics inline if type errors are introduced
+- LSP diagnostics follow \`lsp.diagnostics_on_edit\` by default; pass \`diagnostics\` to override per call
 - Use this for creating new files or completely replacing file contents
-- For partial edits (find/replace), use the \`${editToolName}\` tool instead
-
-Returns: Status message string (for example: "Created new file. Auto-formatted.") with optional inline LSP error lines.`;
+- For partial edits (find/replace), use the \`${editToolName}\` tool instead`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -477,6 +571,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         .string()
         .describe("Path to the file to write (absolute or relative to project root)"),
       content: z.string().describe("The full content to write to the file"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<string> => {
       const file = args.filePath as string;
@@ -486,20 +581,28 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
 
       const relPath = path.relative(context.worktree, filePath);
 
+      // External-directory check first (mirrors opencode-native write.ts:43).
+      {
+        const denial = await assertExternalDirectoryPermission(context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
+      }
+
       // Permission check
-      await context.ask({
-        permission: "edit",
-        patterns: [relPath],
-        always: ["*"],
-        metadata: { filepath: filePath },
-      });
+      await runAsk(
+        context.ask({
+          permission: "edit",
+          patterns: [relPath],
+          always: ["*"],
+          metadata: { filepath: filePath },
+        }),
+      );
 
       const data = await callBridge(ctx, context, "write", {
         file: filePath,
         content,
         create_dirs: true,
-        diagnostics: true,
-        include_diff: true,
+        diagnostics: args.diagnostics ?? diagnosticsOnEditDefault(ctx),
+        include_diff_content: true,
       });
 
       // Error response (e.g. path validation failure)
@@ -509,6 +612,15 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
 
       let output = data.created ? "Created new file." : "File updated.";
       if (data.formatted) output += " Auto-formatted.";
+      // v0.27.1: Rust returns `no_op: true` when post-write content is
+      // byte-identical to the pre-write state (e.g. agent wrote the same
+      // bytes that were already there, or a formatter normalized the
+      // change away). Surface this so the agent doesn't see "File updated"
+      // and assume real bytes changed. See GitHub #45.
+      if (data.no_op === true) {
+        output +=
+          " No net change — the written content is byte-identical to what was already on disk.";
+      }
 
       // Append inline diagnostics if present
       const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
@@ -520,6 +632,19 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
             output += `  Line ${d.line}: ${d.message}\n`;
           }
         }
+      }
+
+      // v0.17.3 honest reporting: when an LSP server didn't respond in time
+      // or its process exited mid-edit, surface that to the agent so they
+      // know diagnostics may be incomplete (rather than assuming silence
+      // means "clean").
+      const pendingServers = data.lsp_pending_servers as string[] | undefined;
+      const exitedServers = data.lsp_exited_servers as string[] | undefined;
+      if (pendingServers && pendingServers.length > 0) {
+        output += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
+      }
+      if (exitedServers && exitedServers.length > 0) {
+        output += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
       }
 
       // Store metadata for tool.execute.after hook (fromPlugin overwrites context.metadata)
@@ -557,11 +682,11 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
 // ---------------------------------------------------------------------------
 
 function getEditDescription(writeToolName: string): string {
-  return `Edit a file by finding and replacing text, or by targeting named symbols.
+  return `Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the \`${writeToolName}\` tool — \`edit\` requires an explicit edit mode and will not silently overwrite a file from \`content\` alone.
 
 **Modes** (determined by which parameters you provide):
 
-Mode priority: operations > edits > symbol (without oldString) > oldString (find/replace) > content-only (${writeToolName})
+Mode priority: operations > appendContent > edits > symbol (without oldString) > oldString (find/replace). If none match, the call is rejected — there is no implicit "write" fallback.
 
 1. **Multi-file transaction** — pass \`operations\` array
    Edits across multiple files with checkpoint-based rollback on failure.
@@ -569,47 +694,45 @@ Mode priority: operations > edits > symbol (without oldString) > oldString (find
    For \`edit_match\`: include \`match\`, \`replacement\`. For \`write\`: include \`content\`.
    Example: \`{ "operations": [{ "file": "a.ts", "command": "edit_match", "match": "old", "replacement": "new" }, { "file": "b.ts", "command": "write", "content": "..." }] }\`
 
-2. **Batch edits** — pass \`filePath\` + \`edits\` array
+2. **Append** — pass \`filePath\` + \`appendContent\`
+   Appends text to the end of a file, creating the file if it does not exist.
+   Example: \`{ "filePath": "notes.txt", "appendContent": "new line\\n" }\`
+
+3. **Batch edits** — pass \`filePath\` + \`edits\` array
    Multiple edits in one file atomically. Each edit is either:
    - \`{ "oldString": "old", "newString": "new" }\` — find/replace
    - \`{ "startLine": 5, "endLine": 7, "content": "new lines" }\` — replace line range (1-based, both inclusive)
    Set content to empty string to delete lines.
 
-3. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
+4. **Symbol replace** — pass \`filePath\` + \`symbol\` + \`content\`
    Replaces an entire named symbol (function, class, type) with new content.
    Includes decorators, attributes, and doc comments in the replacement range.
    **Important:** You must NOT provide \`oldString\` when using symbol mode — if present, the tool silently falls back to find/replace mode.
    Example: \`{ "filePath": "src/app.ts", "symbol": "handleRequest", "content": "function handleRequest() { ... }" }\`
 
-4. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
+5. **Find and replace** — pass \`filePath\` + \`oldString\` + \`newString\`
    Finds the exact text in \`oldString\` and replaces it with \`newString\`.
    Supports fuzzy matching (handles whitespace differences automatically).
    If multiple matches exist, specify which one with \`occurrence\` or use \`replaceAll: true\`.
    Example: \`{ "filePath": "src/app.ts", "oldString": "const x = 1", "newString": "const x = 2" }\`
 
-5. **Replace all occurrences** — add \`replaceAll: true\`
+6. **Replace all occurrences** — add \`replaceAll: true\`
    Replaces every occurrence of \`oldString\` in the file.
    Example: \`{ "filePath": "src/app.ts", "oldString": "oldName", "newString": "newName", "replaceAll": true }\`
 
-6. **Select specific occurrence** — add \`occurrence: N\` (0-indexed)
+7. **Select specific occurrence** — add \`occurrence: N\` (0-indexed)
    When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).
    Example: \`{ "filePath": "src/app.ts", "oldString": "TODO", "newString": "DONE", "occurrence": 0 }\`
 
-Note: Modes 5 and 6 are options on mode 4 (find/replace) — they require \`oldString\`.
+Note: Modes 6 and 7 are options on mode 5 (find/replace) — they require \`oldString\`.
 
 **Behavior:**
 - Backs up files before editing (recoverable via aft_safety undo)
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- LSP error-level diagnostics are returned automatically after non-dry-run edits
-
-Returns: JSON string for the selected edit mode. Dry runs return diff data; non-dry-run edits may append inline LSP error lines.
-
-Common response fields: success (boolean), diff (object with before/after), backup_id (string), syntax_valid (boolean). Exact fields vary by mode.`;
-  // Note: The Returns section intentionally stays high-level because per-mode JSON shapes
-  // vary by Rust command and documenting each would bloat the description for minimal gain.
-  // Agents can parse the JSON response generically — key fields include 'success' and 'diff'.
+- Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.
+- Response is a JSON string for the selected edit mode; key fields include success, diff, backup_id, syntax_valid, and mode-specific fields.`;
 }
 
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
@@ -628,12 +751,20 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .optional()
         .describe("Text to replace with (omit or set to empty string to delete the matched text)"),
       replaceAll: z.boolean().optional().describe("Replace all occurrences"),
-      occurrence: z
-        .number()
-        .optional()
-        .describe("0-indexed occurrence to replace when multiple matches exist"),
+      occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "0-indexed occurrence to replace when multiple matches exist",
+      ),
       symbol: z.string().optional().describe("Named symbol to replace (function, class, type)"),
-      content: z.string().optional().describe("New content for symbol replace or file write"),
+      content: z
+        .string()
+        .optional()
+        .describe(
+          "Replacement content for symbol mode or operations[].command='write'. For whole-file writes, use the `write` tool.",
+        ),
+      appendContent: z
+        .string()
+        .optional()
+        .describe("Text to append to the end of filePath; creates the file if needed"),
       edits: z
         .array(z.record(z.string(), z.unknown()))
         .optional()
@@ -646,25 +777,51 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         .describe(
           "Transaction — array of { file: string, command: 'edit_match' | 'write', match?: string, replacement?: string, content?: string } for multi-file edits with rollback. Note: uses 'file'/'match'/'replacement' (not filePath/oldString/newString)",
         ),
-      dryRun: z
-        .boolean()
-        .optional()
-        .describe("Preview changes without applying (returns diff, default: false)"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<string> => {
+      // Footgun guard: top-level startLine/endLine are not valid params on
+      // edit. They only exist nested inside `edits[]` for batch line-range
+      // mode. Without this guard, Zod silently strips the unknown keys and
+      // the call falls through mode resolution to the content-only-write
+      // branch, overwriting the entire file. Reject with a helpful pointer.
+      const argsRecord = args as Record<string, unknown>;
+      if (argsRecord.startLine !== undefined || argsRecord.endLine !== undefined) {
+        throw new Error(
+          "edit: 'startLine'/'endLine' are not top-level parameters. " +
+            "For line-range edits, nest them inside the `edits` array: " +
+            '`edits: [{ startLine: N, endLine: M, content: "..." }]`. ' +
+            "For find/replace, use `oldString`/`newString` instead.",
+        );
+      }
+
       // Transaction mode — multi-file
       if (Array.isArray(args.operations)) {
         const ops = args.operations as Array<Record<string, unknown>>;
         const files = ops.map((op) => op.file as string).filter(Boolean);
 
-        await context.ask({
-          permission: "edit",
-          patterns: files.map((f) =>
-            path.relative(context.worktree, path.resolve(context.directory, f)),
-          ),
-          always: ["*"],
-          metadata: {},
-        });
+        // External-directory check first (mirrors opencode-native edit.ts:68).
+        {
+          const asked = new Set<string>();
+          for (const file of files) {
+            const absPath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+            if (asked.has(absPath)) continue;
+            asked.add(absPath);
+            const denial = await assertExternalDirectoryPermission(context, absPath);
+            if (denial) return permissionDeniedResponse(denial);
+          }
+        }
+
+        await runAsk(
+          context.ask({
+            permission: "edit",
+            patterns: files.map((f) =>
+              path.relative(context.worktree, path.resolve(context.directory, f)),
+            ),
+            always: ["*"],
+            metadata: {},
+          }),
+        );
 
         const resolvedOps = ops.map((op) => ({
           ...op,
@@ -673,10 +830,11 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
             : path.resolve(context.directory, op.file as string),
         }));
 
-        const params: Record<string, unknown> = { operations: resolvedOps };
-        params.dry_run = args.dryRun === true;
-        const data = await callBridge(ctx, context, "transaction", params);
-        return JSON.stringify(data);
+        const response = await callBridge(ctx, context, "transaction", { operations: resolvedOps });
+        if (response.success === false) {
+          throw new Error((response.message as string | undefined) ?? "transaction failed");
+        }
+        return JSON.stringify(response);
       }
 
       const file = args.filePath as string;
@@ -686,19 +844,32 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       const relPath = path.relative(context.worktree, filePath);
 
-      await context.ask({
-        permission: "edit",
-        patterns: [relPath],
-        always: ["*"],
-        metadata: { filepath: filePath },
-      });
+      // External-directory check first (mirrors opencode-native edit.ts:68).
+      {
+        const denial = await assertExternalDirectoryPermission(context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
+      }
+
+      await runAsk(
+        context.ask({
+          permission: "edit",
+          patterns: [relPath],
+          always: ["*"],
+          metadata: { filepath: filePath },
+        }),
+      );
 
       const params: Record<string, unknown> = { file: filePath };
 
       // Route to appropriate Rust command
       let command: string;
 
-      if (Array.isArray(args.edits)) {
+      if (typeof args.appendContent === "string") {
+        command = "edit_match";
+        params.op = "append";
+        params.append_content = args.appendContent;
+        params.create_dirs = true;
+      } else if (Array.isArray(args.edits)) {
         // Batch mode — translate camelCase to snake_case for Rust
         command = "batch";
         params.edits = (args.edits as Array<Record<string, unknown>>).map((edit) => {
@@ -730,26 +901,28 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         params.replacement = args.newString ?? "";
         if (args.replaceAll !== undefined) params.replace_all = args.replaceAll;
         if (args.occurrence !== undefined) params.occurrence = args.occurrence;
-      } else if (typeof args.content === "string") {
-        // Write mode
-        command = "write";
-        params.content = args.content;
-        params.create_dirs = true;
       } else {
-        throw new Error(
-          "Provide 'oldString' + 'newString', 'symbol' + 'content', 'edits' array, or 'content' for write",
-        );
+        // No mode-selecting parameter matched. We deliberately do NOT fall
+        // through to a content-only "write" mode here, even when `content` is
+        // present: that fallback was the disaster path (a typo or misnamed
+        // param like top-level startLine could silently overwrite the whole
+        // file). For full-file writes, use the dedicated `${writeToolName}`
+        // tool, which is unambiguous about its destructive intent.
+        const hint =
+          typeof args.content === "string"
+            ? ` To write the whole file, use the '${writeToolName}' tool. To edit existing content, provide 'oldString' (and optionally 'newString'), 'symbol' + 'content', or an 'edits' array.`
+            : " Provide 'oldString' (+ optional 'newString'), 'symbol' + 'content', 'edits' array, or 'operations' array.";
+        throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
 
-      if (args.dryRun) params.dry_run = true;
-      if (!args.dryRun) params.diagnostics = true;
+      params.diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
-      if (!args.dryRun) params.include_diff = true;
+      params.include_diff_content = true;
 
       const data = await callBridge(ctx, context, command, params);
 
       // Store metadata for tool.execute.after hook (fromPlugin overwrites context.metadata)
-      if (!args.dryRun && data.success && data.diff) {
+      if (data.success && data.diff) {
         const diff = data.diff as {
           before?: string;
           after?: string;
@@ -778,23 +951,69 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         }
       }
 
-      let result = JSON.stringify(data);
+      // Agent-facing result must NOT carry full before/after file contents.
+      // We requested `include_diff_content` purely for the UI metadata above;
+      // echoing it back to the model makes the payload scale with file size,
+      // not edit size (a 1-line change in a 600-line file = the whole file
+      // twice). Replace diff with counts-only for the agent — the model
+      // already knows what it changed.
+      const agentData = { ...data } as Record<string, unknown>;
+      if (agentData.diff && typeof agentData.diff === "object") {
+        const d = agentData.diff as { additions?: number; deletions?: number };
+        agentData.diff = { additions: d.additions ?? 0, deletions: d.deletions ?? 0 };
+      }
+      let result = JSON.stringify(agentData);
+
+      const globSkipNote = formatGlobSkipReasonsNote(data.format_skip_reasons as unknown);
+      if (globSkipNote) result += `\n\n${globSkipNote}`;
+
+      // v0.27.1: surface `no_op: true` honestly. Rust sets this when the
+      // post-write file content is byte-identical to the pre-write state —
+      // either oldString === newString, a formatter normalized the change
+      // away, or the replacement matched what was already in the file.
+      // The match was satisfied (replacements > 0) but no net file change
+      // landed. Without this note, agents see `+0/-0` and assume the tool
+      // failed silently. See GitHub #45.
+      if (data.no_op === true) {
+        result +=
+          "\n\nNote: no net file change — the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
+      }
 
       // Append inline diagnostics to output (matching write tool pattern)
-      if (!args.dryRun) {
-        const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
-        if (diags && diags.length > 0) {
-          const errors = diags.filter((d) => d.severity === "error");
-          if (errors.length > 0) {
-            const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
-            result += `\n\nLSP errors detected, please fix:\n${diagLines}`;
-          }
+      const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
+      if (diags && diags.length > 0) {
+        const errors = diags.filter((d) => d.severity === "error");
+        if (errors.length > 0) {
+          const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
+          result += `\n\nLSP errors detected, please fix:\n${diagLines}`;
         }
+      }
+      // v0.17.3 honest reporting: surface pending/exited servers so the
+      // agent doesn't mistake silence for "all clear" when an LSP server
+      // simply didn't respond before our wait_ms deadline.
+      const pendingServers = data.lsp_pending_servers as string[] | undefined;
+      const exitedServers = data.lsp_exited_servers as string[] | undefined;
+      if (pendingServers && pendingServers.length > 0) {
+        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
+      }
+      if (exitedServers && exitedServers.length > 0) {
+        result += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
       }
 
       return result;
     },
   };
+}
+
+function formatGlobSkipReasonsNote(reasons: unknown): string | undefined {
+  if (!Array.isArray(reasons)) return undefined;
+  const actionable = reasons
+    .filter((reason): reason is string => typeof reason === "string")
+    .filter((reason) =>
+      ["formatter_not_installed", "formatter_excluded_path", "timeout", "error"].includes(reason),
+    );
+  if (actionable.length === 0) return undefined;
+  return `Note: formatter skipped some glob edit result file(s): ${[...new Set(actionable)].sort().join(", ")}. See per-file format_skipped_reason values for details.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +1052,7 @@ Example patch:
 \`\`\`
 
 **Behavior:**
-- All file changes are applied with checkpoint-based rollback — if any file fails, previous changes are rolled back (best-effort)
+- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. A pre-patch checkpoint is created automatically — use \`aft_safety\` undo if you need to revert.
 - Files are backed up before modification
 - Parent directories are created automatically for new files
 - Fuzzy matching for context anchors (handles whitespace and Unicode differences)
@@ -843,16 +1062,18 @@ Example patch:
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with \`+\` even when creating a new file
 
-Returns: Status message string listing created, updated, moved, deleted, or failed file operations. May include inline LSP errors if type errors are introduced by the patch.`;
+Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description: APPLY_PATCH_DESCRIPTION,
     args: {
       patchText: z.string().describe("The full patch text including Begin/End markers"),
+      diagnostics: z.boolean().optional().describe(DIAGNOSTICS_PARAM_DESCRIPTION),
     },
     execute: async (args, context): Promise<string> => {
       const patchText = args.patchText as string;
+      const diagnostics = args.diagnostics ?? diagnosticsOnEditDefault(ctx);
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
@@ -897,16 +1118,33 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       }
 
       const relPaths = Array.from(affectedAbs).map((abs) => path.relative(context.worktree, abs));
+      const multiFileWritePaths = Array.from(affectedAbs);
 
-      await context.ask({
-        permission: "edit",
-        patterns: relPaths,
-        always: ["*"],
-        metadata: {},
-      });
+      // External-directory check first (mirrors opencode-native patch.ts:298).
+      {
+        const asked = new Set<string>();
+        for (const filePath of multiFileWritePaths) {
+          if (asked.has(filePath)) continue;
+          asked.add(filePath);
+          const denial = await assertExternalDirectoryPermission(context, filePath);
+          if (denial) return permissionDeniedResponse(denial);
+        }
+      }
 
-      // Checkpoint only files that exist pre-patch. Non-existent destinations
-      // are tracked in newlyCreatedAbs and reverted by deletion on rollback.
+      await runAsk(
+        context.ask({
+          permission: "edit",
+          patterns: relPaths,
+          always: ["*"],
+          metadata: {},
+        }),
+      );
+
+      // Pre-patch checkpoint covers files that exist pre-patch (so the
+      // agent can `aft_safety` undo if they want to abort after seeing a
+      // partial result). Newly-created targets are deleted to revert.
+      // Checkpoint failure is non-fatal — agent can still inspect partial
+      // results and proceed.
       const checkpointPaths = Array.from(affectedAbs).filter((abs) => !newlyCreatedAbs.has(abs));
       const checkpointName = `apply_patch_${Date.now()}`;
       let checkpointCreated = false;
@@ -918,8 +1156,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           });
           checkpointCreated = true;
         } catch {
-          // Checkpoint failure is non-fatal — proceed without rollback
-          // protection (the hunk loop still records perFileDiffs for the UI).
+          // Checkpoint failure: agent loses the easy `aft_safety` undo
+          // path but the patch still attempts each hunk independently.
         }
       }
 
@@ -930,7 +1168,21 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       // recomputing via TS-side LCS to keep one source of truth (issue: the
       // `apply_patch` UI was reporting +N/-N≈filesize counts because the
       // local count was diverging from the Rust truth).
+      //
+      // PER-FILE COMMIT MODEL (BUG-6a, dogfooding fix): each hunk commits
+      // independently. A failure on one file no longer rolls back the
+      // others. The pre-patch checkpoint is still created so the agent can
+      // use `aft_safety` to revert successful files manually if they want
+      // to abort the whole patch after seeing a partial result.
+      //
+      // Why this changed: an agent submitted a 3-file patch where 2 files
+      // patched cleanly and the 3rd hit a fuzzy-match drift. The old
+      // atomic-rollback discarded the 2 successes, so the agent had to
+      // re-issue the same patch with the failing file removed — exactly
+      // the per-file commit semantics, just done by hand. The ergonomic
+      // fix is to give them per-file commit out of the box.
       const results: string[] = [];
+      const failures: string[] = [];
       const perFileDiffs: Array<{
         filePath: string;
         before: string;
@@ -938,21 +1190,34 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         additions: number;
         deletions: number;
       }> = [];
-      let patchFailed = false;
 
       for (const hunk of hunks) {
         const filePath = path.resolve(context.directory, hunk.path);
 
         switch (hunk.type) {
           case "add": {
+            // *** Add File: <path> means CREATE; refuse to overwrite an existing
+            // file. The unified `write` bridge command silently overwrites by
+            // design (it's the back-end for both `write` and `apply_patch`'s
+            // create-or-overwrite flow), so the existence check has to happen
+            // here, in the apply_patch wrapper. Without it, an Add hunk against
+            // a path that already exists would clobber the file's contents and
+            // the agent would see a misleading "Created <path>" success.
+            if (fs.existsSync(filePath)) {
+              const msg = `Failed to create ${hunk.path}: file already exists. Use *** Update File: to modify, or *** Delete File: first if you want to replace it entirely.`;
+              results.push(msg);
+              failures.push(hunk.path);
+              break;
+            }
             try {
               const content = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
               const writeResult = await callBridge(ctx, context, "write", {
                 file: filePath,
                 content,
                 create_dirs: true,
-                diagnostics: true,
-                include_diff: true,
+                diagnostics,
+                include_diff_content: true,
+                multi_file_write_paths: multiFileWritePaths,
               });
               const wrDiff = writeResult.diff as
                 | { before?: string; after?: string; additions?: number; deletions?: number }
@@ -969,8 +1234,21 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               });
               results.push(`Created ${hunk.path}`);
             } catch (e) {
-              patchFailed = true;
-              results.push(`Failed to create ${hunk.path}: ${e instanceof Error ? e.message : e}`);
+              const msg = `Failed to create ${hunk.path}: ${e instanceof Error ? e.message : e}`;
+              results.push(msg);
+              failures.push(hunk.path);
+              // The write may have left a partial file on disk for an `add`
+              // hunk. Best-effort cleanup so we don't leave orphan partials.
+              // (Failures here are tolerated: the agent will see the
+              // creation failure in `results` either way.)
+              const filePath = path.resolve(context.directory, hunk.path);
+              if (fs.existsSync(filePath)) {
+                try {
+                  fs.rmSync(filePath, { force: true });
+                } catch {
+                  // ignore — surfaced through the parent failure already
+                }
+              }
             }
             break;
           }
@@ -990,8 +1268,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               });
               results.push(`Deleted ${hunk.path}`);
             } catch (e) {
-              patchFailed = true;
               results.push(`Failed to delete ${hunk.path}: ${e instanceof Error ? e.message : e}`);
+              failures.push(hunk.path);
             }
             break;
           }
@@ -1010,8 +1288,9 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
                 file: targetPath,
                 content: newContent,
                 create_dirs: true,
-                diagnostics: true,
-                include_diff: true,
+                diagnostics,
+                include_diff_content: true,
+                multi_file_write_paths: multiFileWritePaths,
               });
 
               // Collect diagnostics from this file
@@ -1055,14 +1334,56 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
               });
 
               if (hunk.move_path) {
-                await callBridge(ctx, context, "delete_file", { file: filePath });
+                try {
+                  const deleteResult = await callBridge(ctx, context, "delete_file", {
+                    file: filePath,
+                  });
+                  if (deleteResult.success === false) {
+                    throw new Error(
+                      (deleteResult.message as string | undefined) ?? "delete failed",
+                    );
+                  }
+                } catch (deleteError) {
+                  try {
+                    if (!checkpointCreated) {
+                      throw new Error("pre-patch checkpoint was not created");
+                    }
+                    const rollbackResult = await callBridge(ctx, context, "restore_checkpoint", {
+                      name: checkpointName,
+                    });
+                    if (rollbackResult.success === false) {
+                      throw new Error(
+                        (rollbackResult.message as string | undefined) ??
+                          "checkpoint restore failed",
+                      );
+                    }
+                    if (newlyCreatedAbs.has(targetPath) && fs.existsSync(targetPath)) {
+                      const cleanupResult = await callBridge(ctx, context, "delete_file", {
+                        file: targetPath,
+                      });
+                      if (cleanupResult.success === false) {
+                        throw new Error(
+                          (cleanupResult.message as string | undefined) ??
+                            "new destination cleanup failed",
+                        );
+                      }
+                    }
+                  } catch (rollbackError) {
+                    throw new Error(
+                      `success: false; code: move_partial_failure; files: [${filePath}, ${targetPath}]; wrote destination ${targetPath}, but failed to delete source ${filePath} (${formatError(deleteError)}) and failed to restore pre-patch checkpoint ${checkpointName} (${formatError(rollbackError)}). Both copies may exist or destination content may be changed: ${filePath}, ${targetPath}`,
+                    );
+                  }
+                  throw new Error(
+                    `source delete failed after writing move destination; restored pre-patch checkpoint ${checkpointName}: ${formatError(deleteError)}`,
+                  );
+                }
                 results.push(`Updated and moved ${hunk.path} → ${hunk.move_path}`);
               } else {
                 results.push(`Updated ${hunk.path}`);
               }
             } catch (e) {
-              patchFailed = true;
               results.push(`Failed to update ${hunk.path}: ${e instanceof Error ? e.message : e}`);
+              failures.push(hunk.path);
               break;
             }
             break;
@@ -1070,49 +1391,46 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      // On failure, restore checkpoint AND delete files that were newly
-      // created by this patch (adds + move destinations that didn't exist
-      // pre-patch). Checkpoint restore alone only recovers files that
-      // existed before — it cannot undo a newly created file or the
-      // destination side of a partial move (audit #8).
-      if (patchFailed) {
-        const rollbackNotes: string[] = [];
-        if (checkpointCreated) {
-          try {
-            await callBridge(ctx, context, "restore_checkpoint", { name: checkpointName });
-            rollbackNotes.push("restored pre-existing files from checkpoint");
-          } catch {
-            rollbackNotes.push("checkpoint restore FAILED, pre-existing files may be inconsistent");
-          }
-        } else if (checkpointPaths.length > 0) {
-          rollbackNotes.push("no checkpoint was created, pre-existing files may be inconsistent");
+      // PER-FILE COMMIT (BUG-6a): no atomic rollback. The pre-patch
+      // checkpoint stays available so the agent can `aft_safety` revert
+      // successful files manually if they want to abort the whole patch
+      // after seeing a partial outcome.
+      //
+      // Each hunk type self-recovers cleanly on failure:
+      //   - add: the partial file (if any) is deleted in the catch block
+      //          above so we don't leave orphan partials
+      //   - update: applyUpdateChunks throws BEFORE write when fuzzy match
+      //             can't find the lines, so the original file is intact
+      //             on disk. write failures are also pre-commit at the
+      //             bridge level (bridge does its own backup).
+      //   - delete: failed delete leaves the file in place — no cleanup
+      //             needed
+      //
+      // Surface a clear failure summary at the end so the agent can see
+      // which hunks failed and decide whether to retry just those, without
+      // scanning the per-hunk lines.
+      if (failures.length > 0) {
+        const partial = failures.length < hunks.length;
+        const summary = partial
+          ? `Patch partially applied — ${hunks.length - failures.length} of ${hunks.length} hunk(s) succeeded. Failed: ${failures.join(", ")}. Successful changes are kept; use \`aft_safety\` to revert if you want to abort.`
+          : `Patch failed — none of the ${hunks.length} hunk(s) applied: ${failures.join(", ")}.`;
+        results.push(summary);
+        // Total-failure case: throw so OpenCode marks the tool call as errored
+        // in the UI (state.status = "error") and the agent's retry loop sees
+        // a real failure. Returning the failure summary as a normal string
+        // makes OpenCode classify the call as completed/successful — the
+        // agent only sees the failure in the output text, and the UI shows
+        // a green check next to a red error message. This matches OpenCode's
+        // native apply_patch which uses Effect.fail() on every error path
+        // (packages/opencode/src/tool/apply_patch.ts).
+        //
+        // Partial successes still return the string: real changes landed on
+        // disk, the agent needs to see exactly which hunks worked, and the
+        // tool genuinely did do work. Treating it as an error would obscure
+        // the partial outcome.
+        if (!partial) {
+          throw new Error(results.join("\n"));
         }
-
-        // Delete any file we newly created. We call delete_file (which
-        // respects validate_path and backs up), and tolerate already-absent
-        // files so partial-create failures don't double-error.
-        let newlyDeleted = 0;
-        for (const createdAbs of newlyCreatedAbs) {
-          if (!fs.existsSync(createdAbs)) continue;
-          try {
-            await callBridge(ctx, context, "delete_file", { file: createdAbs });
-            newlyDeleted++;
-          } catch {
-            rollbackNotes.push(
-              `failed to delete newly-created ${path.relative(context.worktree, createdAbs)}`,
-            );
-          }
-        }
-        if (newlyDeleted > 0) {
-          rollbackNotes.push(`removed ${newlyDeleted} newly-created file(s)`);
-        }
-
-        results.push(
-          rollbackNotes.length > 0
-            ? `Patch failed — ${rollbackNotes.join("; ")}.`
-            : "Patch failed — nothing to roll back.",
-        );
-        return results.join("\n");
       }
 
       // Store metadata for tool.execute.after hook (match opencode built-in format)
@@ -1211,32 +1529,85 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 // ---------------------------------------------------------------------------
 
 const DELETE_DESCRIPTION =
-  "Delete a file with backup.\n\n" +
-  "The file content is backed up before deletion — use aft_safety undo to recover if needed.";
+  "Delete one or more files (or directories) with backup.\n\n" +
+  "Each file is backed up before deletion — use aft_safety undo to recover any of them. " +
+  "For directories, every file inside is individually backed up before the tree is removed.\n\n" +
+  "Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\n" +
+  "Partial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.";
 
 function createDeleteTool(ctx: PluginContext): ToolDefinition {
   return {
     description: DELETE_DESCRIPTION,
     args: {
-      filePath: z.string().describe("Path to file to delete"),
+      files: z
+        .array(z.string())
+        .min(1)
+        .describe("Paths to delete (one or more). May include directories when recursive=true."),
+      recursive: z
+        .boolean()
+        .optional()
+        .describe(
+          "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+        ),
     },
     execute: async (args, context): Promise<string> => {
-      const filePath = path.isAbsolute(args.filePath as string)
-        ? (args.filePath as string)
-        : path.resolve(context.directory, args.filePath as string);
+      const inputs = args.files as string[];
+      const recursive = args.recursive === true;
+      const absolutePaths = inputs.map((f) =>
+        path.isAbsolute(f) ? f : path.resolve(context.directory, f),
+      );
 
-      await context.ask({
-        permission: "edit",
-        patterns: [filePath],
-        always: ["*"],
-        metadata: { action: "delete" },
+      // External-directory check first (mirrors opencode-native edit.ts:68).
+      {
+        const asked = new Set<string>();
+        for (const filePath of absolutePaths) {
+          if (asked.has(filePath)) continue;
+          asked.add(filePath);
+          const denial = await assertExternalDirectoryPermission(context, filePath);
+          if (denial) return permissionDeniedResponse(denial);
+        }
+      }
+
+      await runAsk(
+        context.ask({
+          permission: "edit",
+          patterns: absolutePaths,
+          always: ["*"],
+          metadata: { action: "delete", count: absolutePaths.length },
+        }),
+      );
+
+      // Single batched call so every file shares one op_id; one `aft_safety
+      // undo` then restores the whole delete atomically.
+      const response = await callBridge(ctx, context, "delete_file", {
+        files: absolutePaths,
+        recursive,
       });
 
-      const result = await callBridge(ctx, context, "delete_file", { file: filePath });
-      if (result.success === false) {
-        throw new Error((result.message as string) || "delete failed");
+      if (response.success === false) {
+        throw new Error((response.message as string | undefined) ?? "delete failed");
       }
-      return JSON.stringify(result);
+
+      const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
+      const skipped =
+        (response.skipped_files as Array<{ file: string; reason: string }> | undefined) ?? [];
+      const deleted = deletedEntries.map((entry) => entry.file);
+
+      // Refuse a fully-failed batch with a real error so the agent surface
+      // doesn't silently render "completed" for nothing-actually-deleted.
+      if (deleted.length === 0 && skipped.length > 0) {
+        throw new Error(
+          `delete failed for all ${skipped.length} file(s):\n` +
+            skipped.map((entry) => `  ${entry.file}: ${entry.reason}`).join("\n"),
+        );
+      }
+
+      return JSON.stringify({
+        success: true,
+        complete: skipped.length === 0,
+        deleted,
+        skipped_files: skipped,
+      });
     },
   };
 }
@@ -1247,14 +1618,18 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
 
 const MOVE_DESCRIPTION =
   "Move or rename a file with backup. Creates parent directories for destination automatically\n" +
-  "Note: This moves/renames files at the OS level.";
+  "Note: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead.";
 
 function createMoveTool(ctx: PluginContext): ToolDefinition {
   return {
     description: MOVE_DESCRIPTION,
     args: {
-      filePath: z.string().describe("Source file path to move"),
-      destination: z.string().describe("Destination file path"),
+      filePath: z
+        .string()
+        .describe("Source file path to move (absolute or relative to project root)"),
+      destination: z
+        .string()
+        .describe("Destination file path (absolute or relative to project root)"),
     },
     execute: async (args, context): Promise<string> => {
       const filePath = path.isAbsolute(args.filePath as string)
@@ -1264,12 +1639,26 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
         ? (args.destination as string)
         : path.resolve(context.directory, args.destination as string);
 
-      await context.ask({
-        permission: "edit",
-        patterns: [filePath, destPath],
-        always: ["*"],
-        metadata: { action: "move" },
-      });
+      // External-directory check first (mirrors opencode-native edit.ts:68).
+      {
+        const sourceDenial = await assertExternalDirectoryPermission(context, filePath, {
+          kind: "file",
+        });
+        if (sourceDenial) return permissionDeniedResponse(sourceDenial);
+        if (destPath !== filePath) {
+          const destDenial = await assertExternalDirectoryPermission(context, destPath);
+          if (destDenial) return permissionDeniedResponse(destDenial);
+        }
+      }
+
+      await runAsk(
+        context.ask({
+          permission: "edit",
+          patterns: [filePath, destPath],
+          always: ["*"],
+          metadata: { action: "move" },
+        }),
+      );
 
       const result = await callBridge(ctx, context, "move_file", {
         file: filePath,
@@ -1289,10 +1678,23 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
 
 /**
  * Returns hoisted tools keyed by opencode's built-in names.
- * Overrides: read, write, edit, apply_patch.
+ * Overrides: read, write, edit, apply_patch (always when hoisting is on).
+ *
+ * Bash hoisting is opt-in: `bash`, `bash_status`, `bash_write`, and `bash_kill` are
+ * registered together when at least one `experimental.bash.*` flag is
+ * enabled (rewrite, compress, or background). When all flags are off,
+ * opencode's native bash stays in place — users without bash experimentals
+ * get zero AFT code in their bash path.
+ *
+ * `bash_status` and `bash_kill` ride alongside `bash` regardless of which
+ * experimental flag enabled it: foreground bash auto-promotes long-running
+ * tasks to background after a short wait-window (v0.20+), so the agent
+ * always needs a way to inspect or kill those promoted tasks. The
+ * `experimental.bash.background` flag only gates explicit
+ * `bash({ background: true })` spawning, not promotion.
  */
 export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition> {
-  return {
+  const tools: Record<string, ToolDefinition> = {
     read: createReadTool(ctx),
     write: createWriteTool(ctx, "edit"),
     edit: createEditTool(ctx, "write"),
@@ -1300,6 +1702,27 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
   };
+
+  // Bash hoisting is gated by the single resolved bash config — see
+  // `resolveBashConfig` in config.ts for the precedence rules (top-level
+  // `bash` wins over legacy `experimental.bash.*`, surface defaults fill in
+  // when neither is set). When enabled, `bash_status` and `bash_kill`
+  // register alongside `bash` so the agent can always inspect and kill
+  // auto-promoted background tasks regardless of which sub-feature was
+  // actually requested.
+  if (resolveBashConfig(ctx.config).enabled) {
+    tools.bash = createBashTool(ctx);
+    tools.bash_status = createBashStatusTool(ctx);
+    tools.bash_write = createBashWriteTool(ctx);
+    tools.bash_watch = createBashWatchTool(ctx);
+    tools.bash_kill = createBashKillTool(ctx);
+  }
+
+  return tools;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -1308,19 +1731,76 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
 export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const aftEditTool = createEditTool(ctx, "aft_write");
 
-  return {
+  const tools: Record<string, ToolDefinition> = {
     aft_read: createReadTool(ctx),
     aft_write: createWriteTool(ctx, "aft_edit"),
     aft_edit: {
       ...aftEditTool,
-      execute: async (args, context): Promise<string> => {
+      // Returns the inner aft_edit tool's result OR a JSON envelope string for
+      // the legacy mode:"write" shim. Newer @opencode-ai/plugin versions
+      // widened ToolResult from `string` to `string | { output, metadata? }`,
+      // so we accept both shapes here; the OpenCode runtime handles both.
+      execute: async (args, context) => {
         const argRecord = args as Record<string, unknown>;
-        const normalizedArgs =
+        // Legacy back-compat: callers (mostly older tests/integrations) used
+        // `{ mode, file, ... }` instead of the current schema. Translate
+        // `file` -> `filePath` so the rest of the wrapper sees the modern
+        // shape. The current edit tool ignores the `mode` field; we keep it
+        // in the args object only so the explicit `mode: "write"` branch
+        // below can detect it.
+        const normalizedArgs: Record<string, unknown> =
           argRecord.mode !== undefined &&
           argRecord.filePath === undefined &&
           typeof argRecord.file === "string"
             ? { ...argRecord, filePath: argRecord.file }
-            : argRecord;
+            : { ...argRecord };
+
+        // Explicit legacy `mode: "write"` — route directly to the Rust
+        // `write` command. We do NOT fall through to the modern edit tool
+        // here, because the modern tool deliberately rejects content-only
+        // calls (the v0.17.2 footgun fix). Legacy `mode: "write"` is an
+        // *explicit* whole-file write request, which is fine; the danger is
+        // *implicit* whole-file writes where a typo in another mode-selecting
+        // param silently degrades into overwrite. Returns the same JSON
+        // envelope shape the legacy callers expect (success / file /
+        // syntax_valid / etc.), not the human-readable string the modern
+        // `write` tool returns.
+        if (
+          normalizedArgs.mode === "write" &&
+          typeof normalizedArgs.filePath === "string" &&
+          typeof normalizedArgs.content === "string"
+        ) {
+          const file = normalizedArgs.filePath as string;
+          const filePath = path.isAbsolute(file) ? file : path.resolve(context.directory, file);
+          const relPath = path.relative(context.worktree, filePath);
+
+          // External-directory check first (mirrors opencode-native write.ts:43).
+          {
+            const denial = await assertExternalDirectoryPermission(context, filePath);
+            if (denial) return permissionDeniedResponse(denial);
+          }
+
+          await runAsk(
+            context.ask({
+              permission: "edit",
+              patterns: [relPath],
+              always: ["*"],
+              metadata: { filepath: filePath },
+            }),
+          );
+          const writeParams: Record<string, unknown> = {
+            file: filePath,
+            content: normalizedArgs.content as string,
+            create_dirs: normalizedArgs.create_dirs !== false,
+            diagnostics: normalizedArgs.diagnostics ?? diagnosticsOnEditDefault(ctx),
+          };
+          const response = await callBridge(ctx, context, "write", writeParams);
+          if (response.success === false) {
+            throw new Error((response.message as string | undefined) ?? "write failed");
+          }
+          return JSON.stringify(response);
+        }
+
         return aftEditTool.execute(normalizedArgs, context);
       },
     },
@@ -1328,4 +1808,18 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
   };
+
+  // Hoist-off mode: same gating as hoisted mode but with the aft_ prefix on
+  // the primary bash tool so it doesn't override OpenCode's native bash.
+  // The sibling status/kill tools keep their unprefixed names because they
+  // refer to AFT-spawned task IDs that the native bash doesn't know about.
+  if (resolveBashConfig(ctx.config).enabled) {
+    tools.aft_bash = createBashTool(ctx);
+    tools.bash_status = createBashStatusTool(ctx);
+    tools.bash_write = createBashWriteTool(ctx);
+    tools.bash_watch = createBashWatchTool(ctx);
+    tools.bash_kill = createBashKillTool(ctx);
+  }
+
+  return tools;
 }

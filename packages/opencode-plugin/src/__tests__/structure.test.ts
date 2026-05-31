@@ -3,11 +3,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { BridgePool } from "../pool.js";
 import { aftPrefixedTools } from "../tools/hoisted.js";
 import { structureTools } from "../tools/structure.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
@@ -38,7 +39,7 @@ function createMockSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 
@@ -115,9 +116,13 @@ describe("Structure tool round-trips", () => {
   let tmpDir: string | null = null;
 
   const createBridge = () => {
-    pool = new BridgePool(BINARY_PATH, {
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
+    pool = new BridgePool(
+      BINARY_PATH,
+      {
+        timeoutMs: TEST_TIMEOUT_MS,
+      },
+      { harness: "opencode" },
+    );
     return pool;
   };
 

@@ -3,6 +3,8 @@
 //!
 //! Used by `write`, `edit_symbol`, `edit_match`, and `batch` commands.
 
+#![cfg_attr(test, allow(clippy::items_after_test_module))]
+
 use std::path::Path;
 
 use crate::config::Config;
@@ -135,49 +137,70 @@ pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
     Some(!tree.root_node().has_error())
 }
 
-/// Result of a dry-run diff computation.
-pub struct DryRunResult {
-    /// Unified diff between original and proposed content.
-    pub diff: String,
-    /// Whether the proposed content has valid syntax. `None` for unsupported languages.
-    pub syntax_valid: Option<bool>,
-}
-
-/// Compute a unified diff between original and proposed content, plus syntax validation.
-///
-/// Returns a standard unified diff with `a/` and `b/` path prefixes and 3 lines of context.
-/// Also validates syntax of the proposed content via tree-sitter.
-pub fn dry_run_diff(original: &str, proposed: &str, path: &Path) -> DryRunResult {
-    let display_path = path.display().to_string();
-    let text_diff = similar::TextDiff::from_lines(original, proposed);
-    let diff = text_diff
-        .unified_diff()
-        .context_radius(3)
-        .header(
-            &format!("a/{}", display_path),
-            &format!("b/{}", display_path),
-        )
-        .to_string();
-    let syntax_valid = validate_syntax_str(proposed, path);
-    DryRunResult { diff, syntax_valid }
-}
-
-/// Extract the `dry_run` boolean from request params.
-///
-/// Returns `true` if `params["dry_run"]` is `true`, `false` otherwise.
-pub fn is_dry_run(params: &serde_json::Value) -> bool {
-    params
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 /// Check if the caller requested diff info in the response.
+///
+/// `include_diff` yields a compact counts-only diff (`additions`/`deletions`),
+/// which is what agent-facing/raw consumers should use — the payload does not
+/// scale with file size. Full before/after content requires the separate
+/// `include_diff_content` flag (UI metadata only); see [`wants_diff_content`].
 pub fn wants_diff(params: &serde_json::Value) -> bool {
     params
         .get("include_diff")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+        || wants_diff_content(params)
+}
+
+/// Check if the caller requested the full before/after file contents in the
+/// diff. This is for UI rendering only (e.g. the OpenCode/Pi plugins building a
+/// diff view in tool metadata) and is deliberately NOT the default: full
+/// content makes the response scale with file size, not edit size, which floods
+/// agent context on large files. Agent-facing/raw consumers should pass
+/// `include_diff` (counts only) instead.
+pub fn wants_diff_content(params: &serde_json::Value) -> bool {
+    params
+        .get("include_diff_content")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Compute compact diff counts (additions/deletions) without echoing any file
+/// content. This is the agent-facing default — the payload is constant-size
+/// regardless of how large the edited file is.
+pub fn compute_diff_counts(before: &str, after: &str) -> serde_json::Value {
+    use similar::ChangeTag;
+
+    let diff = similar::TextDiff::from_lines(before, after);
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => additions += 1,
+            ChangeTag::Delete => deletions += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    serde_json::json!({
+        "additions": additions,
+        "deletions": deletions,
+    })
+}
+
+/// Pick the right diff shape for a response based on request flags.
+///
+/// Default (`include_diff`): compact counts only — constant-size payload that
+/// never floods agent context. Full before/after content is returned only when
+/// the caller explicitly opts in with `include_diff_content` (UI metadata path).
+pub fn compute_diff_for_response(
+    params: &serde_json::Value,
+    before: &str,
+    after: &str,
+) -> serde_json::Value {
+    if wants_diff_content(params) {
+        compute_diff_info(before, after)
+    } else {
+        compute_diff_counts(before, after)
+    }
 }
 
 /// Compute diff info between before/after content for UI metadata.
@@ -230,13 +253,14 @@ pub fn auto_backup(
     session: &str,
     path: &Path,
     description: &str,
+    op_id: Option<&str>,
 ) -> Result<Option<String>, AftError> {
-    if !path.exists() {
+    if std::fs::symlink_metadata(path).is_err() {
         return Ok(None);
     }
     let backup_id = {
         let mut store = ctx.backup().borrow_mut();
-        store.snapshot(session, path, description)?
+        store.snapshot_with_op(session, path, description, op_id)?
     }; // borrow dropped here
     Ok(Some(backup_id))
 }
@@ -251,7 +275,8 @@ pub struct WriteResult {
     /// Whether the file was auto-formatted.
     pub formatted: bool,
     /// Why formatting was skipped, if it was. Values: "unsupported_language",
-    /// "no_formatter_configured", "formatter_not_installed", "timeout", "error".
+    /// "no_formatter_configured", "formatter_not_installed", "formatter_excluded_path",
+    /// "timeout", "error".
     pub format_skipped_reason: Option<String>,
     /// Whether full validation was requested (controls whether validation_errors is included in response).
     pub validate_requested: bool,
@@ -260,32 +285,76 @@ pub struct WriteResult {
     /// Why validation was skipped, if it was. Values: "unsupported_language",
     /// "no_checker_configured", "checker_not_installed", "timeout", "error".
     pub validate_skipped_reason: Option<String>,
-    /// LSP diagnostics for the edited file. Only populated when `diagnostics: true` is
-    /// passed in the edit request AND a language server is available.
-    pub lsp_diagnostics: Vec<crate::lsp::diagnostics::StoredDiagnostic>,
+    /// True when the write+format+validate pipeline detected post-write
+    /// invalid syntax against a previously-valid file and restored the
+    /// pre-write content. The on-disk file is the original; `syntax_valid`
+    /// reports the would-have-been-written status (Some(false)).
+    pub rolled_back: bool,
+    /// Per-edit LSP diagnostics outcome (v0.17.3). Carries the verified-fresh
+    /// diagnostics PLUS per-server status (pending/exited) so the response
+    /// can report `complete: bool` honestly.
+    ///
+    /// `None` means the caller didn't request diagnostics OR the request
+    /// was a fire-and-forget notify (no wait). `Some(outcome)` always
+    /// reports diagnostics from servers that proved freshness against the
+    /// post-edit document version.
+    pub lsp_outcome: Option<crate::lsp::manager::PostEditWaitOutcome>,
 }
 
 impl WriteResult {
-    /// Append LSP diagnostics to a response JSON object.
-    /// Only adds the field when diagnostics were requested and collected.
+    /// Append LSP diagnostics + per-server status to a response JSON
+    /// object.
+    ///
+    /// v0.17.3 honest-reporting contract: when diagnostics were requested
+    /// (`lsp_outcome.is_some()`), this ALWAYS emits `lsp_diagnostics: [...]`
+    /// (even if empty) plus `lsp_complete: bool`, `lsp_pending_servers`,
+    /// and `lsp_exited_servers`. Empty `lsp_diagnostics` no longer means
+    /// "the field disappeared" — it means "we waited and got an explicit
+    /// fresh-but-clean result, OR every expected server is in the pending/
+    /// exited list (check `lsp_complete`)."
+    ///
+    /// When diagnostics were NOT requested (`lsp_outcome.is_none()`),
+    /// nothing is added — keeps the no-LSP edit path's response shape
+    /// unchanged.
     pub fn append_lsp_diagnostics_to(&self, result: &mut serde_json::Value) {
-        if !self.lsp_diagnostics.is_empty() {
-            result["lsp_diagnostics"] = serde_json::json!(self
-                .lsp_diagnostics
-                .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "file": d.file.display().to_string(),
-                        "line": d.line,
-                        "column": d.column,
-                        "end_line": d.end_line,
-                        "end_column": d.end_column,
-                        "severity": d.severity.as_str(),
-                        "message": d.message,
-                        "code": d.code,
-                        "source": d.source,
-                    })
+        result["rolled_back"] = serde_json::json!(self.rolled_back);
+
+        let Some(outcome) = self.lsp_outcome.as_ref() else {
+            return;
+        };
+
+        result["lsp_diagnostics"] = serde_json::json!(outcome
+            .diagnostics
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "file": d.file.display().to_string(),
+                    "line": d.line,
+                    "column": d.column,
+                    "end_line": d.end_line,
+                    "end_column": d.end_column,
+                    "severity": d.severity.as_str(),
+                    "message": d.message,
+                    "code": d.code,
+                    "source": d.source,
                 })
+            })
+            .collect::<Vec<_>>());
+
+        result["lsp_complete"] = serde_json::Value::Bool(outcome.complete());
+
+        if !outcome.pending_servers.is_empty() {
+            result["lsp_pending_servers"] = serde_json::json!(outcome
+                .pending_servers
+                .iter()
+                .map(|key| key.kind.id_str().to_string())
+                .collect::<Vec<_>>());
+        }
+        if !outcome.exited_servers.is_empty() {
+            result["lsp_exited_servers"] = serde_json::json!(outcome
+                .exited_servers
+                .iter()
+                .map(|key| key.kind.id_str().to_string())
                 .collect::<Vec<_>>());
         }
     }
@@ -309,6 +378,23 @@ pub fn write_format_validate(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
+    let pre_write_content = if path.exists() {
+        std::fs::read_to_string(path).ok()
+    } else {
+        None
+    };
+    // Existing clean files are protected from invalid mutations. New files have
+    // no safe prior content to restore, so their pre-write validity remains None
+    // and invalid syntax is reported without rollback.
+    let was_syntax_valid = if pre_write_content.is_some() {
+        match validate_syntax(path) {
+            Ok(valid) => valid,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Step 1: Write
     std::fs::write(path, content).map_err(|e| AftError::InvalidRequest {
         message: format!("failed to write file: {}", e),
@@ -321,6 +407,18 @@ pub fn write_format_validate(
     let syntax_valid = match validate_syntax(path) {
         Ok(sv) => sv,
         Err(_) => None,
+    };
+    let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
+        if let Some(original) = pre_write_content.as_ref() {
+            std::fs::write(path, original).map_err(|e| AftError::InvalidRequest {
+                message: format!("failed to roll back invalid edit: {}", e),
+            })?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
     };
 
     // Step 4: Full validation (type checker) — only when requested
@@ -342,7 +440,8 @@ pub fn write_format_validate(
         validate_requested,
         validation_errors,
         validate_skipped_reason,
-        lsp_diagnostics: Vec::new(),
+        rolled_back,
+        lsp_outcome: None,
     })
 }
 
@@ -451,30 +550,5 @@ mod tests {
         let source = "old content";
         let result = replace_byte_range(source, 0, source.len(), "new content").unwrap();
         assert_eq!(result, "new content");
-    }
-}
-
-/// Format an already-written file (no re-write) without re-writing or validating.
-/// Returns Ok(true) if formatting was applied, Ok(false) if skipped.
-pub fn write_format_only(path: &Path, config: &Config) -> Result<bool, AftError> {
-    use crate::format::detect_formatter;
-    let lang = match crate::parser::detect_language(path) {
-        Some(l) => l,
-        None => return Ok(false),
-    };
-    let formatter = detect_formatter(path, lang, config);
-    if let Some((cmd, args)) = formatter {
-        let status = std::process::Command::new(&cmd)
-            .args(&args)
-            .arg(path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match status {
-            Ok(s) if s.success() => Ok(true),
-            _ => Ok(false),
-        }
-    } else {
-        Ok(false)
     }
 }

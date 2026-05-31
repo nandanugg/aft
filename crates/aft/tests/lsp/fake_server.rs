@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_match)]
+
 use std::io::{self, BufReader, Write};
 
 use aft::lsp::jsonrpc::{Notification, RequestId, ServerMessage};
@@ -19,6 +21,18 @@ fn write_response(writer: &mut impl Write, id: RequestId, result: Value) -> io::
             "jsonrpc": "2.0",
             "id": id,
             "result": result,
+        }),
+    )
+}
+
+fn write_request(writer: &mut impl Write, id: i64, method: &str, params: Value) -> io::Result<()> {
+    write_json_message(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
         }),
     )
 }
@@ -117,15 +131,41 @@ fn write_publish_diagnostics(
     uri: Value,
     diagnostics: Value,
 ) -> io::Result<()> {
+    write_publish_diagnostics_versioned(writer, uri, diagnostics, Value::Null)
+}
+
+/// Same as `write_publish_diagnostics` but includes the LSP `version` field
+/// so the v0.17.3 version-match freshness path can be tested.
+///
+/// When the env var `AFT_FAKE_LSP_STALE_VERSION` is set, the fake server
+/// publishes `version - 1` instead of the actual version, simulating an
+/// out-of-order publish that should be rejected as stale by the post-edit
+/// freshness check.
+fn write_publish_diagnostics_versioned(
+    writer: &mut impl Write,
+    uri: Value,
+    diagnostics: Value,
+    version: Value,
+) -> io::Result<()> {
+    let effective_version = if std::env::var("AFT_FAKE_LSP_STALE_VERSION").is_ok() {
+        match &version {
+            Value::Number(n) if n.is_i64() => Value::Number((n.as_i64().unwrap() - 1).into()),
+            _ => version.clone(),
+        }
+    } else {
+        version
+    };
+
+    let mut params = json!({
+        "uri": uri,
+        "diagnostics": diagnostics,
+    });
+    if !effective_version.is_null() {
+        params["version"] = effective_version;
+    }
     write_notification(
         writer,
-        &Notification::new(
-            "textDocument/publishDiagnostics",
-            Some(json!({
-                "uri": uri,
-                "diagnostics": diagnostics,
-            })),
-        ),
+        &Notification::new("textDocument/publishDiagnostics", Some(params)),
     )
 }
 
@@ -173,20 +213,52 @@ fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    let mut should_register_watched_files = false;
 
     while let Some(message) = read_message(&mut reader)? {
         match message {
             ServerMessage::Request { id, method, params } => match method.as_str() {
                 "initialize" => {
+                    if std::env::var("AFT_FAKE_LSP_INIT_CRASH_MODULE_NOT_FOUND")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        eprintln!(
+                            "Error: Cannot find module '/missing/typescript-language-server/lib/cli.mjs'"
+                        );
+                        eprintln!("code: 'MODULE_NOT_FOUND'");
+                        std::process::exit(1);
+                    }
+                    if let Some(bytes) = std::env::var("AFT_FAKE_LSP_INIT_STDERR_BYTES")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                    {
+                        let mut stderr = io::stderr().lock();
+                        for index in 0..bytes / 80 {
+                            let _ = writeln!(
+                                stderr,
+                                "stderr-fill-line-{index:06}: MODULE_NOT_FOUND cannot find module padding"
+                            );
+                        }
+                        let _ = stderr.flush();
+                        std::process::exit(1);
+                    }
                     // Capability variants controlled by env vars so tests
                     // can exercise different code paths:
-                    //   AFT_FAKE_LSP_PULL=1         → declare diagnosticProvider
-                    //   AFT_FAKE_LSP_WORKSPACE=1    → also support workspace/diagnostic
-                    //   (no env)                    → push-only (legacy behavior)
+                    //   AFT_FAKE_LSP_PULL=1                → declare diagnosticProvider
+                    //   AFT_FAKE_LSP_WORKSPACE=1           → also support workspace/diagnostic
+                    //   AFT_FAKE_LSP_NO_WATCHED_FILES=1    → OMIT workspace.didChangeWatchedFiles
+                    //                                        (exercises the F5 capability-gate skip path)
+                    //   (no env)                           → push-only with watched-files support
                     let pull_enabled =
                         std::env::var("AFT_FAKE_LSP_PULL").ok().as_deref() == Some("1");
                     let workspace_pull =
                         std::env::var("AFT_FAKE_LSP_WORKSPACE").ok().as_deref() == Some("1");
+                    let no_watched_files = std::env::var("AFT_FAKE_LSP_NO_WATCHED_FILES")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
 
                     let mut capabilities = json!({
                         "textDocumentSync": 1,
@@ -197,6 +269,18 @@ fn main() -> io::Result<()> {
                             "prepareProvider": true
                         }
                     });
+
+                    if !no_watched_files {
+                        // Default: advertise didChangeWatchedFiles so the capability gate
+                        // in notify_files_watched_changed (#32) allows notifications
+                        // to reach the fake server during integration tests.
+                        capabilities["workspace"] = json!({
+                            "didChangeWatchedFiles": {
+                                "dynamicRegistration": true
+                            }
+                        });
+                        should_register_watched_files = true;
+                    }
 
                     if pull_enabled {
                         capabilities["diagnosticProvider"] = json!({
@@ -322,8 +406,46 @@ fn main() -> io::Result<()> {
                         std::env::var("AFT_FAKE_LSP_PULL_UNCHANGED").ok().as_deref() == Some("1");
                     let force_error =
                         std::env::var("AFT_FAKE_LSP_PULL_ERROR").ok().as_deref() == Some("1");
+                    let force_method_not_found =
+                        std::env::var("AFT_FAKE_LSP_PULL_METHOD_NOT_FOUND")
+                            .ok()
+                            .as_deref()
+                            == Some("1");
+                    let force_invalid_params = std::env::var("AFT_FAKE_LSP_PULL_INVALID_PARAMS")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
 
-                    if force_error {
+                    if std::env::var("AFT_FAKE_LSP_PULL_EXIT_MODULE_NOT_FOUND")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        eprintln!(
+                            "Error: Cannot find module '/missing/typescript-language-server/lib/cli.mjs'"
+                        );
+                        eprintln!("code: 'MODULE_NOT_FOUND'");
+                        std::process::exit(1);
+                    }
+
+                    if force_method_not_found || force_invalid_params {
+                        let (code, message) = if force_method_not_found {
+                            (-32601, "fake-lsp: pull method not found")
+                        } else {
+                            (-32602, "fake-lsp: invalid pull params")
+                        };
+                        write_json_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": code,
+                                    "message": message
+                                }
+                            }),
+                        )?;
+                    } else if force_error {
                         write_json_message(
                             &mut writer,
                             &json!({
@@ -472,7 +594,35 @@ fn main() -> io::Result<()> {
                 }
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
-                "initialized" => {}
+                "initialized" => {
+                    if should_register_watched_files {
+                        write_request(
+                            &mut writer,
+                            10_000,
+                            "client/registerCapability",
+                            json!({
+                                "registrations": [
+                                    {
+                                        "id": "fake-lsp-watched-files",
+                                        "method": "workspace/didChangeWatchedFiles",
+                                        "registerOptions": {
+                                            "watchers": [
+                                                { "globPattern": "**/*" }
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }),
+                        )?;
+                        should_register_watched_files = false;
+                    }
+                }
+                "workspace/didChangeWatchedFiles" => {
+                    write_notification(
+                        &mut writer,
+                        &Notification::new("custom/watchedFilesChanged", params),
+                    )?;
+                }
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
@@ -481,9 +631,14 @@ fn main() -> io::Result<()> {
                         &mut writer,
                         "custom/documentOpened",
                         uri.clone(),
+                        version.clone(),
+                    )?;
+                    write_publish_diagnostics_versioned(
+                        &mut writer,
+                        uri,
+                        opened_diagnostics(),
                         version,
                     )?;
-                    write_publish_diagnostics(&mut writer, uri, opened_diagnostics())?;
                 }
                 "textDocument/didChange" => {
                     let uri = document_uri(&params);
@@ -492,9 +647,14 @@ fn main() -> io::Result<()> {
                         &mut writer,
                         "custom/documentChanged",
                         uri.clone(),
+                        version.clone(),
+                    )?;
+                    write_publish_diagnostics_versioned(
+                        &mut writer,
+                        uri,
+                        changed_diagnostics(),
                         version,
                     )?;
-                    write_publish_diagnostics(&mut writer, uri, changed_diagnostics())?;
                 }
                 "textDocument/didClose" => {
                     let uri = document_uri(&params);

@@ -3,7 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const TAG = "[aft-pi]";
-const logFile = path.join(os.tmpdir(), "aft-pi.log");
+
+const isTestEnv = process.env.BUN_TEST === "1" || process.env.NODE_ENV === "test";
+const logFile = path.join(os.tmpdir(), isTestEnv ? "aft-pi-test.log" : "aft-pi.log");
 
 /**
  * When AFT_LOG_STDERR=1, logs go to stderr (useful for subprocess tests that
@@ -42,11 +44,12 @@ function scheduleFlush(): void {
   }
 }
 
-function write(level: string, message: string, data?: unknown): void {
+function write(level: string, message: string, data?: unknown, sessionId?: string): void {
   try {
     const timestamp = new Date().toISOString();
     const serialized = data === undefined ? "" : ` ${JSON.stringify(data)}`;
-    const line = `[${timestamp}] ${level} ${TAG} ${message}${serialized}\n`;
+    const sessionPrefix = sessionId ? ` [${sessionId}]` : "";
+    const line = `[${timestamp}] ${level} ${TAG}${sessionPrefix} ${message}${serialized}\n`;
     if (useStderr) {
       process.stderr.write(line);
       return;
@@ -74,6 +77,44 @@ export function error(message: string, data?: unknown): void {
   write("ERROR", message, data);
 }
 
+/**
+ * Log with a session-id prefix. Use for messages that originate from a
+ * specific Pi session (per-request errors, timeouts, crashes during a
+ * session's tool call). Bridge-lifecycle logs (spawn, version, idle) are
+ * project-scoped, not session-scoped — use `log`/`warn`/`error` for those.
+ */
+export function sessionLog(sessionId: string, message: string, data?: unknown): void {
+  write("INFO", message, data, sessionId);
+}
+
+export function sessionWarn(sessionId: string, message: string, data?: unknown): void {
+  write("WARN", message, data, sessionId);
+}
+
+export function sessionError(sessionId: string, message: string, data?: unknown): void {
+  write("ERROR", message, data, sessionId);
+}
+
 export function getLogFilePath(): string {
   return logFile;
 }
+
+/**
+ * Adapter that exposes this logger as a {@link import("@cortexkit/aft-bridge").Logger}
+ * for the shared bridge package.
+ */
+export const bridgeLogger = {
+  log(message: string, meta?: { sessionId?: string }) {
+    if (meta?.sessionId) sessionLog(meta.sessionId, message);
+    else write("INFO", message);
+  },
+  warn(message: string, meta?: { sessionId?: string }) {
+    if (meta?.sessionId) sessionWarn(meta.sessionId, message);
+    else write("WARN", message);
+  },
+  error(message: string, meta?: { sessionId?: string }) {
+    if (meta?.sessionId) sessionError(meta.sessionId, message);
+    else write("ERROR", message);
+  },
+  getLogFilePath: () => logFile,
+};

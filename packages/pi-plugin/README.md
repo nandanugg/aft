@@ -27,8 +27,8 @@ Pi's default `read`, `write`, `edit`, and `grep` are replaced with AFT-backed ve
 | Tool    | Pi built-in              | AFT replacement                                                                              |
 | ------- | ------------------------ | -------------------------------------------------------------------------------------------- |
 | `read`  | Node `fs.readFile`       | Rust reader with line-numbered output, directory listing, binary/image detection              |
-| `write` | Node `fs.writeFile`      | Atomic write with per-file backup, auto-format (biome/prettier/ruff/rustfmt), LSP diagnostics |
-| `edit`  | Plain substring replace  | Progressive fuzzy match (handles whitespace/Unicode drift), dry-run, glob-wide edits          |
+| `write` | Node `fs.writeFile`      | Atomic write with per-file backup, auto-format (biome/oxfmt/prettier/ruff/rustfmt), LSP diagnostics |
+| `edit`  | Plain substring replace  | Progressive fuzzy match (handles whitespace/Unicode drift), backups, glob-wide edits          |
 | `grep`  | ripgrep shell-out        | Trigram-indexed search in-project, ripgrep fallback outside project root                      |
 
 All four keep the same agent-facing parameters as Pi's built-ins, so your prompts, skills, and muscle memory don't change.
@@ -40,7 +40,7 @@ All four keep the same agent-facing parameters as Pi's built-ins, so your prompt
 | `aft_outline`       | Structural outline (functions, classes, headings) for files or directories        |
 | `aft_zoom`          | Symbol-level inspection with call-graph annotations                               |
 | `aft_search`        | Semantic code search (embeddings, local ONNX or OpenAI-compatible)                |
-| `aft_navigate`      | Call-graph navigation: callers, call_tree, impact, trace_to, trace_data           |
+| `aft_callgraph`      | Call-graph navigation: callers, call_tree, impact, trace_to, trace_data           |
 | `aft_conflicts`     | One-call merge-conflict inspection across all conflicted files                    |
 | `aft_import`        | Language-aware import add / remove / organize (TS, JS, Python, Rust, Go)          |
 | `aft_safety`        | Per-file undo, named checkpoints, restore                                         |
@@ -118,7 +118,7 @@ Sensitive semantic backend fields (`backend`, `base_url`, `api_key_env`) are onl
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `minimal`         | `aft_outline`, `aft_zoom`, `aft_safety`                                                                                 |
 | `recommended` (default) | `minimal` + hoisted `read`/`write`/`edit` + `aft_import` + `ast_grep_*` + `lsp_diagnostics` + `aft_conflicts` + (optional) `grep` + (optional) `aft_search` |
-| `all`             | `recommended` + `aft_navigate` + `aft_delete` + `aft_move` + `aft_transform` + `aft_refactor`                           |
+| `all`             | `recommended` + `aft_callgraph` + `aft_delete` + `aft_move` + `aft_transform` + `aft_refactor`                           |
 
 ## Architecture
 

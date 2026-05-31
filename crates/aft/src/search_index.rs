@@ -1,30 +1,58 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use regex::bytes::{Regex, RegexBuilder};
+use regex::bytes::Regex;
 use regex_syntax::hir::{Hir, HirKind};
 
+use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+use crate::fs_lock;
+use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
+
 const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 3;
 const PREVIEW_BYTES: usize = 8 * 1024;
 const EOF_SENTINEL: u8 = 0;
 const MAX_ENTRIES: usize = 10_000_000;
-const MIN_FILE_ENTRY_BYTES: usize = 25;
+const MIN_FILE_ENTRY_BYTES: usize = 57;
 const LOOKUP_ENTRY_BYTES: usize = 16;
 const POSTING_BYTES: usize = 6;
+static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
+
+pub struct CacheLock {
+    _guard: fs_lock::LockGuard,
+}
+
+impl CacheLock {
+    pub fn acquire(cache_dir: &Path) -> std::io::Result<Self> {
+        fs::create_dir_all(cache_dir)?;
+        let path = cache_dir.join("cache.lock");
+        let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
+            .lock()
+            .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
+        fs_lock::try_acquire(&path, Duration::from_secs(2))
+            .map(|guard| Self { _guard: guard })
+            .map_err(|error| match error {
+                fs_lock::AcquireError::Timeout => {
+                    std::io::Error::other("timed out acquiring search cache lock")
+                }
+                fs_lock::AcquireError::Io(error) => error,
+            })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
@@ -35,8 +63,14 @@ pub struct SearchIndex {
     project_root: PathBuf,
     git_head: Option<String>,
     max_file_size: u64,
-    file_trigrams: HashMap<u32, Vec<u32>>,
+    pub file_trigrams: HashMap<u32, Vec<u32>>,
     unindexed_files: HashSet<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LexicalRankResult {
+    pub files: Vec<(PathBuf, f32)>,
+    pub engine_capped: bool,
 }
 
 impl SearchIndex {
@@ -48,6 +82,93 @@ impl SearchIndex {
     /// Number of unique trigrams in the index.
     pub fn trigram_count(&self) -> usize {
         self.postings.len()
+    }
+
+    /// Compute distinct query trigrams from literal tokens.
+    pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
+        query_trigrams_from_tokens(tokens)
+    }
+
+    /// Score-rank file candidates by lexical relevance to query trigrams.
+    pub fn lexical_rank(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        max_files: usize,
+    ) -> Vec<(PathBuf, f32)> {
+        self.lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
+            .files
+    }
+
+    /// Score-rank file candidates and report whether pre-filter candidate
+    /// enumeration hit the internal 200/500 cap before ranking.
+    pub fn lexical_rank_with_stats(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        max_files: usize,
+    ) -> LexicalRankResult {
+        if query_trigrams.is_empty() || max_files == 0 {
+            return LexicalRankResult::default();
+        }
+
+        let mut non_zero: Vec<(u32, usize)> = query_trigrams
+            .iter()
+            .filter_map(|trigram| {
+                let posting_count = self.postings.get(trigram).map_or(0, Vec::len);
+                (posting_count > 0).then_some((*trigram, posting_count))
+            })
+            .collect();
+        if non_zero.is_empty() {
+            return LexicalRankResult::default();
+        }
+
+        non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
+        let selected_count = non_zero.len().min(3);
+        let candidate_cap = if selected_count == 3 { 200 } else { 500 };
+
+        let mut candidate_ids = BTreeSet::new();
+        for (trigram, _) in non_zero.iter().take(selected_count) {
+            if let Some(postings) = self.postings.get(trigram) {
+                for posting in postings {
+                    if self.is_active_file(posting.file_id) {
+                        candidate_ids.insert(posting.file_id);
+                    }
+                }
+            }
+        }
+        let pre_filter_candidate_count = candidate_ids.len();
+        let engine_capped = pre_filter_candidate_count > candidate_cap;
+        let filtered_candidates = candidate_ids
+            .into_iter()
+            .filter_map(|file_id| {
+                self.files
+                    .get(file_id as usize)
+                    .map(|entry| (file_id, entry))
+            })
+            .filter(|(_, entry)| {
+                if let Some(filter) = candidate_filter {
+                    filter(&entry.path)
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut ranked = Vec::new();
+        for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
+            let score = lexical_score(self, query_trigrams, file_id);
+            if score > 0.0 {
+                ranked.push((entry.path.clone(), score));
+            }
+        }
+
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(max_files);
+        LexicalRankResult {
+            files: ranked,
+            engine_capped,
+        }
     }
 }
 
@@ -63,6 +184,7 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
     pub modified: SystemTime,
+    pub content_hash: blake3::Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +204,8 @@ pub struct GrepResult {
     pub files_with_matches: usize,
     pub index_status: IndexStatus,
     pub truncated: bool,
+    pub fully_degraded: bool,
+    pub engine_capped: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +213,7 @@ pub enum IndexStatus {
     Ready,
     Building,
     Fallback,
+    Disabled,
 }
 
 impl IndexStatus {
@@ -97,6 +222,7 @@ impl IndexStatus {
             IndexStatus::Ready => "Ready",
             IndexStatus::Building => "Building",
             IndexStatus::Fallback => "Fallback",
+            IndexStatus::Disabled => "Disabled",
         }
     }
 }
@@ -148,12 +274,6 @@ enum SearchMatcher {
     Regex(Regex),
 }
 
-#[derive(Clone, Debug)]
-enum LiteralSearch {
-    CaseSensitive(Vec<u8>),
-    AsciiCaseInsensitive(Vec<u8>),
-}
-
 impl SearchIndex {
     pub fn new() -> Self {
         SearchIndex {
@@ -198,6 +318,9 @@ impl SearchIndex {
             Some(file_id) => file_id,
             None => return,
         };
+        if let Some(file) = self.files.get_mut(file_id as usize) {
+            file.content_hash = cache_freshness::hash_bytes(content);
+        }
 
         let mut trigram_map: BTreeMap<u32, PostingFilter> = BTreeMap::new();
         for (trigram, next_char, position) in extract_trigrams(content) {
@@ -230,7 +353,15 @@ impl SearchIndex {
     }
 
     pub fn remove_file(&mut self, path: &Path) {
-        let Some(file_id) = self.path_to_id.remove(path) else {
+        let canonical_path = canonicalize_existing_or_deleted_path(path);
+        let file_id = if let Some(file_id) = self.path_to_id.remove(path) {
+            file_id
+        } else if canonical_path.as_path() != path {
+            let Some(file_id) = self.path_to_id.remove(&canonical_path) else {
+                return;
+            };
+            file_id
+        } else {
             return;
         };
 
@@ -254,6 +385,7 @@ impl SearchIndex {
             file.path = PathBuf::new();
             file.size = 0;
             file.modified = UNIX_EPOCH;
+            file.content_hash = cache_freshness::zero_hash();
         }
     }
 
@@ -266,6 +398,7 @@ impl SearchIndex {
         };
 
         if is_binary_path(path, metadata.len()) {
+            self.track_unindexed_file(path, &metadata);
             return;
         }
 
@@ -280,6 +413,7 @@ impl SearchIndex {
         };
 
         if is_binary_bytes(&content) {
+            self.track_unindexed_file(path, &metadata);
             return;
         }
 
@@ -295,90 +429,33 @@ impl SearchIndex {
         search_root: &Path,
         max_results: usize,
     ) -> GrepResult {
-        self.search_grep(
+        match pattern_compile::compile(
             pattern,
-            case_sensitive,
-            include,
-            exclude,
-            search_root,
-            max_results,
-        )
+            CompileOpts {
+                case_insensitive: !case_sensitive,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(compiled) => {
+                self.search_grep(&compiled, include, exclude, search_root, max_results)
+            }
+            CompileResult::InvalidPattern { .. } | CompileResult::UnsupportedSyntax { .. } => {
+                self.empty_grep_result()
+            }
+        }
     }
 
     pub fn search_grep(
         &self,
-        pattern: &str,
-        case_sensitive: bool,
+        pattern: &CompiledPattern,
         include: &[String],
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
     ) -> GrepResult {
-        // Detect if pattern is a plain literal (no regex metacharacters).
-        // If so, use memchr::memmem which is 3-10x faster than regex for byte scanning.
-        let is_literal = !pattern.chars().any(|c| {
-            matches!(
-                c,
-                '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
-            )
-        });
-
-        let literal_search = if is_literal {
-            if case_sensitive {
-                Some(LiteralSearch::CaseSensitive(pattern.as_bytes().to_vec()))
-            } else if pattern.is_ascii() {
-                Some(LiteralSearch::AsciiCaseInsensitive(
-                    pattern
-                        .as_bytes()
-                        .iter()
-                        .map(|byte| byte.to_ascii_lowercase())
-                        .collect(),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Build the regex for non-literal patterns (or literal Unicode fallback).
-        let regex = if literal_search.is_some() {
-            None
-        } else {
-            let regex_pattern = if is_literal {
-                regex::escape(pattern)
-            } else {
-                pattern.to_string()
-            };
-            let mut builder = RegexBuilder::new(&regex_pattern);
-            builder.case_insensitive(!case_sensitive);
-            // Treat `^` and `$` as line anchors (grep semantics), not file anchors.
-            builder.multi_line(true);
-            match builder.build() {
-                Ok(r) => Some(r),
-                Err(_) => {
-                    return GrepResult {
-                        matches: Vec::new(),
-                        total_matches: 0,
-                        files_searched: 0,
-                        files_with_matches: 0,
-                        index_status: if self.ready {
-                            IndexStatus::Ready
-                        } else {
-                            IndexStatus::Building
-                        },
-                        truncated: false,
-                    };
-                }
-            }
-        };
-
-        let matcher = if let Some(literal_search) = literal_search {
-            SearchMatcher::Literal(literal_search)
-        } else {
-            SearchMatcher::Regex(
-                regex.expect("regex should exist when literal matcher is unavailable"),
-            )
+        let matcher = match pattern {
+            CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
+            CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
         };
 
         let filters = match build_path_filters(include, exclude) {
@@ -387,7 +464,13 @@ impl SearchIndex {
         };
         let search_root = canonicalize_or_normalize(search_root);
 
-        let query = decompose_regex(pattern);
+        let raw_pattern = pattern.raw_pattern_for_trigrams();
+        let query = if pattern.case_insensitive() && !raw_pattern.is_ascii() {
+            RegexQuery::default()
+        } else {
+            decompose_regex(&raw_pattern)
+        };
+        let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
         let candidate_ids = self.candidates(&query);
 
         let candidate_files: Vec<&FileEntry> = candidate_ids
@@ -402,6 +485,7 @@ impl SearchIndex {
         let files_searched = AtomicUsize::new(0);
         let files_with_matches = AtomicUsize::new(0);
         let truncated = AtomicBool::new(false);
+        let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
 
         let mut matches = if candidate_files.len() > 10 {
@@ -417,6 +501,7 @@ impl SearchIndex {
                         &files_searched,
                         &files_with_matches,
                         &truncated,
+                        &engine_capped,
                     )
                 })
                 .reduce(Vec::new, |mut left, mut right| {
@@ -435,9 +520,11 @@ impl SearchIndex {
                     &files_searched,
                     &files_with_matches,
                     &truncated,
+                    &engine_capped,
                 ));
 
                 if should_stop_search(&truncated, &total_matches, stop_after) {
+                    engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
             }
@@ -473,6 +560,25 @@ impl SearchIndex {
                 IndexStatus::Building
             },
             truncated: truncated.load(Ordering::Relaxed),
+            fully_degraded,
+            engine_capped: engine_capped.load(Ordering::Relaxed),
+        }
+    }
+
+    fn empty_grep_result(&self) -> GrepResult {
+        GrepResult {
+            matches: Vec::new(),
+            total_matches: 0,
+            files_searched: 0,
+            files_with_matches: 0,
+            index_status: if self.ready {
+                IndexStatus::Ready
+            } else {
+                IndexStatus::Building
+            },
+            truncated: false,
+            fully_degraded: false,
+            engine_capped: false,
         }
     }
 
@@ -482,15 +588,22 @@ impl SearchIndex {
             Err(_) => return Vec::new(),
         };
         let search_root = canonicalize_or_normalize(search_root);
-        let filter_root = if search_root.starts_with(&self.project_root) {
-            &self.project_root
-        } else {
-            &search_root
-        };
+        let mut entries = self
+            .files
+            .iter()
+            .filter(|file| !file.path.as_os_str().is_empty())
+            .filter(|file| is_within_search_root(&search_root, &file.path))
+            .filter(|file| filters.matches(&self.project_root, &file.path))
+            .map(|file| (file.path.clone(), file.modified))
+            .collect::<Vec<_>>();
 
-        let mut paths = walk_project_files_from(filter_root, &search_root, &filters);
-        sort_paths_by_mtime_desc(&mut paths);
-        paths
+        entries.sort_by(|(left_path, left_mtime), (right_path, right_mtime)| {
+            right_mtime
+                .cmp(left_mtime)
+                .then_with(|| left_path.cmp(right_path))
+        });
+
+        entries.into_iter().map(|(path, _)| path).collect()
     }
 
     pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
@@ -557,10 +670,15 @@ impl SearchIndex {
             return;
         }
 
-        let postings_path = cache_dir.join("postings.bin");
-        let lookup_path = cache_dir.join("lookup.bin");
-        let tmp_postings = cache_dir.join("postings.bin.tmp");
-        let tmp_lookup = cache_dir.join("lookup.bin.tmp");
+        let cache_path = cache_dir.join("cache.bin");
+        let tmp_cache = cache_dir.join(format!(
+            "cache.bin.tmp.{}.{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
 
         let active_ids = self.active_file_ids();
         let mut id_map = HashMap::new();
@@ -572,7 +690,7 @@ impl SearchIndex {
         }
 
         let write_result = (|| -> std::io::Result<()> {
-            let mut postings_writer = BufWriter::new(File::create(&tmp_postings)?);
+            let mut postings_writer = BufWriter::new(Cursor::new(Vec::new()));
 
             postings_writer.write_all(INDEX_MAGIC)?;
             write_u32(&mut postings_writer, INDEX_VERSION)?;
@@ -597,7 +715,13 @@ impl SearchIndex {
                 let Some(file) = self.files.get(*old_id as usize) else {
                     return Err(std::io::Error::other("missing file entry for cache write"));
                 };
-                let path = relative_to_root(&self.project_root, &file.path);
+                let path =
+                    cache_relative_path(&self.project_root, &file.path).ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "refusing to cache path outside project root: {}",
+                            file.path.display()
+                        ))
+                    })?;
                 let path = path.to_string_lossy();
                 let path_len = u32::try_from(path.len())
                     .map_err(|_| std::io::Error::other("cached path too large"))?;
@@ -616,6 +740,7 @@ impl SearchIndex {
                 write_u64(&mut postings_writer, file.size)?;
                 write_u64(&mut postings_writer, modified.as_secs())?;
                 write_u32(&mut postings_writer, modified.subsec_nanos())?;
+                postings_writer.write_all(file.content_hash.as_bytes())?;
                 postings_writer.write_all(path.as_bytes())?;
             }
 
@@ -652,9 +777,14 @@ impl SearchIndex {
             )?;
             postings_writer.write_all(&postings_blob)?;
             postings_writer.flush()?;
-            drop(postings_writer);
+            let mut postings_blob_file = postings_writer
+                .into_inner()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .into_inner();
+            let checksum = crc32fast::hash(&postings_blob_file);
+            postings_blob_file.extend_from_slice(&checksum.to_le_bytes());
 
-            let mut lookup_writer = BufWriter::new(File::create(&tmp_lookup)?);
+            let mut lookup_writer = BufWriter::new(Cursor::new(Vec::new()));
             let entry_count = u32::try_from(lookup_entries.len())
                 .map_err(|_| std::io::Error::other("too many lookup entries to cache"))?;
 
@@ -669,30 +799,66 @@ impl SearchIndex {
             }
 
             lookup_writer.flush()?;
-            drop(lookup_writer);
+            let mut lookup_blob_file = lookup_writer
+                .into_inner()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .into_inner();
+            let checksum = crc32fast::hash(&lookup_blob_file);
+            lookup_blob_file.extend_from_slice(&checksum.to_le_bytes());
 
-            fs::rename(&tmp_postings, &postings_path)?;
-            fs::rename(&tmp_lookup, &lookup_path)?;
+            let mut cache_writer = BufWriter::new(File::create(&tmp_cache)?);
+            write_u32(&mut cache_writer, CACHE_MAGIC)?;
+            write_u32(&mut cache_writer, INDEX_VERSION)?;
+            write_u64(
+                &mut cache_writer,
+                u64::try_from(postings_blob_file.len())
+                    .map_err(|_| std::io::Error::other("postings section too large"))?,
+            )?;
+            cache_writer.write_all(&postings_blob_file)?;
+            cache_writer.write_all(&lookup_blob_file)?;
+            cache_writer.flush()?;
+            cache_writer.get_ref().sync_all()?;
+            drop(cache_writer);
+            fs::rename(&tmp_cache, &cache_path)?;
 
             Ok(())
         })();
 
         if write_result.is_err() {
-            let _ = fs::remove_file(&tmp_postings);
-            let _ = fs::remove_file(&tmp_lookup);
+            let _ = fs::remove_file(&tmp_cache);
         }
     }
 
-    pub fn read_from_disk(cache_dir: &Path) -> Option<Self> {
-        let postings_path = cache_dir.join("postings.bin");
-        let lookup_path = cache_dir.join("lookup.bin");
-
-        let mut postings_reader = BufReader::new(File::open(postings_path).ok()?);
-        let mut lookup_reader = BufReader::new(File::open(lookup_path).ok()?);
-        let postings_len_total =
-            usize::try_from(postings_reader.get_ref().metadata().ok()?.len()).ok()?;
-        let lookup_len_total =
-            usize::try_from(lookup_reader.get_ref().metadata().ok()?.len()).ok()?;
+    pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
+        debug_assert!(current_canonical_root.is_absolute());
+        let cache_path = cache_dir.join("cache.bin");
+        let cache_bytes = fs::read(&cache_path).ok()?;
+        if cache_bytes.len() < 16 {
+            return None;
+        }
+        let mut header = Cursor::new(&cache_bytes);
+        if read_u32(&mut header).ok()? != CACHE_MAGIC {
+            return None;
+        }
+        if read_u32(&mut header).ok()? != INDEX_VERSION {
+            return None;
+        }
+        let postings_len_total = usize::try_from(read_u64(&mut header).ok()?).ok()?;
+        let start = usize::try_from(header.position()).ok()?;
+        let postings_end = start.checked_add(postings_len_total)?;
+        if postings_end > cache_bytes.len() {
+            return None;
+        }
+        let postings_bytes = &cache_bytes[start..postings_end];
+        let lookup_bytes = &cache_bytes[postings_end..];
+        let lookup_len_total = lookup_bytes.len();
+        let mut postings_reader = BufReader::new(Cursor::new(postings_bytes));
+        let mut lookup_reader = BufReader::new(Cursor::new(lookup_bytes));
+        if postings_len_total < 4 || lookup_len_total < 4 {
+            return None;
+        }
+        verify_crc32_bytes_slice(postings_bytes).ok()?;
+        verify_crc32_bytes_slice(lookup_bytes).ok()?;
 
         let mut magic = [0u8; 8];
         postings_reader.read_exact(&mut magic).ok()?;
@@ -710,13 +876,16 @@ impl SearchIndex {
         if file_count > MAX_ENTRIES {
             return None;
         }
-        let remaining_postings = remaining_bytes(&mut postings_reader, postings_len_total)?;
+        let postings_body_len = postings_len_total.checked_sub(4)?;
+        let lookup_body_len = lookup_len_total.checked_sub(4)?;
+
+        let remaining_postings = remaining_bytes(&mut postings_reader, postings_body_len)?;
         let minimum_file_bytes = file_count.checked_mul(MIN_FILE_ENTRY_BYTES)?;
         if minimum_file_bytes > remaining_postings {
             return None;
         }
 
-        if head_len > remaining_bytes(&mut postings_reader, postings_len_total)? {
+        if head_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
             return None;
         }
         let mut head_bytes = vec![0u8; head_len];
@@ -725,12 +894,13 @@ impl SearchIndex {
             .ok()
             .filter(|head| !head.is_empty());
 
-        if root_len > remaining_bytes(&mut postings_reader, postings_len_total)? {
+        if root_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
             return None;
         }
         let mut root_bytes = vec![0u8; root_len];
         postings_reader.read_exact(&mut root_bytes).ok()?;
-        let project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
+        let _stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
+        let project_root = current_canonical_root.to_path_buf();
 
         let mut files = Vec::with_capacity(file_count);
         let mut path_to_id = HashMap::new();
@@ -743,22 +913,26 @@ impl SearchIndex {
             let size = read_u64(&mut postings_reader).ok()?;
             let secs = read_u64(&mut postings_reader).ok()?;
             let nanos = read_u32(&mut postings_reader).ok()?;
+            let mut hash_bytes = [0u8; 32];
+            postings_reader.read_exact(&mut hash_bytes).ok()?;
+            let content_hash = blake3::Hash::from_bytes(hash_bytes);
             if nanos >= 1_000_000_000 {
                 return None;
             }
-            if path_len > remaining_bytes(&mut postings_reader, postings_len_total)? {
+            if path_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
                 return None;
             }
             let mut path_bytes = vec![0u8; path_len];
             postings_reader.read_exact(&mut path_bytes).ok()?;
             let relative_path = PathBuf::from(String::from_utf8(path_bytes).ok()?);
-            let full_path = project_root.join(relative_path);
+            let full_path = cached_path_under_root(&project_root, &relative_path)?;
             let file_id_u32 = u32::try_from(file_id).ok()?;
 
             files.push(FileEntry {
                 path: full_path.clone(),
                 size,
                 modified: UNIX_EPOCH + Duration::new(secs, nanos),
+                content_hash,
             });
             path_to_id.insert(full_path, file_id_u32);
             if unindexed[0] == 1 {
@@ -771,7 +945,7 @@ impl SearchIndex {
         if postings_len > max_postings_bytes {
             return None;
         }
-        if postings_len > remaining_bytes(&mut postings_reader, postings_len_total)? {
+        if postings_len > remaining_bytes(&mut postings_reader, postings_body_len)? {
             return None;
         }
         let mut postings_blob = vec![0u8; postings_len];
@@ -789,7 +963,7 @@ impl SearchIndex {
         if entry_count > MAX_ENTRIES {
             return None;
         }
-        let remaining_lookup = remaining_bytes(&mut lookup_reader, lookup_len_total)?;
+        let remaining_lookup = remaining_bytes(&mut lookup_reader, lookup_body_len)?;
         let minimum_lookup_bytes = entry_count.checked_mul(LOOKUP_ENTRY_BYTES)?;
         if minimum_lookup_bytes > remaining_lookup {
             return None;
@@ -829,7 +1003,7 @@ impl SearchIndex {
             postings,
             files,
             path_to_id,
-            ready: true,
+            ready: false,
             project_root,
             git_head,
             max_file_size,
@@ -846,24 +1020,36 @@ impl SearchIndex {
         self.ready = ready;
     }
 
+    pub(crate) fn verify_against_disk(&mut self, current_head: Option<String>) {
+        self.git_head = current_head;
+        verify_file_mtimes(self);
+        self.ready = true;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn verify_against_disk_for_debug(&mut self, current_head: Option<String>) {
+        self.verify_against_disk(current_head);
+    }
+
     pub(crate) fn rebuild_or_refresh(
         root: &Path,
         max_file_size: u64,
         current_head: Option<String>,
         baseline: Option<SearchIndex>,
     ) -> Self {
-        if current_head.is_none() {
-            return SearchIndex::build_with_limit(root, max_file_size);
-        }
-
         if let Some(mut baseline) = baseline {
             baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             baseline.max_file_size = max_file_size;
 
-            if baseline.git_head == current_head {
+            if baseline.git_head == current_head || current_head.is_none() {
                 // HEAD matches, but files may have changed on disk since the index was
                 // last written (e.g., uncommitted edits, stash pop, manual file changes
                 // while OpenCode was closed). Verify mtimes and re-index stale files.
+                // Non-git projects also use this per-file (path, mtime, size)
+                // fingerprint so unchanged trees reuse the disk cache instead of
+                // rebuilding every configure.
+                baseline.git_head = current_head;
                 verify_file_mtimes(&mut baseline);
                 baseline.ready = true;
                 return baseline;
@@ -875,6 +1061,7 @@ impl SearchIndex {
                 let project_root = baseline.project_root.clone();
                 if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
                     baseline.git_head = Some(current);
+                    verify_file_mtimes(&mut baseline);
                     baseline.ready = true;
                     return baseline;
                 }
@@ -898,6 +1085,7 @@ impl SearchIndex {
             path: path.to_path_buf(),
             size,
             modified,
+            content_hash: cache_freshness::zero_hash(),
         });
         self.path_to_id.insert(path.to_path_buf(), file_id);
         Some(file_id)
@@ -961,8 +1149,10 @@ fn search_candidate_file(
     files_searched: &AtomicUsize,
     files_with_matches: &AtomicUsize,
     truncated: &AtomicBool,
+    engine_capped: &AtomicBool,
 ) -> Vec<SharedGrepMatch> {
     if should_stop_search(truncated, total_matches, stop_after) {
+        engine_capped.store(true, Ordering::Relaxed);
         return Vec::new();
     }
 
@@ -970,6 +1160,15 @@ fn search_candidate_file(
         Some(content) => content,
         None => return Vec::new(),
     };
+    // Defense in depth: even though indexing tries to filter binaries via
+    // `is_binary_path` + full-content `is_binary_bytes`, we double-check at
+    // query time. content_inspector is fast (~bytes-per-cycle on a small
+    // preview) and this guarantees we never surface matches inside binary
+    // files even if the indexer somehow let one through (e.g. file changed
+    // between indexing and query).
+    if is_binary_bytes(&content) {
+        return Vec::new();
+    }
     files_searched.fetch_add(1, Ordering::Relaxed);
 
     let shared_path = Arc::new(file.path.clone());
@@ -979,12 +1178,14 @@ fn search_candidate_file(
     let mut matched_this_file = false;
 
     match matcher {
-        SearchMatcher::Literal(LiteralSearch::CaseSensitive(needle)) => {
+        SearchMatcher::Literal(literal) if !literal.case_insensitive_ascii => {
+            let needle = &literal.needle;
             let finder = memchr::memmem::Finder::new(needle);
             let mut start = 0;
 
             while let Some(position) = finder.find(&content[start..]) {
                 if should_stop_search(truncated, total_matches, stop_after) {
+                    engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
 
@@ -1014,13 +1215,15 @@ fn search_candidate_file(
                 });
             }
         }
-        SearchMatcher::Literal(LiteralSearch::AsciiCaseInsensitive(needle)) => {
+        SearchMatcher::Literal(literal) => {
+            let needle = &literal.needle;
             let search_content = content.to_ascii_lowercase();
             let finder = memchr::memmem::Finder::new(needle);
             let mut start = 0;
 
             while let Some(position) = finder.find(&search_content[start..]) {
                 if should_stop_search(truncated, total_matches, stop_after) {
+                    engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
 
@@ -1053,6 +1256,7 @@ fn search_candidate_file(
         SearchMatcher::Regex(regex) => {
             for matched in regex.find_iter(&content) {
                 if should_stop_search(truncated, total_matches, stop_after) {
+                    engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
 
@@ -1180,6 +1384,47 @@ pub fn extract_trigrams(content: &[u8]) -> Vec<(u32, u8, usize)> {
     trigrams
 }
 
+pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for token in tokens {
+        for (trigram, _, _) in extract_trigrams(token.as_bytes()) {
+            if seen.insert(trigram) {
+                out.push(trigram);
+            }
+        }
+    }
+    out
+}
+
+pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) -> f32 {
+    if query_trigrams.is_empty() {
+        return 0.0;
+    }
+
+    let mut hits = 0u32;
+    for &trigram in query_trigrams {
+        if let Some(postings) = index.postings.get(&trigram) {
+            if postings
+                .binary_search_by(|posting| posting.file_id.cmp(&file_id))
+                .is_ok()
+            {
+                hits += 1;
+            }
+        }
+    }
+
+    if hits == 0 {
+        return 0.0;
+    }
+
+    let file_trigram_count = index
+        .file_trigrams
+        .get(&file_id)
+        .map_or(1, |trigrams| trigrams.len().max(1)) as f32;
+    (hits as f32) / (1.0 + file_trigram_count.ln())
+}
+
 pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> PathBuf {
     // Respect AFT_CACHE_DIR for testing — prevents tests from polluting the user's storage
     if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
@@ -1191,10 +1436,14 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     if let Some(dir) = storage_dir {
         return dir.join("index").join(project_cache_key(project_root));
     }
-    // Fallback to ~/.cache/aft/ (legacy, for standalone binary usage)
+    // Fallback to ~/.cache/aft/ (legacy, for standalone binary usage).
+    // On Windows `HOME` is typically unset, so try `USERPROFILE` next.
+    // If neither is set, fall back to a temp directory rather than `"."`
+    // because the search-index code reads/writes absolute paths.
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(std::env::temp_dir);
     home.join(".cache")
         .join("aft")
         .join("index")
@@ -1279,6 +1528,49 @@ pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root)
         .map(PathBuf::from)
         .unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let normalized_root = normalize_path(root);
+    let normalized_path = normalize_path(path);
+    let relative = normalized_path.strip_prefix(&normalized_root).ok()?;
+    validate_cached_relative_path(relative)
+}
+
+pub(crate) fn cached_path_under_root(root: &Path, relative_path: &Path) -> Option<PathBuf> {
+    let relative = validate_cached_relative_path(relative_path)?;
+    let normalized_root = normalize_path(root);
+    let full_path = normalize_path(&normalized_root.join(relative));
+
+    match fs::canonicalize(&full_path) {
+        Ok(canonical_path) => {
+            if canonical_path.starts_with(&normalized_root) {
+                return Some(full_path);
+            }
+
+            let canonical_root = fs::canonicalize(&normalized_root).ok()?;
+            canonical_path
+                .starts_with(&canonical_root)
+                .then_some(full_path)
+        }
+        Err(_) => full_path.starts_with(&normalized_root).then_some(full_path),
+    }
+}
+
+pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
 /// Sort paths newest-first by mtime, falling back to lexicographic order.
@@ -1385,7 +1677,7 @@ pub(crate) fn current_git_head(root: &Path) -> Option<String> {
     run_git(root, &["rev-parse", "HEAD"])
 }
 
-pub(crate) fn project_cache_key(project_root: &Path) -> String {
+pub fn project_cache_key(project_root: &Path) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -1459,25 +1751,48 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+
+    fs::canonicalize(parent)
+        .map(|canonical_parent| canonical_parent.join(file_name))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
 fn verify_file_mtimes(index: &mut SearchIndex) {
-    // Collect stale files (mtime mismatch or deleted)
     let mut stale_paths = Vec::new();
-    for entry in &index.files {
+
+    for entry in &mut index.files {
         if entry.path.as_os_str().is_empty() {
             continue; // tombstoned entry
         }
-        match fs::metadata(&entry.path) {
-            Ok(meta) => {
-                let current_mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-                if current_mtime != entry.modified || meta.len() != entry.size {
-                    stale_paths.push(entry.path.clone());
-                }
+        let cached = FileFreshness {
+            mtime: entry.modified,
+            size: entry.size,
+            content_hash: entry.content_hash,
+        };
+        match cache_freshness::verify_file_strict(&entry.path, &cached) {
+            FreshnessVerdict::HotFresh => {}
+            FreshnessVerdict::ContentFresh {
+                new_mtime,
+                new_size,
+            } => {
+                entry.modified = new_mtime;
+                entry.size = new_size;
             }
-            Err(_) => {
-                // File deleted
-                stale_paths.push(entry.path.clone());
+            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
+                stale_paths.push(entry.path.clone())
             }
         }
     }
@@ -1496,15 +1811,15 @@ fn verify_file_mtimes(index: &mut SearchIndex) {
     }
 
     if !stale_paths.is_empty() {
-        log::info!(
-            "[aft] search index: refreshed {} stale file(s) from disk cache",
+        crate::slog_info!(
+            "search index: refreshed {} stale file(s) from disk cache",
             stale_paths.len()
         );
     }
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
-    path.starts_with(search_root)
+    normalize_path(path).starts_with(normalize_path(search_root))
 }
 
 impl QueryBuild {
@@ -1700,6 +2015,18 @@ fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 
+fn verify_crc32_bytes_slice(bytes: &[u8]) -> std::io::Result<()> {
+    let Some((body, stored)) = bytes.split_last_chunk::<4>() else {
+        return Err(std::io::Error::other("search index checksum missing"));
+    };
+    let expected = u32::from_le_bytes(*stored);
+    let actual = crc32fast::hash(body);
+    if actual != expected {
+        return Err(std::io::Error::other("search index checksum mismatch"));
+    }
+    Ok(())
+}
+
 fn remaining_bytes<R: Seek>(reader: &mut R, total_len: usize) -> Option<usize> {
     let pos = usize::try_from(reader.stream_position().ok()?).ok()?;
     total_len.checked_sub(pos)
@@ -1729,7 +2056,7 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     let output = match Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["diff", "--name-only", &diff_range])
+        .args(["diff", "--name-status", "-M", &diff_range])
         .output()
     {
         Ok(output) => output,
@@ -1740,16 +2067,44 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
         return false;
     }
 
-    let Ok(paths) = String::from_utf8(output.stdout) else {
+    let Ok(diff) = String::from_utf8(output.stdout) else {
         return false;
     };
 
-    for relative_path in paths.lines().map(str::trim).filter(|path| !path.is_empty()) {
-        let path = root.join(relative_path);
-        if path.exists() {
-            index.update_file(&path);
-        } else {
+    for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let mut fields = line.split('\t');
+        let Some(status) = fields.next() else {
+            continue;
+        };
+
+        if status.starts_with('R') {
+            let Some(old_path) = fields
+                .next()
+                .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
+            else {
+                continue;
+            };
+            let Some(new_path) = fields
+                .next()
+                .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
+            else {
+                continue;
+            };
+            index.remove_file(&old_path);
+            index.update_file(&new_path);
+            continue;
+        }
+
+        let Some(path) = fields
+            .next()
+            .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
+        else {
+            continue;
+        };
+        if status.starts_with('D') || !path.exists() {
             index.remove_file(&path);
+        } else {
+            index.update_file(&path);
         }
     }
 
@@ -1815,6 +2170,34 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn cached_path_under_root_allows_missing_lexical_child() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let root = fs::canonicalize(&project).expect("canonicalize project");
+
+        let path = cached_path_under_root(&root, Path::new("future/file.rs"))
+            .expect("missing child should fall back to lexical validation");
+
+        assert_eq!(path, root.join("future/file.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_path_under_root_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::write(outside.join("secret.txt"), "secret").expect("write outside file");
+        std::os::unix::fs::symlink(&outside, project.join("link")).expect("create symlink");
+        let root = fs::canonicalize(&project).expect("canonicalize project");
+
+        assert!(cached_path_under_root(&root, Path::new("link/secret.txt")).is_none());
+    }
 
     #[test]
     fn extract_trigrams_tracks_next_char_and_position() {
@@ -1905,7 +2288,8 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, index.git_head.as_deref());
 
-        let loaded = SearchIndex::read_from_disk(&cache_dir).expect("load index from disk");
+        let loaded =
+            SearchIndex::read_from_disk(&cache_dir, &project).expect("load index from disk");
         assert_eq!(loaded.stored_git_head(), Some("deadbeef"));
         assert_eq!(loaded.files.len(), 1);
         assert_eq!(
@@ -1919,6 +2303,122 @@ mod tests {
     }
 
     #[test]
+    fn cache_path_helpers_reject_absolute_and_parent_paths() {
+        let root = PathBuf::from("/tmp/aft-project");
+
+        assert_eq!(
+            cache_relative_path(&root, &root.join("src/lib.rs")),
+            Some(PathBuf::from("src/lib.rs"))
+        );
+        assert!(cache_relative_path(&root, Path::new("/tmp/outside.rs")).is_none());
+        assert!(cached_path_under_root(&root, Path::new("../outside.rs")).is_none());
+        assert!(cached_path_under_root(&root, Path::new("/tmp/outside.rs")).is_none());
+        assert_eq!(
+            cached_path_under_root(&root, Path::new("src/./lib.rs")),
+            Some(root.join("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn refresh_after_head_change_removes_renames_and_detects_local_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        fs::write(project.join("old.txt"), "old token\n").expect("write old");
+        fs::write(project.join("unchanged.txt"), "before\n").expect("write unchanged");
+
+        Command::new("git")
+            .arg("init")
+            .arg(&project)
+            .status()
+            .expect("git init");
+        for args in [
+            ["config", "user.email", "aft@example.invalid"],
+            ["config", "user.name", "AFT Test"],
+        ] {
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .expect("git config");
+        }
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["add", "."])
+            .status()
+            .expect("git add initial");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .expect("git commit initial");
+        let previous = run_git(&project, &["rev-parse", "HEAD"]).expect("previous head");
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = Some(previous.clone());
+
+        fs::rename(project.join("old.txt"), project.join("new.txt")).expect("rename file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["add", "-A"])
+            .status()
+            .expect("git add rename");
+        Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["commit", "-m", "rename"])
+            .status()
+            .expect("git commit rename");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+
+        fs::write(project.join("unchanged.txt"), "after local edit\n").expect("local edit");
+        fs::write(project.join("untracked.txt"), "untracked token\n").expect("untracked");
+
+        let refreshed = SearchIndex::rebuild_or_refresh(
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current),
+            Some(baseline),
+        );
+
+        assert!(!refreshed
+            .path_to_id
+            .contains_key(&canonical_project.join("old.txt")));
+        assert!(refreshed
+            .path_to_id
+            .contains_key(&canonical_project.join("new.txt")));
+        assert!(refreshed
+            .path_to_id
+            .contains_key(&canonical_project.join("untracked.txt")));
+        let matches = refreshed.grep("after local edit", true, &[], &[], &canonical_project, 10);
+        assert_eq!(matches.matches.len(), 1);
+    }
+
+    #[test]
+    fn read_from_disk_rejects_corrupt_postings_checksum() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("src.txt"), "abcdef").expect("write source");
+
+        let index = SearchIndex::build(&project);
+        let cache_dir = dir.path().join("cache");
+        index.write_to_disk(&cache_dir, None);
+
+        let cache_path = cache_dir.join("cache.bin");
+        let mut bytes = fs::read(&cache_path).expect("read cache");
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(&cache_path, bytes).expect("write corrupted cache");
+
+        assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_none());
+    }
+
+    #[test]
     fn write_to_disk_uses_temp_files_and_cleans_them_up() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
@@ -1929,10 +2429,52 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         index.write_to_disk(&cache_dir, None);
 
-        assert!(cache_dir.join("postings.bin").is_file());
-        assert!(cache_dir.join("lookup.bin").is_file());
-        assert!(!cache_dir.join("postings.bin.tmp").exists());
-        assert!(!cache_dir.join("lookup.bin.tmp").exists());
+        assert!(cache_dir.join("cache.bin").is_file());
+        assert!(fs::read_dir(&cache_dir)
+            .expect("read cache dir")
+            .all(|entry| !entry
+                .expect("cache entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")));
+    }
+
+    #[test]
+    fn concurrent_search_index_writes_do_not_corrupt() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("src.txt"), "abcdef\n").expect("write source");
+        let cache_dir = dir.path().join("cache");
+
+        let a_project = project.clone();
+        let a_cache = cache_dir.clone();
+        let a = std::thread::spawn(move || {
+            let _lock = CacheLock::acquire(&a_cache).expect("acquire cache lock a");
+            let index = SearchIndex::build(&a_project);
+            index.write_to_disk(&a_cache, None);
+        });
+        let b_project = project.clone();
+        let b_cache = cache_dir.clone();
+        let b = std::thread::spawn(move || {
+            let _lock = CacheLock::acquire(&b_cache).expect("acquire cache lock b");
+            let index = SearchIndex::build(&b_project);
+            index.write_to_disk(&b_cache, None);
+        });
+        a.join().expect("writer a");
+        b.join().expect("writer b");
+
+        assert!(SearchIndex::read_from_disk(&cache_dir, &project).is_some());
+    }
+
+    #[test]
+    fn search_index_atomic_rename_survives_partial_write() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("cache.bin.tmp.1.1"), b"partial").expect("write partial tmp");
+
+        assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
     }
 
     #[test]
@@ -1988,6 +2530,72 @@ mod tests {
     }
 
     #[test]
+    fn git_head_unchanged_picks_up_local_edits() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("repo");
+        fs::create_dir_all(&project).expect("create repo dir");
+        let file = project.join("tracked.txt");
+        fs::write(&file, "oldtoken\n").expect("write file");
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .arg("init")
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&project)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let head = current_git_head(&project);
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = head.clone();
+        fs::write(&file, "newtoken\n").expect("edit tracked file");
+
+        let refreshed =
+            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, head, Some(baseline));
+        let result = refreshed.grep("newtoken", true, &[], &[], &project, 10);
+
+        assert_eq!(result.total_matches, 1);
+    }
+
+    #[test]
+    fn non_git_project_reuses_cache_when_files_unchanged() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("file.txt"), "unchangedtoken\n").expect("write file");
+        let baseline = SearchIndex::build(&project);
+        let baseline_file_count = baseline.file_count();
+
+        let refreshed =
+            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, None, Some(baseline));
+
+        assert_eq!(refreshed.file_count(), baseline_file_count);
+        assert_eq!(
+            refreshed
+                .grep("unchangedtoken", true, &[], &[], &project, 10)
+                .total_matches,
+            1
+        );
+    }
+
+    #[test]
     fn resolve_search_scope_disables_index_for_external_path() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
@@ -2016,7 +2624,7 @@ mod tests {
         fs::write(docs.join("guide.md"), "SearchIndex guide\n").expect("write docs file");
 
         let index = SearchIndex::build(&project);
-        let result = index.search_grep("SearchIndex", true, &[], &[], &src, 10);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 10);
 
         assert_eq!(result.files_searched, 1);
         assert_eq!(result.files_with_matches, 1);
@@ -2035,10 +2643,61 @@ mod tests {
         fs::write(src.join("main.rs"), "SearchIndex SearchIndex\n").expect("write src file");
 
         let index = SearchIndex::build(&project);
-        let result = index.search_grep("SearchIndex", true, &[], &[], &src, 10);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 10);
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn grep_case_insensitive_unicode_literal_matches_indexed_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("unicode.txt");
+        fs::write(&file, "äbc\n").expect("write unicode file");
+
+        let index = SearchIndex::build(&project);
+        let result = index.grep("Äbc", false, &[], &[], &project, 10);
+
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].file,
+            fs::canonicalize(file).expect("canonicalize unicode file")
+        );
+    }
+
+    #[test]
+    fn refresh_reindexes_same_size_edit_with_preserved_mtime() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("tokens.txt");
+        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        fs::write(&file, "alpha").expect("write original file");
+        filetime::set_file_mtime(&file, original_mtime).expect("set original mtime");
+
+        let baseline = SearchIndex::build(&project);
+        fs::write(&file, "bravo").expect("write same-size edit");
+        filetime::set_file_mtime(&file, original_mtime).expect("restore original mtime");
+
+        let refreshed =
+            SearchIndex::rebuild_or_refresh(&project, DEFAULT_MAX_FILE_SIZE, None, Some(baseline));
+        let result = refreshed.grep("bravo", true, &[], &[], &project, 10);
+        let canonical_file = fs::canonicalize(&file).expect("canonicalize edited file");
+        let refreshed_id = *refreshed
+            .path_to_id
+            .get(&canonical_file)
+            .expect("file remains indexed");
+
+        assert_eq!(result.total_matches, 1);
+        assert!(refreshed
+            .postings_for_trigram(pack_trigram(b'b', b'r', b'a'), None)
+            .contains(&refreshed_id));
+        assert!(!refreshed
+            .postings_for_trigram(pack_trigram(b'a', b'l', b'p'), None)
+            .contains(&refreshed_id));
     }
 
     #[test]
@@ -2050,7 +2709,7 @@ mod tests {
         fs::write(src.join("main.rs"), "SearchIndex\nSearchIndex\n").expect("write src file");
 
         let index = SearchIndex::build(&project);
-        let result = index.search_grep("SearchIndex", true, &[], &[], &src, 1);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 1);
 
         assert_eq!(result.total_matches, 2);
         assert_eq!(result.matches.len(), 1);
@@ -2122,10 +2781,19 @@ mod tests {
         lookup.extend_from_slice(&INDEX_VERSION.to_le_bytes());
         lookup.extend_from_slice(&0u32.to_le_bytes());
 
-        fs::write(cache_dir.join("postings.bin"), postings).expect("write postings");
-        fs::write(cache_dir.join("lookup.bin"), lookup).expect("write lookup");
+        let postings_checksum = crc32fast::hash(&postings);
+        postings.extend_from_slice(&postings_checksum.to_le_bytes());
+        let lookup_checksum = crc32fast::hash(&lookup);
+        lookup.extend_from_slice(&lookup_checksum.to_le_bytes());
+        let mut cache = Vec::new();
+        cache.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+        cache.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        cache.extend_from_slice(&(postings.len() as u64).to_le_bytes());
+        cache.extend_from_slice(&postings);
+        cache.extend_from_slice(&lookup);
+        fs::write(cache_dir.join("cache.bin"), cache).expect("write cache");
 
-        assert!(SearchIndex::read_from_disk(&cache_dir).is_none());
+        assert!(SearchIndex::read_from_disk(&cache_dir, dir.path()).is_none());
     }
 
     /// Regression: v0.15.2 — sort_paths_by_mtime_desc panicked when files

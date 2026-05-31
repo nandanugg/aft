@@ -1,11 +1,11 @@
 /**
  * aft_import — language-aware import add/remove/organize.
- * Supports TS, JS, TSX, Python, Rust, Go.
+ * Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, Vue.
  */
 
-import { StringEnum } from "@mariozechner/pi-ai";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callBridge, textResult } from "./_shared.js";
 import {
@@ -23,19 +23,44 @@ import {
 
 const ImportParams = Type.Object({
   op: StringEnum(["add", "remove", "organize"] as const, { description: "Import operation" }),
-  filePath: Type.String({ description: "Path to the file" }),
+  filePath: Type.String({ description: "Path to the file (absolute or relative to project root)" }),
   module: Type.Optional(
     Type.String({ description: "Module path (required for add/remove), e.g. 'react', './utils'" }),
   ),
   names: Type.Optional(
-    Type.Array(Type.String(), { description: "Named imports to add, e.g. ['useState']" }),
+    Type.Array(Type.String(), {
+      description:
+        "Named imports to add, using native named-import text with per-name `as` aliasing where supported, e.g. ['useState'], Solidity ['ERC20', 'IERC20 as IToken']",
+    }),
   ),
-  defaultImport: Type.Optional(Type.String({ description: "Default import name (e.g. 'React')" })),
+  defaultImport: Type.Optional(
+    Type.String({ description: "Default import name, ES only (e.g. 'React')" }),
+  ),
+  namespace: Type.Optional(
+    Type.String({
+      description:
+        "Namespace binding: `import * as ns from 'mod'` (ES), `* as N from \"./X.sol\"` (Solidity)",
+    }),
+  ),
+  alias: Type.Optional(
+    Type.String({ description: 'Whole-module alias. Solidity: `import "./X.sol" as X`' }),
+  ),
+  modifiers: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Statement-level modifiers, language-validated: Java/C# 'static', C# 'global'/'unsafe', Java/Kotlin/Scala 'wildcard', Swift '@testable'",
+    }),
+  ),
+  importKind: Type.Optional(
+    Type.String({
+      description:
+        "Symbol-kind import: PHP 'function'/'const', Swift 'struct'/'class'/'enum', Scala 'given'",
+    }),
+  ),
   removeName: Type.Optional(
     Type.String({ description: "Named import to remove; omit to remove entire import" }),
   ),
   typeOnly: Type.Optional(Type.Boolean({ description: "Type-only import (TS only)" })),
-  dryRun: Type.Optional(Type.Boolean({ description: "Preview without writing" })),
   validate: Type.Optional(
     StringEnum(["syntax", "full"] as const, {
       description: "Post-edit validation level (default: syntax)",
@@ -51,13 +76,6 @@ export function buildImportSections(
 ): string[] {
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No import result.")];
-
-  if (response.dry_run === true) {
-    return [
-      theme.fg("warning", `[dry run] ${args.op}`),
-      asString(response.diff) || theme.fg("muted", "No diff available."),
-    ];
-  }
 
   if (args.op === "organize") {
     const groups = asRecords(response.groups);
@@ -87,8 +105,13 @@ export function buildImportSections(
     ];
   }
 
+  const moduleName = asString(response.module) ?? args.module ?? "(module)";
+  const didRemove = response.removed !== false;
+  const removeStatus = didRemove
+    ? `${theme.fg("success", "removed")} ${theme.fg("accent", moduleName)}`
+    : `${theme.fg("warning", "not present")} ${theme.fg("accent", moduleName)}`;
   return [
-    `${theme.fg("success", "removed")} ${theme.fg("accent", asString(response.module) ?? args.module ?? "(module)")}`,
+    removeStatus,
     `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.filePath)}`,
     args.removeName
       ? `${theme.fg("muted", "name")} ${args.removeName}`
@@ -129,7 +152,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_import",
     label: "import",
     description:
-      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go. Ops: `add` (auto-groups stdlib/external/internal, deduplicates), `remove` (pass `removeName` for single name or omit to remove entire import), `organize` (re-sort + deduplicate).",
+      "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, Vue. Ops: `add`, `remove`, `organize`. Use aft_safety checkpoint/undo before broad cleanup.",
     parameters: ImportParams,
     async execute(
       _toolCallId: string,
@@ -151,9 +174,12 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if (params.module !== undefined) req.module = params.module;
       if (params.names !== undefined) req.names = params.names;
       if (params.defaultImport !== undefined) req.default_import = params.defaultImport;
+      if (params.namespace !== undefined) req.namespace = params.namespace;
+      if (params.alias !== undefined) req.alias = params.alias;
+      if (params.modifiers !== undefined) req.modifiers = params.modifiers;
+      if (params.importKind !== undefined) req.import_kind = params.importKind;
       if (params.removeName !== undefined) req.name = params.removeName;
       if (params.typeOnly !== undefined) req.type_only = params.typeOnly;
-      if (params.dryRun !== undefined) req.dry_run = params.dryRun;
       if (params.validate !== undefined) req.validate = params.validate;
 
       const response = await callBridge(bridge, commandMap[params.op], req, extCtx);

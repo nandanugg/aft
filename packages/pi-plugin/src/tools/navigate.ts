@@ -1,13 +1,13 @@
 /**
- * aft_navigate — call-graph navigation across files.
- * Ops: call_tree, callers, trace_to, impact, trace_data.
+ * aft_callgraph — call-graph relationship queries across files.
+ * Ops: call_tree, callers, trace_to, trace_to_symbol, impact, trace_data.
  */
 
-import { StringEnum } from "@mariozechner/pi-ai";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, coerceOptionalInt, optionalInt, textResult } from "./_shared.js";
 import {
   accentPath,
   asBoolean,
@@ -23,17 +23,37 @@ import {
   shortenPath,
 } from "./render-helpers.js";
 
-const NavigateParams = Type.Object({
-  op: StringEnum(["call_tree", "callers", "trace_to", "impact", "trace_data"] as const, {
-    description: "Navigation operation",
-  }),
-  filePath: Type.String({ description: "Source file containing the symbol" }),
-  symbol: Type.String({ description: "Name of the symbol to analyze" }),
-  depth: Type.Optional(Type.Number({ description: "Max traversal depth" })),
-  expression: Type.Optional(
-    Type.String({ description: "Expression to track (required for trace_data)" }),
-  ),
-});
+function navigateParamsSchema() {
+  return Type.Object({
+    op: StringEnum(
+      ["call_tree", "callers", "trace_to", "trace_to_symbol", "impact", "trace_data"] as const,
+      {
+        description: "Navigation operation",
+      },
+    ),
+    filePath: Type.String({
+      description: "Source file containing the symbol (absolute or relative to project root)",
+    }),
+    symbol: Type.String({ description: "Name of the symbol to analyze" }),
+    depth: optionalInt(1, Number.MAX_SAFE_INTEGER),
+    expression: Type.Optional(
+      Type.String({ description: "Expression to track (required for trace_data)" }),
+    ),
+    toSymbol: Type.Optional(
+      Type.String({
+        description: "Target symbol for trace_to_symbol; the returned path ends here",
+      }),
+    ),
+    toFile: Type.Optional(
+      Type.String({
+        description:
+          "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
+      }),
+    ),
+  });
+}
+
+type NavigateArgs = Static<ReturnType<typeof navigateParamsSchema>>;
 
 function treeLine(depth: number, text: string): string {
   return `${"  ".repeat(depth)}${depth === 0 ? "" : "↳ "}${text}`;
@@ -47,6 +67,19 @@ function renderCallTreeNode(node: Record<string, unknown>, depth: number, lines:
   asRecords(node.children).forEach((child) => {
     renderCallTreeNode(child, depth + 1, lines);
   });
+}
+
+function depthWarning(
+  response: Record<string, unknown>,
+  theme: Theme,
+  depthField = "depth_limited",
+  truncatedField = "truncated",
+): string {
+  const limited = asBoolean(response[depthField]);
+  const truncated = asNumber(response[truncatedField]) ?? 0;
+  if (!limited && truncated === 0) return "";
+  const detail = truncated > 0 ? `, ${truncated} truncated` : "";
+  return theme.fg("warning", `(depth limited${detail})`);
 }
 
 function renderTracePath(path: Record<string, unknown>, index: number, lines: string[]): void {
@@ -67,7 +100,7 @@ function renderTracePath(path: Record<string, unknown>, index: number, lines: st
 
 /** Exported for renderer unit tests. */
 export function buildNavigateSections(
-  args: Static<typeof NavigateParams>,
+  args: NavigateArgs,
   payload: unknown,
   theme: Theme,
 ): string[] {
@@ -77,13 +110,16 @@ export function buildNavigateSections(
   if (args.op === "call_tree") {
     const lines: string[] = [];
     renderCallTreeNode(response, 0, lines);
+    const warning = depthWarning(response, theme);
+    if (warning) lines.push(warning);
     return lines.length > 0 ? lines : [theme.fg("muted", "No call tree available.")];
   }
 
   if (args.op === "callers") {
     const groups = asRecords(response.callers);
+    const warning = depthWarning(response, theme);
     const sections = [
-      `${theme.fg("success", `${asNumber(response.total_callers) ?? 0} caller${(asNumber(response.total_callers) ?? 0) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${groups.length} file group${groups.length === 1 ? "" : "s"}`)}`,
+      `${theme.fg("success", `${asNumber(response.total_callers) ?? 0} caller${(asNumber(response.total_callers) ?? 0) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${groups.length} file group${groups.length === 1 ? "" : "s"}`)} ${warning}`.trim(),
     ];
     groups.forEach((group) => {
       const file = shortenPath(asString(group.file) ?? "(unknown file)");
@@ -98,10 +134,32 @@ export function buildNavigateSections(
     return sections;
   }
 
+  if (args.op === "trace_to_symbol") {
+    const path = asRecords(response.path);
+    const complete = asBoolean(response.complete);
+    const reason = asString(response.reason);
+    if (path.length === 0) {
+      const prefix =
+        complete === false ? theme.fg("warning", "No complete path") : theme.fg("muted", "No path");
+      return [`${prefix}${reason ? ` (${reason})` : ""}`];
+    }
+    const lines = [theme.fg("success", `${path.length} hop${path.length === 1 ? "" : "s"}`)];
+    path.forEach((hop, index) => {
+      const symbol = asString(hop.symbol) ?? "(unknown)";
+      const file = shortenPath(asString(hop.file) ?? "(unknown file)");
+      const line = asNumber(hop.line);
+      lines.push(
+        treeLine(index + 1, `${symbol} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}`),
+      );
+    });
+    return lines;
+  }
+
   if (args.op === "trace_to") {
     const paths = asRecords(response.paths);
+    const warning = depthWarning(response, theme, "max_depth_reached", "truncated_paths");
     const sections = [
-      `${theme.fg("success", `${asNumber(response.total_paths) ?? paths.length} path${(asNumber(response.total_paths) ?? paths.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.entry_points_found) ?? 0} entry point${(asNumber(response.entry_points_found) ?? 0) === 1 ? "" : "s"}`)}`,
+      `${theme.fg("success", `${asNumber(response.total_paths) ?? paths.length} path${(asNumber(response.total_paths) ?? paths.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.entry_points_found) ?? 0} entry point${(asNumber(response.entry_points_found) ?? 0) === 1 ? "" : "s"}`)} ${warning}`.trim(),
     ];
     if (paths.length === 0) sections.push(theme.fg("muted", "No entry paths found."));
     paths.forEach((path, index) => {
@@ -114,8 +172,9 @@ export function buildNavigateSections(
 
   if (args.op === "impact") {
     const callers = asRecords(response.callers);
+    const warning = depthWarning(response, theme);
     const sections = [
-      `${theme.fg("warning", `${asNumber(response.total_affected) ?? callers.length} affected call site${(asNumber(response.total_affected) ?? callers.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.affected_files) ?? 0} file${(asNumber(response.affected_files) ?? 0) === 1 ? "" : "s"}`)}`,
+      `${theme.fg("warning", `${asNumber(response.total_affected) ?? callers.length} affected call site${(asNumber(response.total_affected) ?? callers.length) === 1 ? "" : "s"}`)} ${theme.fg("muted", `${asNumber(response.affected_files) ?? 0} file${(asNumber(response.affected_files) ?? 0) === 1 ? "" : "s"}`)} ${warning}`.trim(),
     ];
     if (callers.length === 0) sections.push(theme.fg("muted", "No impacted callers found."));
     callers.forEach((caller) => {
@@ -163,25 +222,22 @@ export function buildNavigateSections(
 }
 
 /** Exported for renderer unit tests. */
-export function renderNavigateCall(
-  args: Static<typeof NavigateParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
+export function renderNavigateCall(args: NavigateArgs, theme: Theme, context: RenderContextLike) {
   const summary = [
     theme.fg("accent", args.op),
     accentPath(theme, args.filePath),
     theme.fg("toolOutput", args.symbol),
+    args.toSymbol ? theme.fg("toolOutput", `→ ${args.toSymbol}`) : undefined,
   ]
     .filter(Boolean)
     .join(" ");
-  return renderToolCall("navigate", summary, theme, context);
+  return renderToolCall("callgraph", summary, theme, context);
 }
 
 /** Exported for renderer unit tests. */
 export function renderNavigateResult(
   result: AgentToolResult<unknown>,
-  args: Static<typeof NavigateParams>,
+  args: NavigateArgs,
   theme: Theme,
   context: RenderContextLike,
 ) {
@@ -194,20 +250,17 @@ export function renderNavigateResult(
 
 export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void {
   pi.registerTool({
-    name: "aft_navigate",
-    label: "navigate",
+    name: "aft_callgraph",
+    label: "callgraph",
     description:
-      "Navigate code structure across files using call graph analysis. All ops require both `filePath` and `symbol`. Use `call_tree` for what a function calls, `callers` for call sites, `trace_to` for entry points, `impact` for blast radius, `trace_data` to follow a value.",
-    parameters: NavigateParams,
-    async execute(
-      _toolCallId: string,
-      params: Static<typeof NavigateParams>,
-      _signal,
-      _onUpdate,
-      extCtx,
-    ) {
+      "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params.",
+    parameters: navigateParamsSchema(),
+    async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
       if (params.op === "trace_data" && !params.expression) {
         throw new Error("op='trace_data' requires an `expression`");
+      }
+      if (params.op === "trace_to_symbol" && !params.toSymbol) {
+        throw new Error("op='trace_to_symbol' requires a `toSymbol`");
       }
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = {
@@ -215,8 +268,11 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
         file: params.filePath,
         symbol: params.symbol,
       };
-      if (params.depth !== undefined) req.depth = params.depth;
+      const depth = coerceOptionalInt(params.depth, "depth", 1, Number.MAX_SAFE_INTEGER);
+      if (depth !== undefined) req.depth = depth;
       if (params.expression !== undefined) req.expression = params.expression;
+      if (params.toSymbol !== undefined) req.toSymbol = params.toSymbol;
+      if (params.toFile !== undefined) req.toFile = params.toFile;
       const response = await callBridge(bridge, params.op, req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },

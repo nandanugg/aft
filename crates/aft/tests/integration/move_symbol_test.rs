@@ -2,8 +2,7 @@
 //!
 //! Uses temp-dir isolation (copy fixtures, mutate copies, verify results)
 //! to test the full move pipeline: symbol extraction, destination insertion,
-//! consumer import rewiring, dry-run mode, checkpoint creation/restore, and
-//! error paths.
+//! consumer import rewiring, checkpoint creation/restore, and error paths.
 
 use crate::helpers::{fixture_path, AftProcess};
 
@@ -45,14 +44,83 @@ fn setup_move_fixture() -> (tempfile::TempDir, String) {
 /// Helper: configure aft with the given project root and assert success.
 fn configure(aft: &mut AftProcess, root: &str) {
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}"}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
         resp
     );
+}
+
+fn write_file(path: &std::path::Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
+    std::fs::write(path, content).expect("write file");
+}
+
+fn assert_move_symbol_unsupported(ext: &str, source: &str, dest: &str) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let src = tmp.path().join(format!("source.{ext}"));
+    let dst = tmp.path().join(format!("dest.{ext}"));
+    write_file(&src, source);
+    write_file(&dst, dest);
+
+    let mut aft = AftProcess::spawn();
+    let resp = aft.send(&format!(
+        r#"{{"id":"unsupported-{ext}","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
+        crate::helpers::json_string(&src.display()),
+        crate::helpers::json_string(&dst.display())
+    ));
+    assert_eq!(resp["success"], false, "move should fail: {resp:?}");
+    assert_eq!(
+        resp["code"], "unsupported_language",
+        "wrong error: {resp:?}"
+    );
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_rejects_python_source() {
+    assert_move_symbol_unsupported("py", "def Foo():\n    pass\n", "\n");
+}
+
+#[test]
+fn move_symbol_rejects_rust_source() {
+    assert_move_symbol_unsupported("rs", "pub fn Foo() {}\n", "\n");
+}
+
+#[test]
+fn move_symbol_rejects_go_source() {
+    assert_move_symbol_unsupported("go", "package main\n\nfunc Foo() {}\n", "package main\n");
+}
+
+#[test]
+fn move_symbol_rewrites_barrel_named_reexport() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let src_dir = tmp.path().join("src");
+    let foo = src_dir.join("foo.ts");
+    let bar = src_dir.join("bar.ts");
+    let index = src_dir.join("index.ts");
+    write_file(&foo, "export function Foo() { return 1; }\n");
+    write_file(&bar, "export const Bar = 2;\n");
+    write_file(&index, "export { Foo } from './foo';\n");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"barrel","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
+        crate::helpers::json_string(&foo.display()),
+        crate::helpers::json_string(&bar.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    let index_content = std::fs::read_to_string(index).expect("read index");
+    assert!(
+        index_content.contains("export { Foo } from './bar';"),
+        "barrel should point at ./bar:\n{index_content}"
+    );
+    aft.shutdown();
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +140,9 @@ fn move_symbol_basic() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(
@@ -152,8 +221,9 @@ fn move_symbol_multiple_consumers() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
@@ -238,8 +308,9 @@ fn move_symbol_aliased_import() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
@@ -267,75 +338,320 @@ fn move_symbol_aliased_import() {
     aft.shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// Dry-run and checkpoint tests
-// ---------------------------------------------------------------------------
-
-/// Dry-run mode: returns diffs for all affected files but modifies nothing on disk.
 #[test]
-fn move_symbol_dry_run() {
-    let (_tmp, root) = setup_move_fixture();
+fn move_symbol_rewrites_source_file_when_remaining_code_uses_moved_symbol() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("helpers.ts");
+
+    write_file(
+        &source,
+        "export function helper(): string {
+  return 'ok';
+}
+
+export function useHelper(): string {
+  return helper();
+}
+",
+    );
+    write_file(
+        &dest,
+        "export const existing = true;
+",
+    );
+
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
-    let source = format!("{}/service.ts", root);
-    let dest = format!("{}/utils.ts", root);
-
-    // Snapshot original file contents
-    let source_before = std::fs::read_to_string(&source).unwrap();
-    let dest_before = std::fs::read_to_string(&dest).unwrap();
-    let ca_before = std::fs::read_to_string(format!("{}/consumer_a.ts", root)).unwrap();
-
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}","dry_run":true}}"#,
-        source, dest
+        r#"{{"id":"source-consumer","command":"move_symbol","file":{},"symbol":"helper","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
     ));
-
-    assert_eq!(resp["success"], true, "dry_run should succeed: {:?}", resp);
-    assert_eq!(resp["dry_run"], true, "response should flag dry_run");
-
-    // Should have diffs for source, dest, and at least one consumer
-    let diffs = resp["diffs"].as_array().expect("diffs should be array");
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
     assert!(
-        diffs.len() >= 3,
-        "should have diffs for source + dest + consumers, got {}",
-        diffs.len()
+        resp["consumers_updated"].as_u64().unwrap() >= 1,
+        "source file should count as an updated consumer: {resp:?}"
     );
 
-    // Each diff should have file and diff fields
-    for diff in diffs {
-        assert!(
-            diff.get("file").is_some(),
-            "diff should have 'file': {:?}",
-            diff
-        );
-        assert!(
-            diff.get("diff").is_some(),
-            "diff should have 'diff': {:?}",
-            diff
-        );
-    }
-
-    // Verify NO files were modified on disk
-    let source_after = std::fs::read_to_string(&source).unwrap();
-    let dest_after = std::fs::read_to_string(&dest).unwrap();
-    let ca_after = std::fs::read_to_string(format!("{}/consumer_a.ts", root)).unwrap();
-
-    assert_eq!(
-        source_before, source_after,
-        "source should be unchanged after dry_run"
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        source_content.contains("import { helper } from './helpers';"),
+        "source should import the moved helper from destination:
+{source_content}"
     );
-    assert_eq!(
-        dest_before, dest_after,
-        "dest should be unchanged after dry_run"
+    assert!(
+        source_content.contains("return helper();"),
+        "remaining source code should still call helper:
+{source_content}"
     );
-    assert_eq!(
-        ca_before, ca_after,
-        "consumer_a should be unchanged after dry_run"
+    assert!(
+        !source_content.contains("export function helper"),
+        "helper declaration should be removed from source:
+{source_content}"
+    );
+
+    let dest_content = std::fs::read_to_string(&dest).expect("read dest");
+    assert!(
+        dest_content.contains("export function helper"),
+        "destination should contain moved helper:
+{dest_content}"
     );
 
     aft.shutdown();
 }
+
+#[test]
+fn move_symbol_does_not_reimport_shadowed_source_references() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+    let consumer = tmp.path().join("consumer.ts");
+
+    write_file(
+        &source,
+        r#"export function logger(): string {
+  return 'moved';
+}
+
+function logData(logger: unknown): unknown {
+  return logger;
+}
+
+export function f(): number {
+  const logger = 1;
+  return logger;
+}
+
+export function destructured(input: { logger: number }): number {
+  const { logger } = input;
+  return logger;
+}
+"#,
+    );
+    write_file(&dest, "export const existing = true;\n");
+    write_file(
+        &consumer,
+        r#"import { logger } from './source';
+
+export const value = logger();
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"shadowed-source","command":"move_symbol","file":{},"symbol":"logger","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        !source_content.contains("from './dest'") && !source_content.contains("from \"./dest\""),
+        "shadowed source references should not add an import from dest:\n{source_content}"
+    );
+    assert!(
+        source_content.contains("function logData(logger: unknown)")
+            && source_content.contains("const logger = 1")
+            && source_content.contains("const { logger } = input"),
+        "shadowing declarations should remain in source:\n{source_content}"
+    );
+
+    let consumer_content = std::fs::read_to_string(&consumer).expect("read consumer");
+    assert!(
+        consumer_content.contains("import { logger } from './dest';"),
+        "other-file consumer should import logger from dest:\n{consumer_content}"
+    );
+    assert!(
+        !consumer_content.contains("from './source'")
+            && !consumer_content.contains("from \"./source\""),
+        "other-file consumer should no longer import logger from source:\n{consumer_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_reimports_unshadowed_source_references() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+
+    write_file(
+        &source,
+        r#"export function logger(): string {
+  return 'moved';
+}
+
+export function useLogger(): string {
+  return logger();
+}
+"#,
+    );
+    write_file(&dest, "export const existing = true;\n");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"unshadowed-source","command":"move_symbol","file":{},"symbol":"logger","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        source_content.contains("import { logger } from './dest';"),
+        "unshadowed source reference should import logger from dest:\n{source_content}"
+    );
+    assert!(
+        source_content.contains("return logger();"),
+        "remaining source code should still call logger:\n{source_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_does_not_reimport_object_keys_or_member_access() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+
+    write_file(
+        &source,
+        r#"export function logger(): string {
+  return 'moved';
+}
+
+export const config = { logger: 1 };
+
+export function read(obj: { logger: number }): number {
+  return obj.logger;
+}
+"#,
+    );
+    write_file(&dest, "export const existing = true;\n");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"object-member-source","command":"move_symbol","file":{},"symbol":"logger","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let source_content = std::fs::read_to_string(&source).expect("read source");
+    assert!(
+        !source_content.contains("from './dest'") && !source_content.contains("from \"./dest\""),
+        "object keys/member access alone should not add an import from dest:\n{source_content}"
+    );
+    assert!(
+        source_content.contains("{ logger: 1 }") && source_content.contains("obj.logger"),
+        "object key and member access should remain in source:\n{source_content}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_preserves_default_import_shape_and_alias() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let old = tmp.path().join("old.ts");
+    let dest = tmp.path().join("new_home.ts");
+    let consumer_foo = tmp.path().join("consumer_foo.ts");
+    let consumer_bar = tmp.path().join("consumer_bar.ts");
+
+    write_file(
+        &old,
+        "export default function Foo(): string {
+  return 'foo';
+}
+
+export function keep(): string {
+  return 'keep';
+}
+",
+    );
+    write_file(
+        &dest,
+        "export const existing = true;
+",
+    );
+    write_file(
+        &consumer_foo,
+        "import Foo from './old';
+
+export const value = Foo();
+",
+    );
+    write_file(
+        &consumer_bar,
+        "import Bar from './old';
+
+export const value = Bar();
+",
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"default-imports","command":"move_symbol","file":{},"symbol":"Foo","destination":{}}}"#,
+        crate::helpers::json_string(&old.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+
+    let foo_content = std::fs::read_to_string(&consumer_foo).expect("read consumer_foo");
+    assert!(
+        foo_content.contains("import Foo from './new_home';"),
+        "default import should stay default for Foo local name:
+{foo_content}"
+    );
+    assert!(
+        !foo_content.contains("import { Foo }"),
+        "default import must not become named import:
+{foo_content}"
+    );
+
+    let bar_content = std::fs::read_to_string(&consumer_bar).expect("read consumer_bar");
+    assert!(
+        bar_content.contains("import Bar from './new_home';"),
+        "default import alias Bar should be preserved:
+{bar_content}"
+    );
+    assert!(
+        !bar_content.contains("import { Foo }"),
+        "aliased default must not become named import:
+{bar_content}"
+    );
+
+    let dest_content = std::fs::read_to_string(&dest).expect("read dest");
+    assert!(
+        dest_content.contains("export default function Foo"),
+        "destination should preserve default export:
+{dest_content}"
+    );
+
+    aft.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint tests
+// ---------------------------------------------------------------------------
 
 /// Checkpoint: move creates a checkpoint that can be listed and restored.
 #[test]
@@ -354,8 +670,9 @@ fn move_symbol_checkpoint() {
 
     // Perform the move
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
     assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
     let checkpoint_name = resp["checkpoint_name"].as_str().unwrap().to_string();
@@ -411,6 +728,99 @@ fn move_symbol_checkpoint() {
     aft.shutdown();
 }
 
+#[test]
+fn move_symbol_operation_undo_restores_source_destination_and_consumers() {
+    let (_tmp, root) = setup_move_fixture();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let source = format!("{}/service.ts", root);
+    let dest = format!("{}/utils.ts", root);
+    let consumer_a = format!("{}/consumer_a.ts", root);
+    let consumer_e = format!("{}/features/consumer_e.ts", root);
+
+    let source_original = std::fs::read_to_string(&source).unwrap();
+    let dest_original = std::fs::read_to_string(&dest).unwrap();
+    let consumer_a_original = std::fs::read_to_string(&consumer_a).unwrap();
+    let consumer_e_original = std::fs::read_to_string(&consumer_e).unwrap();
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"move-before-undo","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert!(
+        resp["backup_ids"].as_array().unwrap().len() >= 4,
+        "move should snapshot source, destination, and consumers: {resp:?}"
+    );
+    assert_ne!(std::fs::read_to_string(&source).unwrap(), source_original);
+    assert_ne!(std::fs::read_to_string(&dest).unwrap(), dest_original);
+    assert_ne!(
+        std::fs::read_to_string(&consumer_a).unwrap(),
+        consumer_a_original
+    );
+    assert_ne!(
+        std::fs::read_to_string(&consumer_e).unwrap(),
+        consumer_e_original
+    );
+
+    let undo = aft.send(r#"{"id":"undo-move-symbol-operation","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert_eq!(undo["operation"], true);
+    assert!(
+        undo["restored_count"].as_u64().unwrap() >= 4,
+        "undo should restore all touched files: {undo:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_original);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), dest_original);
+    assert_eq!(
+        std::fs::read_to_string(&consumer_a).unwrap(),
+        consumer_a_original
+    );
+    assert_eq!(
+        std::fs::read_to_string(&consumer_e).unwrap(),
+        consumer_e_original
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_undo_removes_new_destination_file() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path().display().to_string();
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("new_dest.ts");
+    write_file(
+        &source,
+        "export function keep() { return 1; }\nexport function moveMe() { return 2; }\n",
+    );
+
+    let source_original = std::fs::read_to_string(&source).unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"move-to-new-dest","command":"move_symbol","file":{},"symbol":"moveMe","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert!(dest.exists(), "destination should be created");
+    assert_ne!(std::fs::read_to_string(&source).unwrap(), source_original);
+
+    let undo = aft.send(r#"{"id":"undo-move-new-dest","command":"undo"}"#);
+    assert_eq!(undo["success"], true, "undo should succeed: {undo:?}");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), source_original);
+    assert!(
+        !dest.exists(),
+        "new destination should be deleted by tombstone undo"
+    );
+
+    aft.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Error path tests
 // ---------------------------------------------------------------------------
@@ -427,8 +837,9 @@ fn move_symbol_not_configured() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -448,12 +859,40 @@ fn move_symbol_symbol_not_found() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"nonExistentFn","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"nonExistentFn","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
     assert_eq!(resp["code"], "symbol_not_found");
+
+    aft.shutdown();
+}
+
+#[test]
+fn move_symbol_ambiguous_symbol_is_error_response() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let source = tmp.path().join("source.ts");
+    let dest = tmp.path().join("dest.ts");
+    std::fs::write(
+        &source,
+        "export function duplicate(): string { return 'top'; }\nexport class Boxed {\n  duplicate(): string { return 'method'; }\n}\n",
+    )
+    .expect("write source");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &tmp.path().display().to_string());
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"ambiguous","command":"move_symbol","file":{},"symbol":"duplicate","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+
+    assert_eq!(resp["success"], false, "should fail: {resp:?}");
+    assert_eq!(resp["code"], "ambiguous_symbol");
+    assert!(resp["candidates"].as_array().unwrap().len() >= 2);
 
     aft.shutdown();
 }
@@ -470,8 +909,9 @@ fn move_symbol_non_top_level() {
 
     // "format" is a method inside the DateHelper class in service.ts
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"format","destination":"{}","scope":"DateHelper"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"format","destination":{},"scope":"DateHelper"}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(
@@ -510,8 +950,9 @@ fn move_symbol_file_not_found() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}/nonexistent.ts","symbol":"foo","destination":"{}"}}"#,
-        root, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"foo","destination":{}}}"#,
+        crate::helpers::json_string(&format!("{}/nonexistent.ts", root)),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "should fail: {:?}", resp);
@@ -533,8 +974,8 @@ fn move_symbol_project_too_large() {
     // Configure with an artificially low cap so the 7+ file fixture trips the
     // guard. This asserts the guard fires BEFORE the move writes anything.
     let resp = aft.send(&format!(
-        r#"{{"id":"cfg","command":"configure","project_root":"{}","max_callgraph_files":1}}"#,
-        root
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{},"max_callgraph_files":1}}"#,
+        crate::helpers::json_string(&root)
     ));
     assert_eq!(resp["success"], true);
 
@@ -542,8 +983,9 @@ fn move_symbol_project_too_large() {
     let dest = format!("{}/utils.ts", root);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"move_symbol","file":"{}","symbol":"formatDate","destination":"{}"}}"#,
-        source, dest
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"formatDate","destination":{}}}"#,
+        crate::helpers::json_string(&source),
+        crate::helpers::json_string(&dest)
     ));
 
     assert_eq!(resp["success"], false, "move should fail: {:?}", resp);
@@ -553,6 +995,131 @@ fn move_symbol_project_too_large() {
         msg.contains("max_callgraph_files"),
         "error should mention max_callgraph_files: {}",
         msg
+    );
+
+    aft.shutdown();
+}
+
+/// Move of an exported symbol does not leave the `export` keyword behind.
+///
+/// Regression: when moving `export function greet`, the byte range of
+/// `function_declaration` excludes the wrapping `export_statement`, so
+/// `remove_symbol_from_source` only removed `function greet(...) {...}` and
+/// left a stray `export` that then attached to the next sibling declaration.
+/// `find_export_keyword_start` extends the deletion range backwards to cover
+/// the `export` keyword and trailing whitespace.
+#[test]
+fn move_symbol_does_not_leak_export_keyword() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let source = tmp.path().join("sample.ts");
+    let dest = tmp.path().join("helper.ts");
+
+    std::fs::write(
+        &source,
+        "export function greet(user: string) {\n  return `Hello, ${user}!`;\n}\n\nfunction other(): number {\n  return 1;\n}\n",
+    )
+    .expect("write source");
+
+    let mut aft = AftProcess::spawn();
+    let root = tmp.path().display().to_string();
+    let resp = aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
+    ));
+    assert_eq!(resp["success"], true);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"move_symbol","file":{},"symbol":"greet","destination":{}}}"#,
+        crate::helpers::json_string(&source.display()),
+        crate::helpers::json_string(&dest.display())
+    ));
+    assert_eq!(resp["success"], true, "move should succeed: {:?}", resp);
+
+    let after_source = std::fs::read_to_string(&source).expect("read source");
+    let after_dest = std::fs::read_to_string(&dest).expect("read dest");
+
+    // Source: `other` should still NOT be exported. If the bug regressed,
+    // `export ` would be left attached to `function other`.
+    assert!(
+        !after_source.contains("export function other"),
+        "export keyword leaked onto the next declaration:\n{}",
+        after_source
+    );
+    assert!(
+        after_source.contains("function other(): number {"),
+        "`other` should be present and unmodified:\n{}",
+        after_source
+    );
+    assert!(
+        !after_source.contains("greet"),
+        "`greet` should be removed from source:\n{}",
+        after_source
+    );
+
+    // Destination: `greet` should be exported (single export, not duplicated).
+    assert!(
+        after_dest.contains("export function greet"),
+        "destination should have `export function greet`:\n{}",
+        after_dest
+    );
+    assert!(
+        !after_dest.contains("export export"),
+        "destination should not have duplicate export:\n{}",
+        after_dest
+    );
+
+    aft.shutdown();
+}
+
+/// Extract preserves the `export` keyword on the enclosing function.
+///
+/// Regression: insertion point was `function_declaration.start_byte()`, which
+/// is AFTER the `export` keyword. The extracted function got inserted between
+/// `export ` and `function`, silently transferring the `export` from the
+/// original function to the new extracted one.
+#[test]
+fn extract_function_preserves_enclosing_export_keyword() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let file = tmp.path().join("sample.ts");
+
+    std::fs::write(
+        &file,
+        "export function process(items: string[]) {\n  try {\n    const items2 = items.map(i => i.toLowerCase());\n    const message = `count: ${items2.length}`;\n    console.log(message);\n    return message;\n  } catch (e) {\n    throw new Error(`Failed: ${e}`);\n  }\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let root = tmp.path().display().to_string();
+    let resp = aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&root)
+    ));
+    assert_eq!(resp["success"], true);
+
+    // Extract just the items.map(...) line.
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"extract_function","file":{},"start_line":3,"end_line":4,"name":"makeItems"}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "extract should succeed: {:?}", resp);
+
+    let after = std::fs::read_to_string(&file).expect("read file");
+    // `process` must still be exported after extraction.
+    assert!(
+        after.contains("export function process"),
+        "process should still be exported:\n{}",
+        after
+    );
+    // The extracted function `makeItems` must NOT be exported.
+    assert!(
+        !after.contains("export function makeItems"),
+        "extracted function should not be exported:\n{}",
+        after
+    );
+    assert!(
+        after.contains("function makeItems("),
+        "extracted function should be present:\n{}",
+        after
     );
 
     aft.shutdown();

@@ -3,10 +3,45 @@ import { constants, type Dirent } from "node:fs";
 import { access, cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { BinaryBridge, type BridgeOptions } from "../../bridge.js";
+import { BinaryBridge, type BridgeOptions, setActiveLogger } from "@cortexkit/aft-bridge";
+import { bridgeLogger } from "../../logger.js";
 
-const TARGET_DEBUG_BINARY = resolve(import.meta.dir, "../../../../../target/debug/aft");
-const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin/aft");
+// Route aft-bridge log calls (including forwarded Rust child stderr lines like
+// "[aft] invalidated 7 files") into $TMPDIR/aft-plugin-test.log instead of
+// console.error. Without this, every "invalidated N files" / "watcher started"
+// line emitted by the Rust child during e2e tests leaks onto test stdout and
+// pollutes the bash background-completion output preview.
+setActiveLogger(bridgeLogger);
+
+// Remove a temp dir, tolerating the Windows `EBUSY: resource busy or locked`
+// race: a detached background-bash child (or the bridge's own handles) can keep
+// the temp directory open for a brief window after shutdown, so a single `rm`
+// in a test's teardown throws and fails an otherwise-passing test. Cleanup
+// failures must never fail a test — retry a few times, then give up silently
+// (the OS reaps the temp dir, and a leaked temp dir is harmless in CI).
+async function safeRemoveDir(dir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      // Most commonly EBUSY on Windows while a detached child still holds a
+      // handle. Back off briefly and retry; ignore if it never frees up.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
+// Windows cargo produces `aft.exe`; Unix produces `aft`. Resolve the
+// platform-correct name so CI's fail-loud "binary must be present" guard does
+// not trip on a name mismatch (Windows previously silent-skipped into a false
+// green before the guard landed).
+const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
+const TARGET_DEBUG_BINARY = resolve(
+  import.meta.dir,
+  `../../../../../target/debug/${AFT_BINARY_NAME}`,
+);
+const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin", AFT_BINARY_NAME);
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -109,14 +144,32 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
-  // Redirect search index cache to temp dir so tests don't pollute user's ~/.cache/aft/index/
-  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
-  await copyFixturesToTempDir(tempDir, options?.fixtureNames);
 
-  const bridge = new BinaryBridge(preparedBinary.binaryPath, tempDir, {
-    timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    ...(options?.bridgeOptions ?? {}),
-  });
+  let bridge: BinaryBridge | undefined;
+  try {
+    await copyFixturesToTempDir(tempDir, options?.fixtureNames);
+
+    // Redirect the search index cache to a temp dir so tests don't pollute the
+    // user's ~/.cache/aft/index/. Pass AFT_CACHE_DIR via the bridge's per-child
+    // env instead of mutating process.env: the child spawns lazily on the first
+    // send(), so a process.env mutation scoped to construction would be restored
+    // before the child ever inherits it — and process.env is process-global, so
+    // concurrent harnesses would race. childEnv is applied at spawn time, scoped
+    // to this child only.
+    bridge = new BinaryBridge(
+      preparedBinary.binaryPath,
+      tempDir,
+      {
+        timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
+        ...(options?.bridgeOptions ?? {}),
+      },
+      { harness: "opencode" },
+    );
+  } catch (err) {
+    await safeRemoveDir(tempDir);
+    throw err;
+  }
 
   return {
     binaryPath: preparedBinary.binaryPath,
@@ -130,7 +183,7 @@ export async function createHarness(
       } catch {
         // ignore cleanup errors
       } finally {
-        await rm(tempDir, { recursive: true, force: true });
+        await safeRemoveDir(tempDir);
       }
     },
   };
@@ -303,13 +356,28 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
     };
   }
 
+  const skipReason = build.ok
+    ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
+    : `cargo build failed and no fallback aft binary was found\n${build.output}`;
+
+  // In CI the aft binary is always built before the Bun suites run, so a missing
+  // binary there means the build/setup broke — fail loud instead of letting 25+
+  // e2e files silently `describe.skipIf(!binaryPath)` into a false green. Locally
+  // (CI unset) keep the quiet-skip behavior so contributors without a built
+  // binary can still run the non-e2e suites.
+  if (process.env.CI === "true") {
+    throw new Error(
+      `e2e setup failed: ${skipReason}\n` +
+        "The aft binary must be present in CI (built before Bun tests run). " +
+        "Refusing to silently skip e2e coverage.",
+    );
+  }
+
   return {
     binaryPath: null,
     source: null,
     buildAttempted: true,
-    skipReason: build.ok
-      ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
-      : `cargo build failed and no fallback aft binary was found\n${build.output}`,
+    skipReason,
   };
 }
 

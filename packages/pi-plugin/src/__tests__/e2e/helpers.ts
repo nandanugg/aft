@@ -15,15 +15,23 @@ import { constants } from "node:fs";
 import { access, cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import type { BinaryBridge } from "../../bridge.js";
+import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import { BridgePool, setActiveLogger } from "@cortexkit/aft-bridge";
+import { bridgeLogger } from "../../logger.js";
+
+// Route aft-bridge log calls (including forwarded Rust child stderr lines like
+// "[aft] invalidated 7 files") into $TMPDIR/aft-pi-test.log instead of
+// console.error. Without this, every "invalidated N files" / "watcher started"
+// line emitted by the Rust child during e2e tests leaks onto test stdout and
+// pollutes the bash background-completion output preview.
+setActiveLogger(bridgeLogger);
+
 import type { AftConfig } from "../../config.js";
-import { BridgePool } from "../../pool.js";
 import { registerAstTools } from "../../tools/ast.js";
 import { registerConflictsTool } from "../../tools/conflicts.js";
 import { registerFsTools } from "../../tools/fs.js";
 import { registerHoistedTools } from "../../tools/hoisted.js";
 import { registerImportTools } from "../../tools/imports.js";
-import { registerLspTools } from "../../tools/lsp.js";
 import { registerNavigateTool } from "../../tools/navigate.js";
 import { registerReadingTools } from "../../tools/reading.js";
 import { registerRefactorTool } from "../../tools/refactor.js";
@@ -32,8 +40,16 @@ import { registerSemanticTool } from "../../tools/semantic.js";
 import { registerStructureTool } from "../../tools/structure.js";
 import type { PluginContext } from "../../types.js";
 
-const TARGET_DEBUG_BINARY = resolve(import.meta.dir, "../../../../../target/debug/aft");
-const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin/aft");
+// Windows cargo produces `aft.exe`; Unix produces `aft`. Resolve the
+// platform-correct name so CI's fail-loud "binary must be present" guard does
+// not trip on a name mismatch (Windows previously silent-skipped into a false
+// green before the guard landed).
+const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
+const TARGET_DEBUG_BINARY = resolve(
+  import.meta.dir,
+  `../../../../../target/debug/${AFT_BINARY_NAME}`,
+);
+const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin", AFT_BINARY_NAME);
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -131,11 +147,14 @@ export async function createHarness(
   }
 
   const tempDir = await mkdtemp(join(tmpdir(), "aft-pi-e2e-"));
-  // Redirect AFT caches/indexes to temp so tests don't pollute user data.
-  process.env.AFT_CACHE_DIR = join(tempDir, ".aft-cache");
 
-  if (!options.noFixtures) {
-    await copyFixturesToTempDir(tempDir, options.fixtureNames);
+  try {
+    if (!options.noFixtures) {
+      await copyFixturesToTempDir(tempDir, options.fixtureNames);
+    }
+  } catch (err) {
+    await rm(tempDir, { recursive: true, force: true });
+    throw err;
   }
 
   // Full permissive surface so registerAllTools exposes every tool by default.
@@ -143,17 +162,26 @@ export async function createHarness(
     tool_surface: "all",
     format_on_edit: false,
     validate_on_edit: "syntax",
-    experimental_search_index: true,
-    experimental_semantic_search: false,
+    search_index: true,
+    semantic_search: false,
     restrict_to_project_root: false,
     ...(options.config ?? {}),
   };
 
+  // Redirect AFT caches/indexes to temp so tests don't pollute user data.
+  // Pass AFT_CACHE_DIR via the bridge's per-child env (childEnv) rather than
+  // mutating process.env: bridges spawn lazily and process.env is process-global,
+  // so a construction-scoped mutation would race concurrent harnesses and be
+  // restored before the child inherits it. childEnv is applied at spawn time,
+  // scoped to this child only.
   const pool = new BridgePool(
     preparedBinary.binaryPath,
-    { timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
+    {
+      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
+    },
     // Forward the full config to configure so indexing/restrict/etc. match prod.
-    { ...config, storage_dir: join(tempDir, ".aft-storage") },
+    { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
   );
 
   const bridge = pool.getBridge(tempDir);
@@ -165,6 +193,7 @@ export async function createHarness(
 
   // Permissive surface — every tool wired up. Mirrors resolveToolSurface("all").
   const surface = {
+    hoistBash: true,
     hoistRead: true,
     hoistWrite: true,
     hoistEdit: true,
@@ -172,7 +201,7 @@ export async function createHarness(
     hoistGrep: true,
     outline: true,
     zoom: true,
-    semantic: config.experimental_semantic_search === true,
+    semantic: config.semantic_search === true,
     navigate: true,
     conflicts: true,
     importTool: true,
@@ -181,9 +210,12 @@ export async function createHarness(
     move: true,
     astSearch: true,
     astReplace: true,
-    lspDiagnostics: true,
     structure: true,
     refactor: true,
+    // E2E surface defaults to restricted mode so the existing tests that
+    // expect ui.confirm prompts for external paths keep working. The new
+    // regression test in hoisted.test.ts toggles this flag explicitly.
+    restrictToProjectRoot: true,
   };
 
   registerHoistedTools(api, ctx, surface);
@@ -195,7 +227,6 @@ export async function createHarness(
   registerSafetyTool(api, ctx);
   registerAstTools(api, ctx, surface);
   registerFsTools(api, ctx, surface);
-  registerLspTools(api, ctx);
   registerStructureTool(api, ctx);
   registerRefactorTool(api, ctx);
 
@@ -228,8 +259,9 @@ export async function createHarness(
         await pool.shutdown();
       } catch {
         // ignore
+      } finally {
+        await rm(tempDir, { recursive: true, force: true }).catch(() => {});
       }
-      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     },
   };
 }
@@ -372,11 +404,25 @@ async function prepareBinaryOnce(): Promise<PreparedBinary> {
   if (await isExecutable(FALLBACK_BINARY)) {
     return { binaryPath: FALLBACK_BINARY };
   }
+  const skipReason = build.ok
+    ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
+    : `cargo build failed and no fallback aft binary was found\n${build.output}`;
+
+  // In CI the aft binary is always built before the Bun suites run, so a missing
+  // binary there means setup broke — fail loud instead of silently
+  // `describe.skipIf(!binaryPath)`-ing e2e coverage into a false green. Locally
+  // (CI unset) keep the quiet skip so the non-e2e suites still run without a build.
+  if (process.env.CI === "true") {
+    throw new Error(
+      `e2e setup failed: ${skipReason}\n` +
+        "The aft binary must be present in CI (built before Bun tests run). " +
+        "Refusing to silently skip e2e coverage.",
+    );
+  }
+
   return {
     binaryPath: null,
-    skipReason: build.ok
-      ? `aft binary not found at ${relative(PROJECT_ROOT, TARGET_DEBUG_BINARY)} or ${FALLBACK_BINARY}`
-      : `cargo build failed and no fallback aft binary was found\n${build.output}`,
+    skipReason,
   };
 }
 

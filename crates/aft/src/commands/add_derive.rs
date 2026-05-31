@@ -19,6 +19,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, target, derives, syntax_valid?, backup_id? }`
 pub fn handle_add_derive(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -155,25 +156,19 @@ pub fn handle_add_derive(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Find existing derive attribute ---
     let (new_source, final_derives) = apply_derive(&source, &root, target_info, &derives);
 
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
-
     // --- Auto-backup ---
-    let backup_id =
-        match edit::auto_backup(ctx, req.session(), &path, "add_derive: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "add_derive: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     // --- Write, format, and validate ---
     let mut write_result =
@@ -185,7 +180,7 @@ pub fn handle_add_derive(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("add_derive: {}", file);

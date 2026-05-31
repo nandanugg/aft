@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { BridgePool } from "../pool.js";
+import { BridgePool } from "@cortexkit/aft-bridge";
 import { projectRootFor } from "../tools/_shared.js";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
@@ -19,7 +19,7 @@ const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
  */
 describe("BridgePool project-key sharing", () => {
   test("same canonical project root collapses to one bridge entry", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       // Two different "session IDs" used to key the pool; with the new design
       // only the project root matters, so both calls must hit the same entry.
@@ -33,7 +33,7 @@ describe("BridgePool project-key sharing", () => {
   });
 
   test("different project roots get separate bridges", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       pool.getBridge("/tmp/project-one");
       pool.getBridge("/tmp/project-two");
@@ -44,7 +44,7 @@ describe("BridgePool project-key sharing", () => {
   });
 
   test("trailing separators normalize to the same key", () => {
-    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 });
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
     try {
       const a = pool.getBridge("/tmp/project-trail");
       const b = pool.getBridge("/tmp/project-trail/");
@@ -52,6 +52,38 @@ describe("BridgePool project-key sharing", () => {
       expect(a).toBe(b);
       expect(a).toBe(c);
       expect(pool.size).toBe(1);
+    } finally {
+      pool.shutdown().catch(() => {});
+    }
+  });
+
+  test("real paths collapse symlinked project roots to one bridge", () => {
+    const real = realpathSync(mkdtempSync(join(tmpdir(), "aft-opencode-pool-")));
+    const linkDir = realpathSync(mkdtempSync(join(tmpdir(), "aft-opencode-pool-link-")));
+    const link = join(linkDir, "link");
+    symlinkSync(real, link);
+
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
+    try {
+      const viaLink = pool.getBridge(link);
+      const viaReal = pool.getBridge(real);
+
+      expect(viaLink).toBe(viaReal);
+      expect(pool.size).toBe(1);
+    } finally {
+      pool.shutdown().catch(() => {});
+    }
+  });
+
+  test("root-scoped active lookup does not fall back to another project", () => {
+    const pool = new BridgePool(BINARY_PATH, { timeoutMs: 1_000 }, { harness: "opencode" });
+    try {
+      const projectA = pool.getBridge("/tmp/project-a");
+      const projectB = pool.getBridge("/tmp/project-b");
+      (projectA as { isAlive: () => boolean }).isAlive = () => true;
+      (projectB as { isAlive: () => boolean }).isAlive = () => false;
+
+      expect(pool.getActiveBridgeForRoot("/tmp/project-b")).toBeNull();
     } finally {
       pool.shutdown().catch(() => {});
     }

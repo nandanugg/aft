@@ -1,14 +1,15 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { consumeToolMetadata } from "../metadata-store.js";
-import type { BridgePool } from "../pool.js";
-import { hoistedTools } from "../tools/hoisted.js";
+import { aftPrefixedTools, hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 let sdkCtx = createMockSdkContext(PROJECT_CWD);
@@ -32,8 +33,11 @@ function createMockClient(): any {
 }
 
 /** Helper to create a PluginContext with a pool and a mock client. */
-function createPluginContext(pool: BridgePool): PluginContext {
-  return { pool, client: createMockClient(), config: {} as any, storageDir: "/tmp/aft-test" };
+function createPluginContext(
+  pool: BridgePool,
+  config: PluginContext["config"] = {} as PluginContext["config"],
+): PluginContext {
+  return { pool, client: createMockClient(), config, storageDir: "/tmp/aft-test" };
 }
 
 /** Mock SDK ToolContext for test execute calls. */
@@ -46,7 +50,7 @@ function createMockSdkContext(directory: string): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask: noopAsk,
   };
 }
 
@@ -55,6 +59,7 @@ function createMockHoistedHarness(
     command: string,
     params: Record<string, unknown>,
   ) => Promise<BridgeResponse> | BridgeResponse,
+  config: PluginContext["config"] = {} as PluginContext["config"],
 ) {
   const calls: SendCall[] = [];
   const bridge = {
@@ -70,7 +75,7 @@ function createMockHoistedHarness(
 
   return {
     calls,
-    tools: hoistedTools(createPluginContext(pool)),
+    tools: hoistedTools(createPluginContext(pool, config)),
   };
 }
 
@@ -111,6 +116,201 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Refusing to write outside project root");
   });
 
+  test("write defaults diagnostics off and omits LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({ success: true }));
+
+    const result = await tools.write.execute(
+      { filePath: "src/app.ts", content: "export {};\n" },
+      sdkCtx,
+    );
+
+    expect(result).toBe("File updated.");
+    expect(result).not.toContain("lsp_diagnostics");
+    expect(result).not.toContain("LSP errors detected");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({
+      command: "write",
+      params: {
+        file: resolve(tmpDir, "src/app.ts"),
+        content: "export {};\n",
+        create_dirs: true,
+        diagnostics: false,
+        include_diff_content: true,
+        session_id: "test",
+      },
+    });
+  });
+
+  test("write uses lsp.diagnostics_on_edit as the default", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({ success: true }), {
+      lsp: { diagnostics_on_edit: true },
+    } as PluginContext["config"]);
+
+    await tools.write.execute({ filePath: "src/app.ts", content: "export {};\n" }, sdkCtx);
+    expect(calls[0].params.diagnostics).toBe(true);
+
+    await tools.write.execute(
+      { filePath: "src/app.ts", content: "export {};\n", diagnostics: false },
+      sdkCtx,
+    );
+    expect(calls[1].params.diagnostics).toBe(false);
+  });
+
+  test("write honors diagnostics true and includes LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      lsp_diagnostics: [{ severity: "error", line: 7, message: "Bad type" }],
+    }));
+
+    const result = await tools.write.execute(
+      { filePath: "src/app.ts", content: "export {};\n", diagnostics: true },
+      sdkCtx,
+    );
+
+    expect(calls[0].params.diagnostics).toBe(true);
+    expect(result).toContain("LSP errors detected");
+    expect(result).toContain("Line 7: Bad type");
+  });
+
+  test("edit defaults diagnostics off and omits LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+    }));
+
+    const result = await tools.edit.execute(
+      { filePath: "src/app.ts", oldString: "before", newString: "after" },
+      sdkCtx,
+    );
+
+    expect(JSON.parse(result)).toEqual({ success: true, replacements: 1 });
+    expect(result).not.toContain("lsp_diagnostics");
+    expect(result).not.toContain("LSP errors detected");
+    expect(calls[0].command).toBe("edit_match");
+    expect(calls[0].params.diagnostics).toBe(false);
+  });
+
+  test("edit honors diagnostics true and includes LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const diagnostics = [{ severity: "error", line: 3, message: "Missing import" }];
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+      lsp_diagnostics: diagnostics,
+    }));
+
+    const result = await tools.edit.execute(
+      {
+        filePath: "src/app.ts",
+        oldString: "before",
+        newString: "after",
+        diagnostics: true,
+      },
+      sdkCtx,
+    );
+
+    const parsed = JSON.parse(result.split("\n\nLSP errors detected")[0]);
+    expect(parsed.lsp_diagnostics).toEqual(diagnostics);
+    expect(calls[0].params.diagnostics).toBe(true);
+    expect(result).toContain("Line 3: Missing import");
+  });
+
+  test("apply_patch defaults diagnostics off and omits LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+    await writeFile(resolve(tmpDir, "file.ts"), "old\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: file.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") return { success: true };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = await tools.apply_patch.execute({ patchText }, sdkCtx);
+
+    const writeCall = calls.find((call) => call.command === "write");
+    expect(writeCall?.params.diagnostics).toBe(false);
+    expect(result).toContain("Updated file.ts");
+    expect(result).not.toContain("lsp_diagnostics");
+    expect(result).not.toContain("LSP errors detected");
+  });
+
+  test("apply_patch honors diagnostics true and includes LSP payload", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+    await writeFile(resolve(tmpDir, "file.ts"), "old\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: file.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") {
+        return {
+          success: true,
+          lsp_diagnostics: [{ severity: "error", line: 9, message: "Patch type error" }],
+        };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = await tools.apply_patch.execute({ patchText, diagnostics: true }, sdkCtx);
+
+    const writeCall = calls.find((call) => call.command === "write");
+    expect(writeCall?.params.diagnostics).toBe(true);
+    expect(result).toContain("LSP errors detected in file.ts");
+    expect(result).toContain("Line 9: Patch type error");
+  });
+
+  test("mutation tool schemas reject non-boolean diagnostics", () => {
+    const { tools } = createMockHoistedHarness(async () => ({ success: true }));
+    const pool = {
+      getBridge: () => ({ send: async () => ({ success: true }) }),
+    } as unknown as BridgePool;
+    const prefixedTools = aftPrefixedTools(createPluginContext(pool));
+
+    for (const toolDef of [
+      tools.write,
+      tools.edit,
+      tools.apply_patch,
+      prefixedTools.aft_write,
+      prefixedTools.aft_edit,
+      prefixedTools.aft_apply_patch,
+    ]) {
+      const diagnosticsSchema = toolDef.args.diagnostics as { parse: (value: unknown) => unknown };
+      expect(() => diagnosticsSchema.parse("yes")).toThrow();
+    }
+  });
+
   failingTest("edit throws the Rust error response for failed replacements", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
@@ -128,6 +328,13 @@ describe("Hoisted tool execute handlers", () => {
     ).rejects.toThrow("Match not found in file");
   });
 
+  // Still `failingTest`: hoisted apply_patch's add-hunk branch checks
+  // `try/catch` around the bridge call, but the bridge returns `success:
+  // false` responses without throwing — so the catch never runs, the hunk
+  // is treated as Created, and the original error message is silently lost.
+  // Separately tracked from the total-failure-throws fix; needs the add path
+  // to assert response.success === true (or throw) before treating the hunk
+  // as a success.
   failingTest("apply_patch throws the Rust error response when a patch write fails", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
@@ -150,18 +357,101 @@ describe("Hoisted tool execute handlers", () => {
     );
   });
 
-  test("delete throws the Rust error response when deletion fails", async () => {
+  test("delete throws when every file in the batch fails", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      expect(command).toBe("delete_file");
+      const files = (params.files as string[]) ?? [];
+      return {
+        success: true,
+        complete: false,
+        deleted: [],
+        skipped_files: files.map((file) => ({ file, reason: "Cannot delete protected file" })),
+      };
+    });
+
+    await expect(
+      tools.aft_delete.execute({ files: ["locked.ts", "also-locked.ts"] }, sdkCtx),
+    ).rejects.toThrow("Cannot delete protected file");
+  });
+
+  test("delete throws the Rust error response before synthesizing success", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
       expect(command).toBe("delete_file");
-      return { success: false, message: "Cannot delete protected file" };
+      return { success: false, message: "bridge delete refused" };
     });
 
-    await expect(tools.aft_delete.execute({ filePath: "locked.ts" }, sdkCtx)).rejects.toThrow(
-      "Cannot delete protected file",
+    await expect(tools.aft_delete.execute({ files: ["doomed.ts"] }, sdkCtx)).rejects.toThrow(
+      "bridge delete refused",
     );
+  });
+
+  test("delete returns partial-success payload when some files fail", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      expect(command).toBe("delete_file");
+      const files = (params.files as string[]) ?? [];
+      const deleted: Array<{ file: string; backup_id: string | null }> = [];
+      const skipped: Array<{ file: string; reason: string }> = [];
+      for (const file of files) {
+        if (file.includes("blocked.ts")) {
+          skipped.push({ file, reason: "permission denied" });
+        } else {
+          deleted.push({ file, backup_id: null });
+        }
+      }
+      return {
+        success: true,
+        complete: skipped.length === 0,
+        deleted,
+        skipped_files: skipped,
+      };
+    });
+
+    const raw = await tools.aft_delete.execute({ files: ["a.ts", "blocked.ts", "c.ts"] }, sdkCtx);
+    const parsed = JSON.parse(raw);
+    expect(parsed.success).toBe(true);
+    expect(parsed.complete).toBe(false);
+    expect(parsed.deleted).toHaveLength(2);
+    expect(parsed.deleted[0]).toContain("a.ts");
+    expect(parsed.deleted[1]).toContain("c.ts");
+    expect(parsed.skipped_files).toEqual([
+      expect.objectContaining({ reason: "permission denied" }),
+    ]);
+    expect(parsed.skipped_files[0].file).toContain("blocked.ts");
+  });
+
+  test("delete reports complete=true when every file succeeds", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      expect(command).toBe("delete_file");
+      const files = (params.files as string[]) ?? [];
+      return {
+        success: true,
+        complete: true,
+        deleted: files.map((file) => ({ file, backup_id: null })),
+        skipped_files: [],
+      };
+    });
+
+    const raw = await tools.aft_delete.execute({ files: ["a.ts", "b.ts"] }, sdkCtx);
+    const parsed = JSON.parse(raw);
+    expect(parsed).toEqual({
+      success: true,
+      complete: true,
+      deleted: expect.any(Array),
+      skipped_files: [],
+    });
+    expect(parsed.deleted).toHaveLength(2);
   });
 
   test("move throws the Rust error response when rename fails", async () => {
@@ -208,11 +498,53 @@ describe("Hoisted tool execute handlers", () => {
           { match: "before", replacement: "after" },
           { line_start: 4, line_end: 6, content: "replacement" },
         ],
-        diagnostics: true,
-        include_diff: true,
+        diagnostics: false,
+        include_diff_content: true,
         session_id: "test",
       },
     });
+  });
+
+  test("transaction edit throws the Rust error response", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      expect(command).toBe("transaction");
+      return { success: false, message: "transaction rejected" };
+    });
+
+    await expect(
+      tools.edit.execute(
+        {
+          operations: [{ file: "a.ts", command: "write", content: "export const a = 1;\n" }],
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("transaction rejected");
+  });
+
+  test('legacy aft_edit mode:"write" throws the Rust error response', async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const pool = {
+      getBridge: () => ({
+        send: async (command: string, params: Record<string, unknown>) => {
+          expect(command).toBe("write");
+          expect(params.diagnostics).toBe(false);
+          return { success: false, message: "legacy write refused" };
+        },
+      }),
+    } as unknown as BridgePool;
+    const tools = aftPrefixedTools(createPluginContext(pool));
+
+    await expect(
+      tools.aft_edit.execute(
+        { mode: "write", file: "legacy.ts", content: "export const x = 1;\n" },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("legacy write refused");
   });
 
   test("edit forwards replaceAll to Rust for multiple occurrences", async () => {
@@ -243,14 +575,56 @@ describe("Hoisted tool execute handlers", () => {
         match: "oldName",
         replacement: "newName",
         replace_all: true,
-        diagnostics: true,
-        include_diff: true,
+        diagnostics: false,
+        include_diff_content: true,
         session_id: "test",
       },
     });
   });
 
-  test("apply_patch restores the checkpoint after a later hunk fails", async () => {
+  /// Diff-payload contract: the plugin requests full before/after from Rust
+  /// (include_diff_content) for UI metadata, but the AGENT-facing result must
+  /// strip the file content down to counts only. Echoing before/after into the
+  /// model context makes the payload scale with file size, not edit size.
+  test("edit agent result strips diff before/after to counts-only", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const bigBefore = `${"x".repeat(50_000)}\n`;
+    const bigAfter = `${"y".repeat(50_000)}\n`;
+    const { tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+      diff: { before: bigBefore, after: bigAfter, additions: 1, deletions: 1 },
+    }));
+
+    const result = await tools.edit.execute(
+      { filePath: "big.ts", oldString: "x", newString: "y" },
+      sdkCtx,
+    );
+
+    // Agent result must NOT contain the 50KB file content from either side.
+    expect(result).not.toContain(bigBefore);
+    expect(result).not.toContain(bigAfter);
+    expect(result.length).toBeLessThan(2_000);
+
+    // Counts survive for the agent's verification signal.
+    const parsed = JSON.parse(result.split("\n\n")[0]) as {
+      success: boolean;
+      diff?: { additions?: number; deletions?: number; before?: string; after?: string };
+    };
+    expect(parsed.success).toBe(true);
+    expect(parsed.diff).toEqual({ additions: 1, deletions: 1 });
+    expect(parsed.diff?.before).toBeUndefined();
+    expect(parsed.diff?.after).toBeUndefined();
+  });
+
+  /// BUG-6a (per-file commit): when a 2-hunk patch has 1 success and 1
+  /// failure, the successful hunk MUST stay applied. Pre-fix, AFT rolled
+  /// the whole patch back via checkpoint restore + newly-created cleanup,
+  /// throwing away the agent's correct work and forcing them to manually
+  /// split patches. New behavior: each hunk commits independently.
+  test("apply_patch keeps successful hunks when a later hunk fails (per-file commit)", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -281,11 +655,9 @@ describe("Hoisted tool execute handlers", () => {
       }
 
       if (command === "delete_file") {
+        // Cleanup of the failed-add partial. We don't expect any other
+        // delete_file calls — successful hunks must NOT be deleted.
         await rm(params.file as string, { force: true });
-        return { success: true };
-      }
-
-      if (command === "restore_checkpoint") {
         return { success: true };
       }
 
@@ -296,26 +668,42 @@ describe("Hoisted tool execute handlers", () => {
 
     expect(result).toContain("Created created.ts");
     expect(result).toContain("Failed to create broken.ts: Simulated patch failure");
-    // Both hunks are adds (newly-created), so there is no checkpoint — rollback
-    // proceeds purely by deleting the newly-created file.
-    expect(result).toContain("removed 1 newly-created file(s)");
-    // No checkpoint call because both paths were newly-created (checkpointPaths empty).
-    expect(calls.map((call) => call.command)).toEqual(["write", "write", "delete_file"]);
-    expect(existsSync(createdFile)).toBe(false);
+    // New: explicit partial-success summary.
+    expect(result).toContain("Patch partially applied");
+    expect(result).toContain("1 of 2 hunk(s) succeeded");
+    expect(result).toContain("Failed: broken.ts");
+    expect(result).toContain("aft_safety");
+
+    // No "rolled back" wording — we keep successful changes.
+    expect(result).not.toContain("removed 1 newly-created file(s)");
+    expect(result).not.toContain("restored pre-existing files");
+
+    // The successful add MUST still be on disk.
+    expect(existsSync(createdFile)).toBe(true);
+
+    // No checkpoint call because both paths were newly-created
+    // (checkpointPaths empty). The failed-add file is best-effort cleaned
+    // up via delete_file in the catch block — but only because the
+    // simulated write threw AFTER the file was supposedly created. Our
+    // mock's write throws before fs.write happens so the file never
+    // exists; assert it was attempted but tolerate either outcome.
+    expect(calls.some((c) => c.command === "write" && c.params.file === createdFile)).toBe(true);
+    expect(calls.some((c) => c.command === "write" && c.params.file === failedFile)).toBe(true);
+    // Crucially: NO restore_checkpoint and NO delete on createdFile.
+    expect(calls.some((c) => c.command === "restore_checkpoint")).toBe(false);
+    expect(calls.some((c) => c.command === "delete_file" && c.params.file === createdFile)).toBe(
+      false,
+    );
   });
 
-  test("apply_patch move rollback deletes orphan destination when source delete fails", async () => {
+  test("apply_patch restores checkpoint when move source delete fails", async () => {
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
-    // Pre-existing source file that's being moved; the move destination does
-    // not exist before the patch. On partial failure (source delete errors)
-    // the destination must be removed — otherwise the old and new files
-    // co-exist (audit #8 regression).
+    const earlierFile = resolve(tmpDir, "src/earlier.ts");
     const sourceFile = resolve(tmpDir, "src/original.ts");
     const destFile = resolve(tmpDir, "src/renamed.ts");
     await writeFile(sourceFile, "export const x = 1;\n", { flag: "wx" }).catch(async () => {
-      // Parent dir doesn't exist yet — create it and retry.
       const { mkdir } = await import("node:fs/promises");
       await mkdir(resolve(tmpDir as string, "src"), { recursive: true });
       await writeFile(sourceFile, "export const x = 1;\n");
@@ -323,6 +711,8 @@ describe("Hoisted tool execute handlers", () => {
 
     const patchText = [
       "*** Begin Patch",
+      "*** Add File: src/earlier.ts",
+      "+export const earlier = true;",
       "*** Update File: src/original.ts",
       "*** Move to: src/renamed.ts",
       "@@",
@@ -336,6 +726,10 @@ describe("Hoisted tool execute handlers", () => {
       if (command === "checkpoint") return { success: true };
       if (command === "write") {
         const file = params.file as string;
+        if (file === earlierFile) {
+          await writeFile(file, params.content as string);
+          return { success: true };
+        }
         if (file === destFile) {
           await writeFile(file, params.content as string);
           destWritten = true;
@@ -349,7 +743,6 @@ describe("Hoisted tool execute handlers", () => {
           throw new Error("Simulated delete_file failure");
         }
         if (file === destFile) {
-          // Rollback's newly-created cleanup. Actually remove it.
           await rm(destFile, { force: true });
           return { success: true };
         }
@@ -361,14 +754,236 @@ describe("Hoisted tool execute handlers", () => {
     const result = await tools.apply_patch.execute({ patchText }, sdkCtx);
 
     expect(destWritten).toBe(true);
-    // The fix must remove the orphan destination.
+    expect(existsSync(earlierFile)).toBe(true);
     expect(existsSync(destFile)).toBe(false);
-    // And report it in the rollback summary.
-    expect(result).toContain("removed 1 newly-created file(s)");
-    // Source should be restored via checkpoint (we checkpointed it pre-patch).
-    expect(calls.map((c) => c.command)).toContain("restore_checkpoint");
-    // Newly-created destination must have been deleted.
+    expect(result).toContain("Failed to update src/original.ts");
+    expect(result).toContain("restored pre-patch checkpoint");
+    expect(result).toContain("Patch partially applied");
+    expect(calls.some((c) => c.command === "restore_checkpoint")).toBe(true);
     expect(calls.some((c) => c.command === "delete_file" && c.params.file === destFile)).toBe(true);
+  });
+
+  test("apply_patch restores pre-existing move destination when source delete fails", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const sourceFile = resolve(tmpDir, "src/original.ts");
+    const destFile = resolve(tmpDir, "src/renamed.ts");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(resolve(tmpDir, "src"), { recursive: true });
+    await writeFile(sourceFile, "export const x = 1;\n");
+    await writeFile(destFile, "ORIGINAL\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: src/original.ts",
+      "*** Move to: src/renamed.ts",
+      "@@",
+      "-export const x = 1;",
+      "+export const x = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") {
+        await writeFile(params.file as string, params.content as string);
+        return { success: true };
+      }
+      if (command === "delete_file") {
+        if (params.file === sourceFile) throw new Error("source locked");
+        throw new Error(`unexpected delete_file for ${String(params.file)}`);
+      }
+      if (command === "restore_checkpoint") {
+        await writeFile(destFile, "ORIGINAL\n");
+        return { success: true };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    // Total-failure (single hunk) now throws so OpenCode classifies the call
+    // as errored. Inspect the thrown error for the rollback messaging.
+    let caught: unknown;
+    try {
+      await tools.apply_patch.execute({ patchText }, sdkCtx);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("restored pre-patch checkpoint");
+    expect(await readFile(destFile, "utf-8")).toBe("ORIGINAL\n");
+    expect(calls.some((c) => c.command === "restore_checkpoint")).toBe(true);
+    expect(calls.some((c) => c.command === "delete_file" && c.params.file === destFile)).toBe(
+      false,
+    );
+  });
+
+  test("apply_patch reports both copies when move rollback delete also fails", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const sourceFile = resolve(tmpDir, "src/original.ts");
+    const destFile = resolve(tmpDir, "src/renamed.ts");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(resolve(tmpDir, "src"), { recursive: true });
+    await writeFile(sourceFile, "export const x = 1;\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: src/original.ts",
+      "*** Move to: src/renamed.ts",
+      "@@",
+      "-export const x = 1;",
+      "+export const x = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    const { tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") {
+        await writeFile(params.file as string, params.content as string);
+        return { success: true };
+      }
+      if (command === "delete_file") {
+        const file = params.file as string;
+        if (file === sourceFile) throw new Error("source locked");
+      }
+      if (command === "restore_checkpoint") throw new Error("restore locked");
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    // Total-failure (single hunk) now throws so OpenCode classifies the call
+    // as errored. Inspect the thrown error for the move-rollback messaging.
+    let caught: unknown;
+    try {
+      await tools.apply_patch.execute({ patchText }, sdkCtx);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+
+    expect(existsSync(sourceFile)).toBe(true);
+    expect(existsSync(destFile)).toBe(true);
+    expect(message).toContain("move_partial_failure");
+    expect(message).toContain(sourceFile);
+    expect(message).toContain(destFile);
+    expect(message).toContain("Both copies may exist or destination content may be changed");
+  });
+
+  /// BUG-6a dogfooding repro: the user's exact 3-file complaint. A multi-
+  /// file patch where 2 files patch cleanly and the 3rd hits a fuzzy-match
+  /// drift used to roll back the 2 successes. Now the 2 successes commit
+  /// and only the failed file is reported as failing.
+  test("apply_patch keeps successful files when ONE of three updates fails (user repro)", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const okFile1 = resolve(tmpDir, "cli-program.ts");
+    const okFile2 = resolve(tmpDir, "cli-installer.ts");
+    const driftFile = resolve(tmpDir, "athena-council-guard.ts");
+
+    // Seed all three files with realistic pre-patch content.
+    await writeFile(okFile1, "old line 1\n");
+    await writeFile(okFile2, "old line 2\n");
+    await writeFile(driftFile, "drifted content that won't match\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: cli-program.ts",
+      "@@",
+      "-old line 1",
+      "+new line 1",
+      "*** Update File: cli-installer.ts",
+      "@@",
+      "-old line 2",
+      "+new line 2",
+      "*** Update File: athena-council-guard.ts",
+      "@@",
+      "-expected line that doesn't exist in file",
+      "+something else",
+      "*** End Patch",
+    ].join("\n");
+
+    const { calls, tools } = createMockHoistedHarness(async (command, params) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") {
+        const file = params.file as string;
+        await writeFile(file, params.content as string);
+        return { success: true };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const result = await tools.apply_patch.execute({ patchText }, sdkCtx);
+
+    expect(result).toContain("Updated cli-program.ts");
+    expect(result).toContain("Updated cli-installer.ts");
+    expect(result).toContain("Failed to update athena-council-guard.ts");
+    expect(result).toContain("Patch partially applied");
+    expect(result).toContain("2 of 3 hunk(s) succeeded");
+    expect(result).toContain("aft_safety");
+
+    // The two successful files must reflect the new content on disk.
+    expect((await import("node:fs/promises")).readFile(okFile1, "utf-8")).resolves.toBe(
+      "new line 1\n",
+    );
+    expect((await import("node:fs/promises")).readFile(okFile2, "utf-8")).resolves.toBe(
+      "new line 2\n",
+    );
+    // The drifted file is unchanged (applyUpdateChunks throws BEFORE write).
+    expect((await import("node:fs/promises")).readFile(driftFile, "utf-8")).resolves.toBe(
+      "drifted content that won't match\n",
+    );
+
+    // No restore_checkpoint anywhere — that's the whole fix.
+    expect(calls.some((c) => c.command === "restore_checkpoint")).toBe(false);
+    // No delete_file on the successful files — we keep them.
+    expect(calls.some((c) => c.command === "delete_file" && c.params.file === okFile1)).toBe(false);
+    expect(calls.some((c) => c.command === "delete_file" && c.params.file === okFile2)).toBe(false);
+  });
+
+  // Regression test for the dogfooded report where a single-file patch hit
+  // a fuzzy-match drift, our code wrote the failure summary to `output`,
+  // and OpenCode's UI rendered the call as `state.status: "completed"` —
+  // green check next to "Patch failed — none of the 1 hunk(s) applied".
+  // Total-failure cases must throw so OpenCode classifies them as errored
+  // (matching native apply_patch which uses Effect.fail for all errors).
+  test("apply_patch throws when ALL hunks fail (so OpenCode marks it errored)", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const driftFile = resolve(tmpDir, "src/hooks/index.ts");
+    await mkdir(resolve(tmpDir, "src/hooks"), { recursive: true });
+    await writeFile(driftFile, "actual content that the patch does not expect\n");
+
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: src/hooks/index.ts",
+      "@@",
+      '-export { createDelegateTaskRetryHook } from "./delegate-task-retry";',
+      '-export { createJsonErrorRecoveryHook } from "./json-error-recovery";',
+      "*** End Patch",
+    ].join("\n");
+
+    const { tools } = createMockHoistedHarness(async (command) => {
+      if (command === "checkpoint") return { success: true };
+      if (command === "write") return { success: true };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    let caught: unknown;
+    try {
+      await tools.apply_patch.execute({ patchText }, sdkCtx);
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toContain("Failed to update src/hooks/index.ts");
+    expect(message).toContain("Patch failed");
+    expect(message).toContain("none of the 1 hunk(s) applied");
   });
 
   test("read returns binary-file messages without trying to split missing content", async () => {
@@ -418,9 +1033,119 @@ describe("Hoisted tool execute handlers", () => {
     const truncatedResult = await tools.read.execute({ filePath: "big.ts" }, sdkCtx);
 
     expect(directoryResult).toBe("a.ts\nsrc/");
+    // Case B: agent did NOT specify a range, response was clamped → hint footer
+    // is useful, tells the agent more exists and how to get it.
     expect(truncatedResult).toBe(
       "1: one\n2: two\n(Showing lines 1-2 of 10. Use startLine/endLine to read other sections.)",
     );
+  });
+
+  test("read does not append a footer when the file fits in default limit (case A)", async () => {
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      content: "1: one\n2: two\n3: three",
+      // truncated:false means the response IS the whole file — no footer needed.
+      truncated: false,
+      start_line: 1,
+      end_line: 3,
+      total_lines: 3,
+    }));
+
+    const result = await tools.read.execute({ filePath: "small.ts" }, sdkCtx);
+
+    expect(result).toBe("1: one\n2: two\n3: three");
+  });
+
+  test("read drops the navigation hint when the agent supplied startLine/endLine (case B)", async () => {
+    // Repro for the dogfooding bug: agent calls read({startLine: 130, endLine: 190})
+    // on a 191-line file and gets back lines 130-190 EXACTLY. Telling them
+    // "use startLine/endLine to read other sections" right after they used
+    // those exact params is patronizing. They have the math.
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      content: "130: ...\n190: ...",
+      // Rust still reports truncated:true because the response is a slice
+      // of the file (end_line < total_lines). The plugin must NOT key the
+      // hint off this flag alone — it needs to know the agent picked the slice.
+      truncated: true,
+      start_line: 130,
+      end_line: 190,
+      total_lines: 191,
+    }));
+
+    const result = await tools.read.execute(
+      { filePath: "registry.ts", startLine: 130, endLine: 190 },
+      sdkCtx,
+    );
+
+    // The user's exact complaint: when end_line matches total_lines (or is
+    // close to it after a deliberate range), no footer should be emitted at
+    // all. Agent gets back only the content.
+    expect(result).toBe("130: ...\n190: ...");
+    expect(result).not.toContain("Use startLine/endLine");
+  });
+
+  test("read drops the footer entirely when the agent's range happens not to cover the full file (case B)", async () => {
+    // Subtle case: agent asked 100-150 of a 200-line file. They got back
+    // exactly what they asked for. The earlier "compact when clamped"
+    // branch would have spuriously emitted `(Lines 100-150 of 200)` here,
+    // which is the SAME shape of patronizing footer as the original bug —
+    // re-teaching an agent that they got less than the whole file when
+    // THEY chose to. Agent has the math: they sent the request and they
+    // can see the content length.
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      content: "100: ...\n150: ...",
+      truncated: true,
+      start_line: 100,
+      end_line: 150,
+      total_lines: 200,
+    }));
+
+    const result = await tools.read.execute(
+      { filePath: "mid.ts", startLine: 100, endLine: 150 },
+      sdkCtx,
+    );
+
+    expect(result).toBe("100: ...\n150: ...");
+    expect(result).not.toContain("Use startLine/endLine");
+    expect(result).not.toContain("(Lines 100-150");
+  });
+
+  test("read drops the navigation hint when the agent supplied offset/limit (case B)", async () => {
+    // Same as the startLine/endLine case but for the OpenCode-built-in-
+    // compatible offset/limit param shape. Agent that picked the slice
+    // should not be re-taught how to pick a slice.
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-hoisted-"));
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      content: "10: ...\n29: ...",
+      truncated: true,
+      start_line: 10,
+      end_line: 29,
+      total_lines: 30,
+    }));
+
+    const result = await tools.read.execute(
+      { filePath: "small.ts", offset: 10, limit: 20 },
+      sdkCtx,
+    );
+
+    // No footer at all — agent picked the range, has the math.
+    expect(result).toBe("10: ...\n29: ...");
+    expect(result).not.toContain("Use startLine/endLine");
+    expect(result).not.toContain("(Lines");
   });
 
   test("write distinguishes new files from updates", async () => {
@@ -545,5 +1270,151 @@ describe("Hoisted tool execute handlers", () => {
 
     const deleteEntry = meta.files.find((f) => f.type === "delete");
     expect(deleteEntry?.deletions).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Verify the bash hoisting gate. Hoisted bash replaces OpenCode's built-in
+ * bash, so registering it without any `experimental.bash.*` flag set means
+ * users with default config silently get our (untested-against-them) bash
+ * code path with zero experimental benefit. We register `bash`,
+ * `bash_status`, and `bash_kill` together when at least one
+ * `experimental.bash.*` flag is enabled.
+ *
+ * `bash_status` and `bash_kill` ride alongside `bash` regardless of which
+ * experimental flag enabled it: foreground bash auto-promotes long-running
+ * tasks to background after a short wait-window, so the agent always needs
+ * tools to inspect or kill those promoted tasks. Earlier versions gated
+ * them on `experimental.bash.background` specifically, which left
+ * compress/rewrite-only users with promotion messages referencing
+ * non-existent tools. (See council audit
+ * `.alfonso/athena/council-aft-bash-timeout-audit-057818e1583d3883/`.)
+ */
+describe("Hoisted bash gating (post v0.27.2 graduation)", () => {
+  function toolsWithConfig(
+    cfg: Partial<PluginContext["config"]>,
+    prefixed = false,
+  ): Record<string, unknown> {
+    const pool = { getBridge: () => ({ send: async () => ({}) }) } as unknown as BridgePool;
+    const ctx: PluginContext = {
+      pool,
+      client: createMockClient(),
+      config: cfg as PluginContext["config"],
+      storageDir: "/tmp/aft-test",
+    };
+    return prefixed ? aftPrefixedTools(ctx) : hoistedTools(ctx);
+  }
+
+  // ---- Surface defaults (new graduation behavior) ----------------------
+
+  test("no bash config + tool_surface=recommended → bash registered (graduated on by default)", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended" });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+    expect(tools.read).toBeDefined();
+    expect(tools.edit).toBeDefined();
+  });
+
+  test("no bash config + tool_surface=all → bash registered", () => {
+    const tools = toolsWithConfig({ tool_surface: "all" });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("no bash config + tool_surface=minimal → bash NOT registered", () => {
+    // Minimal surface opts out of everything not strictly core, including
+    // bash. Users on minimal need to opt back in with explicit `bash: true`.
+    const tools = toolsWithConfig({ tool_surface: "minimal" });
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
+  });
+
+  // ---- Top-level bash shape (new surface) ------------------------------
+
+  test("bash: true → all three bash tools registered, all sub-features on", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended", bash: true });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("bash: false → no bash-family tools registered (hard opt-out)", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended", bash: false });
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
+  });
+
+  test("bash: { rewrite: false } → partial override; bash still registered (object form enables hoist)", () => {
+    const tools = toolsWithConfig({ tool_surface: "recommended", bash: { rewrite: false } });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  // ---- Legacy experimental.bash shape (backward compat) ----------------
+
+  test("legacy experimental.bash.rewrite=true → all three bash tools registered", () => {
+    // Foreground bash can auto-promote even without the background flag,
+    // so status/kill must be available for the promoted task.
+    const tools = toolsWithConfig({ experimental: { bash: { rewrite: true } } });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("legacy experimental.bash.compress=true → all three bash tools registered", () => {
+    const tools = toolsWithConfig({ experimental: { bash: { compress: true } } });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("legacy experimental.bash.background=true → all three bash tools registered", () => {
+    const tools = toolsWithConfig({ experimental: { bash: { background: true } } });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("legacy experimental.bash with all three flags true → full bash surface", () => {
+    const tools = toolsWithConfig({
+      experimental: { bash: { rewrite: true, compress: true, background: true } },
+    });
+    expect(tools.bash).toBeDefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("legacy experimental.bash empty + tool_surface=minimal → NOT registered", () => {
+    // Empty legacy block + minimal surface = no opt-in anywhere, no bash.
+    const tools = toolsWithConfig({ tool_surface: "minimal", experimental: { bash: {} } });
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
+  });
+
+  // ---- Hoist-off mode --------------------------------------------------
+
+  test("hoist-off + legacy experimental.bash.rewrite=true → aft_bash plus status/kill registered", () => {
+    const tools = toolsWithConfig(
+      { hoist_builtin_tools: false, experimental: { bash: { rewrite: true } } },
+      true,
+    );
+    expect(tools.aft_bash).toBeDefined();
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeDefined();
+    expect(tools.bash_kill).toBeDefined();
+  });
+
+  test("hoist-off + bash: false → no bash-family tools registered", () => {
+    const tools = toolsWithConfig({ hoist_builtin_tools: false, bash: false }, true);
+    expect(tools.aft_bash).toBeUndefined();
+    expect(tools.bash).toBeUndefined();
+    expect(tools.bash_status).toBeUndefined();
+    expect(tools.bash_kill).toBeUndefined();
   });
 });

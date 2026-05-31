@@ -1,13 +1,22 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import type { BridgePool } from "../pool.js";
-import { searchTools } from "../tools/search.js";
+import { searchTools, splitIncludeArg } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
+import { noopAsk } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
 type BridgeCall = { projectRoot: string };
+type AskCall = {
+  permission?: string;
+  patterns?: string[];
+  metadata?: Record<string, unknown>;
+};
 
 function createMockClient(): any {
   return {
@@ -29,7 +38,10 @@ function createPluginContext(pool: BridgePool, config: Record<string, unknown>):
   };
 }
 
-function createMockSdkContext(directory = "/tmp/search-tests"): ToolContext {
+function createMockSdkContext(
+  directory = "/tmp/search-tests",
+  ask: ToolContext["ask"] = noopAsk,
+): ToolContext {
   return {
     sessionID: "search-session",
     messageID: "message-id",
@@ -38,8 +50,20 @@ function createMockSdkContext(directory = "/tmp/search-tests"): ToolContext {
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: async () => {},
+    ask,
   };
+}
+
+function recordingAsk(
+  calls: AskCall[],
+  deny?: { permission: string; message: string },
+): ToolContext["ask"] {
+  return (async (input: AskCall) => {
+    calls.push(input);
+    if (deny && input.permission === deny.permission) {
+      throw new Error(deny.message);
+    }
+  }) as unknown as ToolContext["ask"];
 }
 
 function createMockSearchHarness(
@@ -163,5 +187,147 @@ describe("searchTools", () => {
     const output = await tools.glob.execute({ pattern: "src/**/*.ts" }, createMockSdkContext());
 
     expect(output).toBe(["src/one.ts", "src/two.ts"].join("\n"));
+  });
+
+  test("brace-aware include forwards a single glob with a brace alternation intact (regression)", async () => {
+    // Regression: naive String.split(",") used to chop "**/*.{vue,ts}"
+    // into ["**/*.{vue", "ts}"], yielding the user-facing
+    // "unclosed alternate group; missing '}'" globset error.
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute(
+      { pattern: "foo", include: "**/*.{vue,ts,tsx}" },
+      createMockSdkContext(),
+    );
+    expect(sendCalls[0]?.params.include).toEqual(["**/*.{vue,ts,tsx}"]);
+  });
+
+  test("brace-aware include preserves brace groups while still splitting top-level commas", async () => {
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute(
+      { pattern: "foo", include: "*.ts,**/*.{vue,tsx}" },
+      createMockSdkContext(),
+    );
+    expect(sendCalls[0]?.params.include).toEqual(["**/*.ts", "**/*.{vue,tsx}"]);
+  });
+
+  test("backward-compatible: comma-separated includes without braces still split", async () => {
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute({ pattern: "foo", include: "*.tsx,*.ts" }, createMockSdkContext());
+    expect(sendCalls[0]?.params.include).toEqual(["**/*.tsx", "**/*.ts"]);
+  });
+
+  test("grep checks external permission per parsed multi-path fragment", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const inside = path.join(project, "src");
+      const external = path.join(tmpRoot, "external");
+      fs.mkdirSync(inside, { recursive: true });
+      fs.mkdirSync(external, { recursive: true });
+      const askCalls: AskCall[] = [];
+      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+        success: true,
+        text: "ok",
+      }));
+
+      await tools.grep.execute(
+        { pattern: "TODO", path: `${inside} ${external}` },
+        createMockSdkContext(project, recordingAsk(askCalls)),
+      );
+
+      const externalAsks = askCalls.filter((call) => call.permission === "external_directory");
+      expect(externalAsks).toHaveLength(1);
+      expect(externalAsks[0]?.patterns).toEqual([path.join(external, "*").replaceAll("\\", "/")]);
+      expect(externalAsks[0]?.metadata?.filepath).toBe(external);
+      expect(sendCalls[0]?.params.path).toBe(`${inside} ${external}`);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob rejects when any parsed multi-path fragment is externally denied", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const inside = path.join(project, "src");
+      const external = path.join(tmpRoot, "external");
+      fs.mkdirSync(inside, { recursive: true });
+      fs.mkdirSync(external, { recursive: true });
+      const askCalls: AskCall[] = [];
+      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+        success: true,
+        files: [],
+      }));
+
+      const raw = await tools.glob.execute(
+        { pattern: "**/*.ts", path: `${inside} ${external}` },
+        createMockSdkContext(
+          project,
+          recordingAsk(askCalls, {
+            permission: "external_directory",
+            message: "external denied",
+          }),
+        ),
+      );
+
+      expect(JSON.parse(raw).message).toBe("external denied");
+      expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
+      expect(sendCalls).toHaveLength(0);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob splits exact absolute file patterns into path and basename", async () => {
+    const project = "/tmp/search-tests";
+    const absoluteFile = path.join(project, "src", "exact.ts");
+    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      files: [absoluteFile],
+    }));
+
+    await tools.glob.execute({ pattern: absoluteFile }, createMockSdkContext(project));
+
+    expect(sendCalls[0]?.params).toMatchObject({
+      pattern: "exact.ts",
+      path: path.dirname(absoluteFile),
+    });
+  });
+});
+
+describe("splitIncludeArg", () => {
+  test("splits plain comma-separated patterns", () => {
+    expect(splitIncludeArg("*.ts,*.tsx")).toEqual(["*.ts", "*.tsx"]);
+  });
+
+  test("preserves a single brace group as one pattern", () => {
+    expect(splitIncludeArg("**/*.{vue,ts,tsx}")).toEqual(["**/*.{vue,ts,tsx}"]);
+  });
+
+  test("splits top-level commas while preserving nested brace groups", () => {
+    expect(splitIncludeArg("*.ts,**/*.{vue,tsx},*.go")).toEqual(["*.ts", "**/*.{vue,tsx}", "*.go"]);
+  });
+
+  test("handles nested braces correctly", () => {
+    expect(splitIncludeArg("**/*.{a,{b,c},d}")).toEqual(["**/*.{a,{b,c},d}"]);
+  });
+
+  test("trims whitespace and drops empty segments", () => {
+    expect(splitIncludeArg(" *.ts , *.tsx , ")).toEqual(["*.ts", "*.tsx"]);
+  });
+
+  test("tolerates an unclosed brace by treating remaining commas as content (no crash)", () => {
+    // Unmatched '{' shouldn't throw — pattern is forwarded to the backend
+    // as one chunk so globset's own error surfaces, not a JS crash here.
+    expect(splitIncludeArg("**/*.{vue,ts")).toEqual(["**/*.{vue,ts"]);
   });
 });

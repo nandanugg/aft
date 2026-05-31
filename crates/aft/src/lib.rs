@@ -1,5 +1,6 @@
 #![allow(
     clippy::collapsible_if,
+    clippy::collapsible_match,
     clippy::double_ended_iterator_last,
     clippy::int_plus_one,
     clippy::large_enum_variant,
@@ -11,6 +12,7 @@
     clippy::manual_strip,
     clippy::manual_unwrap_or_default,
     clippy::map_clone,
+    clippy::iter_kv_map,
     clippy::needless_borrow,
     clippy::needless_borrows_for_generic_args,
     clippy::needless_range_loop,
@@ -23,6 +25,7 @@
     clippy::single_match,
     clippy::too_many_arguments,
     clippy::type_complexity,
+    clippy::unnecessary_sort_by,
     clippy::unnecessary_cast,
     clippy::unnecessary_lazy_evaluations,
     clippy::unnecessary_map_or
@@ -43,34 +46,51 @@
 // Response::error instead of panicking. Confirmed zero .unwrap()/.expect() in
 // production error paths as of v0.6.3 audit.
 
+pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
+pub mod bash_background;
+pub mod bash_permissions;
+pub mod bash_rewrite;
+pub mod cache_freshness;
 pub mod callgraph;
 pub mod calls;
 pub mod checkpoint;
 pub mod commands;
+pub mod compress;
 pub mod config;
 pub mod context;
+pub mod db;
 pub mod edit;
 pub mod error;
 pub mod extract;
 pub mod format;
+pub mod fs_lock;
 pub mod fuzzy_match;
-pub mod go_helper;
-pub mod go_overlay;
+pub mod grep_executor;
+pub mod harness;
 pub mod imports;
 pub mod indent;
+pub mod inspect;
 pub mod language;
+pub mod log_ctx;
 pub mod lsp;
 pub mod lsp_hints;
-pub mod parse_cache;
+pub mod migrate_storage;
 pub mod parser;
-pub mod persistent_cache;
+pub mod pattern_compile;
 pub mod protocol;
+pub mod query_shape;
 pub mod search_index;
 pub mod semantic_index;
-pub mod similarity;
+pub mod symbol_cache_disk;
 pub mod symbols;
+pub mod url_fetch;
+// Compiled on all platforms so cross-platform unit tests in
+// `commands::bash::try_spawn_with_fallback` can exercise the retry
+// decision logic without a real Windows runtime. The module itself only
+// uses portable APIs; only its callers are Windows-gated.
+pub mod windows_shell;
 
 #[cfg(test)]
 mod tests {
@@ -224,7 +244,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "project has 20001 source files, exceeding max_callgraph_files=20000. Call-graph operations (callers, trace_to, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
+            "project has 20001 source files, exceeding max_callgraph_files=20000. Call-graph operations (callers, trace_to, trace_to_symbol, trace_data, impact) are disabled for this root. Open a specific subdirectory or raise max_callgraph_files in config."
         );
         assert_eq!(err.code(), "project_too_large");
     }
@@ -248,6 +268,6 @@ mod tests {
         assert_eq!(cfg.max_symbol_depth, 10);
         assert_eq!(cfg.formatter_timeout_secs, 10);
         assert_eq!(cfg.type_checker_timeout_secs, 30);
-        assert_eq!(cfg.max_callgraph_files, 20_000);
+        assert_eq!(cfg.max_callgraph_files, 5_000);
     }
 }

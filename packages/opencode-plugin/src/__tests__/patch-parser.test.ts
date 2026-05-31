@@ -83,4 +83,195 @@ describe("applyUpdateChunks error paths", () => {
       "Failed to find expected lines in src/example.ts:\nmissing line",
     );
   });
+
+  test("error includes 'already applied' hint when the new_lines are already in the file", () => {
+    // Simulates an agent retrying apply_patch after partially applying earlier:
+    // the old line is gone (already replaced), the new line is already present.
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["const mainQuota = await getFreshMainQuota(auth.access, storage)"],
+        new_lines: ["const mainQuota = await getMainQuotaForRouting(auth.access, storage)"],
+      },
+    ];
+
+    const fileWithRewriteAlreadyApplied =
+      "alpha\nconst mainQuota = await getMainQuotaForRouting(auth.access, storage)\nbeta\n";
+
+    expect(() =>
+      applyUpdateChunks(fileWithRewriteAlreadyApplied, "src/example.ts", chunks),
+    ).toThrow(/already appears in the file/);
+  });
+
+  test("error has no 'already applied' hint when both old and new lines are absent", () => {
+    // Genuinely wrong patch — neither side matches the file.
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["missing old line"],
+        new_lines: ["missing new line"],
+      },
+    ];
+
+    let message = "";
+    try {
+      applyUpdateChunks("unrelated content\n", "src/example.ts", chunks);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toContain("Failed to find expected lines");
+    expect(message).not.toContain("already appears in the file");
+  });
+
+  /// BUG-6c (fuzzy match resilience): the model emitted 4-space indents
+  /// but the file actually uses a single tab. With the new "indent" tier
+  /// in the seekSequence ladder, the patch should still apply.
+  test("matches when patch uses spaces but file uses tabs (indent tier)", () => {
+    // File has TAB indentation.
+    const file = "function foo() {\n\treturn 42;\n}\n";
+
+    // Patch's chunk uses 4-SPACE indentation.
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["    return 42;"],
+        new_lines: ["    return 43;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(file, "src/foo.ts", chunks);
+
+    // Replacement landed: line 2 is now the new content. Note: the
+    // replacement uses the patch's whitespace (4 spaces), not the file's
+    // tab — this is a known tradeoff of the indent tier. The agent gets
+    // a working patch and the file's formatter (biome/prettier) will
+    // re-indent on the next save.
+    expect(result).toBe("function foo() {\n    return 43;\n}\n");
+  });
+
+  /// Inverse: file uses 4-space, patch uses tab. Indent tier handles
+  /// drift in either direction.
+  test("matches when patch uses tabs but file uses spaces (indent tier, inverse)", () => {
+    const file = "function foo() {\n    return 42;\n}\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["\treturn 42;"],
+        new_lines: ["\treturn 43;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(file, "src/foo.ts", chunks);
+    expect(result).toBe("function foo() {\n\treturn 43;\n}\n");
+  });
+
+  /// BUG-6b (better diagnostics): when the match fails, the error
+  /// includes the closest-match line number, how many lines matched,
+  /// and the first divergence point. Without this the agent has to
+  /// `grep -n` to figure out where their hunk thought it was pointing.
+  test("error includes closest-match line and divergence diagnostic (BUG-6b)", () => {
+    const file =
+      "function foo() {\n  const x = 1;\n  const y = 2;\n  const z = 3;\n  return x + y + z;\n}\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["  const x = 1;", "  const y = 2;", "  const Q = 99;"], // last line drifts
+        new_lines: ["  const x = 1;", "  const y = 2;", "  const Q = 100;"],
+      },
+    ];
+
+    let message = "";
+    try {
+      applyUpdateChunks(file, "src/foo.ts", chunks);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+
+    // Tells the agent WHICH line the closest match starts at.
+    expect(message).toContain("Closest match starts at line 2");
+    // Tells them HOW MANY lines matched before divergence.
+    expect(message).toContain("2 of 3 lines matched");
+    // Tells them WHERE the divergence is.
+    expect(message).toContain("First divergence at line 4");
+    // Shows expected vs actual at the divergence point so they don't
+    // have to reread the file to figure out the drift.
+    expect(message).toContain('expected: "  const Q = 99;"');
+    expect(message).toContain('actual:   "  const z = 3;"');
+  });
+
+  /// BUG-6b: even when there's no plausible closest match (no candidate
+  /// line in the file even loosely matches the pattern's first line), the
+  /// error still names the tiers we already tried so the agent knows what
+  /// kinds of drift they don't need to manually fix.
+  test("error lists the match tiers that were tried (BUG-6b)", () => {
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["completely unrelated line"],
+        new_lines: ["replacement"],
+      },
+    ];
+
+    let message = "";
+    try {
+      applyUpdateChunks("alpha\nbeta\ngamma\n", "src/foo.ts", chunks);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+
+    expect(message).toContain("Tried match tiers:");
+    expect(message).toContain("exact");
+    expect(message).toContain("trim");
+    expect(message).toContain("indent");
+    expect(message).toContain("unicode");
+  });
+});
+
+describe("applyUpdateChunks pure-insertion (empty old_lines)", () => {
+  // Regression: a pure-insertion chunk (only `+` lines after a `@@` header,
+  // so old_lines is empty) WITH a change_context must insert at the context
+  // location, not at end-of-file. Previously lineIndex (set by change_context)
+  // was ignored and the lines were appended to EOF, silently corrupting files.
+  test("inserts at change_context location, not end-of-file", () => {
+    const original = "function foo() {\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        change_context: "function foo() {",
+        old_lines: [],
+        new_lines: ["  const x = 42;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/example.ts", chunks);
+
+    expect(result).toBe(
+      "function foo() {\n  const x = 42;\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n",
+    );
+    // Explicitly assert it did NOT land inside bar() at end-of-file.
+    expect(result).not.toContain("  return 2;\n  const x = 42;");
+  });
+
+  test("falls back to end-of-file when there is no change_context", () => {
+    const original = "alpha\nbeta\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: [],
+        new_lines: ["gamma"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/example.ts", chunks);
+    expect(result).toBe("alpha\nbeta\ngamma\n");
+  });
+
+  test("inserts after context even when later content matches the new lines", () => {
+    // Guards against a naive 'already applied' style short-circuit: the
+    // inserted text appears elsewhere in the file but must still be placed
+    // right after its own context anchor.
+    const original = "import a;\nimport b;\n\nconst x = 1;\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        change_context: "import a;",
+        old_lines: [],
+        new_lines: ["import inserted;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/example.ts", chunks);
+    expect(result).toBe("import a;\nimport inserted;\nimport b;\n\nconst x = 1;\n");
+  });
 });

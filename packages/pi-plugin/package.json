@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-pi",
-  "version": "0.16.1",
+  "version": "0.33.0",
   "type": "module",
   "description": "Pi coding agent extension for Agent File Tools (AFT) — tree-sitter and LSP-powered code analysis",
   "main": "dist/index.js",
@@ -8,40 +8,46 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cortexkit/aft"
+    "url": "git+https://github.com/cortexkit/aft.git"
   },
   "files": [
     "dist",
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @mariozechner/pi-coding-agent --external @mariozechner/pi-ai --external @mariozechner/pi-tui --external @sinclair/typebox --external diff && tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @earendil-works/pi-tui --external typebox --external diff && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/__tests__/",
-    "prepublishOnly": "bun run build"
+    "lint": "biome check src",
+    "prepublishOnly": "bun run build",
+    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.33",
+    "@cortexkit/aft-bridge": "0.33.0",
+    "@xterm/headless": "^5.5.0",
+    "comment-json": "^5.0.0",
     "diff": "^8.0.4",
+    "typebox": "^1.1.24",
     "zod": "^4.1.8"
   },
   "optionalDependencies": {
-    "@cortexkit/aft-darwin-arm64": "0.16.1",
-    "@cortexkit/aft-darwin-x64": "0.16.1",
-    "@cortexkit/aft-linux-arm64": "0.16.1",
-    "@cortexkit/aft-linux-x64": "0.16.1",
-    "@cortexkit/aft-win32-x64": "0.16.1"
+    "@cortexkit/aft-darwin-arm64": "0.33.0",
+    "@cortexkit/aft-darwin-x64": "0.33.0",
+    "@cortexkit/aft-linux-arm64": "0.33.0",
+    "@cortexkit/aft-linux-x64": "0.33.0",
+    "@cortexkit/aft-win32-arm64": "0.33.0",
+    "@cortexkit/aft-win32-x64": "0.33.0"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "exports": {
     ".": {

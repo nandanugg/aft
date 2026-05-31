@@ -21,6 +21,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, target, field, tag_string, syntax_valid?, backup_id? }`
 pub fn handle_add_struct_tags(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -195,23 +196,13 @@ pub fn handle_add_struct_tags(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
-
     // --- Auto-backup ---
     let backup_id = match edit::auto_backup(
         ctx,
         req.session(),
         &path,
         "add_struct_tags: pre-edit backup",
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -229,7 +220,7 @@ pub fn handle_add_struct_tags(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     log::debug!("add_struct_tags: {}", file);

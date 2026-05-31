@@ -40,7 +40,14 @@
     }
   },
   "files": {
-    "includes": ["packages/**/*.ts", "packages/**/*.tsx", "packages/**/*.js", "scripts/**/*.mjs"]
+    "includes": [
+      "packages/**/*.ts",
+      "packages/**/*.tsx",
+      "packages/**/*.js",
+      "scripts/**/*.mjs",
+      "tests/pi-rpc/**/*.ts",
+      "benchmarks/codegraph-replication/**/*.ts"
+    ]
   },
   "overrides": [
     {
@@ -62,6 +69,19 @@
         "rules": {
           "suspicious": {
             "noExplicitAny": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["**/tui/**/*.tsx"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          },
+          "style": {
+            "noNonNullAssertion": "off"
           }
         }
       }

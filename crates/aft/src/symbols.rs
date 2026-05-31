@@ -13,10 +13,10 @@ pub enum SymbolKind {
     TypeAlias,
     /// Top-level const/let variable declaration
     Variable,
-    /// Top-level const declaration (Go `const X = ...`)
-    Constant,
     /// Markdown heading (h1, h2, h3, etc.)
     Heading,
+    /// Synthetic file-level summary chunk for generic entry-point files.
+    FileSummary,
 }
 
 /// Location range within a source file (line/column, 0-indexed internally).
@@ -44,8 +44,28 @@ impl serde::Serialize for Range {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Range {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct SerializedRange {
+            start_line: u32,
+            start_col: u32,
+            end_line: u32,
+            end_col: u32,
+        }
+
+        let range = SerializedRange::deserialize(deserializer)?;
+        Ok(Self {
+            start_line: range.start_line.saturating_sub(1),
+            start_col: range.start_col.saturating_sub(1),
+            end_line: range.end_line.saturating_sub(1),
+            end_col: range.end_col.saturating_sub(1),
+        })
+    }
+}
+
 /// A symbol discovered in a source file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,

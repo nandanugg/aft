@@ -41,8 +41,8 @@ fn markdown_outline_extracts_headings() {
     let mut aft = AftProcess::spawn();
     aft.configure(dir.path());
     let resp = aft.send(&format!(
-        r#"{{"id":"md-1","command":"outline","file":"{}"}}"#,
-        md_file.display()
+        r#"{{"id":"md-1","command":"outline","file":{}}}"#,
+        crate::helpers::json_string(&md_file.display())
     ));
 
     assert_eq!(resp["success"], true, "outline should succeed: {:?}", resp);
@@ -126,8 +126,8 @@ fn markdown_outline_section_ranges_cover_content() {
     let mut aft = AftProcess::spawn();
     aft.configure(dir.path());
     let resp = aft.send(&format!(
-        r#"{{"id":"md-2","command":"outline","file":"{}"}}"#,
-        md_file.display()
+        r#"{{"id":"md-2","command":"outline","file":{}}}"#,
+        crate::helpers::json_string(&md_file.display())
     ));
 
     assert_eq!(resp["success"], true);
@@ -171,8 +171,8 @@ fn markdown_zoom_by_heading_name() {
     let mut aft = AftProcess::spawn();
     aft.configure(dir.path());
     let resp = aft.send(&format!(
-        r#"{{"id":"md-3","command":"zoom","file":"{}","symbol":"Architecture"}}"#,
-        md_file.display()
+        r#"{{"id":"md-3","command":"zoom","file":{},"symbol":"Architecture"}}"#,
+        crate::helpers::json_string(&md_file.display())
     ));
 
     assert_eq!(
@@ -198,6 +198,57 @@ fn markdown_zoom_by_heading_name() {
 }
 
 #[test]
+fn markdown_zoom_accepts_copied_heading_prefixes() {
+    let dir = TempDir::new().unwrap();
+    let md_file = dir.path().join("readme.md");
+    fs::write(&md_file, SAMPLE_MD).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    aft.configure(dir.path());
+
+    let bare = aft.send(&format!(
+        r#"{{"id":"md-prefix-bare","command":"zoom","file":{},"symbol":"Architecture"}}"#,
+        crate::helpers::json_string(&md_file.display())
+    ));
+    assert_eq!(bare["success"], true, "bare heading should work: {bare:?}");
+
+    for (id, symbol, expected) in [
+        (
+            "md-prefix-h2",
+            "## Architecture",
+            "The architecture section",
+        ),
+        (
+            "md-prefix-h3",
+            "### Sub-feature A",
+            "Details about sub-feature A",
+        ),
+        ("md-prefix-h1", "# Project Title", "Some introduction text"),
+    ] {
+        let resp = aft.send(&format!(
+            r#"{{"id":"{}","command":"zoom","file":{},"symbol":"{}"}}"#,
+            id,
+            crate::helpers::json_string(&md_file.display()),
+            symbol
+        ));
+        assert_eq!(
+            resp["success"], true,
+            "prefixed markdown heading {symbol:?} should work: {resp:?}"
+        );
+        if symbol == "## Architecture" {
+            assert_eq!(
+                resp["range"], bare["range"],
+                "## Architecture should match the bare heading range"
+            );
+        }
+        assert!(
+            resp["content"].as_str().unwrap().contains(expected),
+            "content should include {expected:?}: {resp:?}"
+        );
+    }
+}
+
+#[test]
 fn markdown_zoom_heading_not_found() {
     let dir = TempDir::new().unwrap();
     let md_file = dir.path().join("readme.md");
@@ -206,8 +257,8 @@ fn markdown_zoom_heading_not_found() {
     let mut aft = AftProcess::spawn();
     aft.configure(dir.path());
     let resp = aft.send(&format!(
-        r#"{{"id":"md-4","command":"zoom","file":"{}","symbol":"Missing Heading"}}"#,
-        md_file.display()
+        r#"{{"id":"md-4","command":"zoom","file":{},"symbol":"Missing Heading"}}"#,
+        crate::helpers::json_string(&md_file.display())
     ));
 
     assert_eq!(
@@ -228,8 +279,8 @@ fn markdown_write_preserves_content() {
 
     let new_content = "# New Doc\\n\\nSome content.\\n";
     let resp = aft.send(&format!(
-        r#"{{"id":"md-5","command":"write","file":"{}","content":"{}"}}"#,
-        md_file.display(),
+        r#"{{"id":"md-5","command":"write","file":{},"content":"{}"}}"#,
+        crate::helpers::json_string(&md_file.display()),
         new_content
     ));
 
@@ -250,8 +301,8 @@ fn markdown_mdx_extension_supported() {
     let mut aft = AftProcess::spawn();
     aft.configure(dir.path());
     let resp = aft.send(&format!(
-        r#"{{"id":"md-6","command":"outline","file":"{}"}}"#,
-        mdx_file.display()
+        r#"{{"id":"md-6","command":"outline","file":{}}}"#,
+        crate::helpers::json_string(&mdx_file.display())
     ));
 
     assert_eq!(resp["success"], true, "mdx should be supported: {:?}", resp);

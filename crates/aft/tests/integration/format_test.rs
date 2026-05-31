@@ -22,27 +22,53 @@ fn is_on_path(binary: &str) -> bool {
         .is_ok()
 }
 
-#[cfg(unix)]
+/// Install a stub `tsc` checker that prints a fixed TS2322 error and exits 2.
+/// On Unix the stub is a `tsc` shell script with the executable bit set.
+/// On Windows it's a `tsc.cmd` batch file (Windows resolves both `tsc` and
+/// `tsc.cmd` against PATH via PATHEXT). Either way the resolver finds it
+/// when `<dir>/node_modules/.bin` is prepended to PATH.
 fn install_tsc_stub(dir: &std::path::Path, file_name: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    let stub = bin_dir.join("tsc");
-    fs::write(
-        &stub,
-        format!(
-            "#!/bin/sh\nprintf '%s(1,7): error TS2322: Type \\\"string\\\" is not assignable to type \\\"number\\\".\\n' '{}/{file_name}'\nexit 2\n",
-            dir.display()
-        ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&stub).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub, perms).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = bin_dir.join("tsc");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s(1,7): error TS2322: Type \\\"string\\\" is not assignable to type \\\"number\\\".\\n' '{}/{file_name}'\nexit 2\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&stub, perms).unwrap();
+    }
+
+    #[cfg(windows)]
+    {
+        // Batch file: @echo off + a single echo with the canonical error
+        // format. Path uses backslashes per Windows convention so the
+        // resolver-printed location matches the file we wrote.
+        let stub = bin_dir.join("tsc.cmd");
+        fs::write(
+            &stub,
+            format!(
+                "@echo off\r\necho {}\\{file_name}(1,7): error TS2322: Type \"string\" is not assignable to type \"number\".\r\nexit /b 2\r\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+    }
 }
 
-#[cfg(unix)]
+/// Prepend `<dir>/node_modules/.bin` to a PATH-style env var so a stub
+/// installed via `install_tsc_stub` resolves before any real `tsc` on the
+/// runner. Cross-platform: `std::env::split_paths` and `join_paths` use
+/// `:` on Unix and `;` on Windows automatically.
 fn prepend_path(existing_path: &std::ffi::OsStr, dir: &std::path::Path) -> std::ffi::OsString {
     let mut paths = std::env::split_paths(existing_path).collect::<Vec<_>>();
     paths.insert(0, dir.join("node_modules").join(".bin"));
@@ -83,8 +109,8 @@ fn format_integration_applied_rustfmt() {
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     aft.configure(&dir);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-1","command":"write","file":"{}","content":"{}"}}"#,
-        target.display(),
+        r#"{{"id":"fmt-1","command":"write","file":{},"content":"{}"}}"#,
+        crate::helpers::json_string(&target.display()),
         ugly_code
     ));
 
@@ -126,8 +152,8 @@ fn format_integration_unsupported_language() {
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-2","command":"write","file":"{}","content":"hello world"}}"#,
-        target.display()
+        r#"{{"id":"fmt-2","command":"write","file":{},"content":"hello world"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -154,8 +180,8 @@ fn format_integration_no_formatter_configured() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-3","command":"write","file":"{}","content":"x = 1"}}"#,
-        target.display()
+        r#"{{"id":"fmt-3","command":"write","file":{},"content":"x = 1"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -182,12 +208,15 @@ fn format_integration_formatter_not_installed() {
     let _ = fs::remove_file(&target);
 
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+    ]);
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-3b","command":"write","file":"{}","content":"const x = 1;\n"}}"#,
-        target.display()
+        r#"{{"id":"fmt-3b","command":"write","file":{},"content":"const x = 1;\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -195,6 +224,87 @@ fn format_integration_formatter_not_installed() {
     assert_eq!(
         resp["format_skipped_reason"], "formatter_not_installed",
         "skip reason should be formatter_not_installed: {:?}",
+        resp
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn format_integration_oxfmt_config_runs_oxfmt() {
+    let dir = format_test_dir("oxfmt_config_runs");
+    fs::write(dir.join(".oxfmtrc.json"), "{}\n").unwrap();
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("oxfmt");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = \"--write\" ]; then printf 'const x = 1;\n' > \"$2\"; fi\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let target = dir.join("format_oxfmt.ts");
+    let _ = fs::remove_file(&target);
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-3c","command":"write","file":{},"content":"const   x=1;\n"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert_eq!(
+        resp["formatted"], true,
+        "oxfmt should have formatted the file"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "const x = 1;\n");
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
+    let dir = format_test_dir("oxfmt_ignored_path");
+    fs::write(dir.join(".oxfmtrc.json"), "{}\n").unwrap();
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("oxfmt");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'Expected at least one target file after applying ignore rules.\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let target = dir.join("format_oxfmt_ignored.ts");
+    let _ = fs::remove_file(&target);
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-3d","command":"write","file":{},"content":"const   x=1;\n"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert_eq!(resp["formatted"], false);
+    assert_eq!(
+        resp["format_skipped_reason"], "formatter_excluded_path",
+        "oxfmt ignored paths should report formatter_excluded_path: {:?}",
         resp
     );
 
@@ -216,8 +326,8 @@ fn format_integration_add_import_with_format() {
     let mut aft = AftProcess::spawn();
     aft.configure(&dir);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-4","command":"add_import","file":"{}","module":"std::collections::HashMap"}}"#,
-        target.display()
+        r#"{{"id":"fmt-4","command":"add_import","file":{},"module":"std::collections::HashMap"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(
@@ -262,8 +372,8 @@ fn format_integration_edit_symbol_with_format() {
     // Use edit_symbol to replace the function
     let new_body = r#"fn greet() {\n    println!(\"hello world\");\n}"#;
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-5","command":"edit_symbol","file":"{}","symbol":"greet","operation":"replace","content":"{}"}}"#,
-        target.display(),
+        r#"{{"id":"fmt-5","command":"edit_symbol","file":{},"symbol":"greet","operation":"replace","content":"{}"}}"#,
+        crate::helpers::json_string(&target.display()),
         new_body
     ));
 
@@ -299,8 +409,8 @@ fn format_integration_fields_always_present() {
     let mut aft = AftProcess::spawn();
     aft.configure(&dir);
     let resp = aft.send(&format!(
-        r#"{{"id":"fmt-6a","command":"write","file":"{}","content":"Hello markdown"}}"#,
-        md_target.display()
+        r#"{{"id":"fmt-6a","command":"write","file":{},"content":"Hello markdown"}}"#,
+        crate::helpers::json_string(&md_target.display())
     ));
 
     assert_eq!(
@@ -322,8 +432,8 @@ fn format_integration_fields_always_present() {
     let _ = fs::remove_file(&rs_target);
 
     let resp2 = aft.send(&format!(
-        r#"{{"id":"fmt-6b","command":"write","file":"{}","content":"fn main() {{}}"}}"#,
-        rs_target.display()
+        r#"{{"id":"fmt-6b","command":"write","file":{},"content":"fn main() {{}}"}}"#,
+        crate::helpers::json_string(&rs_target.display())
     ));
 
     assert_eq!(
@@ -356,8 +466,8 @@ fn validate_full_default_no_errors() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-1","command":"write","file":"{}","content":"fn main() {{}}"}}"#,
-        target.display()
+        r#"{{"id":"val-1","command":"write","file":{},"content":"fn main() {{}}"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -366,7 +476,7 @@ fn validate_full_default_no_errors() {
         && !resp["validation_errors"].is_null()
         && resp["validation_errors"]
             .as_array()
-            .map_or(false, |a| !a.is_empty());
+            .is_some_and(|a| !a.is_empty());
     assert!(
         !has_errors,
         "validation_errors should be absent or empty without validate:full, got: {:?}",
@@ -399,14 +509,14 @@ fn validate_on_edit_full_from_config_runs_checker() {
 
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-full","command":"configure","project_root":"{}","validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
-        dir.display()
+        r#"{{"id":"cfg-val-full","command":"configure","harness":"opencode","project_root":{},"validate_on_edit":"full","checker":{{"typescript":"tsc"}}}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"val-config-full","command":"write","file":"{}","content":"const x: number = \"oops\";\n"}}"#,
-        target.display()
+        r#"{{"id":"val-config-full","command":"write","file":{},"content":"const x: number = \"oops\";\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -435,14 +545,14 @@ fn validate_on_edit_off_from_config_skips_checker() {
 
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&format!(
-        r#"{{"id":"cfg-val-off","command":"configure","project_root":"{}","validate_on_edit":"off"}}"#,
-        dir.display()
+        r#"{{"id":"cfg-val-off","command":"configure","harness":"opencode","project_root":{},"validate_on_edit":"off"}}"#,
+        crate::helpers::json_string(&dir.display())
     ));
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
 
     let resp = aft.send(&format!(
-        r#"{{"id":"val-config-off","command":"write","file":"{}","content":"const x: number = \"oops\";\n"}}"#,
-        target.display()
+        r#"{{"id":"val-config-off","command":"write","file":{},"content":"const x: number = \"oops\";\n"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -450,7 +560,7 @@ fn validate_on_edit_off_from_config_skips_checker() {
         && !resp["validation_errors"].is_null()
         && resp["validation_errors"]
             .as_array()
-            .map_or(false, |errors| !errors.is_empty());
+            .is_some_and(|errors| !errors.is_empty());
     assert!(
         !has_errors,
         "validate_on_edit:off should not produce validation_errors: {:?}",
@@ -478,8 +588,8 @@ fn validate_full_with_checker() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-2","command":"write","file":"{}","content":"fn main() {{}}","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-2","command":"write","file":{},"content":"fn main() {{}}","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -508,8 +618,8 @@ fn validate_full_unsupported_language() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-3","command":"write","file":"{}","content":"hello","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-3","command":"write","file":{},"content":"hello","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -532,14 +642,54 @@ fn validate_full_no_checker_configured() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-3b","command":"write","file":"{}","content":"const x = 1;\n","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-3b","command":"write","file":{},"content":"const x = 1;\n","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
     assert_eq!(
         resp["validate_skipped_reason"], "no_checker_configured",
         "should skip validation without checker config: {:?}",
+        resp
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_full_nonzero_without_diagnostics_reports_error() {
+    let dir = format_test_dir("validate_checker_error_no_diagnostics");
+    fs::write(dir.join("tsconfig.json"), "{}\n").unwrap();
+    let target = dir.join("validate_checker_error_no_diagnostics.ts");
+    let _ = fs::remove_file(&target);
+
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("tsc");
+    fs::write(
+        &stub,
+        "#!/bin/sh\necho 'failed before diagnostics' >&2\nexit 2\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+    let resp = aft.send(&format!(
+        r#"{{"id":"val-error-no-diag","command":"write","file":{},"content":"const x = 1;\n","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert_eq!(
+        resp["validate_skipped_reason"], "error",
+        "non-zero checker without parseable diagnostics must not look clean: {:?}",
         resp
     );
 
@@ -556,12 +706,15 @@ fn validate_full_checker_not_installed() {
     let _ = fs::remove_file(&target);
 
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
-    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+    ]);
     let cfg = aft.configure(&dir);
     assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
     let resp = aft.send(&format!(
-        r#"{{"id":"val-3c","command":"write","file":"{}","content":"const x = 1;\n","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-3c","command":"write","file":{},"content":"const x = 1;\n","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
@@ -587,8 +740,8 @@ fn validate_full_flows_through_add_import() {
 
     let mut aft = AftProcess::spawn();
     let resp = aft.send(&format!(
-        r#"{{"id":"val-4","command":"add_import","file":"{}","module":"std::collections::HashMap","validate":"full"}}"#,
-        target.display()
+        r#"{{"id":"val-4","command":"add_import","file":{},"module":"std::collections::HashMap","validate":"full"}}"#,
+        crate::helpers::json_string(&target.display())
     ));
 
     assert_eq!(

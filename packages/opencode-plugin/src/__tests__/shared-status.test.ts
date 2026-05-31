@@ -12,26 +12,14 @@ const baseResponse = Object.freeze({
     format_on_edit: false,
     validate_on_edit: "off",
     restrict_to_project_root: false,
-    experimental_search_index: true,
-    experimental_semantic_search: true,
+    search_index: true,
+    semantic_search: true,
   },
   search_index: { status: "ready", files: 4, trigrams: 400 },
   semantic_index: {
     status: "ready",
     entries: 128,
     dimension: 384,
-  },
-  go_overlay: {
-    backend: "aft_go_sidecar",
-    state: "ready",
-    provider_id: "go-sidecar@sha256",
-    provider_version: "0.0.1",
-    schema_version: 2,
-    feature_hash: "abc123",
-    env_hash: "env999",
-    source_fingerprint: "src123",
-    produced_at: "2025-01-01T00:00:00Z",
-    last_error: null,
   },
   disk: {
     storage_dir: "/tmp/storage",
@@ -56,6 +44,19 @@ describe("coerceAftStatus", () => {
     expect(status.semantic_index.model).toBe("text-embedding-3-small");
     expect(status.semantic_index).not.toHaveProperty("api_key_env");
   });
+
+  test("opencode_status_snapshot_includes_compression_passthrough", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      compression: {
+        project: { events: 3, original_tokens: 300, compressed_tokens: 210, savings_tokens: 90 },
+        session: { events: 1, original_tokens: 100, compressed_tokens: 70, savings_tokens: 30 },
+      },
+    } as unknown as Record<string, unknown>);
+
+    expect(status.compression?.project.events).toBe(3);
+    expect(status.compression?.session.savings_tokens).toBe(30);
+  });
 });
 
 describe("formatStatus* output", () => {
@@ -68,25 +69,7 @@ describe("formatStatus* output", () => {
     expect(dialog).toContain("model: text-embedding-3-small");
     expect(markdown).toContain("**Backend:** openai_compatible");
     expect(markdown).toContain("**Model:** text-embedding-3-small");
-    expect(markdown).toContain("## AFT Status");
-    expect(markdown).toContain("**Go overlay backend:** `aft_go_sidecar`");
-    expect(markdown).toContain("**Go overlay state:** `ready`");
-    expect(dialog).toContain("Go overlay backend: aft_go_sidecar");
-    expect(dialog).toContain("Go overlay state: ready");
     expect(dialog).not.toContain("AFT_SEMANTIC_KEY");
     expect(markdown).not.toContain("AFT_SEMANTIC_KEY");
-  });
-
-  test("supports go_overlay metadata in status formatting", () => {
-    const status = coerceAftStatus(baseResponse as unknown as Record<string, unknown>);
-
-    expect(status.go_overlay.backend).toBe("aft_go_sidecar");
-    expect(status.go_overlay.state).toBe("ready");
-    expect(status.go_overlay.schema_version).toBe(2);
-
-    const markdown = formatStatusMarkdown(status);
-    expect(markdown).toContain("### Go overlay metadata");
-    expect(markdown).toContain("**Provider id:** go-sidecar@sha256");
-    expect(markdown).toContain("**Schema version:** 2");
   });
 });

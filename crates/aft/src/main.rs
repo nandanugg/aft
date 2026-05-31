@@ -1,11 +1,21 @@
-use std::collections::HashSet;
-use std::io::{self, BufRead, BufWriter, Write};
-
+mod cli;
+use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
-use aft::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus};
+use aft::context::{
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
+    SemanticRefreshRequest,
+};
+use aft::log_ctx;
 use aft::lsp::client::LspEvent;
 use aft::parser::TreeSitterProvider;
-use aft::protocol::{EchoParams, RawRequest, Response};
+use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
+use std::collections::HashSet;
+use std::io::{self, BufRead, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn main() {
     // Handle --version flag before anything else
@@ -14,15 +24,20 @@ fn main() {
         return;
     }
 
-    // --no-cache: disable the persistent call-graph cache for this invocation.
-    // Sets AFT_DISABLE_CACHE=1 so that CacheManager sees it on all code paths
-    // regardless of when configure() is called.
-    let no_cache = std::env::args().any(|a| a == "--no-cache");
-    if no_cache {
-        // SAFETY: single-threaded at this point (before any thread::spawn calls).
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::set_var("AFT_DISABLE_CACHE", "1");
+    if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match aft::migrate_storage::parse_cli_args(args) {
+            Ok(args) => {
+                let status = aft::migrate_storage::run_with_options(
+                    args,
+                    aft::migrate_storage::Options::default(),
+                );
+                std::process::exit(i32::from(status.code()));
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -40,24 +55,106 @@ fn main() {
         })
         .init();
 
-    log::info!("started, pid {}", std::process::id());
-
-    let mut config = Config::default();
-    if no_cache {
-        config.cache_enabled = false;
+    if std::env::args().nth(1).as_deref() == Some("warmup") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::warmup::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
     }
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
 
-    let stdin = io::stdin();
-    let reader = stdin.lock();
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
+    aft::slog_info!("started, pid {}", std::process::id());
 
-    for line_result in reader.lines() {
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    install_signal_handler(ctx.bash_background().clone(), ctx.lsp_child_registry());
+
+    // Install bash output-compression closure on the BgTaskRegistry. The
+    // closure captures the shared filter-registry handle and the shared
+    // compress-flag (atomic) so the watchdog thread can compress without
+    // touching the rest of AppContext. The flag is updated from `configure`
+    // when `experimental.bash.compress` changes; the filter registry is
+    // updated when `reset_filter_registry` is called.
+    {
+        let filter_registry_handle = ctx.shared_filter_registry();
+        let compress_flag = ctx.bash_compress_flag();
+        ctx.bash_background()
+            .set_compressor(move |command: &str, output: String| {
+                if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return output;
+                }
+                let registry_guard = match filter_registry_handle.read() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                aft::compress::compress_with_registry(command, &output, &registry_guard)
+            });
+    }
+
+    let stdout_writer = ctx.stdout_writer();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_from_push = Arc::clone(&shutdown_requested);
+    ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame: PushFrame| {
+        let Ok(mut writer) = stdout_writer.lock() else {
+            aft::slog_error!("stdout push frame lock poisoned; shutting down bridge");
+            shutdown_from_push.store(true, Ordering::SeqCst);
+            return;
+        };
+        write_push_frame_or_request_shutdown(&mut *writer, &frame, &shutdown_from_push);
+    }))));
+
+    // Stdin is read by a dedicated thread that forwards lines through a
+    // channel. The main thread does recv_timeout so it wakes periodically
+    // even when no agent traffic is arriving — that periodic wake runs
+    // the drain_* functions so background-build channel events (e.g.
+    // SemanticIndexEvent::Ready) get processed and their status_changed
+    // push frames emitted. Without the wake, the sidebar can stay stuck
+    // on "loading" indefinitely until the next request happens to arrive.
+    const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+    let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let reader = stdin.lock();
+        for line_result in reader.lines() {
+            if line_tx.send(line_result).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let line_result = match line_rx.recv_timeout(DRAIN_INTERVAL) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Periodic drain so push frames flow even without requests.
+                // Cheap on the idle path: each drain just checks try_recv
+                // on a channel and bails if empty.
+                drain_configure_warning_events(&ctx);
+                drain_search_index_events(&ctx);
+                drain_semantic_index_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
+                drain_inspect_events(&ctx);
+                drain_watcher_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
+                drain_lsp_events(&ctx);
+                if shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                log::error!("stdin read error: {}", e);
+                aft::slog_error!("stdin read error: {}", e);
                 break;
             }
         };
@@ -67,20 +164,40 @@ fn main() {
             continue;
         }
 
+        let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
                 // Drain search index FIRST so watcher events apply to the latest index.
                 // If reversed, watcher updates applied to the old index would be lost
                 // when the background-built index replaces it.
+                drain_configure_warning_events(&ctx);
                 drain_search_index_events(&ctx);
                 drain_semantic_index_events(&ctx);
-                ctx.drain_go_helper();
+                drain_semantic_refresh_events(&ctx);
+                drain_inspect_events(&ctx);
                 drain_watcher_events(&ctx);
+                drain_semantic_refresh_events(&ctx);
                 drain_lsp_events(&ctx);
-                dispatch(req, &ctx)
+                let request_id = req.id.clone();
+                let session_id = req.session().to_string();
+                let command = req.command.clone();
+                let session_id_for_log = req.session_id.clone();
+                let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
+                    log_ctx::with_session(session_id_for_log, || dispatch(req, &ctx))
+                }));
+                match dispatch_result {
+                    Ok(mut response) => {
+                        attach_bg_completions(&mut response, &ctx, &session_id, &command);
+                        response
+                    }
+                    Err(payload) => {
+                        shutdown_after_response = true;
+                        dispatch_panic_response(request_id, &command, payload.as_ref())
+                    }
+                }
             }
             Err(e) => {
-                log::error!("parse error: {} — input: {}", e, trimmed);
+                aft::slog_error!("parse error: {} — input: {}", e, trimmed);
                 Response::error(
                     "_parse_error",
                     "parse_error",
@@ -89,14 +206,224 @@ fn main() {
             }
         };
 
-        if let Err(e) = write_response(&mut writer, &response) {
-            log::error!("stdout write error: {}", e);
+        if let Err(e) = write_response(&ctx, &response) {
+            aft::slog_error!("stdout write error: {}", e);
+            break;
+        }
+        drain_configure_warning_events(&ctx);
+        if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
             break;
         }
     }
 
     ctx.lsp().shutdown_all();
-    log::info!("stdin closed, shutting down");
+    ctx.bash_background().detach();
+    aft::slog_info!("stdin closed, shutting down");
+}
+
+#[cfg(unix)]
+fn install_signal_handler(
+    bg_registry: BgTaskRegistry,
+    lsp_children: aft::lsp::child_registry::LspChildRegistry,
+) {
+    let signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]);
+    let Ok(mut signals) = signals else {
+        if let Err(error) = signals {
+            aft::slog_error!("failed to install signal handlers: {error}");
+        }
+        return;
+    };
+
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            // Plugin restarts can SIGTERM the bridge while background bash jobs
+            // are still running. Detach first so child handles are not killed by
+            // Rust drop glue and can be rehydrated from disk.
+            bg_registry.detach();
+            // Kill LSP children synchronously before exit. Without this, LSP
+            // child processes (typescript-language-server, biome lsp-proxy,
+            // etc.) get orphaned to PID 1 because process::exit bypasses the
+            // graceful shutdown path that LspManager::shutdown_all uses on
+            // the natural stdin-closed exit. Graceful shutdown takes up to
+            // 5s per server (shutdown request + exit notification + poll),
+            // which is too slow for a signal handler — we SIGKILL instead.
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                aft::slog_info!("signal {}: killed {} LSP child process(es)", signal, killed);
+            }
+            std::process::exit(128 + signal);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+static WINDOWS_SIGNAL_REGISTRIES: std::sync::OnceLock<(
+    BgTaskRegistry,
+    aft::lsp::child_registry::LspChildRegistry,
+)> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_console_handler(ctrl_type: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    const CTRL_LOGOFF_EVENT: u32 = 5;
+    const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+    if matches!(
+        ctrl_type,
+        CTRL_C_EVENT
+            | CTRL_BREAK_EVENT
+            | CTRL_CLOSE_EVENT
+            | CTRL_LOGOFF_EVENT
+            | CTRL_SHUTDOWN_EVENT
+    ) {
+        if let Some((bg_registry, lsp_children)) = WINDOWS_SIGNAL_REGISTRIES.get() {
+            bg_registry.detach();
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                aft::slog_info!(
+                    "windows console event {ctrl_type}: killed {killed} LSP child process(es)"
+                );
+            }
+        }
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+}
+
+#[cfg(not(unix))]
+fn install_signal_handler(
+    bg_registry: BgTaskRegistry,
+    lsp_children: aft::lsp::child_registry::LspChildRegistry,
+) {
+    #[cfg(windows)]
+    {
+        let _ = WINDOWS_SIGNAL_REGISTRIES.set((bg_registry, lsp_children));
+        // SAFETY: registers a process-global console-control callback. The
+        // callback only uses cloneable registries stored in OnceLock.
+        let ok = unsafe { SetConsoleCtrlHandler(Some(windows_console_handler), 1) };
+        if ok == 0 {
+            aft::slog_error!("failed to install Windows console control handler");
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (bg_registry, lsp_children);
+    }
+}
+
+fn write_push_frame_or_request_shutdown(
+    writer: &mut impl Write,
+    frame: &PushFrame,
+    shutdown_requested: &AtomicBool,
+) {
+    if let Err(error) = write_push_frame(writer, frame) {
+        aft::slog_error!(
+            "stdout push frame write error: {}; shutting down bridge",
+            error
+        );
+        shutdown_requested.store(true, Ordering::SeqCst);
+    }
+}
+
+fn dispatch_panic_response(
+    request_id: impl Into<String>,
+    command: &str,
+    payload: &(dyn std::any::Any + Send),
+) -> Response {
+    let panic_message = panic_payload_message(payload);
+    aft::slog_error!(
+        "command '{}' panicked: {}; shutting down bridge",
+        command,
+        panic_message
+    );
+    Response::error(
+        request_id,
+        "internal_error",
+        format!("command '{command}' panicked: {panic_message}"),
+    )
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn drain_configure_warning_events(ctx: &AppContext) {
+    for (generation, frame) in ctx.drain_configure_warnings() {
+        if ctx.configure_generation() != generation {
+            aft::slog_info!(
+                "dropping stale configure_warnings for generation {} (current {})",
+                generation,
+                ctx.configure_generation()
+            );
+            continue;
+        }
+
+        if let Some(sender) = ctx.progress_sender_handle() {
+            sender(PushFrame::ConfigureWarnings(frame));
+        }
+    }
+}
+
+fn drain_inspect_events(ctx: &AppContext) {
+    ctx.inspect_manager().drain_completions();
+}
+
+fn attach_bg_completions(
+    response: &mut Response,
+    ctx: &AppContext,
+    session_id: &str,
+    command: &str,
+) {
+    if matches!(
+        command,
+        "configure"
+            | "bash_status"
+            | "bash_write"
+            | "bash_promote"
+            | "bash_drain_completions"
+            | "bash_notify"
+            | "bash_unnotify"
+            | "bash_ack_completions"
+    ) {
+        return;
+    }
+    let completions = ctx
+        .bash_background()
+        .drain_completions_for_session(Some(session_id));
+    if completions.is_empty() {
+        return;
+    }
+    let value = serde_json::json!(completions);
+    match response.data.as_object_mut() {
+        Some(data) => {
+            data.insert("bg_completions".to_string(), value);
+        }
+        None => {
+            response.data = serde_json::json!({ "bg_completions": value });
+        }
+    }
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
@@ -107,6 +434,19 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
         ),
         "echo" => handle_echo(&req),
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
+        "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
+        "bash_unnotify" => aft::commands::bash_notify::handle_unnotify(&req, ctx),
+        "bash_promote" => aft::commands::bash_promote::handle(&req, ctx),
+        "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
+        "bash_write" => aft::commands::bash_write::handle(&req, ctx),
+        "db_get_state" => aft::commands::state::handle_db_get_state(&req, ctx),
+        "db_set_state" => aft::commands::state::handle_db_set_state(&req, ctx),
+        "db_get_host_state" => aft::commands::state::handle_db_get_host_state(&req, ctx),
+        "db_set_host_state" => aft::commands::state::handle_db_set_host_state(&req, ctx),
         "outline" => aft::commands::outline::handle_outline(&req, ctx),
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
@@ -134,35 +474,38 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
-        "go_overlay_session_open" => {
-            aft::commands::go_overlay_session::handle_go_overlay_session_open(&req, ctx)
-        }
-        "go_overlay_session_touch" => {
-            aft::commands::go_overlay_session::handle_go_overlay_session_touch(&req, ctx)
-        }
-        "go_overlay_session_close" => {
-            aft::commands::go_overlay_session::handle_go_overlay_session_close(&req, ctx)
-        }
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
-        "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
-        "similar" => aft::commands::similar::handle_similar(&req, ctx),
+        "semantic_search" => {
+            if let Some(response) = wait_for_semantic_index_before_search(&req, ctx) {
+                response
+            } else {
+                aft::commands::semantic_search::handle_semantic_search(&req, ctx)
+            }
+        }
         "status" => aft::commands::status::handle_status(&req, ctx),
+        "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
+        "trust_filter_project" => {
+            aft::commands::trust_filter_project::handle_trust_filter_project(&req, ctx)
+        }
+        "untrust_filter_project" => {
+            aft::commands::untrust_filter_project::handle_untrust_filter_project(&req, ctx)
+        }
         "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
         "callers" => aft::commands::callers::handle_callers(&req, ctx),
-        "dispatched_by" => aft::commands::dispatched_by::handle_dispatched_by(&req, ctx),
-        "dispatches" => aft::commands::dispatches::handle_dispatches(&req, ctx),
-        "implementations" => aft::commands::implementations::handle_implementations(&req, ctx),
-        "writers" => aft::commands::writers::handle_writers(&req, ctx),
         "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
+        "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
         "impact" => aft::commands::impact::handle_impact(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
         "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),
         "extract_function" => aft::commands::extract_function::handle_extract_function(&req, ctx),
         "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
+        "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
+        "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
         "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),
         "ast_replace" => aft::commands::ast_replace::handle_ast_replace(&req, ctx),
         "lsp_diagnostics" => aft::commands::lsp_diagnostics::handle_lsp_diagnostics(&req, ctx),
+        "lsp_inspect" => aft::commands::lsp_inspect::handle_lsp_inspect(&req, ctx),
         "lsp_hover" => aft::commands::lsp_hover::handle_lsp_hover(&req, ctx),
         "lsp_goto_definition" => {
             aft::commands::lsp_goto_definition::handle_lsp_goto_definition(&req, ctx)
@@ -181,7 +524,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         // that integration tests execute. See: crates/aft/tests/integration/safety_test.rs
         "snapshot" => handle_snapshot(&req, ctx),
         _ => {
-            log::warn!("unknown command: {}", req.command);
+            aft::slog_warn!("unknown command: {}", req.command);
             Response::error(
                 &req.id,
                 "unknown_command",
@@ -206,6 +549,43 @@ fn handle_echo(req: &RawRequest) -> Response {
 ///
 /// Params: `file` (string, required) — path to snapshot.
 /// Returns: `{ backup_id }`.
+fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
+    if std::env::var_os("AFT_WAIT_FOR_SEMANTIC_READY").is_none() || !ctx.config().semantic_search {
+        return None;
+    }
+
+    let timeout_ms = std::env::var("AFT_WAIT_FOR_SEMANTIC_READY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(600_000);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        drain_search_index_events(ctx);
+        drain_semantic_index_events(ctx);
+
+        match ctx.semantic_index_status().borrow().clone() {
+            SemanticIndexStatus::Ready { .. }
+            | SemanticIndexStatus::Disabled
+            | SemanticIndexStatus::Failed(_) => return None,
+            SemanticIndexStatus::Building { stage, .. } => {
+                if Instant::now() >= deadline {
+                    return Some(Response::error(
+                        &req.id,
+                        "semantic_index_timeout",
+                        format!(
+                            "semantic index did not become ready before semantic_search within {timeout_ms}ms (stage: {stage})"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -231,25 +611,137 @@ fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
-fn write_response(writer: &mut BufWriter<io::StdoutLock>, response: &Response) -> io::Result<()> {
+fn write_response(ctx: &AppContext, response: &Response) -> io::Result<()> {
+    let stdout_writer = ctx.stdout_writer();
+    let mut writer = stdout_writer
+        .lock()
+        .map_err(|_| io::Error::other("stdout writer lock poisoned"))?;
     serde_json::to_writer(&mut *writer, response)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
 }
 
+fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()> {
+    serde_json::to_writer(&mut *writer, frame)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
 /// Source file extensions that the call graph supports.
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "rs", "go"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "pyi", "rs", "go",
+];
 
 /// Drain pending file watcher events and invalidate changed source files
 /// in the call graph.
 ///
+/// Decide whether a `notify::Event` represents a real content change worth
+/// invalidating cached state for. Pulled out as a free function so unit
+/// tests can exercise every notify event variant without setting up a
+/// watcher pipeline.
+///
+/// The filter rejects:
+/// - `Access(_)` (read syscalls; cause feedback loops on atime)
+/// - `Modify(Metadata(AccessTime|Permissions|Ownership|Extended))`
+///   (no content change — biome-lint reproducer)
+/// - Anything that's not Create/Remove/Modify
+///
+/// And accepts:
+/// - `Create(_)`, `Remove(_)`, `Modify(Name(_))` (rename)
+/// - `Modify(Data(_))`, `Modify(Other)`, `Modify(Any)`
+/// - `Modify(Metadata(WriteTime|Any|Other))` (real or unknown content change)
+pub(crate) fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
+    use notify::event::{MetadataKind, ModifyKind};
+    use notify::EventKind;
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Metadata(meta)) => !matches!(
+            meta,
+            MetadataKind::AccessTime
+                | MetadataKind::Permissions
+                | MetadataKind::Ownership
+                | MetadataKind::Extended
+        ),
+        EventKind::Modify(_) => true,
+        _ => false,
+    }
+}
+
+fn watcher_path_is_infra_skip(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    path.components().any(|c| {
+        matches!(c, Component::Normal(name) if matches!(
+            name.to_str().unwrap_or(""),
+            ".git" | ".opencode" | ".alfonso" | ".gsd" | "node_modules" | "target"
+        ))
+    })
+}
+
+fn watcher_path_is_gitignore(path: &std::path::Path) -> bool {
+    path.file_name().map(|n| n == ".gitignore").unwrap_or(false)
+}
+
+fn canonicalize_watcher_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical;
+    }
+
+    let parent = path.parent().map(std::path::Path::to_path_buf);
+    let file_name = path.file_name().map(std::ffi::OsStr::to_os_string);
+    match (parent, file_name) {
+        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
+            .map(|canonical_parent| canonical_parent.join(file_name))
+            .unwrap_or(path),
+        _ => path,
+    }
+}
+
+fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> HashSet<std::path::PathBuf>
+where
+    I: IntoIterator<Item = std::path::PathBuf>,
+{
+    let raw_paths: Vec<std::path::PathBuf> = raw_paths.into_iter().collect();
+
+    // If any .gitignore file changed, rebuild the matcher before filtering
+    // this same batch so sibling events are checked against fresh rules.
+    if raw_paths.iter().any(|path| watcher_path_is_gitignore(path)) {
+        log::debug!("watcher: .gitignore changed, rebuilding matcher before filter");
+        ctx.rebuild_gitignore();
+    }
+
+    raw_paths
+        .into_iter()
+        .map(canonicalize_watcher_path)
+        .filter(|path| {
+            if watcher_path_is_infra_skip(path) {
+                return false;
+            }
+
+            if let Some(matcher) = ctx.gitignore() {
+                if path.starts_with(matcher.path()) {
+                    let is_dir = path.is_dir();
+                    if matcher
+                        .matched_path_or_any_parents(path, is_dir)
+                        .is_ignore()
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
 /// Borrows the watcher receiver and callgraph in separate phases to avoid
 /// RefCell borrow conflicts. Events are deduplicated by PathBuf — notify
 /// fires multiple events per file write (Create, Modify, etc.).
 fn drain_watcher_events(ctx: &AppContext) {
-    // Phase 1: collect changed paths from the receiver, filtering out
-    // non-project directories that cause excessive invalidation noise.
+    // Phase 1: collect changed paths from the receiver without applying the
+    // gitignore matcher yet; .gitignore writes in this same batch must rebuild
+    // the matcher before any sibling path is filtered.
     let changed: HashSet<std::path::PathBuf> = {
         let rx_ref = ctx.watcher_rx().borrow();
         let rx = match rx_ref.as_ref() {
@@ -257,40 +749,50 @@ fn drain_watcher_events(ctx: &AppContext) {
             None => return, // No watcher configured
         };
 
-        let mut paths = HashSet::new();
+        let mut raw_paths = Vec::new();
         while let Ok(event_result) = rx.try_recv() {
             if let Ok(event) = event_result {
                 // Only process events that indicate actual file content changes.
+                //
                 // Skip Access events — on Linux with atime enabled, reading a file
-                // during update_file triggers an access event, creating a feedback loop.
-                use notify::EventKind;
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
-                    _ => continue,
+                // during update_file triggers an access event, creating a feedback
+                // loop.
+                //
+                // Skip Modify(Metadata(...)) events that don't imply content
+                // changes: AccessTime, Permissions, Ownership, Extended.
+                // The biome-lint case is the canonical reproducer — running
+                // `biome check` opens every TS file for read, which on Linux
+                // (and on macOS in some configurations) updates atime and fires
+                // notify `Modify(Metadata(AccessTime))` events. Without this
+                // filter, every read-only lint pass invalidates the entire
+                // symbol cache, search index, and semantic index — completely
+                // unnecessary work.
+                //
+                // We KEEP `Modify(Metadata(WriteTime))` because mtime change
+                // does indicate a real content modification on every supported
+                // platform. We KEEP `Modify(Metadata(Any))` and
+                // `Modify(Metadata(Other))` as catch-all "we can't tell what
+                // metadata changed" cases — better to over-invalidate than to
+                // miss a real edit.
+                if !watcher_event_invalidates(&event.kind) {
+                    continue;
                 }
                 for path in event.paths {
-                    // Skip internal directories that generate frequent non-source events.
-                    let path_str = path.to_string_lossy();
-                    if path_str.contains("/.git/")
-                        || path_str.contains("\\.git\\")
-                        || path_str.contains("/.opencode/")
-                        || path_str.contains("\\.opencode\\")
-                        || path_str.contains("/node_modules/")
-                        || path_str.contains("\\node_modules\\")
-                        || path_str.contains("/target/")
-                        || path_str.contains("\\target\\")
-                    {
-                        continue;
-                    }
-                    paths.insert(path);
+                    raw_paths.push(path);
                 }
             }
         }
-        paths
+        filter_watcher_raw_paths(ctx, raw_paths)
     }; // receiver borrow dropped here
 
     if changed.is_empty() {
         return;
+    }
+
+    if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
+        for path in &changed {
+            symbol_cache.invalidate(path);
+        }
     }
 
     // Phase 2: invalidate each changed file in the call graph
@@ -317,53 +819,60 @@ fn drain_watcher_events(ctx: &AppContext) {
     }
 
     let mut semantic_index_ref = ctx.semantic_index().borrow_mut();
+    let mut semantic_status_changed = false;
+    let mut semantic_refresh_paths = Vec::new();
     if let Some(index) = semantic_index_ref.as_mut() {
+        let mut stale_paths = Vec::new();
         for path in &changed {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if SOURCE_EXTENSIONS.contains(&ext) {
                     index.invalidate_file(path);
+                    if path.exists() {
+                        stale_paths.push(path.clone());
+                    }
                 }
+            }
+        }
+        if !stale_paths.is_empty() {
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                for path in &stale_paths {
+                    status.add_refreshing_file(path.clone());
+                }
+                semantic_refresh_paths = stale_paths;
+                semantic_status_changed = true;
             }
         }
     }
 
-    let go_overlay_runtime = {
-        let config = ctx.config();
-        let Some(root) = config.project_root.clone() else {
-            log::info!("invalidated {} files", changed.len());
-            return;
-        };
-        let cache_dir = aft::search_index::resolve_cache_dir(&root, config.storage_dir.as_deref());
-        let runtime =
-            aft::go_overlay::GoOverlayRuntimeConfig::new(config.go_overlay_backend, cache_dir);
-        let request = aft::go_overlay::GoOverlayRequest::new(
-            root,
-            aft::go_overlay::DEFAULT_GO_OVERLAY_TIMEOUT,
-            aft::go_helper::HelperFlags {
-                no_call_context: !config.emit_call_context,
-                no_return_analysis: !config.emit_return_analysis,
-            },
-            config.go_overlay_backend,
-        );
-        (runtime, request)
-    };
-    let invalidation = aft::go_overlay::build_invalidation(
-        &go_overlay_runtime.1.root,
-        &changed.iter().cloned().collect::<Vec<_>>(),
-    );
-    if invalidation.module_dirty || !invalidation.dirty_files.is_empty() {
-        ctx.mark_go_overlay_stale();
-        ctx.schedule_go_overlay_refresh(aft::go_overlay::DEFAULT_GO_OVERLAY_TIMEOUT);
-    }
-    if let Err(err) = aft::go_overlay::invalidate_provider(
-        &go_overlay_runtime.0,
-        &go_overlay_runtime.1,
-        &invalidation,
-    ) {
-        log::debug!("[aft] go-overlay invalidate failed: {err}");
+    drop(semantic_index_ref);
+    drop(index_ref);
+
+    if !semantic_refresh_paths.is_empty() {
+        let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
+            sender
+                .send(SemanticRefreshRequest {
+                    paths: semantic_refresh_paths.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            aft::slog_warn!(
+                "semantic refresh worker unavailable; dropping {} refreshing file(s)",
+                semantic_refresh_paths.len()
+            );
+            let mut status = ctx.semantic_index_status().borrow_mut();
+            for path in &semantic_refresh_paths {
+                status.cancel_refreshing_file(path);
+            }
+            semantic_status_changed = true;
+        }
     }
 
-    log::info!("invalidated {} files", changed.len());
+    aft::slog_info!("invalidated {} files", changed.len());
+    if semantic_status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
 }
 
 fn drain_search_index_events(ctx: &AppContext) {
@@ -380,18 +889,9 @@ fn drain_search_index_events(ctx: &AppContext) {
         latest
     };
 
-    if let Some((index, symbol_cache)) = latest {
+    if let Some(index) = latest {
         *ctx.search_index().borrow_mut() = Some(index);
-        // Merge pre-warmed symbol cache into the provider's parser
-        if symbol_cache.len() > 0 {
-            if let Some(tsp) = ctx
-                .provider()
-                .as_any()
-                .downcast_ref::<aft::parser::TreeSitterProvider>()
-            {
-                tsp.merge_warm_cache(symbol_cache);
-            }
-        }
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
 
@@ -414,6 +914,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     let mut keep_receiver = true;
+    let mut status_changed = false;
     for event in events {
         match event {
             SemanticIndexEvent::Progress {
@@ -431,19 +932,89 @@ fn drain_semantic_index_events(ctx: &AppContext) {
             }
             SemanticIndexEvent::Ready(index) => {
                 *ctx.semantic_index().borrow_mut() = Some(index);
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Ready;
+                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
                 keep_receiver = false;
+                status_changed = true;
             }
             SemanticIndexEvent::Failed(error) => {
                 *ctx.semantic_index().borrow_mut() = None;
+                ctx.clear_semantic_refresh_worker();
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
+                status_changed = true;
             }
         }
     }
 
     if !keep_receiver {
         *ctx.semantic_index_rx().borrow_mut() = None;
+    }
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+fn drain_semantic_refresh_events(ctx: &AppContext) {
+    let events = {
+        let rx_ref = ctx.semantic_refresh_event_rx().borrow();
+        let Some(rx) = rx_ref.as_ref() else {
+            return;
+        };
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    };
+
+    if events.is_empty() {
+        return;
+    }
+
+    let mut status_changed = false;
+    for event in events {
+        match event {
+            SemanticRefreshEvent::Started { paths } => {
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in paths {
+                        status.start_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+            SemanticRefreshEvent::Completed {
+                added_entries,
+                updated_metadata,
+                completed_paths,
+            } => {
+                if let Some(index) = ctx.semantic_index().borrow_mut().as_mut() {
+                    index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
+                }
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &completed_paths {
+                        status.complete_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+            SemanticRefreshEvent::Failed { paths, error } => {
+                aft::slog_warn!("semantic refresh failed: {}", error);
+                let mut status = ctx.semantic_index_status().borrow_mut();
+                if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
+                    for path in &paths {
+                        status.complete_refreshing_file(path);
+                    }
+                    status_changed = true;
+                }
+            }
+        }
+    }
+
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
 }
 
@@ -485,8 +1056,248 @@ fn drain_lsp_events(ctx: &AppContext) {
                 );
             }
             LspEvent::ServerExited { server_kind, root } => {
-                log::info!("exited {:?} {}", server_kind, root.display());
+                aft::slog_info!("exited {:?} {}", server_kind, root.display());
+                ctx.status_emitter().signal(ctx.build_status_snapshot());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod watcher_filter_tests {
+    use super::{
+        dispatch_panic_response, drain_configure_warning_events, filter_watcher_raw_paths,
+        watcher_event_invalidates, write_push_frame_or_request_shutdown,
+    };
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame};
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        RenameMode,
+    };
+    use notify::EventKind;
+    use tempfile::TempDir;
+
+    fn make_ctx_with_root(root: &std::path::Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            },
+        )
+    }
+
+    #[test]
+    fn create_and_remove_invalidate() {
+        assert!(watcher_event_invalidates(&EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Remove(
+            RemoveKind::File
+        )));
+    }
+
+    #[test]
+    fn modify_data_invalidates() {
+        // The "actual file write" case — must invalidate.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Any)
+        )));
+    }
+
+    #[test]
+    fn modify_name_rename_invalidates() {
+        // Renames should invalidate the old path's cached state.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::To)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::From)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_writetime_invalidates() {
+        // mtime change implies real content edit on every supported platform.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_any_or_other_invalidates() {
+        // Catch-all "we can't tell what changed" — better to over-invalidate.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Other)
+        )));
+    }
+
+    /// Regression: biome-lint reading every TS file under Linux atime triggers
+    /// notify `Modify(Metadata(AccessTime))` events. Treating those as
+    /// invalidations re-parses the entire symbol cache, search index, and
+    /// semantic index for every read-only lint pass — wasted work.
+    #[test]
+    fn modify_metadata_access_time_does_not_invalidate() {
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_permissions_ownership_extended_do_not_invalidate() {
+        // chmod / chown / xattrs don't change content.
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Permissions)
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Ownership)
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Extended)
+        )));
+    }
+
+    #[test]
+    fn access_events_do_not_invalidate() {
+        // Read syscalls cause an atime feedback loop on Linux when the watcher
+        // is watching a directory we read into.
+        assert!(!watcher_event_invalidates(&EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+    }
+
+    #[test]
+    fn other_event_kinds_do_not_invalidate() {
+        // `Other`, `Any` — we explicitly opt out of unknown event categories
+        // since the existing `Modify(_)` and `Modify(Metadata(Any))` arms
+        // already handle the meaningful catch-all cases.
+        assert!(!watcher_event_invalidates(&EventKind::Other));
+        assert!(!watcher_event_invalidates(&EventKind::Any));
+    }
+
+    #[test]
+    fn dispatch_panic_response_is_clear_internal_error() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+
+        let response = dispatch_panic_response("panic-id", "db_get_state", payload.as_ref());
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "internal_error");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("command 'db_get_state' panicked: boom"));
+    }
+
+    #[test]
+    fn push_frame_write_error_requests_shutdown() {
+        struct BrokenWriter;
+
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdout closed",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let frame = PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new(
+            "/repo",
+            0,
+            false,
+            5_000,
+            Vec::new(),
+        ));
+
+        write_push_frame_or_request_shutdown(&mut BrokenWriter, &frame, &shutdown);
+
+        assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn configure_warning_drain_drops_stale_generation() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(tmp.path());
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel();
+        ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(move |frame| {
+            let _ = frame_tx.send(frame);
+        }))));
+
+        let warnings_tx = ctx.configure_warnings_sender();
+        let current_generation = ctx.advance_configure_generation();
+        warnings_tx
+            .send((
+                current_generation - 1,
+                ConfigureWarningsFrame::new("/stale", 1, false, 5_000, Vec::new()),
+            ))
+            .unwrap();
+        warnings_tx
+            .send((
+                current_generation,
+                ConfigureWarningsFrame::new("/current", 2, false, 5_000, Vec::new()),
+            ))
+            .unwrap();
+
+        drain_configure_warning_events(&ctx);
+
+        let frame = frame_rx.try_recv().expect("current warning frame");
+        match frame {
+            PushFrame::ConfigureWarnings(frame) => {
+                assert_eq!(frame.project_root, "/current");
+                assert_eq!(frame.source_file_count, 2);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        assert!(frame_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn gitignore_write_rebuilds_before_filtering_same_batch_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let gitignore = root.join(".gitignore");
+        let ignored = root.join("foo.txt");
+        let kept = root.join("bar.txt");
+        std::fs::write(&ignored, "ignored").unwrap();
+        std::fs::write(&kept, "kept").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        ctx.rebuild_gitignore();
+        assert!(ctx.gitignore().is_none());
+
+        std::fs::write(&gitignore, "foo.txt\n").unwrap();
+        let changed =
+            filter_watcher_raw_paths(&ctx, vec![gitignore.clone(), ignored.clone(), kept.clone()]);
+
+        let gitignore = std::fs::canonicalize(gitignore).unwrap();
+        let ignored = std::fs::canonicalize(ignored).unwrap();
+        let kept = std::fs::canonicalize(kept).unwrap();
+        assert!(changed.contains(&gitignore));
+        assert!(!changed.contains(&ignored));
+        assert!(changed.contains(&kept));
     }
 }

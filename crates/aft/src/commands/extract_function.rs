@@ -1,8 +1,8 @@
 //! Handler for the `extract_function` command: extract a range of code into
 //! a new function with auto-detected parameters and return value.
 //!
-//! Follows the edit_symbol.rs pattern: validate → parse → compute → dry_run
-//! check → auto_backup → write_format_validate → respond.
+//! Follows the edit_symbol.rs pattern: validate → parse → compute →
+//! auto_backup → write_format_validate → respond.
 
 use std::path::Path;
 
@@ -25,15 +25,17 @@ use crate::protocol::{RawRequest, Response};
 ///   - `name` (string, required) — name for the new function
 ///   - `start_line` (u32, required) — first line of the range to extract (1-based)
 ///   - `end_line` (u32, required) — last line (exclusive, 1-based) of the range to extract
-///   - `dry_run` (bool, optional) — if true, return diff without writing
 ///
 /// Returns on success:
-///   `{ file, name, parameters, return_type, extracted_range, call_site_range, syntax_valid, backup_id }`
+///   `{ file, name, parameters, return_type, extracted_range, call_site_range, syntax_valid?, backup_id }`
+///
+/// `syntax_valid` is absent when syntax validation could not run.
 ///
 /// Error codes:
 ///   - `unsupported_language` — file is not TS/JS/TSX/Python
 ///   - `this_reference_in_range` — range contains `this`/`self`
 pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -267,8 +269,27 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Compute new file content ---
     // Insert the extracted function before the enclosing function (or at the range position
     // if there's no enclosing function).
+    //
+    // For TS/JS, when the enclosing function is wrapped in `export` (or
+    // `export default`), the parser reports the function_declaration as
+    // a child of an export_statement. If we use fn_node.start_byte() as
+    // the insertion point, the `export` keyword stays attached to the
+    // start of the file content, and the extracted function gets inserted
+    // BETWEEN `export ` and `function`, producing:
+    //   `export function newFn(...) {} \n\n function originalFn(...) {}`
+    // The export keyword silently jumps from the original function to the
+    // extracted one. Fix: if the parent is an export_statement, insert
+    // before the export_statement instead.
     let insert_pos = if let Some(fn_node) = enclosing_fn {
-        fn_node.start_byte()
+        let mut anchor = fn_node;
+        if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+            if let Some(parent) = fn_node.parent() {
+                if parent.kind() == "export_statement" {
+                    anchor = parent;
+                }
+            }
+        }
+        anchor.start_byte()
     } else {
         start_byte
     };
@@ -289,28 +310,13 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         ReturnKind::Void => "void",
     };
 
-    // --- Dry-run check ---
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "dry_run": true,
-                "diff": dr.diff,
-                "syntax_valid": dr.syntax_valid,
-                "parameters": free_vars.parameters,
-                "return_type": return_type,
-            }),
-        );
-    }
-
     // --- Auto-backup before mutation ---
     let backup_id = match edit::auto_backup(
         ctx,
         req.session(),
         &path,
         &format!("extract_function: {}", name),
+        Some(&op_id),
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -328,12 +334,12 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
     }
 
     let param_count = free_vars.parameters.len();
     log::debug!(
-        "[aft] extract_function: {} from {}:{}-{} ({} params)",
+        "extract_function: {} from {}:{}-{} ({} params)",
         name,
         file,
         start_line,
@@ -342,16 +348,17 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     );
 
     // --- Build response ---
-    let syntax_valid = write_result.syntax_valid.unwrap_or(true);
-
     let mut result = serde_json::json!({
         "file": file,
         "name": name,
         "parameters": free_vars.parameters,
         "return_type": return_type,
-        "syntax_valid": syntax_valid,
         "formatted": write_result.formatted,
     });
+
+    if let Some(valid) = write_result.syntax_valid {
+        result["syntax_valid"] = serde_json::json!(valid);
+    }
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -623,33 +630,5 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);
         assert_eq!(json["code"], "this_reference_in_range");
-    }
-
-    #[test]
-    fn extract_function_dry_run_returns_diff() {
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/extract_function/sample.ts");
-
-        let req = make_request(
-            "7",
-            "extract_function",
-            serde_json::json!({
-                "file": fixture.display().to_string(),
-                "name": "computeResult",
-                "start_line": 15,
-                "end_line": 17,
-                "dry_run": true,
-            }),
-        );
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        let resp = handle_extract_function(&req, &ctx);
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["success"], true);
-        assert_eq!(json["dry_run"], true);
-        assert!(json["diff"].as_str().is_some(), "should have diff");
-        assert!(json["parameters"].is_array(), "should have parameters");
     }
 }

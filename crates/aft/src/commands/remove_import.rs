@@ -23,6 +23,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Returns: `{ file, removed, module, name?, syntax_valid?, backup_id? }`
 pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
+    let op_id = crate::backup::new_op_id();
     // --- Extract params ---
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -70,7 +71,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         None => {
             return Response::error(
                 &req.id,
-                "invalid_request",
+                "unsupported_language",
                 format!(
                     "remove_import: unsupported file extension: {}",
                     path.extension()
@@ -84,7 +85,7 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
     if !imports::is_supported(lang) {
         return Response::error(
             &req.id,
-            "invalid_request",
+            "unsupported_language",
             format!(
                 "remove_import: import management not yet supported for {:?}",
                 lang
@@ -147,28 +148,19 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::success(&req.id, result);
     }
 
-    // --- Auto-backup (skip for dry-run) ---
-    let backup_id = if !edit::is_dry_run(&req.params) {
-        match edit::auto_backup(ctx, req.session(), &path, "remove_import: pre-edit backup") {
-            Ok(id) => id,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
+    // --- Auto-backup ---
+    let backup_id = match edit::auto_backup(
+        ctx,
+        req.session(),
+        &path,
+        "remove_import: pre-edit backup",
+        Some(&op_id),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
         }
-    } else {
-        None
     };
-
-    // Dry-run: return diff without modifying disk
-    if edit::is_dry_run(&req.params) {
-        let dr = edit::dry_run_diff(&source, &new_source, &path);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true, "dry_run": true, "removed": true, "diff": dr.diff, "syntax_valid": dr.syntax_valid,
-            }),
-        );
-    }
 
     // --- Write, format, and validate ---
     let mut write_result =
@@ -180,7 +172,20 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
         };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_diagnostics = ctx.lsp_post_write(&path, &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
+    }
+
+    // A rollback means post-write syntax validation failed and the file was
+    // restored — the import was NOT removed. Report that honestly with an error
+    // instead of claiming `removed: true`.
+    if write_result.rolled_back {
+        return Response::error(
+            &req.id,
+            "generated_invalid_syntax",
+            format!(
+                "remove_import: removing '{module}' from {file} would produce invalid syntax; file left unchanged"
+            ),
+        );
     }
 
     log::debug!("remove_import: {}", file);
@@ -234,19 +239,29 @@ fn remove_name_from_imports(
     let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     for (_, imp) in matching {
-        if imp.names.contains(&target_name.to_string()) {
-            if imp.names.len() == 1 {
-                // Only one named import — remove entire statement
+        // Match against either the imported name or the local binding so the
+        // caller can ask to remove `input` even when the specifier is stored
+        // verbatim as `stdin as input` (TS/JS).
+        let any_match = imp
+            .names
+            .iter()
+            .any(|n| imports::specifier_matches(n, target_name));
+        if any_match {
+            let new_names: Vec<String> = imp
+                .names
+                .iter()
+                .filter(|n| !imports::specifier_matches(n, target_name))
+                .cloned()
+                .collect();
+            let has_other = imp.default_import.is_some()
+                || imp.namespace_import.is_some()
+                || !new_names.is_empty();
+            if !has_other {
+                // No bindings remain — remove entire statement
                 let range = line_range(source, &imp.byte_range);
                 edits.push((range, String::new()));
             } else {
-                // Multiple names — regenerate without target
-                let new_names: Vec<String> = imp
-                    .names
-                    .iter()
-                    .filter(|n| n.as_str() != target_name)
-                    .cloned()
-                    .collect();
+                // Other bindings remain — regenerate without target
                 let new_line = imports::generate_import_line(
                     lang,
                     &imp.module_path,

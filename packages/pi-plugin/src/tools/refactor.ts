@@ -3,11 +3,18 @@
  * Ops: move (symbol across files), extract (lines → function), inline (call site).
  */
 
-import { StringEnum } from "@mariozechner/pi-ai";
-import type { AgentToolResult, ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
-import { type Static, Type } from "@sinclair/typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  textResult,
+} from "./_shared.js";
 import {
   accentPath,
   asNumber,
@@ -19,21 +26,21 @@ import {
   renderErrorResult,
   renderSections,
   renderToolCall,
-  renderUnifiedDiff,
   shortenPath,
 } from "./render-helpers.js";
 
 const RefactorParams = Type.Object({
   op: StringEnum(["move", "extract", "inline"] as const, { description: "Refactoring operation" }),
-  filePath: Type.String({ description: "Source file" }),
+  filePath: Type.String({
+    description: "Source file (absolute or relative to project root)",
+  }),
   symbol: Type.Optional(Type.String({ description: "Symbol name (for move, inline)" })),
   destination: Type.Optional(Type.String({ description: "Target file (for move)" })),
   scope: Type.Optional(Type.String({ description: "Disambiguation scope for move op" })),
   name: Type.Optional(Type.String({ description: "New function name (for extract)" })),
-  startLine: Type.Optional(Type.Number({ description: "1-based start line (for extract)" })),
-  endLine: Type.Optional(Type.Number({ description: "1-based end line, inclusive (for extract)" })),
-  callSiteLine: Type.Optional(Type.Number({ description: "1-based call site line (for inline)" })),
-  dryRun: Type.Optional(Type.Boolean({ description: "Preview as diff" })),
+  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  callSiteLine: optionalInt(1, Number.MAX_SAFE_INTEGER),
 });
 
 /** Exported for renderer unit tests. */
@@ -44,22 +51,6 @@ export function buildRefactorSections(
 ): string[] {
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No refactor result.")];
-
-  if (response.dry_run === true) {
-    const diffs = asRecords(response.diffs);
-    const sections = [theme.fg("warning", `[dry run] ${args.op}`)];
-    if (diffs.length === 0) {
-      sections.push(theme.fg("muted", "No diff available."));
-      return sections;
-    }
-    diffs.forEach((diff) => {
-      const file = shortenPath(asString(diff.file) ?? "(unknown file)");
-      const rendered =
-        renderUnifiedDiff(asString(diff.diff) ?? "") || theme.fg("muted", "No diff available.");
-      sections.push(`${theme.fg("accent", file)}\n${rendered}`);
-    });
-    return sections;
-  }
 
   if (args.op === "move") {
     const results = asRecords(response.results);
@@ -127,7 +118,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_refactor",
     label: "refactor",
     description:
-      "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol (only top-level exports); `extract` pulls a line range into a new function; `inline` replaces a call site with the function body.",
+      "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol; `extract` pulls a line range into a new function; `inline` replaces a call site. Use aft_safety checkpoint/undo before risky refactors.",
     parameters: RefactorParams,
     async execute(
       _toolCallId: string,
@@ -142,18 +133,45 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         extract: "extract_function",
         inline: "inline_symbol",
       };
-      const req: Record<string, unknown> = { file: params.filePath };
-      if (params.symbol !== undefined) req.symbol = params.symbol;
-      if (params.destination !== undefined) req.destination = params.destination;
-      if (params.scope !== undefined) req.scope = params.scope;
-      if (params.name !== undefined) req.name = params.name;
-      if (params.startLine !== undefined) req.start_line = params.startLine;
-      // Agent uses inclusive end_line; Rust extract_function expects exclusive.
-      if (params.endLine !== undefined) {
-        req.end_line = params.op === "extract" ? params.endLine + 1 : params.endLine;
+      // Per-op required-field validation using isEmptyParam so empty strings
+      // ("") sent by GPT-family models trigger the proper "required" error
+      // instead of being passed through to Rust as a valid empty value.
+      if ((params.op === "move" || params.op === "inline") && isEmptyParam(params.symbol)) {
+        throw new Error(`'symbol' is required for '${params.op}' op`);
       }
-      if (params.callSiteLine !== undefined) req.call_site_line = params.callSiteLine;
-      if (params.dryRun !== undefined) req.dry_run = params.dryRun;
+      if (params.op === "move" && isEmptyParam(params.destination)) {
+        throw new Error("'destination' is required for 'move' op");
+      }
+      if (params.op === "extract" && isEmptyParam(params.name)) {
+        throw new Error("'name' is required for 'extract' op");
+      }
+
+      const req: Record<string, unknown> = { file: params.filePath };
+      // Use isEmptyParam everywhere so "" / [] / null don't slip through as
+      // valid string params that Rust then has to deal with.
+      if (!isEmptyParam(params.symbol)) req.symbol = params.symbol;
+      if (!isEmptyParam(params.destination)) req.destination = params.destination;
+      if (!isEmptyParam(params.scope)) req.scope = params.scope;
+      if (!isEmptyParam(params.name)) req.name = params.name;
+      const startLine = coerceOptionalInt(
+        params.startLine,
+        "startLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      const endLine = coerceOptionalInt(params.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+      const callSiteLine = coerceOptionalInt(
+        params.callSiteLine,
+        "callSiteLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      if (startLine !== undefined) req.start_line = startLine;
+      // Agent uses inclusive end_line; Rust extract_function expects exclusive.
+      if (endLine !== undefined) {
+        req.end_line = params.op === "extract" ? endLine + 1 : endLine;
+      }
+      if (callSiteLine !== undefined) req.call_site_line = callSiteLine;
       const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
       return textResult(JSON.stringify(response, null, 2));
     },

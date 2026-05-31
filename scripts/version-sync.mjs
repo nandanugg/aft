@@ -10,12 +10,13 @@
  *   node scripts/version-sync.mjs --from-tag       # read from GITHUB_REF_NAME (e.g. v0.2.0)
  *   node scripts/version-sync.mjs 0.2.0 --dry-run  # preview changes without writing
  *
- * Updates 9 locations:
+ * Updates 10 locations:
  *   1-5. npm/{platform}/package.json  → version field
- *   6.   aft-opencode/package.json → version field + all optionalDependencies versions
- *   7.   aft-pi/package.json → version field + all optionalDependencies versions
- *   8.   aft-cli/package.json → version field
- *   9.   Cargo.toml → version field
+ *   6.   aft-bridge/package.json → version field
+ *   7.   aft-opencode/package.json → version field + all optionalDependencies versions + aft-bridge dep
+ *   8.   aft-pi/package.json → version field + all optionalDependencies versions + aft-bridge dep
+ *   9.   aft-cli/package.json → version field + aft-bridge dep (workspace:* → semver)
+ *   10.  Cargo.toml → version field
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -27,7 +28,14 @@ const root = join(__dirname, "..");
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/;
 
-const PLATFORM_DIRS = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64"];
+const PLATFORM_DIRS = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-arm64",
+  "linux-x64",
+  "win32-arm64",
+  "win32-x64",
+];
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -94,6 +102,16 @@ function updateJsonFile(filePath, version, updates, dryRun) {
     }
   }
 
+  // Update internal @cortexkit/aft-* dependencies (e.g. aft-bridge in plugins)
+  if (updates?.internalDeps && pkg.dependencies) {
+    for (const [dep, oldVer] of Object.entries(pkg.dependencies)) {
+      if (dep.startsWith("@cortexkit/aft-") && oldVer !== version) {
+        changes.push(`  dependencies["${dep}"]: ${oldVer} → ${version}`);
+        pkg.dependencies[dep] = version;
+      }
+    }
+  }
+
   if (changes.length === 0) {
     return { path: filePath, changes: ["  (already at target version)"] };
   }
@@ -131,6 +149,48 @@ function updateCargoToml(filePath, version, dryRun) {
   return { path: filePath, changes };
 }
 
+/**
+ * Update an inline path-dep version pin in a Cargo.toml.
+ *
+ * Matches a line of the form:
+ *   <depName> = { path = "...", version = "<old>" [, ...] }
+ *
+ * and rewrites just the `version = "..."` segment. The path remains
+ * load-bearing for workspace builds; the version is required so cargo
+ * accepts the manifest for publication and so consumers resolving from
+ * crates.io get the matching version.
+ */
+function updateCargoPathDep(filePath, depName, version, dryRun) {
+  const content = readFileSync(filePath, "utf-8");
+  // depName can contain hyphens — escape for safe regex insertion.
+  const depEscaped = depName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+  // Match a line starting with `<dep> = { ... version = "<old>" ... }`.
+  // Capture the prefix up to (and including) `version = "` so we can rewrite
+  // just the version literal without touching path or other fields.
+  const re = new RegExp(`^(${depEscaped}\\s*=\\s*\\{[^\\n]*version\\s*=\\s*)"([^"]+)"`, "m");
+  const match = content.match(re);
+
+  if (!match) {
+    return {
+      path: filePath,
+      changes: [`  WARNING: could not find ${depName} path-dep with version pin`],
+    };
+  }
+
+  if (match[2] === version) {
+    return { path: filePath, changes: [`  (${depName} dep already at target version)`] };
+  }
+
+  const changes = [`  ${depName} dep version: ${match[2]} → ${version}`];
+
+  if (!dryRun) {
+    const updated = content.replace(re, `$1"${version}"`);
+    writeFileSync(filePath, updated, "utf-8");
+  }
+
+  return { path: filePath, changes };
+}
+
 // --- Main ---
 
 const { version, dryRun } = parseArgs(process.argv);
@@ -145,21 +205,46 @@ for (const dir of PLATFORM_DIRS) {
   results.push(updateJsonFile(filePath, version, {}, dryRun));
 }
 
-// 6: @cortexkit/aft-opencode
+// 6: @cortexkit/aft-bridge (shared transport)
+const bridgePath = join(root, "packages", "aft-bridge", "package.json");
+results.push(updateJsonFile(bridgePath, version, {}, dryRun));
+
+// 7: @cortexkit/aft-opencode
 const corePath = join(root, "packages", "opencode-plugin", "package.json");
-results.push(updateJsonFile(corePath, version, { optionalDependencies: true }, dryRun));
+results.push(
+  updateJsonFile(corePath, version, { optionalDependencies: true, internalDeps: true }, dryRun),
+);
 
-// 7: @cortexkit/aft-pi
+// 8: @cortexkit/aft-pi
 const piPath = join(root, "packages", "pi-plugin", "package.json");
-results.push(updateJsonFile(piPath, version, { optionalDependencies: true }, dryRun));
+results.push(
+  updateJsonFile(piPath, version, { optionalDependencies: true, internalDeps: true }, dryRun),
+);
 
-// 8: @cortexkit/aft (unified CLI)
+// 9: @cortexkit/aft (unified CLI)
+// internalDeps: true rewrites `@cortexkit/aft-bridge: "workspace:*"` → the
+// real semver at publish time. Bun resolves workspace:* in local dev but
+// `npm publish` does not, so without this rewrite the published tarball
+// leaks the protocol literally and `npx @cortexkit/aft@<version>` fails
+// with EUNSUPPORTEDPROTOCOL on install. See note for v0.28.0 → v0.28.1
+// regression: aft-bridge wasn't a runtime dep of the CLI before #46 added
+// doctor --fix's ensureBinary() call, so this gap stayed latent until that
+// commit shipped.
 const cliPath = join(root, "packages", "aft-cli", "package.json");
-results.push(updateJsonFile(cliPath, version, {}, dryRun));
+results.push(updateJsonFile(cliPath, version, { internalDeps: true }, dryRun));
 
-// 9: Cargo.toml
+// 10: Cargo.toml — agent-file-tools (main crate)
 const cargoPath = join(root, "crates", "aft", "Cargo.toml");
 results.push(updateCargoToml(cargoPath, version, dryRun));
+
+// 11: Cargo.toml — aft-tokenizer (leaf crate, published first so the main
+// crate can resolve its `version =` constraint from crates.io). Also keep
+// the inline path-dep version pin (`aft-tokenizer = { path = "...",
+// version = "<version>" }`) in `crates/aft/Cargo.toml` in lockstep — cargo
+// refuses to publish a crate whose path-dep has no `version =`.
+const tokenizerPath = join(root, "crates", "aft-tokenizer", "Cargo.toml");
+results.push(updateCargoToml(tokenizerPath, version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-tokenizer", version, dryRun));
 
 // Report
 let updateCount = 0;

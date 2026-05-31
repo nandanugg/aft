@@ -6,6 +6,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  formatZoomBatchResult,
   renderOutlineCall,
   renderOutlineResult,
   renderZoomCall,
@@ -16,13 +17,13 @@ import { makeContext, makeResult, mockTheme, renderToString } from "./render-tes
 describe("reading renderers", () => {
   test("renderOutlineCall and renderZoomCall show targets", () => {
     const outline = renderToString(
-      renderOutlineCall({ filePath: "src/a.ts" }, mockTheme, makeContext({ filePath: "src/a.ts" })),
+      renderOutlineCall({ target: "src/a.ts" }, mockTheme, makeContext({ target: "src/a.ts" })),
     );
     const zoom = renderToString(
       renderZoomCall(
-        { filePath: "src/a.ts", symbol: "run" },
+        { filePath: "src/a.ts", symbols: "run" },
         mockTheme,
-        makeContext({ filePath: "src/a.ts", symbol: "run" }),
+        makeContext({ filePath: "src/a.ts", symbols: "run" }),
       ),
     );
 
@@ -80,5 +81,44 @@ describe("reading renderers", () => {
 
     expect(error).toContain("symbol not found");
     expect(empty).toContain("No outline available");
+  });
+
+  test("batched zoom keeps successes visible when another symbol fails", () => {
+    const batch = formatZoomBatchResult(
+      "sample.ts",
+      ["run", "Missing"],
+      [
+        {
+          success: true,
+          name: "run",
+          kind: "function",
+          range: { start_line: 1, end_line: 1, start_col: 0, end_col: 24 },
+          content: "export function run() {}",
+          context_before: [],
+          context_after: [],
+          annotations: { calls_out: [], called_by: [] },
+        },
+        { success: false, message: "symbol not found" },
+      ],
+    );
+    const rendered = renderToString(
+      renderZoomResult(
+        makeResult(batch.text, batch),
+        { filePath: "sample.ts", symbols: ["run", "Missing"] },
+        mockTheme,
+        makeContext({ filePath: "sample.ts", symbols: ["run", "Missing"] }),
+      ),
+    );
+
+    expect(batch.complete).toBe(false);
+    expect(batch.text).toContain("Incomplete zoom results");
+    // Successful entries are now formatted as plain text via formatZoomText —
+    // line-numbered, no JSON escapes.
+    expect(batch.text).toContain("sample.ts:1-1 [function run]");
+    expect(batch.text).toContain("export function run() {}");
+    expect(batch.text).toContain('Symbol "Missing" not found: symbol not found');
+    expect(rendered).toContain("Incomplete zoom results");
+    expect(rendered).toContain("export function run() {}");
+    expect(rendered).toContain("symbol not found");
   });
 });
