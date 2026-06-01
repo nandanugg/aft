@@ -695,6 +695,13 @@ impl AppContext {
             // Hidden files are filtered by default, but `.gitignore` starts with
             // `.` so we need to traverse "hidden" entries to find nested ones.
             .hidden(false)
+            // Bound the nested-ignore-file discovery walk. Without this, a
+            // configure against a very high root (e.g. `/`) walks the entire
+            // filesystem and blocks the request for minutes. Eight levels is
+            // ample for real nested `.gitignore`/`.aftignore` files; this
+            // matches the cap that shipped through v0.33.0 (a refactor dropped
+            // it, which regressed `configure` on large/high roots).
+            .max_depth(Some(8))
             .filter_entry(|entry| {
                 let name = entry.file_name().to_string_lossy();
                 !matches!(
