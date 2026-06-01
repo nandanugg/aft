@@ -302,9 +302,9 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         .collect::<Vec<_>>();
 
     let edges_by_source = edges_by_source(&parsed);
-    let reachable = reachable_exports(&parsed, &edges_by_source);
-    let referenced_type_names = collect_referenced_type_names(&parsed);
     let dispatched_method_names = collect_dispatched_method_names(&parsed);
+    let reachable = reachable_exports(&parsed, &edges_by_source, &dispatched_method_names);
+    let referenced_type_names = collect_referenced_type_names(&parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
@@ -408,6 +408,7 @@ fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTre
 fn reachable_exports(
     contributions: &[DeadCodeContribution],
     edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    dispatched_method_names: &BTreeSet<String>,
 ) -> BTreeSet<ExportNode> {
     let imported_exports_by_file = imported_exports_by_file(contributions);
     let namespace_imports_by_file = namespace_imported_exports_by_file(contributions);
@@ -423,6 +424,24 @@ fn reachable_exports(
             if export.is_entry_point {
                 queue.push_back((contribution.file.clone(), export.symbol.clone()));
             }
+        }
+    }
+
+    // Methods reached only via receiver dispatch (`obj.method()`) carry no
+    // resolvable call edge — the receiver type is unknown — so they never
+    // become reachable BFS nodes. They ARE rescued from the dead list by name
+    // (`dispatched_method_names`), but that rescue keeps only the method itself
+    // alive; it does NOT propagate liveness THROUGH the method body. Every free
+    // function the method calls is then orphaned and reported dead despite
+    // having real callers (e.g. `BgTaskRegistry::spawn` -> `task_paths`, which
+    // has 33 callers yet was flagged dead). Seed each dispatch-live method body
+    // as a BFS root, keyed by its scoped caller identity (`Type::method`, the
+    // form `edges_by_source` uses for sources) so liveness flows through to the
+    // method's callees. This widens the existing dead_code under-reporting bias
+    // by exactly one hop and never severs a live chain.
+    for source in edges_by_source.keys() {
+        if dispatched_method_names.contains(symbol_liveness_name(&source.1)) {
+            queue.push_back(source.clone());
         }
     }
 
@@ -1832,6 +1851,63 @@ mod tests {
         assert_eq!(aggregate["count"], 1);
         assert_eq!(aggregate["items"][0]["symbol"], "render");
         assert_eq!(aggregate["uncertain_count"], 0);
+    }
+
+    #[test]
+    fn free_function_called_from_dispatch_live_method_body_is_live() {
+        // Regression for the dead_code reachability bug: a free function reached
+        // only through a method whose only caller is a receiver dispatch
+        // (`obj.method()`) must NOT be reported dead. The method ("render") is
+        // rescued from the dead list by dispatch-name, but liveness must also
+        // flow THROUGH its body to the free function it calls ("helper").
+        // Mirrors the real `BgTaskRegistry::spawn` -> `task_paths` case, where
+        // `task_paths` had 33 callers yet was flagged dead because the BFS never
+        // entered the dispatch-only method body. Method bodies are keyed by
+        // scoped identity (`Service::render`) while exports are bare (`render`),
+        // so the body edge is unreachable without seeding the scoped method node.
+        let (_temp_dir, root, paths) = fixture_project(&[
+            (
+                "src/service.ts",
+                "export class Service { render() { helper(); } }\n",
+            ),
+            ("src/helper.ts", "export function helper() {}\n"),
+            (
+                "src/consumer.ts",
+                "function run(service: Service) { service.render(); }\n",
+            ),
+        ]);
+        let helper_target = format!("{}::helper", root.join("src/helper.ts").display());
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(
+                paths,
+                vec![
+                    export(&root, "src/service.ts", "render", "method"),
+                    export(&root, "src/helper.ts", "helper", "function"),
+                ],
+                vec![
+                    // The method's ONLY caller is a receiver dispatch — no
+                    // resolvable edge into `Service::render`.
+                    outbound(
+                        &root,
+                        "src/consumer.ts",
+                        "run",
+                        &dispatched_target("render", "service.render"),
+                    ),
+                    // The dispatch-only method body calls a free function. The
+                    // caller identity is scoped (`Service::render`), the form the
+                    // edge map uses for sources.
+                    outbound(&root, "src/service.ts", "Service::render", &helper_target),
+                ],
+            ),
+        ));
+
+        assert_eq!(
+            aggregate["count"], 0,
+            "free function reached via dispatch-live method body must be live: {aggregate:#}"
+        );
+        assert!(aggregate["items"].as_array().unwrap().is_empty());
     }
 
     #[test]
