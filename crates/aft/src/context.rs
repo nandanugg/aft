@@ -1717,11 +1717,47 @@ mod gitignore_tests {
             .is_ignore()
     }
 
+    /// Run `f` with global git-ignore discovery neutralized.
+    ///
+    /// `rebuild_gitignore` loads git's global excludes (the `ignore` crate
+    /// resolves `$XDG_CONFIG_HOME/git/ignore`, falling back to
+    /// `$HOME/.config/git/ignore`). A developer machine commonly has that file,
+    /// so a "no project ignore → None" assertion is only deterministic when
+    /// global discovery is pointed at an empty directory. Pointing
+    /// `XDG_CONFIG_HOME` at a fresh tempdir does that without touching `HOME`
+    /// (so it can't race the `HOME`-mutating configure tests). Serialized by a
+    /// process-local mutex; env is restored before the closure result is used.
+    fn with_neutralized_global_gitignore<R>(f: impl FnOnce() -> R) -> R {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by LOCK above; restored immediately after `f`.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
     #[test]
     fn rebuild_gitignore_returns_none_without_project_root() {
         let provider = Box::new(crate::parser::TreeSitterProvider::new());
         let ctx = AppContext::new(provider, Config::default());
-        ctx.rebuild_gitignore();
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
         assert!(ctx.gitignore().is_none());
     }
 
@@ -1729,7 +1765,7 @@ mod gitignore_tests {
     fn rebuild_gitignore_returns_none_for_project_with_no_gitignore() {
         let tmp = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(tmp.path());
-        ctx.rebuild_gitignore();
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
         assert!(ctx.gitignore().is_none());
     }
 
