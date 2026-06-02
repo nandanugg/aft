@@ -28,9 +28,13 @@ mock.module("solid-js", () => ({
   onCleanup: () => undefined,
 }));
 
-const { formatCompressionSidebarRows, resolveTuiStorageDir, scopedSidebarSnapshot } = await import(
-  "../tui/sidebar.tsx"
-);
+const {
+  collapsedCompressionValue,
+  formatCompressionSidebarRows,
+  resolveTuiStorageDir,
+  scopedSidebarSnapshot,
+  shouldSuppressUninitializedDowngrade,
+} = await import("../tui/sidebar.tsx");
 
 const compression = (overrides: Partial<StatusCompression> = {}): StatusCompression => ({
   project: {
@@ -105,5 +109,71 @@ describe("sidebar compression rows", () => {
     expect(rows).toHaveLength(3);
     expect(rows[0]).toEqual({ kind: "scope", label: "Project" });
     expect(rows.some((row) => row.kind === "scope" && row.label === "Session")).toBe(false);
+  });
+});
+
+describe("shouldSuppressUninitializedDowngrade (sidebar flicker fix)", () => {
+  test("suppresses a not_initialized downgrade when good data is already shown", () => {
+    expect(shouldSuppressUninitializedDowngrade("not_initialized", true)).toBe(true);
+  });
+
+  test("allows the first not_initialized snapshot (no good data yet)", () => {
+    expect(shouldSuppressUninitializedDowngrade("not_initialized", false)).toBe(false);
+  });
+
+  test("never suppresses a real (initialized) snapshot, even over good data", () => {
+    expect(shouldSuppressUninitializedDowngrade("main", true)).toBe(false);
+    expect(shouldSuppressUninitializedDowngrade("worktree", true)).toBe(false);
+  });
+
+  test("treats undefined cache_role as a real snapshot (does not suppress)", () => {
+    expect(shouldSuppressUninitializedDowngrade(undefined, true)).toBe(false);
+  });
+});
+
+describe("collapsedCompressionValue (collapsed sidebar row)", () => {
+  test("returns null when no compression recorded (0 project events)", () => {
+    expect(collapsedCompressionValue(undefined)).toBeNull();
+    expect(
+      collapsedCompressionValue(compression({ project: { ...compression().project, events: 0 } })),
+    ).toBeNull();
+  });
+
+  test("shortens tokens and shows ratio — e.g. 7.6M / 64%", () => {
+    const value = collapsedCompressionValue(
+      compression({
+        project: {
+          events: 100,
+          original_tokens: 11_900_000,
+          compressed_tokens: 4_235_000,
+          savings_tokens: 7_665_687,
+        },
+      }),
+    );
+    // 7,665,687 → 7.7M (formatCount rounds to one decimal); ratio 7.66M/11.9M ≈ 64%.
+    expect(value).toBe("7.7M / 64%");
+  });
+
+  test("uses K scale for thousands", () => {
+    const value = collapsedCompressionValue(
+      compression({
+        project: {
+          events: 5,
+          original_tokens: 10_000,
+          compressed_tokens: 6_500,
+          savings_tokens: 3_500,
+        },
+      }),
+    );
+    expect(value).toBe("4K / 35%");
+  });
+
+  test("0% ratio when original tokens is 0 (no divide-by-zero)", () => {
+    const value = collapsedCompressionValue(
+      compression({
+        project: { events: 1, original_tokens: 0, compressed_tokens: 0, savings_tokens: 0 },
+      }),
+    );
+    expect(value).toBe("0 / 0%");
   });
 });

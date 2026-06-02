@@ -17,6 +17,7 @@ import {
   createAftSidebarSlot,
   formatCompressionSidebarRows,
   resolveTuiStorageDir,
+  shouldSuppressUninitializedDowngrade,
 } from "./sidebar";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
@@ -160,7 +161,20 @@ const StatusDialog = (props: StatusDialogProps) => {
       );
       if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
       if ((response as Record<string, unknown>).success !== false) {
-        setStatus(coerceAftStatus(response as Record<string, unknown>));
+        const snapshot = coerceAftStatus(response as Record<string, unknown>);
+        // Stale-while-revalidate: don't downgrade a good snapshot to a transient
+        // `not_initialized` (bridge mid-respawn / session-dir key miss) — it
+        // arrives as success:true and would blank the dialog until the next poll.
+        const current = status();
+        if (
+          shouldSuppressUninitializedDowngrade(
+            snapshot.cache_role,
+            current !== null && current.cache_role !== "not_initialized",
+          )
+        ) {
+          return;
+        }
+        setStatus(snapshot);
         setError(null);
       }
     } catch {

@@ -142,6 +142,43 @@ const SectionHeader = (props: { theme: TuiThemeCurrent; title: string; marginTop
   </box>
 );
 
+// Map a status tone to a theme color — used for the collapsed-view status dots.
+function toneColor(theme: TuiThemeCurrent, tone: "ok" | "warn" | "err" | "muted"): string {
+  switch (tone) {
+    case "ok":
+      return theme.success ?? theme.accent;
+    case "warn":
+      return theme.warning;
+    case "err":
+      return theme.error;
+    default:
+      return theme.textMuted;
+  }
+}
+
+// Collapsed-view row: label on the left, a status dot (or compact value) on the
+// right. Mirrors the expanded StatRow layout so the columns line up.
+const CollapsedRow = (props: { theme: TuiThemeCurrent; label: string; children: JSX.Element }) => (
+  <box width="100%" flexDirection="row" justifyContent="space-between">
+    <text fg={props.theme.textMuted}>{props.label}</text>
+    {props.children}
+  </box>
+);
+
+// Compact "saved / ratio" string for the collapsed Compression row — e.g.
+// "7.6M / 64%". Uses the local `formatCount` (not the aft-bridge token
+// formatter) so the TUI bundle doesn't pull the bridge barrel, which exports
+// URL-fetch helpers unsuitable for Bun's TUI runtime. Returns null when no
+// compression has been recorded yet.
+export function collapsedCompressionValue(
+  compression: StatusCompression | undefined,
+): string | null {
+  if (!compression || compression.project.events <= 0) return null;
+  const { savings_tokens, original_tokens } = compression.project;
+  const pct = original_tokens > 0 ? Math.round((savings_tokens / original_tokens) * 100) : 0;
+  return `${formatCount(savings_tokens)} / ${pct}%`;
+}
+
 // v0.27 moved AFT storage to the CortexKit root. TUI code must use a
 // lightweight local path helper rather than the shared bridge barrel, which
 // also exports URL-fetch helpers unsuitable for Bun's TUI runtime.
@@ -177,6 +214,22 @@ export function scopedSidebarSnapshot(
   return scoped.snapshot;
 }
 
+/**
+ * Stale-while-revalidate guard. A transient `not_initialized` snapshot (bridge
+ * mid-respawn after a binary swap, or a momentary session-dir key miss) arrives
+ * over RPC as `success: true`, so a naive `setStatus` would overwrite a good
+ * snapshot and collapse the panel to the lazy-bridge placeholder — the blank
+ * flicker that recovers on the next poll. Suppress the downgrade only when we
+ * already hold initialized data for the same context; never blocks the first
+ * real snapshot, and a genuine context switch clears separately.
+ */
+export function shouldSuppressUninitializedDowngrade(
+  incomingCacheRole: string | undefined,
+  haveInitializedForContext: boolean,
+): boolean {
+  return incomingCacheRole === "not_initialized" && haveInitializedForContext;
+}
+
 const SidebarContent = (props: {
   api: TuiPluginApi;
   sessionID: () => string;
@@ -184,6 +237,9 @@ const SidebarContent = (props: {
   pluginVersion: string;
 }) => {
   const [status, setStatus] = createSignal<ScopedSidebarStatus | null>(null);
+  // Collapsed/expanded toggle — local UI state (not persisted), mirroring
+  // OpenCode's native MCP sidebar section. Default expanded.
+  const [collapsed, setCollapsed] = createSignal(false);
   let inflight: {
     controller: AbortController;
     generation: number;
@@ -251,6 +307,16 @@ const SidebarContent = (props: {
       if (currentDirectory() !== directory || props.sessionID() !== sid) return;
       if (response && (response as Record<string, unknown>).success !== false) {
         const snapshot = coerceAftStatus(response as Record<string, unknown>);
+        // Stale-while-revalidate: keep the last-good snapshot instead of
+        // flickering to the lazy-bridge placeholder on a transient
+        // not_initialized. See shouldSuppressUninitializedDowngrade.
+        const current = status();
+        const haveGoodForContext =
+          current !== null &&
+          current.directory === directory &&
+          current.sessionID === sid &&
+          current.snapshot.cache_role !== "not_initialized";
+        if (shouldSuppressUninitializedDowngrade(snapshot.cache_role, haveGoodForContext)) return;
         setStatus({ directory, sessionID: sid, snapshot });
         requestRender();
       }
@@ -394,12 +460,27 @@ const SidebarContent = (props: {
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: AFT badge + binary version + degraded badge (when active) */}
-      <box flexDirection="row" justifyContent="space-between" alignItems="center">
+      {/* Header: triangle toggle + AFT badge + binary version + degraded badge.
+          Clicking the header row collapses/expands the panel (mirrors OpenCode's
+          native MCP sidebar section). Only interactive once initialized — the
+          lazy-bridge placeholder has nothing to collapse. */}
+      <box
+        flexDirection="row"
+        justifyContent="space-between"
+        alignItems="center"
+        onMouseDown={() => {
+          if (!notInitialized()) setCollapsed((x) => !x);
+        }}
+      >
         <box flexDirection="row" alignItems="center">
+          {/* Triangle lives inside the accent badge so the toggle reads as one
+              unit: "▶ AFT" / "▼ AFT". Hidden pre-init (nothing to collapse). */}
           <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
             <text fg={props.theme.background}>
-              <b>AFT</b>
+              <b>
+                {notInitialized() ? "" : collapsed() ? "▶ " : "▼ "}
+                AFT
+              </b>
             </text>
           </box>
           {s()?.degraded && (
@@ -445,8 +526,29 @@ const SidebarContent = (props: {
         </box>
       )}
 
+      {/* Collapsed view — condensed status dots + compact compression. Shown
+          only when initialized AND collapsed. Three rows mirroring the section
+          order of the expanded grid. */}
+      {!notInitialized() && collapsed() && (
+        <box width="100%" flexDirection="column">
+          <CollapsedRow theme={props.theme} label="Search Index">
+            <text fg={toneColor(props.theme, searchStatus().tone)}>●</text>
+          </CollapsedRow>
+          <CollapsedRow theme={props.theme} label="Semantic Index">
+            <text fg={toneColor(props.theme, semanticStatus().tone)}>●</text>
+          </CollapsedRow>
+          {collapsedCompressionValue(s()?.compression) && (
+            <CollapsedRow theme={props.theme} label="Compression">
+              <text fg={props.theme.textMuted}>
+                <b>{collapsedCompressionValue(s()?.compression)}</b>
+              </text>
+            </CollapsedRow>
+          )}
+        </box>
+      )}
+
       {/* Search index */}
-      {!notInitialized() && (
+      {!notInitialized() && !collapsed() && (
         <>
           <SectionHeader theme={props.theme} title="Search Index" />
           <StatRow
