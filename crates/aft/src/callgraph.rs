@@ -370,6 +370,7 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::CSharp
         | LangId::Bash
         | LangId::Solidity
+        | LangId::Scss
         | LangId::Vue
         | LangId::Json
         | LangId::Scala

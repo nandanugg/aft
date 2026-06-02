@@ -2697,7 +2697,10 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "sh"
                 | "bash"
                 | "zsh"
+                | "inc"
+                | "php"
                 | "sol"
+                | "scss"
                 | "vue"
                 | "yaml"
                 | "yml"
@@ -2947,6 +2950,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn semantic_index_includes_php_inc_and_scss_extensions() {
+        for file in ["partial.inc", "index.php", "styles.scss"] {
+            assert!(
+                is_semantic_indexed_extension(Path::new(file)),
+                "{file} should be semantic-index eligible"
+            );
+        }
+    }
 
     fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
     where

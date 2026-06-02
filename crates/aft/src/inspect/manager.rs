@@ -1688,6 +1688,7 @@ fn duplicates_supports_language(language: crate::parser::LangId) -> bool {
             | crate::parser::LangId::Json
             | crate::parser::LangId::Scala
             | crate::parser::LangId::Solidity
+            | crate::parser::LangId::Scss
             | crate::parser::LangId::Vue
             | crate::parser::LangId::Markdown
             | crate::parser::LangId::Java
@@ -1726,6 +1727,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Markdown => "markdown",
         crate::parser::LangId::Yaml => "yaml",
         crate::parser::LangId::Solidity => "solidity",
+        crate::parser::LangId::Scss => "scss",
         crate::parser::LangId::Vue => "vue",
         crate::parser::LangId::Json => "json",
         crate::parser::LangId::Scala => "scala",

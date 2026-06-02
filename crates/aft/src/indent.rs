@@ -42,6 +42,7 @@ impl IndentStyle {
             | LangId::Scala
             | LangId::Ruby
             | LangId::Lua
+            | LangId::Scss
             | LangId::Yaml => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,

@@ -200,6 +200,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Markdown) => "markdown",
         Some(LangId::Yaml) => "yaml",
         Some(LangId::Solidity) => "solidity",
+        Some(LangId::Scss) => "scss",
         Some(LangId::Vue) => "vue",
         Some(LangId::Json) => "json",
         Some(LangId::Scala) => "scala",

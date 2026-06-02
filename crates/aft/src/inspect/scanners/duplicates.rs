@@ -518,6 +518,7 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::Json
             | LangId::Scala
             | LangId::Solidity
+            | LangId::Scss
             | LangId::Vue
             | LangId::Markdown
             | LangId::Java
@@ -546,6 +547,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Markdown => "markdown",
         LangId::Yaml => "yaml",
         LangId::Solidity => "solidity",
+        LangId::Scss => "scss",
         LangId::Vue => "vue",
         LangId::Json => "json",
         LangId::Scala => "scala",

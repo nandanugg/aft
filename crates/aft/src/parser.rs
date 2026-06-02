@@ -391,6 +391,21 @@ const SOL_QUERY: &str = r#"
   name: (identifier) @var.name) @var.def
 "#;
 
+const SCSS_QUERY: &str = r#"
+;; SCSS definitions
+(mixin_statement
+  name: (identifier) @mixin.name) @mixin.def
+
+(function_statement
+  name: (identifier) @fn.name) @fn.def
+
+(declaration
+  (property_name) @var.name) @var.def
+
+(rule_set
+  (selectors) @selector.name) @selector.def
+"#;
+
 const SCALA_QUERY: &str = r#"
 ;; classes / objects / traits
 (class_definition
@@ -576,6 +591,7 @@ pub enum LangId {
     Html,
     Markdown,
     Solidity,
+    Scss,
     Vue,
     Json,
     Scala,
@@ -607,6 +623,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "html" | "htm" => Some(LangId::Html),
         "md" | "markdown" | "mdx" => Some(LangId::Markdown),
         "sol" => Some(LangId::Solidity),
+        "scss" => Some(LangId::Scss),
         "vue" => Some(LangId::Vue),
         "json" | "jsonc" => Some(LangId::Json),
         "scala" | "sc" => Some(LangId::Scala),
@@ -614,7 +631,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "rb" => Some(LangId::Ruby),
         "kt" | "kts" => Some(LangId::Kotlin),
         "swift" => Some(LangId::Swift),
-        "php" => Some(LangId::Php),
+        "inc" | "php" => Some(LangId::Php),
         "lua" => Some(LangId::Lua),
         "pl" | "pm" | "t" => Some(LangId::Perl),
         "yaml" | "yml" => Some(LangId::Yaml),
@@ -639,6 +656,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Html => tree_sitter_html::LANGUAGE.into(),
         LangId::Markdown => tree_sitter_md::LANGUAGE.into(),
         LangId::Solidity => tree_sitter_solidity::LANGUAGE.into(),
+        LangId::Scss => tree_sitter_scss::language(),
         LangId::Vue => tree_sitter_vue::LANGUAGE.into(),
         LangId::Json => tree_sitter_json::LANGUAGE.into(),
         LangId::Scala => tree_sitter_scala::LANGUAGE.into(),
@@ -669,6 +687,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Html => None, // HTML uses direct tree walking like Markdown
         LangId::Markdown => None,
         LangId::Solidity => Some(SOL_QUERY),
+        LangId::Scss => Some(SCSS_QUERY),
         LangId::Vue => None,
         LangId::Json => None,
         LangId::Scala => Some(SCALA_QUERY),
@@ -706,6 +725,8 @@ static BASH_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Bash));
 static SOL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Solidity));
+static SCSS_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Scss));
 static SCALA_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Scala));
 static JAVA_QUERY_CACHE: LazyLock<Result<Query, String>> =
@@ -744,6 +765,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
         LangId::Solidity => Some(&*SOL_QUERY_CACHE),
+        LangId::Scss => Some(&*SCSS_QUERY_CACHE),
         LangId::Scala => Some(&*SCALA_QUERY_CACHE),
         LangId::Java => Some(&*JAVA_QUERY_CACHE),
         LangId::Ruby => Some(&*RUBY_QUERY_CACHE),
@@ -1284,6 +1306,7 @@ pub fn extract_symbols_from_tree(
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
         LangId::Solidity => extract_solidity_symbols(source, &root, query),
+        LangId::Scss => extract_scss_symbols(source, &root, query),
         LangId::Scala => extract_scala_symbols(source, &root, query),
         LangId::Java => extract_java_symbols(source, &root, query),
         LangId::Ruby => extract_ruby_symbols(source, &root, query),
@@ -1374,6 +1397,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 kind == "comment" && is_adjacent_line(&prev, &current, source)
             }
             LangId::Solidity
+            | LangId::Scss
             | LangId::Scala
             | LangId::Java
             | LangId::Kotlin
@@ -4836,6 +4860,99 @@ fn php_scope_chain(node: &Node, source: &str) -> Vec<String> {
     chain
 }
 
+fn extract_scss_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::Scss;
+    let capture_names = query.capture_names();
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        let mut mixin_name_node = None;
+        let mut mixin_def_node = None;
+        let mut fn_name_node = None;
+        let mut fn_def_node = None;
+        let mut var_name_node = None;
+        let mut var_def_node = None;
+        let mut selector_name_node = None;
+        let mut selector_def_node = None;
+
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+            match name {
+                "mixin.name" => mixin_name_node = Some(cap.node),
+                "mixin.def" => mixin_def_node = Some(cap.node),
+                "fn.name" => fn_name_node = Some(cap.node),
+                "fn.def" => fn_def_node = Some(cap.node),
+                "var.name" => var_name_node = Some(cap.node),
+                "var.def" => var_def_node = Some(cap.node),
+                "selector.name" => selector_name_node = Some(cap.node),
+                "selector.def" => selector_def_node = Some(cap.node),
+                _ => {}
+            }
+        }
+
+        if let (Some(name_node), Some(def_node)) = (mixin_name_node, mixin_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Function,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Function,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
+            if !node_text(source, &name_node).starts_with('$') {
+                continue;
+            }
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Variable,
+                vec![],
+                true,
+            );
+        }
+        if let (Some(name_node), Some(def_node)) = (selector_name_node, selector_def_node) {
+            push_captured_symbol(
+                &mut symbols,
+                source,
+                lang,
+                name_node,
+                def_node,
+                SymbolKind::Class,
+                vec![],
+                true,
+            );
+        }
+    }
+
+    Ok(symbols)
+}
+
 fn extract_php_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::Php;
     let capture_names = query.capture_names();
@@ -5975,7 +6092,7 @@ mod tests {
     use super::*;
     use crate::language::LanguageProvider;
     use crate::symbol_cache_disk;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5999,6 +6116,75 @@ mod tests {
             exported: true,
             parent: None,
         }
+    }
+
+    #[test]
+    fn inc_and_scss_extensions_are_detected() {
+        assert_eq!(
+            detect_language(Path::new("template.inc")),
+            Some(LangId::Php)
+        );
+        assert_eq!(
+            detect_language(Path::new("styles.scss")),
+            Some(LangId::Scss)
+        );
+        assert_eq!(detect_language(Path::new("template.tpl")), None);
+    }
+
+    #[test]
+    fn inc_files_parse_with_php_grammar() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file = tmp.path().join("partial.inc");
+        std::fs::write(&file, "<?php\nfunction render_partial() { return 1; }\n")
+            .expect("write inc file");
+
+        let mut parser = FileParser::new();
+        let symbols = parser
+            .extract_symbols(&file)
+            .expect("extract php inc symbols");
+        let function = symbols
+            .iter()
+            .find(|symbol| symbol.name == "render_partial")
+            .expect("find PHP function in .inc");
+        assert_eq!(function.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn scss_symbols_include_mixin_variable_function_and_rule() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let file = tmp.path().join("styles.scss");
+        std::fs::write(
+            &file,
+            r#"$brand-color: #336699;
+
+@mixin button-base($padding) {
+  padding: $padding;
+}
+
+@function double($value) {
+  @return $value * 2;
+}
+
+.card, .panel {
+  color: $brand-color;
+}
+"#,
+        )
+        .expect("write scss file");
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).expect("extract scss symbols");
+        let get = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; got {symbols:?}"))
+        };
+
+        assert_eq!(get("button-base").kind, SymbolKind::Function);
+        assert_eq!(get("double").kind, SymbolKind::Function);
+        assert_eq!(get("$brand-color").kind, SymbolKind::Variable);
+        assert_eq!(get(".card, .panel").kind, SymbolKind::Class);
     }
 
     #[test]

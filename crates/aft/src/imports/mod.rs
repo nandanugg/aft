@@ -564,6 +564,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Swift => Some(&swift::SWIFT_SYNTAX),
         LangId::Zig
         | LangId::Bash
+        | LangId::Scss
         | LangId::Json
         | LangId::Html
         | LangId::Markdown
