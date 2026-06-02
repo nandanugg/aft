@@ -109,8 +109,12 @@ describe("loadAftConfig", () => {
           format_on_edit: false,
           lsp: {
             servers: {
+              // `extensions` as a string (not an array) is malformed under the
+              // schema. (Omitting extensions/binary entirely is now a valid
+              // partial built-in override, so the malformed case must use a
+              // genuinely wrong shape.)
               tinymist: {
-                extensions: [".typ"],
+                extensions: ".typ",
               },
             },
           },

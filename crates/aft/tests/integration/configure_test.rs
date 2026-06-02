@@ -931,6 +931,8 @@ fn configure_rejects_malformed_lsp_servers() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
 
+    // A present-but-blank binary is a typo, not an intentional inherit
+    // (which is expressed by omitting the field), so it is still rejected.
     let configure = aft.send(
         &json!({
             "id": "cfg-lsp-bad",
@@ -939,8 +941,8 @@ fn configure_rejects_malformed_lsp_servers() {
             "project_root": dir.path(),
             "lsp_servers": [{
                 "id": "tinymist",
-                "extensions": [],
-                "binary": "tinymist"
+                "extensions": [".typ"],
+                "binary": "   "
             }]
         })
         .to_string(),
@@ -951,7 +953,38 @@ fn configure_rejects_malformed_lsp_servers() {
     assert!(configure["message"]
         .as_str()
         .unwrap()
-        .contains("extensions must not be empty"));
+        .contains("binary must not be empty"));
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+/// A partial override of a built-in server (omitting extensions/binary to
+/// inherit them) must be accepted — previously the whole `lsp` config section
+/// was silently dropped when these were required.
+#[test]
+fn configure_accepts_partial_builtin_lsp_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-lsp-partial",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "lsp_servers": [{
+                "id": "rust",
+                "args": ["--extra-flag"]
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "partial override should configure: {configure:#}"
+    );
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
