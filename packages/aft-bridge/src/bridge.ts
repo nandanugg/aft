@@ -6,6 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
+import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
@@ -323,6 +324,13 @@ export class BinaryBridge {
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Updated after every successfully parsed stdout frame from the child. */
   private lastChildActivityAt = 0;
+  /**
+   * Latest agent status-bar counts seen on any `data.status_bar` envelope. The
+   * Rust bridge attaches current counts to (almost) every response; we cache
+   * the freshest so the per-tool after-hook can render the bar without extra
+   * plumbing per call. `undefined` until the first attach (no scan yet).
+   */
+  private lastStatusBar: StatusBarCounts | undefined;
   /** Consecutive non-bash-style request timeouts without an id-matched response. */
   private consecutiveRequestTimeouts = 0;
   private errorPrefix: string;
@@ -1166,6 +1174,7 @@ export class BinaryBridge {
           clearTimeout(entry.timer);
           this.consecutiveRequestTimeouts = 0;
           this.scheduleRestartCountReset();
+          this.captureStatusBar(response);
           entry.resolve(response);
         } else if (typeof response.type === "string") {
           this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
@@ -1174,6 +1183,26 @@ export class BinaryBridge {
         this.warnVia(`Failed to parse stdout line: ${line}`);
       }
     }
+  }
+
+  /**
+   * Cache the agent status-bar counts from a response. The Rust `Response.data`
+   * is `#[serde(flatten)]`, so the attached `status_bar` object lands at the
+   * TOP LEVEL of the wire envelope (`response.status_bar`), not nested under a
+   * `data` key — same as `bg_completions`.
+   */
+  private captureStatusBar(response: Record<string, unknown>): void {
+    const parsed = parseStatusBarCounts(response.status_bar);
+    if (parsed) this.lastStatusBar = parsed;
+  }
+
+  /**
+   * Latest agent status-bar counts seen on any response, or `undefined` before
+   * the first attach (no inspect scan has populated Tier-2 yet). The per-tool
+   * after-hook reads this and applies emit-on-change gating.
+   */
+  getStatusBar(): StatusBarCounts | undefined {
+    return this.lastStatusBar;
   }
 
   private handleTimeout(triggeringSessionId?: string): void {

@@ -18,6 +18,8 @@ export type {
   ConfigureWarningsContext,
   StatusSnapshot,
 } from "./bridge.js";
+// --- bash output hints (shared by both plugin hosts) ---
+export { maybeAppendConflictsHint, maybeAppendGrepHint } from "./bash-hints.js";
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
 // --- binary resolution ---
@@ -74,6 +76,16 @@ export type {
   StatusResponse,
 } from "./protocol.js";
 export { findBinary, findBinarySync, platformKey } from "./resolver.js";
+// --- agent status bar (shared by both plugin hosts) ---
+export type { StatusBarCounts, StatusBarEmitState } from "./status-bar.js";
+export {
+  createStatusBarEmitState,
+  formatStatusBar,
+  parseStatusBarCounts,
+  shouldEmitStatusBar,
+  STATUS_BAR_HEARTBEAT_CALLS,
+  statusBarLine,
+} from "./status-bar.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   ZoomMultiTargetEntry,

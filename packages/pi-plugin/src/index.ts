@@ -50,6 +50,7 @@ import {
   handleTurnEndBgCompletions,
 } from "./bg-notifications.js";
 import { registerStatusCommand } from "./commands/aft-status.js";
+import { statusBarBlockForSession } from "./status-bar-inject.js";
 import {
   type AftConfig,
   loadAftConfig,
@@ -801,11 +802,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ) => unknown,
     ) => void
   )("tool_result", async (event, extCtx) => {
-    const content = await appendToolResultBgCompletions(
-      { ctx, directory: extCtx.cwd, sessionID: resolveSessionId(extCtx) },
+    const sessionID = resolveSessionId(extCtx);
+    const bgContent = await appendToolResultBgCompletions(
+      { ctx, directory: extCtx.cwd, sessionID },
       event.content,
     );
-    if (!content) return undefined;
+    // Start from the bg-completion-augmented content if present, else original.
+    let content = bgContent ?? event.content;
+    // Agent status bar — IDE-style health glance, appended on emit-on-change.
+    // Read from the active bridge (no spawn); the Rust side keeps counts current.
+    const activeBridge = pool.getActiveBridgeForRoot(extCtx.cwd);
+    const bar = statusBarBlockForSession(sessionID, activeBridge?.getStatusBar());
+    if (bar) content = [...content, { type: "text", text: bar }];
+    // Nothing to add → leave the tool result untouched.
+    if (content === event.content) return undefined;
     return { content, details: event.details, isError: event.isError };
   });
 

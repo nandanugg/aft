@@ -45,6 +45,7 @@ import {
   sendWarning,
 } from "./notifications.js";
 import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
+import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
@@ -960,6 +961,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       const sessionID = extractSessionID(eventInput.event.properties);
       if ((eventType === "session.deleted" || eventType === "session.shutdown") && sessionID) {
         inspectTier2Idle.clear(sessionID);
+        clearStatusBarSession(sessionID);
         return;
       }
       if (eventType !== "session.idle") return;
@@ -1054,6 +1056,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         { ctx, directory: sessionDir, sessionID: toolInput.sessionID },
         output,
       );
+      // Agent status bar — IDE-style health glance, appended on emit-on-change.
+      // Read from the active bridge (no spawn); the Rust side keeps counts current.
+      if (output.output !== undefined) {
+        const activeBridge = ctx.pool.getActiveBridgeForRoot(sessionDir);
+        const suffix = statusBarSuffixForSession(toolInput.sessionID, activeBridge?.getStatusBar());
+        if (suffix) output.output += suffix;
+      }
     },
     config: async (config: { command?: Record<string, unknown> } | undefined) => {
       // Defensive guard: if OpenCode passes undefined or a non-object,

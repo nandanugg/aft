@@ -1,5 +1,10 @@
 import * as fs from "node:fs/promises";
-import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import {
+  type BinaryBridge,
+  type BridgeRequestOptions,
+  maybeAppendConflictsHint,
+  maybeAppendGrepHint,
+} from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -363,7 +368,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
           if (isTerminalStatus(status.status)) {
-            return bashResult(formatForegroundResult(status), {
+            return bashResult(withBashHints(formatForegroundResult(status), params.command), {
               exit_code: status.exit_code as number | undefined,
               duration_ms: status.duration_ms as number | undefined,
               truncated: status.output_truncated as boolean | undefined,
@@ -394,7 +399,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       };
 
       const output = (response.output as string | undefined) ?? "";
-      return bashResult(output, details);
+      return bashResult(withBashHints(output, params.command), details);
     },
     renderCall(args, theme, context) {
       return renderBashCall(args?.command, args?.description, theme, context);
@@ -441,6 +446,19 @@ function formatPromotionMessage(
 /** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
 function formatSeconds(ms: number): string {
   return `${Number((ms / 1000).toFixed(1))}s`;
+}
+
+/**
+ * Append AFT bash-output hints (conflicts / grep) to a foreground bash result.
+ * Pi knows the exact command, so the grep hint is matched against it directly
+ * rather than the echoed first output line. Mirrors OpenCode's
+ * `tool.execute.after` nudges; only fires on terminal bash output (not
+ * background-spawn/promotion messages, which have no real output yet).
+ */
+function withBashHints(output: string, command: string): string {
+  let result = maybeAppendConflictsHint(output);
+  result = maybeAppendGrepHint(result, command);
+  return result;
 }
 
 function formatForegroundResult(data: Record<string, unknown>): string {
