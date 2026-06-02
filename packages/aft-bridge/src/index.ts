@@ -9,6 +9,8 @@
 
 // --- logger contract ---
 export { setActiveLogger } from "./active-logger.js";
+// --- bash output hints (shared by both plugin hosts) ---
+export { maybeAppendConflictsHint, maybeAppendGrepHint } from "./bash-hints.js";
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,
@@ -18,8 +20,6 @@ export type {
   ConfigureWarningsContext,
   StatusSnapshot,
 } from "./bridge.js";
-// --- bash output hints (shared by both plugin hosts) ---
-export { maybeAppendConflictsHint, maybeAppendGrepHint } from "./bash-hints.js";
 // --- transport ---
 export { BinaryBridge, compareSemver, tagStderrLine } from "./bridge.js";
 // --- binary resolution ---
@@ -82,8 +82,8 @@ export {
   createStatusBarEmitState,
   formatStatusBar,
   parseStatusBarCounts,
-  shouldEmitStatusBar,
   STATUS_BAR_HEARTBEAT_CALLS,
+  shouldEmitStatusBar,
   statusBarLine,
 } from "./status-bar.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---

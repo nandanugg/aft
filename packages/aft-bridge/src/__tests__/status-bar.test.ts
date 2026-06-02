@@ -3,9 +3,9 @@ import {
   createStatusBarEmitState,
   formatStatusBar,
   parseStatusBarCounts,
-  shouldEmitStatusBar,
   STATUS_BAR_HEARTBEAT_CALLS,
   type StatusBarCounts,
+  shouldEmitStatusBar,
 } from "../status-bar.js";
 
 function counts(overrides: Partial<StatusBarCounts> = {}): StatusBarCounts {

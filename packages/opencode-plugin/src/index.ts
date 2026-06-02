@@ -45,7 +45,6 @@ import {
   sendWarning,
 } from "./notifications.js";
 import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
-import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
@@ -58,6 +57,7 @@ import {
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { ensureTuiPluginEntry } from "./shared/tui-config.js";
 import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
+import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";

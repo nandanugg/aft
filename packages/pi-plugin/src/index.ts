@@ -50,7 +50,6 @@ import {
   handleTurnEndBgCompletions,
 } from "./bg-notifications.js";
 import { registerStatusCommand } from "./commands/aft-status.js";
-import { statusBarBlockForSession } from "./status-bar-inject.js";
 import {
   type AftConfig,
   loadAftConfig,
@@ -72,6 +71,7 @@ import {
   deliverConfigureWarnings,
   sendFeatureAnnouncement,
 } from "./notifications.js";
+import { statusBarBlockForSession } from "./status-bar-inject.js";
 
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
