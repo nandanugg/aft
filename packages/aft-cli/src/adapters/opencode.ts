@@ -104,7 +104,9 @@ export class OpenCodeAdapter implements HarnessAdapter {
 
   isInstalled(): boolean {
     try {
-      execSync("opencode --version", { stdio: "ignore" });
+      // timeout: a misbehaving/booting host must never hang the probe (and a
+      // hung probe under PATH self-resolution is what enabled a fork bomb).
+      execSync("opencode --version", { stdio: "ignore", timeout: 5000 });
       return true;
     } catch {
       return false;
@@ -113,7 +115,11 @@ export class OpenCodeAdapter implements HarnessAdapter {
 
   getHostVersion(): string | null {
     try {
-      return execSync("opencode --version", { encoding: "utf-8", stdio: "pipe" }).trim();
+      return execSync("opencode --version", {
+        encoding: "utf-8",
+        stdio: "pipe",
+        timeout: 5000,
+      }).trim();
     } catch {
       return null;
     }

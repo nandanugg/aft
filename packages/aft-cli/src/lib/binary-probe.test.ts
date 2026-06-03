@@ -21,24 +21,24 @@ describe("binary probe version validation", () => {
     expect(normalizeBinaryVersion("hello from another binary\n")).toBeNull();
   });
 
-  test("skips mismatched candidates and reports them as unmatched", async () => {
+  test("reports a version-mismatched cache candidate as unmatched", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-cli-binary-probe-audit-"));
-    const pathDir = join(root, "path");
-    mkdirSync(pathDir, { recursive: true });
-
     const cacheDir = join(root, "cache", "bin", "v9.8.7");
     mkdirSync(cacheDir, { recursive: true });
+    // The cache candidate path is constructed by us (never the CLI shim), so it
+    // is probed without the native-executable guard; a fake shell binary is a
+    // valid stand-in here.
     writeFakeAft(join(cacheDir, getAftBinaryName()), 'printf "aft 8.0.0\\n"');
-    writeFakeAft(join(pathDir, getAftBinaryName()), 'printf "aft 9.8.1\\n"');
 
     await withEnv(
       {
         AFT_CACHE_DIR: join(root, "cache"),
-        PATH: `${pathDir}${delimiter}${process.env.PATH ?? ""}`,
+        // No native PATH binary available, so resolution must not match.
+        PATH: process.env.PATH ?? "",
       },
       () => {
         const probe = probeAftBinary("9.8.7");
-        expect(probe.version).toBe("9.8.1");
+        expect(probe.version).toBeNull();
         expect(probe.candidates).toContainEqual(
           expect.objectContaining({ status: "unmatched", version: "8.0.0" }),
         );
@@ -46,11 +46,34 @@ describe("binary probe version validation", () => {
     );
   });
 
-  test("rejects random PATH garbage instead of treating it as healthy", async () => {
+  test("reports a non-semver cache candidate as invalid instead of healthy", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-cli-binary-probe-invalid-"));
+    const cacheDir = join(root, "cache", "bin", "v7.7.7");
+    mkdirSync(cacheDir, { recursive: true });
+    writeFakeAft(join(cacheDir, getAftBinaryName()), 'printf "definitely not aft\\n"');
+
+    await withEnv(
+      {
+        AFT_CACHE_DIR: join(root, "cache"),
+        PATH: process.env.PATH ?? "",
+      },
+      () => {
+        expect(probeBinaryVersion("7.7.7")).toBeNull();
+        const probe = probeAftBinary("7.7.7");
+        expect(probe.candidates).toContainEqual(expect.objectContaining({ status: "invalid" }));
+      },
+    );
+  });
+
+  test("skips a script-shim `aft` on PATH (fork-bomb guard)", async () => {
+    // A `which aft` hit that is a node/sh script shim (e.g. the CLI's own npx
+    // bin) must never be probed — probing it re-enters the CLI and fork-bombs.
+    // Even though this shim prints a perfectly valid version, it must be
+    // filtered out before any --version invocation.
+    const root = mkdtempSync(join(tmpdir(), "aft-cli-binary-probe-shim-"));
     const pathDir = join(root, "path");
     mkdirSync(pathDir, { recursive: true });
-    writeFakeAft(join(pathDir, getAftBinaryName()), 'printf "definitely not aft\\n"');
+    writeFakeAft(join(pathDir, getAftBinaryName()), 'printf "aft 7.7.7\\n"');
 
     await withEnv(
       {
@@ -58,9 +81,13 @@ describe("binary probe version validation", () => {
         PATH: `${pathDir}${delimiter}${process.env.PATH ?? ""}`,
       },
       () => {
-        expect(probeBinaryVersion("7.7.7")).toBeNull();
         const probe = probeAftBinary("7.7.7");
-        expect(probe.candidates).toContainEqual(expect.objectContaining({ status: "invalid" }));
+        // The shim is native-filtered, so it never becomes a candidate at all —
+        // no "matched" 7.7.7 from it, and resolution finds nothing.
+        expect(probe.version).toBeNull();
+        expect(
+          probe.candidates.some((c) => c.path.startsWith(pathDir) && c.status === "matched"),
+        ).toBe(false);
       },
     );
   });

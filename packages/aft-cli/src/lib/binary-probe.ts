@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isNativeExecutable } from "@cortexkit/aft-bridge";
 import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
 
 async function loadPluginVersion(): Promise<string> {
@@ -204,8 +205,16 @@ function aftBinaryCandidates(preferredVersion?: string): string[] {
       encoding: "utf-8",
       env: process.env,
     }).trim();
-    if (resolved) {
-      pushCandidate(candidates, resolved.split(/\r?\n/)[0]);
+    // Guard against self-resolution recursion: `aft` on PATH may be THIS CLI's
+    // own node-script shim (npx prepends node_modules/.bin to PATH, and the
+    // CLI's bin is named `aft`). Probing it with --version re-enters the CLI and
+    // fork-bombs. Only accept native executables. Iterate all lines so a real
+    // native binary after a `.cmd`/script shim (Windows `where`) is still found.
+    for (const line of resolved.split(/\r?\n/)) {
+      const candidate = line.trim();
+      if (candidate && isNativeExecutable(candidate)) {
+        pushCandidate(candidates, candidate);
+      }
     }
   } catch {
     // ignore — PATH lookup is best-effort
