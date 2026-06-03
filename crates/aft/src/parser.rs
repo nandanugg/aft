@@ -1043,19 +1043,25 @@ impl SymbolCache {
     pub(crate) fn disk_entries(
         &self,
     ) -> Vec<(&PathBuf, SystemTime, u64, blake3::Hash, &Vec<Symbol>)> {
+        // Persist EVERY parsed entry, including files that legitimately parse to
+        // zero symbols (e.g. a TS file with only imports, a config-shaped file).
+        // Previously these were filtered out, so they were never written to disk;
+        // on the next spawn `load_from_disk` couldn't reload them, the prewarm
+        // skip-check (`contains_path_with_mtime`) missed, and they were re-parsed
+        // on every startup forever (the "N new" churn in issue #86). An empty
+        // entry serializes to `symbols: []` — a few bytes — and makes the prewarm
+        // skip it. It also makes the "persisted symbol cache: N files" count
+        // accurate (was overstated by the filtered-out empties).
         self.entries
             .iter()
-            .filter_map(|(path, cached)| {
-                if cached.symbols.is_empty() {
-                    return None;
-                }
-                Some((
+            .map(|(path, cached)| {
+                (
                     path,
                     cached.mtime,
                     cached.size,
                     cached.content_hash,
                     &cached.symbols,
-                ))
+                )
             })
             .collect()
     }
