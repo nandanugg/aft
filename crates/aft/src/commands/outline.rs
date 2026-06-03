@@ -865,7 +865,7 @@ fn should_skip_directory(path: &Path) -> bool {
             | "coverage"
             | ".nyc_output"
             | ".cache"
-    ) || name.starts_with('.')
+    )
 }
 
 fn display_path(path: &Path, fallback: &str, project_root: Option<&Path>) -> String {

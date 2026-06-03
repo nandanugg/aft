@@ -35,7 +35,7 @@ aft impact <file> <symbol>
 aft trace_to <file> <symbol>
 aft trace_data <file> <symbol> <expression> [depth]
 aft read <file> [start_line] [limit]
-aft grep <pattern> [path]
+aft grep <pattern> [path]              # ERE syntax: use | for alternation, not \|
 aft glob <pattern> [path]
 ```
 

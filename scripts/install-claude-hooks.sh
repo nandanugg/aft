@@ -8,8 +8,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AFT_ROOT="$(dirname "$SCRIPT_DIR")"
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
+ZSH_CONFIG_FILE="$HOME/.zshrc"
+FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+LOCAL_BIN_DIR="${AFT_LOCAL_BIN_DIR:-$HOME/.local/bin}"
+ENV_BLOCK_START="# >>> aft-go-helper >>>"
+ENV_BLOCK_END="# <<< aft-go-helper <<<"
+CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
+CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 SESSION_REMINDER_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-reminder.sh"
+SESSION_END_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-end.sh"
+SESSION_RUNTIME_TEMPLATE="$AFT_ROOT/templates/aft-session-runtime.sh"
 DISCOVERY_GATE_TEMPLATE="$AFT_ROOT/templates/claude/aft-code-discovery-gate.sh"
 
 # Colors
@@ -21,6 +30,153 @@ NC='\033[0m' # No Color
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+escape_sed_replacement() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  printf '%s' "$value"
+}
+
+strip_managed_block() {
+  local file="$1"
+  local start="${2:-$ENV_BLOCK_START}"
+  local end="${3:-$ENV_BLOCK_END}"
+  local temp_file
+  temp_file="$(mktemp)"
+  if [ -f "$file" ]; then
+    awk -v start="$start" -v end="$end" '
+      $0 == start { in_block = 1; next }
+      $0 == end { in_block = 0; next }
+      !in_block { print }
+    ' "$file" > "$temp_file" || error "Failed to update $file"
+  fi
+  printf '%s' "$temp_file"
+}
+
+upsert_shell_helper_env() {
+  local helper_path="$1"
+  local file="$2"
+  local shell_kind="$3"
+  local temp_file
+  temp_file="$(strip_managed_block "$file")"
+  mkdir -p "$(dirname "$file")"
+  if [ -s "$temp_file" ]; then
+    printf '\n' >> "$temp_file"
+  fi
+  {
+    printf '%s\n' "$ENV_BLOCK_START"
+    if [ "$shell_kind" = "fish" ]; then
+      printf 'set -gx AFT_GO_HELPER_PATH "%s"\n' "$helper_path"
+    else
+      printf 'export AFT_GO_HELPER_PATH="%s"\n' "$helper_path"
+    fi
+    printf '%s\n' "$ENV_BLOCK_END"
+  } >> "$temp_file"
+  overwrite_file "$temp_file" "$file"
+}
+
+overwrite_file() {
+  local source="$1"
+  local target="$2"
+  if [ -e "$target" ] && cmp -s "$source" "$target"; then
+    rm -f "$source"
+    return 0
+  fi
+  cat "$source" > "$target"
+  rm -f "$source"
+}
+
+upsert_shell_path_env() {
+  local bin_dir="$1"
+  local file="$2"
+  local shell_kind="$3"
+  local temp_file
+  temp_file="$(strip_managed_block "$file" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END")"
+  mkdir -p "$(dirname "$file")"
+  if [ -s "$temp_file" ]; then
+    printf '\n' >> "$temp_file"
+  fi
+  {
+    printf '%s\n' "$CLI_PATH_BLOCK_START"
+    if [ "$shell_kind" = "fish" ]; then
+      printf 'fish_add_path "%s"\n' "$bin_dir"
+    else
+      printf 'case ":$PATH:" in\n'
+      printf '  *":%s:"*) ;;\n' "$bin_dir"
+      printf '  *) export PATH="%s:$PATH" ;;\n' "$bin_dir"
+      printf 'esac\n'
+    fi
+    printf '%s\n' "$CLI_PATH_BLOCK_END"
+  } >> "$temp_file"
+  overwrite_file "$temp_file" "$file"
+}
+
+link_command() {
+  local source="$1"
+  local target="$2"
+  local label="$3"
+  local current
+
+  if [ -L "$target" ]; then
+    current="$(readlink "$target")"
+    if [ "$current" = "$source" ]; then
+      info "$label already linked: $target"
+      return 0
+    fi
+    ln -sfn "$source" "$target" && info "Updated $label symlink: $target -> $source"
+    return 0
+  fi
+
+  if [ -e "$target" ]; then
+    if [ "$target" -ef "$source" ]; then
+      info "$label already available: $target"
+      return 0
+    fi
+    warn "$target already exists and is not a symlink; leaving it unchanged"
+    return 1
+  fi
+
+  ln -s "$source" "$target" && info "Linked $label: $target -> $source"
+}
+
+install_path_command() {
+  local source="$1"
+  local name="$2"
+
+  if [ ! -x "$source" ]; then
+    warn "Cannot expose $name on PATH; source is not executable: $source"
+    return 1
+  fi
+
+  if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+    if link_command "$source" "/usr/local/bin/$name" "$name"; then
+      return 0
+    fi
+  fi
+
+  mkdir -p "$LOCAL_BIN_DIR"
+  if link_command "$source" "$LOCAL_BIN_DIR/$name" "$name"; then
+    upsert_shell_path_env "$LOCAL_BIN_DIR" "$ZSH_CONFIG_FILE" "zsh"
+    upsert_shell_path_env "$LOCAL_BIN_DIR" "$FISH_CONFIG_FILE" "fish"
+    info "Ensured $LOCAL_BIN_DIR is configured on PATH in $ZSH_CONFIG_FILE and $FISH_CONFIG_FILE"
+    return 0
+  fi
+
+  warn "Could not expose $name on PATH; add $source manually"
+  return 1
+}
+
+install_templated_file() {
+  local source="$1"
+  local target="$2"
+  local replacement="$3"
+  local escaped
+  escaped="$(escape_sed_replacement "$replacement")"
+  cp "$source" "$target"
+  sed -i '' "s|__AFT_BINARY_PATH__|$escaped|g" "$target"
+  chmod +x "$target"
+}
 
 # Check for required tools
 command -v jq &>/dev/null || error "jq is required but not installed. Install with: brew install jq"
@@ -50,13 +206,22 @@ if command -v go &>/dev/null; then
     fi
     cd "$AFT_ROOT"
 else
-    warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
-    GO_HELPER_BINARY=""
+    if [ -x "$GO_HELPER_BINARY" ]; then
+        info "Using existing aft-go-helper: $GO_HELPER_BINARY"
+    else
+        warn "Go toolchain not found — skipping aft-go-helper build. Install Go for type-accurate call resolution in Go projects."
+        GO_HELPER_BINARY=""
+    fi
 fi
 
 # Create directories
 mkdir -p "$HOOKS_DIR"
 info "Created hooks directory: $HOOKS_DIR"
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+    upsert_shell_helper_env "$GO_HELPER_BINARY" "$ZSH_CONFIG_FILE" "zsh"
+    upsert_shell_helper_env "$GO_HELPER_BINARY" "$FISH_CONFIG_FILE" "fish"
+    info "Configured AFT_GO_HELPER_PATH in $ZSH_CONFIG_FILE and $FISH_CONFIG_FILE"
+fi
 
 # Write aft CLI wrapper
 cat > "$HOOKS_DIR/aft" << 'WRAPPER_EOF'
@@ -134,13 +299,19 @@ call_aft() {
   # interface-dispatch edges. Without it, the helper thread gets killed
   # when aft exits right after answering the command — cache never gets
   # written, and cross-package interface calls stay unresolved.
-  local config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  local config_req
+  config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
   # triggers SIGPIPE (exit 141) on the upstream grep once the response exceeds the
   # pipe buffer, silently killing the script on large outlines.
-  local result=$( (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2>/dev/null | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
+  #
+  # stderr: filter [aft] progress lines through to the user's terminal and
+  # drop everything else (tree-sitter warnings, etc.). Without this the
+  # first query on a large project looks like a hang — configure can take
+  # 10+ seconds and there's nothing to see until the response arrives.
+  local result=$( (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2> >(grep --line-buffered '^\[aft\]' >&2) | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
 
   # Check success
   local success=$(echo "$result" | jq -r '.success // false')
@@ -372,7 +543,7 @@ SIMILARITY (Tier 3):
 
 BASIC COMMANDS:
   aft read <file> [start] [limit]  Read with line numbers
-  aft grep <pattern> [path]        Trigram-indexed search
+  aft grep <pattern> [path]        Trigram-indexed search (ERE syntax: use | for alternation, not \|)
   aft glob <pattern> [path]        File pattern matching
 
 EXAMPLES:
@@ -501,9 +672,11 @@ info "Installed hook script: $HOOKS_DIR/aft-hook.sh"
 # toward AFT semantic tools before it reaches for raw Grep/Glob/Read.
 # Modeled on codebase-memory-mcp's equivalent pair.
 if [ -f "$SESSION_REMINDER_TEMPLATE" ]; then
-    cp "$SESSION_REMINDER_TEMPLATE" "$HOOKS_DIR/aft-session-reminder.sh"
-    chmod +x "$HOOKS_DIR/aft-session-reminder.sh"
+    install_templated_file "$SESSION_RUNTIME_TEMPLATE" "$HOOKS_DIR/aft-session-runtime.sh" "$AFT_BINARY"
+    install_templated_file "$SESSION_REMINDER_TEMPLATE" "$HOOKS_DIR/aft-session-reminder.sh" "$AFT_BINARY"
+    install_templated_file "$SESSION_END_TEMPLATE" "$HOOKS_DIR/aft-session-end.sh" "$AFT_BINARY"
     info "Installed hook script: $HOOKS_DIR/aft-session-reminder.sh"
+    info "Installed hook script: $HOOKS_DIR/aft-session-end.sh"
 else
     warn "Missing template: $SESSION_REMINDER_TEMPLATE — skipping session reminder"
 fi
@@ -522,18 +695,27 @@ cat > "$CLAUDE_DIR/AFT.md" << 'INSTRUCTIONS_EOF'
 
 Tree-sitter powered code analysis for massive context savings (60-90% token reduction).
 
-## Start With Outline, Escalate From There
+## Two Kinds of Questions, Two Kinds of Tools
 
-**Outline is the default entry point.** Before reading full files, run `aft outline` to get structure — ~10% the tokens of a full read. This applies to code, markdown, config, and docs.
+Every code question is either **what exists** (structure) or **what runs** (behavior). AFT has separate tools for each — pick by the question, not by caution.
 
-**Escalate to semantic commands only when the task needs them:**
-- `aft zoom <file> <symbol>` — when you need to read a specific function body.
-- `aft call_tree` / `aft callers` — when you need cross-file call relationships (grep can't infer these).
-- `aft impact` — before a refactor, to see what breaks.
-- `aft trace_to` — when debugging how execution reaches a point.
-- `aft trace_data` — when tracking where a value came from or where it flows next.
+**"What exists here?"** → `aft outline`. Use when you need to know which files live in a directory, which symbols a file defines, what types are declared. Outline is fast and cheap; reach for it freely when surveying a codebase.
 
-**Don't use semantic commands reflexively.** For verification tasks — "does this symbol still exist?", "is this doc accurate?" — outline alone is usually enough. Reaching for zoom/call_tree on every task inflates work without improving answers.
+**"How does this work / flow / connect?"** → `aft trace_to`, `aft call_tree`, `aft callers`. These are the right tool for *every* behavior or flow question, not a last resort:
+- `aft call_tree <file> <symbol>` — what this function calls (forward graph).
+- `aft callers <file> <symbol>` — who calls this function (reverse graph).
+- `aft trace_to <file> <symbol>` — how execution reaches this point (entry-point paths).
+- `aft trace_data <file> <symbol> <expr>` — how a value flows through assignments and calls.
+- `aft impact <file> <symbol>` — what breaks if this changes.
+- `aft zoom <file> <symbol>` — read a specific function body with call-graph annotations.
+
+**Default to trace tools for behavior questions.** "What's the normal flow for X?", "what handles Y?", "who sends this event?", "how does the happy path work?" — all of these are trace / call_tree / callers questions. Outline-diving through directories to piece together a flow is slower and less accurate than following the call graph directly from a known entry point (HTTP handler, Kafka consumer, CLI main, etc.).
+
+**Grep is fine for "does this string appear?"** but reach for semantic tools when the answer requires understanding the behavior behind the name.
+
+### Performance note
+
+First `aft` call in a project can take 10-30 seconds on a large codebase (parsing hundreds of files, running the optional Go helper). Progress lines go to stderr. Subsequent calls reuse a disk cache and are near-instant unless files changed. Cold-start slowness is not a hang — watch stderr for progress.
 
 ## AFT CLI Commands
 
@@ -568,7 +750,7 @@ aft trace_data <file> <symbol> <expression> [depth]
 
 ```bash
 aft read <file> [start_line] [limit]   # Read with line numbers
-aft grep <pattern> [path]              # Trigram-indexed search
+aft grep <pattern> [path]              # Trigram-indexed search (ERE syntax: use | for alternation, not \|)
 aft glob <pattern> [path]              # File pattern matching
 ```
 
@@ -610,20 +792,19 @@ Hops marked `"approximate": true` are lossy (field access, struct wraps, writer 
 
 ## Rules
 
-Match the command to the task type. Outline is universal; the semantic graph tools pay off for *comprehension* tasks, not for *verification* tasks.
+Match the command to the question, not to caution.
 
-**Verification** ("does X still exist?", "is this doc accurate?"):
-1. Start with `aft outline`.
-2. Outline is usually enough — don't reach for zoom/call_tree unless you need behavior, not just presence.
-3. **Outline before delegating.** When briefing a subagent to explore a repo or directory, run `aft outline <path>` yourself first and include the output in the subagent prompt.
+**Structural / "what exists" questions** — "does X still exist?", "what files are in this dir?", "what symbols does this file declare?":
+1. `aft outline` is the right tool. Fast and cheap.
+2. For directory reads, always outline first to anchor; confirm which specific files are actually needed before expanding with zoom / selective reads.
+3. When briefing a subagent to explore a repo, run `aft outline <path>` yourself first and include the output in the subagent prompt — subagents don't follow ordering guarantees.
 
-**Comprehension** ("how does this flow work?", "what breaks if I change X?", "where did this value come from?"):
-4. Use `zoom` for function bodies.
-5. Use `call_tree` / `callers` for cross-file call relationships grep cannot see.
-6. Use `impact` before a refactor.
-7. Use `trace_to` for control flow questions, `trace_data` for data flow questions.
+**Behavioral / "what runs" questions** — "how does X work?", "what's the flow for Y?", "who calls Z?", "what happens if I change W?":
+4. Reach for `aft trace_to` / `aft call_tree` / `aft callers` / `aft trace_data` / `aft impact` **first**, not as a last resort. These tools answer the question directly; outline-diving through directories to piece together a flow is slower and less accurate.
+5. Start from a known entry point (HTTP handler, Kafka consumer, main, test entry) and follow the call graph out. Use `aft zoom` when you need to read the body of a specific function you've identified.
+6. A zero result from `callers` or `trace_to` is itself information — but cross-check with `aft grep` on the symbol name if the result looks surprisingly sparse; some dispatch patterns (reflection, DI frameworks, callback registration) can't be resolved statically.
 
-**When grep is fine.** `aft grep` for a bare identifier is correct when you just need to know "does this string appear, and where." Reach for semantic commands when you need to understand *behavior* behind the name, not every time a name shows up.
+**`aft grep` is fine for "does this string appear?"** Reach for semantic tools when the answer requires understanding the behavior behind the name.
 
 ## Context Protection
 
@@ -724,19 +905,32 @@ if [ -f "$SETTINGS_FILE" ]; then
         )) + [
           {
             "matcher": "startup",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
           },
           {
             "matcher": "resume",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
           },
           {
             "matcher": "clear",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
           },
           {
             "matcher": "compact",
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh")}]
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-reminder.sh"), "timeout": 300}]
+          }
+        ]
+      ) |
+      .hooks.SessionEnd = (
+        ((.hooks.SessionEnd // []) | map(
+          . as $entry
+          | ($entry.hooks // [])
+              | map(select((.command // "") | contains("aft-session-end.sh")))
+              | length as $aft
+          | if $aft > 0 then empty else $entry end
+        )) + [
+          {
+            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-end.sh"), "timeout": 5}]
           }
         ]
       )
@@ -776,19 +970,24 @@ else
     "SessionStart": [
       {
         "matcher": "startup",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       },
       {
         "matcher": "resume",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       },
       {
         "matcher": "clear",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       },
       {
         "matcher": "compact",
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh"}]
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-end.sh", "timeout": 5}]
       }
     ]
   }
@@ -797,23 +996,11 @@ SETTINGS_EOF
     info "Created settings.json with AFT hooks (Grep + Glob interception, discovery gate, session reminder)"
 fi
 
-# Add aft to PATH via symlink
-if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
-    ln -sf "$HOOKS_DIR/aft" /usr/local/bin/aft 2>/dev/null && \
-        info "Symlinked aft to /usr/local/bin/aft" || \
-        warn "Could not symlink to /usr/local/bin (run with sudo if needed)"
-
-    # Also symlink the Go helper so find_helper_binary picks it up via PATH.
-    if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-        ln -sf "$GO_HELPER_BINARY" /usr/local/bin/aft-go-helper 2>/dev/null && \
-            info "Symlinked aft-go-helper to /usr/local/bin/aft-go-helper" || \
-            warn "Could not symlink aft-go-helper to /usr/local/bin (run with sudo if needed)"
-    fi
-else
-    warn "Cannot write to /usr/local/bin - add $HOOKS_DIR to PATH manually"
-    if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-        warn "Also add $GO_HELPER_BINARY to PATH as 'aft-go-helper' for Go interface dispatch resolution"
-    fi
+# Add aft to PATH via an idempotent symlink. Prefer /usr/local/bin when it is
+# writable, otherwise fall back to ~/.local/bin and configure shells to see it.
+install_path_command "$HOOKS_DIR/aft" "aft" || true
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+    install_path_command "$GO_HELPER_BINARY" "aft-go-helper" || true
 fi
 
 echo ""
@@ -822,12 +1009,15 @@ echo ""
 echo "Installed files:"
 echo "  $HOOKS_DIR/aft                         - CLI wrapper"
 echo "  $HOOKS_DIR/aft-hook.sh                 - Grep/Glob interceptor (routes through AFT)"
-echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart reminder (AFT discovery protocol)"
+echo "  $HOOKS_DIR/aft-session-runtime.sh      - Shared session lifecycle helper"
+echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart prewarm + reminder"
+echo "  $HOOKS_DIR/aft-session-end.sh          - SessionEnd cleanup hook"
 echo "  $HOOKS_DIR/aft-code-discovery-gate.sh  - PreToolUse gate (nudges toward AFT tools once per session)"
 echo "  $CLAUDE_DIR/AFT.md                     - Claude instructions"
 echo "  $CLAUDE_DIR/settings.json              - Hook configuration"
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-    echo "  $GO_HELPER_BINARY - Go interface-dispatch resolver"
+  echo "  $GO_HELPER_BINARY - Go interface-dispatch resolver"
+  echo "  $ZSH_CONFIG_FILE / $FISH_CONFIG_FILE - AFT_GO_HELPER_PATH"
 fi
 echo ""
 echo "Usage:"
@@ -836,8 +1026,7 @@ echo "  aft zoom file.ts func    # Inspect function"
 echo "  aft callers file.ts func # Find all callers"
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
     echo ""
-    echo "Go interface dispatch is enabled. AFT will automatically resolve"
-    echo "interface method calls to their concrete implementations in Go projects."
+echo "Go helper support is available through aft-go-helper."
 fi
 echo ""
 echo "Restart Claude Code to activate hooks."

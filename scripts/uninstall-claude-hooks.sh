@@ -4,8 +4,17 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AFT_ROOT="$(dirname "$SCRIPT_DIR")"
 CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
+ZSH_CONFIG_FILE="$HOME/.zshrc"
+FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+LOCAL_BIN_DIR="${AFT_LOCAL_BIN_DIR:-$HOME/.local/bin}"
+ENV_BLOCK_START="# >>> aft-go-helper >>>"
+ENV_BLOCK_END="# <<< aft-go-helper <<<"
+CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
+CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -15,10 +24,37 @@ NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
+remove_managed_block() {
+  local file="$1"
+  local start="${2:-$ENV_BLOCK_START}"
+  local end="${3:-$ENV_BLOCK_END}"
+  local temp_file
+  [ -f "$file" ] || return 0
+  temp_file="$(mktemp)"
+  awk -v start="$start" -v end="$end" '
+    $0 == start { in_block = 1; next }
+    $0 == end { in_block = 0; next }
+    !in_block { print }
+  ' "$file" > "$temp_file" || return 1
+  mv "$temp_file" "$file"
+  info "Removed managed AFT block from $file"
+}
+
+remove_symlink_if_target() {
+  local path="$1"
+  local target="$2"
+  if [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ]; then
+    rm -f "$path"
+    info "Removed $path symlink"
+  fi
+}
+
 # Remove hook files
 [ -f "$HOOKS_DIR/aft" ] && rm "$HOOKS_DIR/aft" && info "Removed $HOOKS_DIR/aft"
 [ -f "$HOOKS_DIR/aft-hook.sh" ] && rm "$HOOKS_DIR/aft-hook.sh" && info "Removed $HOOKS_DIR/aft-hook.sh"
+[ -f "$HOOKS_DIR/aft-session-runtime.sh" ] && rm "$HOOKS_DIR/aft-session-runtime.sh" && info "Removed $HOOKS_DIR/aft-session-runtime.sh"
 [ -f "$HOOKS_DIR/aft-session-reminder.sh" ] && rm "$HOOKS_DIR/aft-session-reminder.sh" && info "Removed $HOOKS_DIR/aft-session-reminder.sh"
+[ -f "$HOOKS_DIR/aft-session-end.sh" ] && rm "$HOOKS_DIR/aft-session-end.sh" && info "Removed $HOOKS_DIR/aft-session-end.sh"
 [ -f "$HOOKS_DIR/aft-code-discovery-gate.sh" ] && rm "$HOOKS_DIR/aft-code-discovery-gate.sh" && info "Removed $HOOKS_DIR/aft-code-discovery-gate.sh"
 
 # Remove AFT.md
@@ -42,16 +78,25 @@ if [ -f "$SETTINGS_FILE" ] && command -v jq &>/dev/null; then
           (.command // "") as $c
           | ($c | contains("aft-hook.sh")) or
             ($c | contains("aft-code-discovery-gate.sh")) or
-            ($c | contains("aft-session-reminder.sh"))
+            ($c | contains("aft-session-reminder.sh")) or
+            ($c | contains("aft-session-end.sh"))
         ) | any;
       .hooks.PreToolUse = ((.hooks.PreToolUse // []) | map(select(drops_aft | not))) |
-      .hooks.SessionStart = ((.hooks.SessionStart // []) | map(select(drops_aft | not)))
+      .hooks.SessionStart = ((.hooks.SessionStart // []) | map(select(drops_aft | not))) |
+      .hooks.SessionEnd = ((.hooks.SessionEnd // []) | map(select(drops_aft | not)))
     ' "$SETTINGS_FILE" > "$TEMP_FILE" 2>/dev/null && mv "$TEMP_FILE" "$SETTINGS_FILE" && \
         info "Removed AFT hooks from settings.json"
 fi
 
-# Remove symlink
-[ -L "/usr/local/bin/aft" ] && rm "/usr/local/bin/aft" 2>/dev/null && info "Removed /usr/local/bin/aft symlink"
+# Remove only AFT-owned symlinks.
+remove_symlink_if_target "/usr/local/bin/aft" "$HOOKS_DIR/aft"
+remove_symlink_if_target "$LOCAL_BIN_DIR/aft" "$HOOKS_DIR/aft"
+remove_symlink_if_target "/usr/local/bin/aft-go-helper" "$AFT_ROOT/target/release/aft-go-helper"
+remove_symlink_if_target "$LOCAL_BIN_DIR/aft-go-helper" "$AFT_ROOT/target/release/aft-go-helper"
+remove_managed_block "$ZSH_CONFIG_FILE"
+remove_managed_block "$FISH_CONFIG_FILE"
+remove_managed_block "$ZSH_CONFIG_FILE" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END"
+remove_managed_block "$FISH_CONFIG_FILE" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END"
 
 echo ""
 echo -e "${GREEN}AFT Claude Code hooks uninstalled.${NC}"
