@@ -7,6 +7,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AFT_ROOT="$(dirname "$SCRIPT_DIR")"
 PLUGIN_PACKAGE_DIR="$AFT_ROOT/packages/opencode-plugin"
 CONFIG_DIR="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+ZSH_CONFIG_FILE="$HOME/.zshrc"
+FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+LOCAL_BIN_DIR="${AFT_LOCAL_BIN_DIR:-$HOME/.local/bin}"
+AFT_CLI_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aft/bin"
+AFT_CLI_WRAPPER="$AFT_CLI_DIR/aft"
+ENV_BLOCK_START="# >>> aft-go-helper >>>"
+ENV_BLOCK_END="# <<< aft-go-helper <<<"
+CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
+CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,6 +37,31 @@ detect_config_path() {
     return
   fi
   printf '%s' "$CONFIG_DIR/${base_name}.json"
+}
+
+remove_managed_block() {
+  local file="$1"
+  local start="${2:-$ENV_BLOCK_START}"
+  local end="${3:-$ENV_BLOCK_END}"
+  local temp_file
+  [ -f "$file" ] || return 0
+  temp_file="$(mktemp)"
+  awk -v start="$start" -v end="$end" '
+    $0 == start { in_block = 1; next }
+    $0 == end { in_block = 0; next }
+    !in_block { print }
+  ' "$file" > "$temp_file" || return 1
+  mv "$temp_file" "$file"
+  info "Removed managed AFT block from $file"
+}
+
+remove_symlink_if_target() {
+  local path="$1"
+  local target="$2"
+  if [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ]; then
+    rm -f "$path"
+    info "Removed $path symlink"
+  fi
 }
 
 ensure_plugin_deps() {
@@ -97,6 +131,15 @@ ensure_plugin_deps
 
 remove_plugin_config "$(detect_config_path opencode)" "OpenCode server plugin entry"
 remove_plugin_config "$(detect_config_path tui)" "OpenCode TUI plugin entry"
+remove_symlink_if_target "/usr/local/bin/aft" "$AFT_CLI_WRAPPER"
+remove_symlink_if_target "$LOCAL_BIN_DIR/aft" "$AFT_CLI_WRAPPER"
+remove_symlink_if_target "/usr/local/bin/aft-go-helper" "$AFT_ROOT/target/release/aft-go-helper"
+remove_symlink_if_target "$LOCAL_BIN_DIR/aft-go-helper" "$AFT_ROOT/target/release/aft-go-helper"
+[ -f "$AFT_CLI_WRAPPER" ] && rm -f "$AFT_CLI_WRAPPER" && info "Removed $AFT_CLI_WRAPPER"
+remove_managed_block "$ZSH_CONFIG_FILE"
+remove_managed_block "$FISH_CONFIG_FILE"
+remove_managed_block "$ZSH_CONFIG_FILE" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END"
+remove_managed_block "$FISH_CONFIG_FILE" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END"
 
 echo ""
 echo -e "${GREEN}AFT OpenCode integration uninstalled.${NC}"

@@ -72,7 +72,7 @@ Hops marked `"approximate": true` are lossy (field access, struct wraps, writer 
 
 ```bash
 aft read <file> [start_line] [limit]   # Read with line numbers
-aft grep <pattern> [path]              # Trigram-indexed search
+aft grep <pattern> [path]              # Trigram-indexed search (ERE syntax: use | for alternation, not \|)
 aft glob <pattern> [path]              # File pattern matching
 ```
 
