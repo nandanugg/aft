@@ -157,6 +157,16 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         "formatted": write_result.formatted,
     });
 
+    // Aggregate diff counts across all applied edits, computed from the
+    // original source vs the final (post-format) on-disk content. Without
+    // this, batch responses reported `edits_applied` but +0/-0, so the
+    // agent-facing summary said "Edited (+0/-0, N edits)" even when content
+    // changed. Mirrors the edit_match find/replace path.
+    if edit::wants_diff(&req.params) {
+        let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| content.clone());
+        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
+    }
+
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }

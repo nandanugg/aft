@@ -881,6 +881,50 @@ fn batch_multiple_edits() {
 }
 
 #[test]
+fn batch_reports_aggregate_diff_counts() {
+    // Regression: batch responses used to report `edits_applied` but no `diff`,
+    // so the agent-facing summary said "Edited (+0/-0, N edits)" even when
+    // content changed. With include_diff, batch must return aggregate
+    // additions/deletions across all edits (computed source -> final content).
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_diff.ts");
+
+    // Two line replacements (each is -1/+1) plus one pure insertion line.
+    let content = "const a = 1;\nconst b = 2;\nconst c = 3;\n";
+    fs::write(&target, content).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-diff-1",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "include_diff": true,
+        "edits": [
+            { "match": "const a = 1;", "replacement": "const a = 10;\nconst aa = 11;" },
+            { "match": "const b = 2;", "replacement": "const b = 20;" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch should succeed: {:?}", resp);
+    assert_eq!(resp["edits_applied"], 2);
+    let diff = &resp["diff"];
+    assert!(
+        diff.is_object(),
+        "batch must include aggregate diff counts: {:?}",
+        resp
+    );
+    // a: 1->2 lines (a=10 + aa=11) => +2/-1 ; b: 1->1 line => +1/-1.
+    // Aggregate: additions = 3, deletions = 2.
+    assert_eq!(diff["additions"], 3, "additions mismatch: {:?}", diff);
+    assert_eq!(diff["deletions"], 2, "deletions mismatch: {:?}", diff);
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn batch_rollback_on_failure() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
