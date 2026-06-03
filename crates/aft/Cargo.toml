@@ -77,9 +77,17 @@ url = "2"
 content_inspector = "0.2.4"
 memchr = "2"
 rayon = "1"
-fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tree-sitter-scss = { package = "cortexkit-tree-sitter-scss", version = "1.0.1" }
+# Local embedding backend (all-MiniLM-L6-v2) driven directly through ort, so we
+# control intra-op thread count (fastembed hardcoded all-cores). hf-hub fetches
+# the model on fresh installs; ureq feature = sync + rustls (no native-tls, for
+# clean cross-platform builds).
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic", "half"] }
+tokenizers = "0.22.2"
+ndarray = "0.17.2"
+half = "2"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

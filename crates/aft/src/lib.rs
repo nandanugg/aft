@@ -73,6 +73,7 @@ pub mod imports;
 pub mod indent;
 pub mod inspect;
 pub mod language;
+pub mod local_embed;
 pub mod log_ctx;
 pub mod lsp;
 pub mod lsp_hints;

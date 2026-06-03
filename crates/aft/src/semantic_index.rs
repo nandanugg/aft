@@ -6,7 +6,7 @@ use crate::search_index::{cache_relative_path, cached_path_under_root};
 use crate::symbols::{Symbol, SymbolKind};
 use crate::{slog_info, slog_warn};
 
-use fastembed::{EmbeddingModel as FastembedEmbeddingModel, InitOptions, TextEmbedding};
+use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -127,7 +127,9 @@ impl SemanticIndexFingerprint {
 }
 
 enum SemanticEmbeddingEngine {
-    Fastembed(TextEmbedding),
+    /// Local ONNX embedder (all-MiniLM-L6-v2 via raw `ort`). The config-facing
+    /// backend string stays "fastembed" for index-fingerprint compatibility.
+    Local(LocalEmbedder),
     OpenAiCompatible {
         client: Client,
         model: String,
@@ -433,7 +435,7 @@ impl SemanticEmbeddingModel {
 
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
-                SemanticEmbeddingEngine::Fastembed(initialize_text_embedding(&model)?)
+                SemanticEmbeddingEngine::Local(LocalEmbedder::new(&model)?)
             }
             SemanticBackend::OpenAiCompatible => {
                 let raw = config.base_url.as_ref().ok_or_else(|| {
@@ -519,10 +521,8 @@ impl SemanticEmbeddingModel {
         }
 
         let dimension = match &mut self.engine {
-            SemanticEmbeddingEngine::Fastembed(model) => {
-                let vectors = model
-                    .embed(vec!["semantic index fingerprint probe".to_string()], None)
-                    .map_err(|error| format_embedding_init_error(error.to_string()))?;
+            SemanticEmbeddingEngine::Local(model) => {
+                let vectors = model.embed(&["semantic index fingerprint probe".to_string()])?;
                 vectors
                     .first()
                     .map(|v| v.len())
@@ -590,9 +590,8 @@ impl SemanticEmbeddingModel {
 
     fn embed_texts(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         match &mut self.engine {
-            SemanticEmbeddingEngine::Fastembed(model) => model
-                .embed(texts, None::<usize>)
-                .map_err(|error| format_embedding_init_error(error.to_string()))
+            SemanticEmbeddingEngine::Local(model) => model
+                .embed(&texts)
                 .map_err(|error| format!("failed to embed batch: {error}")),
             SemanticEmbeddingEngine::OpenAiCompatible {
                 client,
@@ -1003,23 +1002,6 @@ pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> Stri
     )
 }
 
-pub fn initialize_text_embedding(model: &str) -> Result<TextEmbedding, String> {
-    // Pre-validate before ort can panic on a bad library
-    pre_validate_onnx_runtime()?;
-
-    let selected_model = match model {
-        "all-MiniLM-L6-v2" | "all-minilm-l6-v2" => FastembedEmbeddingModel::AllMiniLML6V2,
-        _ => {
-            return Err(format!(
-                "unsupported fastembed model '{}'. Supported: all-MiniLM-L6-v2",
-                model
-            ))
-        }
-    };
-
-    TextEmbedding::try_new(InitOptions::new(selected_model)).map_err(format_embedding_init_error)
-}
-
 pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
     if message.trim_start().starts_with("ONNX Runtime not found.") {
         return true;
@@ -1046,7 +1028,7 @@ pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
     mentions_onnx_runtime && mentions_dynamic_load_failure
 }
 
-fn format_embedding_init_error(error: impl Display) -> String {
+pub fn format_embedding_init_error(error: impl Display) -> String {
     let message = error.to_string();
 
     if is_onnx_runtime_unavailable(&message) {
@@ -1183,6 +1165,7 @@ impl SemanticIndex {
         project_root: &Path,
         files: &[PathBuf],
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
+        let collect_started = std::time::Instant::now();
         let per_file: Vec<(
             PathBuf,
             Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
@@ -1223,6 +1206,13 @@ impl SemanticIndex {
                 }
             }
         }
+
+        slog_info!(
+            "semantic collect: {} chunks from {} files in {} ms",
+            chunks.len(),
+            file_metadata.len(),
+            collect_started.elapsed().as_millis()
+        );
 
         (chunks, file_metadata)
     }
@@ -1268,6 +1258,8 @@ impl SemanticIndex {
         let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
         let mut expected_dimension: Option<usize> = None;
         let batch_size = max_batch_size.max(1);
+        let embed_started = std::time::Instant::now();
+        let batch_count = total_chunks.div_ceil(batch_size);
         for batch_start in (0..chunks.len()).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(chunks.len());
             let batch_texts: Vec<String> = chunks[batch_start..batch_end]
@@ -1303,6 +1295,18 @@ impl SemanticIndex {
                 callback(entries.len(), total_chunks);
             }
         }
+
+        let embed_ms = embed_started.elapsed().as_millis();
+        let rate = (total_chunks as u128 * 1000)
+            .checked_div(embed_ms)
+            .unwrap_or(0) as u64;
+        slog_info!(
+            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s)",
+            total_chunks,
+            batch_count,
+            embed_ms,
+            rate
+        );
 
         let dimension = entries
             .first()
