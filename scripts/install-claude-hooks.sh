@@ -10,8 +10,11 @@ CLAUDE_DIR="$HOME/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 ZSH_CONFIG_FILE="$HOME/.zshrc"
 FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+LOCAL_BIN_DIR="${AFT_LOCAL_BIN_DIR:-$HOME/.local/bin}"
 ENV_BLOCK_START="# >>> aft-go-helper >>>"
 ENV_BLOCK_END="# <<< aft-go-helper <<<"
+CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
+CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 SESSION_REMINDER_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-reminder.sh"
 SESSION_END_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-end.sh"
@@ -37,10 +40,12 @@ escape_sed_replacement() {
 
 strip_managed_block() {
   local file="$1"
+  local start="${2:-$ENV_BLOCK_START}"
+  local end="${3:-$ENV_BLOCK_END}"
   local temp_file
   temp_file="$(mktemp)"
   if [ -f "$file" ]; then
-    awk -v start="$ENV_BLOCK_START" -v end="$ENV_BLOCK_END" '
+    awk -v start="$start" -v end="$end" '
       $0 == start { in_block = 1; next }
       $0 == end { in_block = 0; next }
       !in_block { print }
@@ -80,6 +85,86 @@ overwrite_file() {
   fi
   cat "$source" > "$target"
   rm -f "$source"
+}
+
+upsert_shell_path_env() {
+  local bin_dir="$1"
+  local file="$2"
+  local shell_kind="$3"
+  local temp_file
+  temp_file="$(strip_managed_block "$file" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END")"
+  mkdir -p "$(dirname "$file")"
+  if [ -s "$temp_file" ]; then
+    printf '\n' >> "$temp_file"
+  fi
+  {
+    printf '%s\n' "$CLI_PATH_BLOCK_START"
+    if [ "$shell_kind" = "fish" ]; then
+      printf 'fish_add_path "%s"\n' "$bin_dir"
+    else
+      printf 'case ":$PATH:" in\n'
+      printf '  *":%s:"*) ;;\n' "$bin_dir"
+      printf '  *) export PATH="%s:$PATH" ;;\n' "$bin_dir"
+      printf 'esac\n'
+    fi
+    printf '%s\n' "$CLI_PATH_BLOCK_END"
+  } >> "$temp_file"
+  overwrite_file "$temp_file" "$file"
+}
+
+link_command() {
+  local source="$1"
+  local target="$2"
+  local label="$3"
+  local current
+
+  if [ -L "$target" ]; then
+    current="$(readlink "$target")"
+    if [ "$current" = "$source" ]; then
+      info "$label already linked: $target"
+      return 0
+    fi
+    ln -sfn "$source" "$target" && info "Updated $label symlink: $target -> $source"
+    return 0
+  fi
+
+  if [ -e "$target" ]; then
+    if [ "$target" -ef "$source" ]; then
+      info "$label already available: $target"
+      return 0
+    fi
+    warn "$target already exists and is not a symlink; leaving it unchanged"
+    return 1
+  fi
+
+  ln -s "$source" "$target" && info "Linked $label: $target -> $source"
+}
+
+install_path_command() {
+  local source="$1"
+  local name="$2"
+
+  if [ ! -x "$source" ]; then
+    warn "Cannot expose $name on PATH; source is not executable: $source"
+    return 1
+  fi
+
+  if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+    if link_command "$source" "/usr/local/bin/$name" "$name"; then
+      return 0
+    fi
+  fi
+
+  mkdir -p "$LOCAL_BIN_DIR"
+  if link_command "$source" "$LOCAL_BIN_DIR/$name" "$name"; then
+    upsert_shell_path_env "$LOCAL_BIN_DIR" "$ZSH_CONFIG_FILE" "zsh"
+    upsert_shell_path_env "$LOCAL_BIN_DIR" "$FISH_CONFIG_FILE" "fish"
+    info "Ensured $LOCAL_BIN_DIR is configured on PATH in $ZSH_CONFIG_FILE and $FISH_CONFIG_FILE"
+    return 0
+  fi
+
+  warn "Could not expose $name on PATH; add $source manually"
+  return 1
 }
 
 install_templated_file() {
@@ -463,7 +548,7 @@ SIMILARITY (Tier 3):
 
 BASIC COMMANDS:
   aft read <file> [start] [limit]  Read with line numbers
-  aft grep <pattern> [path]        Trigram-indexed search
+  aft grep <pattern> [path]        Trigram-indexed search (ERE syntax: use | for alternation, not \|)
   aft glob <pattern> [path]        File pattern matching
 
 EXAMPLES:
@@ -670,7 +755,7 @@ aft trace_data <file> <symbol> <expression> [depth]
 
 ```bash
 aft read <file> [start_line] [limit]   # Read with line numbers
-aft grep <pattern> [path]              # Trigram-indexed search
+aft grep <pattern> [path]              # Trigram-indexed search (ERE syntax: use | for alternation, not \|)
 aft glob <pattern> [path]              # File pattern matching
 ```
 
@@ -916,23 +1001,11 @@ SETTINGS_EOF
     info "Created settings.json with AFT hooks (Grep + Glob interception, discovery gate, session reminder)"
 fi
 
-# Add aft to PATH via symlink
-if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
-    ln -sf "$HOOKS_DIR/aft" /usr/local/bin/aft 2>/dev/null && \
-        info "Symlinked aft to /usr/local/bin/aft" || \
-        warn "Could not symlink to /usr/local/bin (run with sudo if needed)"
-
-    # Also symlink the Go helper so find_helper_binary picks it up via PATH.
-    if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-        ln -sf "$GO_HELPER_BINARY" /usr/local/bin/aft-go-helper 2>/dev/null && \
-            info "Symlinked aft-go-helper to /usr/local/bin/aft-go-helper" || \
-            warn "Could not symlink aft-go-helper to /usr/local/bin (run with sudo if needed)"
-    fi
-else
-    warn "Cannot write to /usr/local/bin - add $HOOKS_DIR to PATH manually"
-    if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-        warn "Also add $GO_HELPER_BINARY to PATH as 'aft-go-helper' for Go interface dispatch resolution"
-    fi
+# Add aft to PATH via an idempotent symlink. Prefer /usr/local/bin when it is
+# writable, otherwise fall back to ~/.local/bin and configure shells to see it.
+install_path_command "$HOOKS_DIR/aft" "aft" || true
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+    install_path_command "$GO_HELPER_BINARY" "aft-go-helper" || true
 fi
 
 echo ""

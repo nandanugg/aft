@@ -15,8 +15,11 @@ CODEX_CONFIG_FILE="$CODEX_DIR/config.toml"
 CODEX_AFT_DOC="$CODEX_DIR/AFT.md"
 ZSH_CONFIG_FILE="$HOME/.zshrc"
 FISH_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+LOCAL_BIN_DIR="${AFT_LOCAL_BIN_DIR:-$HOME/.local/bin}"
 ENV_BLOCK_START="# >>> aft-go-helper >>>"
 ENV_BLOCK_END="# <<< aft-go-helper <<<"
+CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
+CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 WRAPPER_TEMPLATE="$AFT_ROOT/templates/aft-wrapper.sh"
 SESSION_RUNTIME_TEMPLATE="$AFT_ROOT/templates/aft-session-runtime.sh"
@@ -75,10 +78,12 @@ install_templated_file() {
 
 strip_managed_block() {
   local file="$1"
+  local start="${2:-$ENV_BLOCK_START}"
+  local end="${3:-$ENV_BLOCK_END}"
   local temp_file
   temp_file="$(mktemp)"
   if [ -f "$file" ]; then
-    awk -v start="$ENV_BLOCK_START" -v end="$ENV_BLOCK_END" '
+    awk -v start="$start" -v end="$end" '
       $0 == start { in_block = 1; next }
       $0 == end { in_block = 0; next }
       !in_block { print }
@@ -109,6 +114,86 @@ upsert_shell_helper_env() {
   overwrite_file "$temp_file" "$file"
 }
 
+upsert_shell_path_env() {
+  local bin_dir="$1"
+  local file="$2"
+  local shell_kind="$3"
+  local temp_file
+  temp_file="$(strip_managed_block "$file" "$CLI_PATH_BLOCK_START" "$CLI_PATH_BLOCK_END")"
+  mkdir -p "$(dirname "$file")"
+  if [ -s "$temp_file" ]; then
+    printf '\n' >> "$temp_file"
+  fi
+  {
+    printf '%s\n' "$CLI_PATH_BLOCK_START"
+    if [ "$shell_kind" = "fish" ]; then
+      printf 'fish_add_path "%s"\n' "$bin_dir"
+    else
+      printf 'case ":$PATH:" in\n'
+      printf '  *":%s:"*) ;;\n' "$bin_dir"
+      printf '  *) export PATH="%s:$PATH" ;;\n' "$bin_dir"
+      printf 'esac\n'
+    fi
+    printf '%s\n' "$CLI_PATH_BLOCK_END"
+  } >> "$temp_file"
+  overwrite_file "$temp_file" "$file"
+}
+
+link_command() {
+  local source="$1"
+  local target="$2"
+  local label="$3"
+  local current
+
+  if [ -L "$target" ]; then
+    current="$(readlink "$target")"
+    if [ "$current" = "$source" ]; then
+      info "$label already linked: $target"
+      return 0
+    fi
+    ln -sfn "$source" "$target" && info "Updated $label symlink: $target -> $source"
+    return 0
+  fi
+
+  if [ -e "$target" ]; then
+    if [ "$target" -ef "$source" ]; then
+      info "$label already available: $target"
+      return 0
+    fi
+    warn "$target already exists and is not a symlink; leaving it unchanged"
+    return 1
+  fi
+
+  ln -s "$source" "$target" && info "Linked $label: $target -> $source"
+}
+
+install_path_command() {
+  local source="$1"
+  local name="$2"
+
+  if [ ! -x "$source" ]; then
+    warn "Cannot expose $name on PATH; source is not executable: $source"
+    return 1
+  fi
+
+  if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+    if link_command "$source" "/usr/local/bin/$name" "$name"; then
+      return 0
+    fi
+  fi
+
+  mkdir -p "$LOCAL_BIN_DIR"
+  if link_command "$source" "$LOCAL_BIN_DIR/$name" "$name"; then
+    upsert_shell_path_env "$LOCAL_BIN_DIR" "$ZSH_CONFIG_FILE" "zsh"
+    upsert_shell_path_env "$LOCAL_BIN_DIR" "$FISH_CONFIG_FILE" "fish"
+    info "Ensured $LOCAL_BIN_DIR is configured on PATH in $ZSH_CONFIG_FILE and $FISH_CONFIG_FILE"
+    return 0
+  fi
+
+  warn "Could not expose $name on PATH; add $source manually"
+  return 1
+}
+
 can_query_toml_with_yq() {
   command -v yq >/dev/null 2>&1 || return 1
   [ -s "$CODEX_CONFIG_FILE" ] || return 1
@@ -117,7 +202,7 @@ can_query_toml_with_yq() {
 
 config_already_has_codex_settings() {
   can_query_toml_with_yq || return 1
-  [ "$(yq -p toml -r '(.suppress_unstable_features_warning == true) and (.features.codex_hooks == true)' "$CODEX_CONFIG_FILE" 2>/dev/null)" = "true" ]
+  [ "$(yq -p toml -r '(.suppress_unstable_features_warning == true) and (.features.hooks == true)' "$CODEX_CONFIG_FILE" 2>/dev/null)" = "true" ]
 }
 
 ensure_root_boolean() {
@@ -213,6 +298,26 @@ ensure_features_boolean() {
   overwrite_file "$temp_file" "$CODEX_CONFIG_FILE"
 }
 
+remove_features_key() {
+  local key="$1"
+  local temp_file
+  temp_file="$(mktemp)"
+
+  awk -v key="$key" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      in_features = ($0 ~ /^[[:space:]]*\[features\][[:space:]]*$/)
+      print
+      next
+    }
+    in_features && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      next
+    }
+    { print }
+  ' "$CODEX_CONFIG_FILE" > "$temp_file" || error "Failed to update $CODEX_CONFIG_FILE"
+
+  overwrite_file "$temp_file" "$CODEX_CONFIG_FILE"
+}
+
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     error "Codex hooks are currently not supported on Windows."
@@ -303,11 +408,12 @@ else
 fi
 
 # Update config.toml directly so the active config layer owns the hook settings.
+remove_features_key "codex_hooks"
 if config_already_has_codex_settings; then
   info "config.toml already has Codex hook settings"
 else
   ensure_root_boolean "suppress_unstable_features_warning" "true"
-  ensure_features_boolean "codex_hooks" "true"
+  ensure_features_boolean "hooks" "true"
   info "Updated config.toml with Codex hook settings"
 fi
 
@@ -419,22 +525,11 @@ EOF
   info "Created hooks.json with AFT hook configuration"
 fi
 
-# Add aft to PATH via symlink when possible.
-if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
-  ln -sf "$CODEX_BIN_DIR/aft" /usr/local/bin/aft 2>/dev/null && \
-    info "Symlinked aft to /usr/local/bin/aft" || \
-    warn "Could not symlink aft to /usr/local/bin"
-
-  if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-    ln -sf "$GO_HELPER_BINARY" /usr/local/bin/aft-go-helper 2>/dev/null && \
-      info "Symlinked aft-go-helper to /usr/local/bin/aft-go-helper" || \
-      warn "Could not symlink aft-go-helper to /usr/local/bin"
-  fi
-else
-  warn "Cannot write to /usr/local/bin - add $CODEX_BIN_DIR to PATH manually"
-  if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
-    warn "Also add $GO_HELPER_BINARY to PATH as aft-go-helper for Go interface dispatch resolution"
-  fi
+# Add aft to PATH via an idempotent symlink. Prefer /usr/local/bin when it is
+# writable, otherwise fall back to ~/.local/bin and configure shells to see it.
+install_path_command "$CODEX_BIN_DIR/aft" "aft" || true
+if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
+  install_path_command "$GO_HELPER_BINARY" "aft-go-helper" || true
 fi
 
 echo ""
