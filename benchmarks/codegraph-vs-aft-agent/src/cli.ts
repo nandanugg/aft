@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import type { AgentArm, AgentCheck, AgentCorpus, AgentReport, AgentRunResult, AgentTask, TokenUsage } from "./types";
+import type { AgentArm, AgentCheck, AgentCorpus, AgentReport, AgentRunResult, AgentTask, ArmConfig, TokenBreakdown, TokenUsage } from "./types";
 import { copyFixture, ensureExists, HARNESS_DIR, percentile, readOpencodeAuthKey, resetDir, round, runCommand, writeJson } from "./util";
 
 interface CliOptions {
@@ -31,6 +31,12 @@ async function main(): Promise<void> {
   const selectedTasks = selectTasks(corpus.tasks, options.taskIds, options.limit);
   resetDir(options.runRoot);
   mkdirSync(options.outDir, { recursive: true });
+  // Bug #1 fix: clear stale transcripts at the start of every run so artifacts
+  // from a previous run can never be mistaken for fresh data. The transcripts
+  // dir lives under outDir (mounted to the host), so fresh transcripts always
+  // refresh on the host.
+  const transcriptsDir = resolve(options.outDir, "transcripts");
+  resetDir(transcriptsDir);
 
   const results: AgentRunResult[] = [];
   for (const task of selectedTasks) {
@@ -98,11 +104,19 @@ async function runTaskArm(task: AgentTask, arm: AgentArm, fixturePath: string, o
   writeFileSync(stdoutPath, stdout);
   writeFileSync(stderrPath, stderr);
 
+  // Bug #1 fix: render a fresh human-readable transcript into the mounted
+  // outDir/transcripts/ for THIS run, so analysis never reads stale artifacts.
+  const transcriptsDir = resolve(options.outDir, "transcripts");
+  mkdirSync(transcriptsDir, { recursive: true });
+  const transcriptPath = resolve(transcriptsDir, `${task.id}.${arm}.txt`);
+  writeFileSync(transcriptPath, renderTranscript(stdout));
+
   const wallTimeMs = performance.now() - started;
   const answerText = extractVisibleText(stdout);
   const checks = await evaluateChecks(task.checks, repoPath, answerText || stdout, options.timeoutMs);
   const success = exitCode === 0 && checks.every((check) => check.pass) && !error;
   const tokens = parseTokenUsage(stdout);
+  const tokenBreakdown = parseTokenBreakdown(stdout);
   return {
     arm,
     taskId: task.id,
@@ -113,10 +127,12 @@ async function runTaskArm(task: AgentTask, arm: AgentArm, fixturePath: string, o
     wallTimeMs: round(wallTimeMs, 3),
     exitCode,
     tokens,
+    tokenBreakdown,
     toolCalls: countToolCalls(stdout),
     answerText: truncate(answerText || stdout, 4000),
     stdoutPath,
     stderrPath,
+    transcriptPath,
     repoPath,
     checks,
     error,
@@ -139,44 +155,10 @@ async function prepareArm(
   if (arm === "aft") {
     writeJson(resolve(opencodeDir, "opencode.json"), {
       $schema: "https://opencode.ai/config.json",
-      plugin: ["@cortexkit/aft-opencode@latest"],
+      plugin: [AFT_PLUGIN_SPEC],
       provider,
     });
-    // Fair-comparison surface: keep file/edit/grep/bash mechanics IDENTICAL to the
-    // codegraph arm (native OpenCode tools) so the only difference benchmarked is the
-    // code-intelligence layer — AFT's aft_search/aft_outline/aft_zoom/aft_navigate vs
-    // codegraph's codegraph_* tools.
-    //   - hoist_builtin_tools:false → native read/write/edit (AFT registers aft_* prefixed; disabled below)
-    //   - bash:false                → native bash on both arms (AFT otherwise hoists bash)
-    //   - grep/glob disabled         → native grep/glob (search_index stays true so aft_search keeps its lexical lane)
-    //   - tool_surface:"all"         → expose aft_navigate (the codegraph_trace/callers comparator)
-    //   - everything non-comparison disabled (safety/import/ast-grep/conflicts/lsp/refactor/transform/move/delete)
-    const aftBenchConfig = {
-      search_index: true,
-      semantic_search: true,
-      hoist_builtin_tools: false,
-      bash: false,
-      tool_surface: "all",
-      disabled_tools: [
-        "aft_read",
-        "aft_write",
-        "aft_edit",
-        "aft_apply_patch",
-        "grep",
-        "glob",
-        "aft_safety",
-        "aft_import",
-        "ast_grep_search",
-        "ast_grep_replace",
-        "aft_conflicts",
-        "lsp_diagnostics",
-        "aft_refactor",
-        "aft_transform",
-        "aft_move",
-        "aft_delete",
-      ],
-    };
-    writeFileSync(resolve(opencodeDir, "aft.jsonc"), `${JSON.stringify(aftBenchConfig, null, 2)}\n`);
+    writeFileSync(resolve(opencodeDir, "aft.jsonc"), `${JSON.stringify(aftBenchConfig(), null, 2)}\n`);
     if (!dryRun) {
       const storageDir = cortexKitStorageRoot();
       const warmup = await runCommand(
@@ -198,13 +180,7 @@ async function prepareArm(
   writeJson(resolve(opencodeDir, "opencode.json"), {
     $schema: "https://opencode.ai/config.json",
     provider,
-    mcp: {
-      codegraph: {
-        type: "local",
-        command: ["codegraph", "serve", "--mcp", "--path", repoPath, "--no-watch"],
-        enabled: true,
-      },
-    },
+    mcp: codegraphMcpConfig(repoPath),
   });
 
   const init = await runCommand(["codegraph", "init", repoPath], HARNESS_DIR, timeoutMs, codegraphEnv());
@@ -312,6 +288,13 @@ function buildReport(corpus: AgentCorpus, tasks: AgentTask[], options: CliOption
       toolCallsMedian: percentile(toolCalls, 50),
     };
   }
+  // Bug #2 fix: record the resolved per-arm config so every run is
+  // self-describing and two runs can be confirmed to use the same setup.
+  const armConfigs: Record<AgentArm, ArmConfig> = {
+    aft: resolveArmConfig("aft"),
+    codegraph: resolveArmConfig("codegraph"),
+  };
+
   return {
     benchmark: "codegraph-vs-aft-agent",
     timestamp: new Date().toISOString(),
@@ -322,10 +305,18 @@ function buildReport(corpus: AgentCorpus, tasks: AgentTask[], options: CliOption
     taskCount: tasks.length,
     summary,
     results,
+    armConfigs,
     metadata: {
       dryRun: options.dryRun,
       fixturePath: corpus.fixturePath,
-      methodology: "OpenCode CLI runs the same deterministic tasks with either AFT plugin tools or CodeGraph MCP tools. Scoring checks final answers, file contents, and optional commands.",
+      providerBaseUrl: options.providerBaseUrl ?? null,
+      providerName: options.providerName ?? null,
+      timeoutMs: options.timeoutMs,
+      // Echo the resolved arm configs into metadata too, so a reader scanning
+      // `metadata` alone can confirm the tool surface / disabled tools / model
+      // wiring used by each arm without cross-referencing armConfigs.
+      armConfigs,
+      methodology: "OpenCode CLI runs the same deterministic tasks with either AFT plugin tools or CodeGraph MCP tools. Both arms keep native read/edit/write/grep/glob/bash; the only variable is the code-intelligence layer (aft_* vs codegraph_*). Indexes are pre-warmed per arm before the agent runs. Scoring checks final answers, file contents, and optional commands.",
       auth: "API keys are read from OPENCODE_API_KEY/OPENAI_API_KEY or mounted ~/.local/share/opencode/auth.json; keys are never written to reports.",
     },
   };
@@ -353,9 +344,25 @@ function markdownSummary(report: AgentReport): string {
     "",
     "## Per task",
     "",
-    "| task | arm | kind | status | model | wall ms | tokens | tool calls |",
-    "| --- | --- | --- | --- | --- | ---: | ---: | ---: |",
-    ...report.results.map((result) => `| ${result.taskId} | ${result.arm} | ${result.kind} | ${result.success ? "PASS" : "FAIL"} | ${result.model} | ${result.wallTimeMs.toFixed(0)} | ${result.tokens.total} | ${result.toolCalls} |`),
+    "| task | arm | kind | status | model | wall ms | tokens | prompt in | tool-out tok≈ | tool calls |",
+    "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ...report.results.map((result) => {
+      const b = result.tokenBreakdown;
+      return `| ${result.taskId} | ${result.arm} | ${result.kind} | ${result.success ? "PASS" : "FAIL"} | ${result.model} | ${result.wallTimeMs.toFixed(0)} | ${result.tokens.total} | ${b?.promptInputTokens ?? 0} | ${b?.toolOutputTokensEst ?? 0} | ${result.toolCalls} |`;
+    }),
+    "",
+    "## Arm configuration (recorded for cross-run comparability)",
+    "",
+    ...report.arms.flatMap((arm) => {
+      const c = report.armConfigs[arm];
+      const detail = arm === "aft" ? JSON.stringify(c.aft) : JSON.stringify(c.mcp);
+      return [
+        `- **${arm}** — intelligence layer: \`${c.intelligenceLayer}\``,
+        `  - pre-warm: ${c.preWarm}`,
+        `  - shared built-in tools: ${Object.keys(c.builtinTools).join(", ")}`,
+        `  - config: \`${detail}\``,
+      ];
+    }),
     "",
   ];
   return `${lines.join("\n")}\n`;
@@ -453,6 +460,103 @@ function customProviderConfig(baseUrl: string, name?: string): Record<string, un
   };
 }
 
+// ── Arm configuration (single source of truth) ──────────────────────────────
+// Both arms keep file/edit/grep/glob/bash mechanics IDENTICAL (native OpenCode
+// tools) so the only variable under test is the code-intelligence layer.
+
+const AFT_PLUGIN_SPEC = "@cortexkit/aft-opencode@latest";
+const CODEGRAPH_PKG = "@colbymchenry/codegraph@0.9.6";
+
+/**
+ * Fair-comparison AFT surface. Disables every AFT tool that is NOT the
+ * code-intelligence comparator, so AFT's aft_search/aft_outline/aft_zoom/
+ * aft_callgraph are pitted against codegraph_* while file/edit/grep/bash stay
+ * native on both arms.
+ *   - hoist_builtin_tools:false → native read/write/edit (AFT aft_* prefixed; disabled below)
+ *   - bash:false                → native bash on both arms (AFT otherwise hoists bash)
+ *   - grep/glob disabled         → native grep/glob (search_index stays true so aft_search keeps its lexical lane)
+ *   - tool_surface:"all"         → expose aft_callgraph (the codegraph_trace/callers comparator)
+ *   - everything non-comparison disabled (safety/import/ast-grep/conflicts/lsp/refactor/transform/move/delete)
+ */
+function aftBenchConfig(): Record<string, unknown> {
+  return {
+    search_index: true,
+    semantic_search: true,
+    hoist_builtin_tools: false,
+    bash: false,
+    tool_surface: "all",
+    disabled_tools: [
+      "aft_read",
+      "aft_write",
+      "aft_edit",
+      "aft_apply_patch",
+      "grep",
+      "glob",
+      "aft_safety",
+      "aft_import",
+      "ast_grep_search",
+      "ast_grep_replace",
+      "aft_conflicts",
+      "lsp_diagnostics",
+      "aft_refactor",
+      "aft_transform",
+      "aft_move",
+      "aft_delete",
+    ],
+  };
+}
+
+function codegraphMcpConfig(repoPath: string): Record<string, unknown> {
+  return {
+    codegraph: {
+      type: "local",
+      command: ["codegraph", "serve", "--mcp", "--path", repoPath, "--no-watch"],
+      enabled: true,
+    },
+  };
+}
+
+/**
+ * The built-in OpenCode tool mechanics exposed to BOTH arms. Kept identical so
+ * the comparison isolates the code-intelligence layer. Recorded in metadata so
+ * a reader can verify fairness without re-deriving it from the config.
+ */
+function sharedBuiltinTools(): Record<string, string> {
+  return {
+    read: "native OpenCode read",
+    edit: "native OpenCode edit",
+    write: "native OpenCode write",
+    grep: "native OpenCode grep",
+    glob: "native OpenCode glob",
+    bash: "native OpenCode bash",
+  };
+}
+
+/**
+ * Resolved, self-describing config for one arm — recorded into report metadata
+ * so two runs can be confirmed to use the same setup (Bug #2 fix).
+ */
+function resolveArmConfig(arm: AgentArm): ArmConfig {
+  if (arm === "aft") {
+    return {
+      arm,
+      intelligenceLayer: AFT_PLUGIN_SPEC,
+      aft: aftBenchConfig(),
+      builtinTools: sharedBuiltinTools(),
+      preWarm: "aft warmup --root <repo> (builds lexical + semantic index)",
+    };
+  }
+  return {
+    arm,
+    intelligenceLayer: CODEGRAPH_PKG,
+    // Use a stable placeholder, not the per-task repo path, so the recorded
+    // config is comparable across runs and tasks.
+    mcp: codegraphMcpConfig("<per-task repo>"),
+    builtinTools: sharedBuiltinTools(),
+    preWarm: "codegraph init <repo> && codegraph index <repo> --quiet",
+  };
+}
+
 function codegraphEnv(): Record<string, string> {
   return { CI: "1", CODEGRAPH_NO_WATCH: "1", CODEGRAPH_NO_DAEMON: "1" };
 }
@@ -517,6 +621,102 @@ function parseTokenUsage(stdout: string): TokenUsage {
   }
   if (total === 0) total = input + output;
   return { input, output, total };
+}
+
+/**
+ * Decompose where a run's tokens go so each result is self-describing for the
+ * fixed-overhead (system prompt + tool defs) vs variable (tool output / turns)
+ * analysis. Parses the OpenCode `--format json` event stream:
+ *   - step_finish parts carry cumulative `tokens` (first step.input ≈ system+tools+task)
+ *   - tool_use parts carry `state.output` (re-fed into context next turn)
+ *   - text parts carry assistant text
+ */
+function parseTokenBreakdown(stdout: string): TokenBreakdown {
+  let promptInputTokens = 0;
+  let toolOutputChars = 0;
+  let assistantTextChars = 0;
+  let steps = 0;
+  let firstInputSeen = false;
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const part = (event.part as Record<string, unknown> | undefined) ?? {};
+    const partType = typeof part.type === "string" ? part.type : "";
+    const tokens = part.tokens as Record<string, unknown> | undefined;
+    if (tokens && typeof tokens.input === "number") {
+      steps += 1;
+      if (!firstInputSeen) {
+        promptInputTokens = tokens.input;
+        firstInputSeen = true;
+      }
+    }
+    if (event.type === "tool_use" || partType === "tool") {
+      const state = part.state as Record<string, unknown> | undefined;
+      const output = state?.output;
+      if (typeof output === "string") toolOutputChars += output.length;
+    }
+    if (partType === "text") {
+      const text = part.text;
+      if (typeof text === "string") assistantTextChars += text.length;
+    }
+  }
+  return {
+    promptInputTokens,
+    toolOutputChars,
+    toolOutputTokensEst: Math.round(toolOutputChars / 4),
+    assistantTextChars,
+    steps,
+  };
+}
+
+/**
+ * Render a human-readable [TOOL CALL]/[TOOL RESULT]/[ASSISTANT TEXT] transcript
+ * from the OpenCode `--format json` event stream (Bug #1 fix — the harness
+ * previously left only stale committed transcripts and never regenerated them).
+ */
+function renderTranscript(stdout: string): string {
+  const lines: string[] = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const part = (event.part as Record<string, unknown> | undefined) ?? {};
+    const partType = typeof part.type === "string" ? part.type : "";
+    if (event.type === "tool_use" || partType === "tool") {
+      const tool = typeof part.tool === "string" ? part.tool : "unknown";
+      const state = (part.state as Record<string, unknown> | undefined) ?? {};
+      const input = state.input;
+      lines.push("");
+      lines.push(`[TOOL CALL] ${tool}  input=${JSON.stringify(input ?? {})}`);
+      const output = state.output;
+      lines.push("[TOOL RESULT]");
+      if (typeof output === "string") {
+        lines.push(output.length > 4000 ? `${output.slice(0, 4000)}\n…(truncated, ${output.length} chars total)` : output);
+      } else if (output != null) {
+        lines.push(JSON.stringify(output));
+      }
+    } else if (partType === "text") {
+      const text = part.text;
+      if (typeof text === "string" && text.trim()) {
+        lines.push("");
+        lines.push("[ASSISTANT TEXT]");
+        lines.push(text.trim());
+      }
+    }
+  }
+  const body = lines.join("\n").trim();
+  return body ? `${body}\n` : "(no tool calls or assistant text captured)\n";
 }
 
 function collectTokens(value: unknown, onToken: (kind: "input" | "output" | "total", value: number) => void): void {
