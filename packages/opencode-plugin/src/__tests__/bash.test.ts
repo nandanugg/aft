@@ -776,11 +776,7 @@ describe("bash_status tool", () => {
   });
 
   test("bash_kill forwards task_id and returns confirmation", async () => {
-    const calls: Array<{ cmd: string; params: Record<string, unknown> }> = [];
-    const { killTool } = makeCtx((cmd, params) => {
-      calls.push({ cmd, params });
-      return { success: true, status: "killed" };
-    });
+    const { killTool, calls } = makeCtx(() => ({ success: true, status: "killed" }));
     const result = await killTool.execute({ taskId: "bash-deadbeef" }, createMockSdkContext());
     expect(result).toBe("Task bash-deadbeef: killed");
     expect(calls[0].cmd).toBe("bash_kill");
