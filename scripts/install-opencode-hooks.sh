@@ -15,8 +15,10 @@ ENV_BLOCK_END="# <<< aft-go-helper <<<"
 CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
 CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
-SERVER_PLUGIN_PATH="$AFT_ROOT/packages/opencode-plugin/src/index.ts"
-TUI_PLUGIN_PATH="$AFT_ROOT/packages/opencode-plugin/src/tui/index.tsx"
+SERVER_PLUGIN_SOURCE_PATH="$AFT_ROOT/packages/opencode-plugin/src/index.ts"
+TUI_PLUGIN_SOURCE_PATH="$AFT_ROOT/packages/opencode-plugin/src/tui/index.tsx"
+SERVER_PLUGIN_PATH="$AFT_ROOT/packages/opencode-plugin/dist/index.js"
+TUI_PLUGIN_PATH="$AFT_ROOT/packages/opencode-plugin/dist/tui.js"
 WRAPPER_TEMPLATE="$AFT_ROOT/templates/aft-wrapper.sh"
 AFT_CLI_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aft/bin"
 AFT_CLI_WRAPPER="$AFT_CLI_DIR/aft"
@@ -207,6 +209,20 @@ ensure_plugin_deps() {
   ) || error "Failed to install Bun dependencies"
 }
 
+build_plugin_packages() {
+  info "Building AFT bridge package..."
+  (
+    cd "$AFT_ROOT/packages/aft-bridge"
+    bun run build
+  ) || error "Failed to build AFT bridge package"
+
+  info "Building local OpenCode plugin package..."
+  (
+    cd "$PLUGIN_PACKAGE_DIR"
+    bun run build
+  ) || error "Failed to build OpenCode plugin package"
+}
+
 update_plugin_config() {
   local config_path="$1"
   local schema_url="$2"
@@ -301,10 +317,14 @@ command -v bun >/dev/null 2>&1 || error "bun is required but not installed or no
 command -v cargo >/dev/null 2>&1 || error "cargo is required but not installed or not on PATH."
 command -v opencode >/dev/null 2>&1 || error "opencode is required but not installed or not on PATH."
 
-[ -f "$SERVER_PLUGIN_PATH" ] || error "Server plugin entry not found at $SERVER_PLUGIN_PATH"
-[ -f "$TUI_PLUGIN_PATH" ] || error "TUI plugin entry not found at $TUI_PLUGIN_PATH"
+[ -f "$SERVER_PLUGIN_SOURCE_PATH" ] || error "Server plugin source not found at $SERVER_PLUGIN_SOURCE_PATH"
+[ -f "$TUI_PLUGIN_SOURCE_PATH" ] || error "TUI plugin source not found at $TUI_PLUGIN_SOURCE_PATH"
 
 ensure_plugin_deps
+build_plugin_packages
+
+[ -f "$SERVER_PLUGIN_PATH" ] || error "Built server plugin entry not found at $SERVER_PLUGIN_PATH"
+[ -f "$TUI_PLUGIN_PATH" ] || error "Built TUI plugin entry not found at $TUI_PLUGIN_PATH"
 
 if command -v go >/dev/null 2>&1; then
   info "Building aft-go-helper (Go interface-dispatch resolver)..."
@@ -361,7 +381,7 @@ if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
 fi
 echo ""
 echo "Notes:"
-echo "  OpenCode now loads this checkout's plugin source directly."
+echo "  OpenCode now loads this checkout's built plugin output."
 echo "  The plugin prefers $AFT_BINARY over cached or published binaries."
 echo "  OpenCode AFT config now defaults Go overlay queries to the warm AFT-Go sidecar."
 echo "  If you move this repo, rerun this installer to refresh the absolute plugin paths."
