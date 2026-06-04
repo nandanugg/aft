@@ -156,9 +156,9 @@ describe("loadAftConfig", () => {
   });
 
   // Audit v0.17 #17: project config CANNOT set `restrict_to_project_root`,
-  // `url_fetch_allow_private`, or `max_callgraph_files`. These are user-only
-  // because a hostile repo opening in OpenCode could otherwise weaken the
-  // file/network/resource boundary protecting the user's machine.
+  // `url_fetch_allow_private`, `go_overlay_provider`, or `max_callgraph_files`.
+  // These are user-only because a hostile repo opening in OpenCode could otherwise
+  // weaken the file/network/resource boundary protecting the user's machine.
   test("project config can override lsp.diagnostics_on_edit", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { diagnostics_on_edit: false } }));
@@ -223,6 +223,38 @@ describe("loadAftConfig", () => {
     // User's 20000 preserved; project's 1 ignored.
     expect(config.max_callgraph_files).toBe(20000);
     expect(result.stderr).toContain("Ignoring max_callgraph_files from project config");
+  });
+
+  test("go_overlay_provider from user config is accepted", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ go_overlay_provider: "aft_go_sidecar" }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.go_overlay_provider).toBe("aft_go_sidecar");
+    expect(result.stderr).not.toContain("go_overlay_provider");
+  });
+
+  test("project config cannot set go_overlay_provider (strict allowlist)", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ go_overlay_provider: "local_helper" }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ go_overlay_provider: "aft_go_sidecar" }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.go_overlay_provider).toBe("local_helper");
+    expect(result.stderr).toContain("Ignoring go_overlay_provider from project config");
   });
 
   test("project config cannot set auto_update (strict allowlist)", () => {

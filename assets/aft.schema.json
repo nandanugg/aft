@@ -102,6 +102,18 @@
       "default": false,
       "description": "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field."
     },
+    "go_overlay_provider": {
+      "type": "string",
+      "enum": [
+        "local_helper",
+        "local",
+        "aft_go_sidecar",
+        "sidecar",
+        "aft-go-sidecar"
+      ],
+      "default": "local_helper",
+      "description": "Go callgraph overlay backend. Use `aft_go_sidecar` to keep a warm Go sidecar for type-aware interface dispatch and method-call edges. User-level config only; project config cannot override it."
+    },
     "bash": {
       "oneOf": [
         {

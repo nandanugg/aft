@@ -277,9 +277,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...resolveProjectOverridesForConfigure(aftConfig),
     bash_permissions: true,
   };
-  // url_fetch_allow_private is user-config only (project config is stripped in loadAftConfig).
+  // User-config-only fields: project config is stripped in loadAftConfig.
   if (aftConfig.url_fetch_allow_private !== undefined) {
     configOverrides.url_fetch_allow_private = aftConfig.url_fetch_allow_private;
+  }
+  if (aftConfig.go_overlay_provider !== undefined) {
+    configOverrides.go_overlay_provider = aftConfig.go_overlay_provider;
   }
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";

@@ -35,6 +35,13 @@ const CheckerEnum = z.enum([
 ]);
 
 const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
+const GoOverlayProviderEnum = z.enum([
+  "local_helper",
+  "local",
+  "aft_go_sidecar",
+  "sidecar",
+  "aft-go-sidecar",
+]);
 
 const SemanticConfigSchema = z.object({
   /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
@@ -247,6 +254,8 @@ export const AftConfigSchema = z
     search_index: z.boolean().optional(),
     /** Enable semantic search. Default: false. */
     semantic_search: z.boolean().optional(),
+    /** Go callgraph overlay backend. User-level only; project config cannot change it. */
+    go_overlay_provider: GoOverlayProviderEnum.optional(),
     /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
     inspect: InspectConfigSchema.optional(),
     /**
@@ -1164,6 +1173,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "inspect" handled separately — deep-merged.
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
+  // "go_overlay_provider" — USER ONLY (controls Go analysis backend/process model).
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "max_callgraph_files" — USER ONLY (resource budget).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
@@ -1184,6 +1194,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   const stripped: string[] = [];
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
+  if (override.go_overlay_provider !== undefined) stripped.push("go_overlay_provider");
   if (override.max_callgraph_files !== undefined) stripped.push("max_callgraph_files");
   if (override.auto_update !== undefined) stripped.push("auto_update");
   return stripped;
