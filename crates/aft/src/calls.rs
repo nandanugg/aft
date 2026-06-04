@@ -7,6 +7,15 @@ use std::collections::BTreeSet;
 
 use crate::parser::LangId;
 
+// Defensive recursion bound for AST walkers. Hand-written code nests only tens
+// of levels deep, but minified bundles, generated code, and very long
+// expression/type chains can produce trees thousands of nodes deep. The inspect
+// rayon pool uses bounded worker stacks, so unbounded AST recursion here can
+// overflow the stack and SIGABRT the entire bridge. Past this depth we stop
+// descending and treat the node as an opaque leaf. Kept well under the pool
+// stack budget (see dispatch.rs stack_size).
+const MAX_AST_WALK_DEPTH: u32 = 1_500;
+
 /// Returns the tree-sitter node kind strings that represent call expressions
 /// for the given language.
 pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
@@ -66,6 +75,18 @@ pub fn walk_for_calls(
     call_kinds: &[&str],
     results: &mut Vec<(String, u32)>,
 ) {
+    walk_for_calls_at_depth(node, source, byte_start, byte_end, call_kinds, results, 0);
+}
+
+fn walk_for_calls_at_depth(
+    node: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    call_kinds: &[&str],
+    results: &mut Vec<(String, u32)>,
+    depth: u32,
+) {
     let node_start = node.start_byte();
     let node_end = node.end_byte();
 
@@ -80,17 +101,26 @@ pub fn walk_for_calls(
         }
     }
 
+    // Stop descending past MAX_AST_WALK_DEPTH to avoid overflowing the bounded
+    // inspect worker stack on pathologically deep trees (minified bundles,
+    // generated code, long chains). Treat the truncated subtree as an opaque
+    // leaf; calls already discovered at this node are still reported.
+    if depth >= MAX_AST_WALK_DEPTH {
+        return;
+    }
+
     // Recurse into children
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            walk_for_calls(
+            walk_for_calls_at_depth(
                 cursor.node(),
                 source,
                 byte_start,
                 byte_end,
                 call_kinds,
                 results,
+                depth + 1,
             );
             if !cursor.goto_next_sibling() {
                 break;
@@ -239,10 +269,30 @@ fn collect_type_references(
     lang: LangId,
     results: &mut BTreeSet<String>,
 ) {
+    collect_type_references_at_depth(node, source, byte_start, byte_end, lang, results, 0);
+}
+
+fn collect_type_references_at_depth(
+    node: tree_sitter::Node,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    lang: LangId,
+    results: &mut BTreeSet<String>,
+    depth: u32,
+) {
     let node_start = node.start_byte();
     let node_end = node.end_byte();
 
     if node_end <= byte_start || node_start >= byte_end {
+        return;
+    }
+
+    // Stop descending past MAX_AST_WALK_DEPTH to avoid overflowing the bounded
+    // inspect worker stack on pathologically deep trees (minified bundles,
+    // generated code, long chains). Treat the truncated subtree as an opaque
+    // leaf; type references inside it are intentionally skipped.
+    if depth >= MAX_AST_WALK_DEPTH {
         return;
     }
 
@@ -257,7 +307,15 @@ fn collect_type_references(
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_type_references(cursor.node(), source, byte_start, byte_end, lang, results);
+            collect_type_references_at_depth(
+                cursor.node(),
+                source,
+                byte_start,
+                byte_end,
+                lang,
+                results,
+                depth + 1,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -332,6 +390,16 @@ fn collect_type_reference_identifiers(
     lang: LangId,
     results: &mut BTreeSet<String>,
 ) {
+    collect_type_reference_identifiers_at_depth(node, source, lang, results, 0);
+}
+
+fn collect_type_reference_identifiers_at_depth(
+    node: tree_sitter::Node,
+    source: &str,
+    lang: LangId,
+    results: &mut BTreeSet<String>,
+    depth: u32,
+) {
     if is_type_reference_identifier(lang, node.kind()) {
         let name = source[node.byte_range()].trim();
         if let Some(name) = clean_type_reference_name(name) {
@@ -339,10 +407,20 @@ fn collect_type_reference_identifiers(
         }
     }
 
+    if depth >= MAX_AST_WALK_DEPTH {
+        return;
+    }
+
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_type_reference_identifiers(cursor.node(), source, lang, results);
+            collect_type_reference_identifiers_at_depth(
+                cursor.node(),
+                source,
+                lang,
+                results,
+                depth + 1,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -469,5 +547,103 @@ fn collect_calls_full(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::grammar_for;
+
+    fn parse_typescript(source: &str) -> tree_sitter::Tree {
+        let grammar = grammar_for(LangId::TypeScript);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&grammar)
+            .expect("typescript grammar should initialize");
+        parser.parse(source, None).expect("parse deep source")
+    }
+
+    fn deeply_nested_calls(depth: usize) -> String {
+        let mut source = String::with_capacity(depth * 3 + 32);
+        source.push_str("const x = ");
+        for _ in 0..depth {
+            source.push_str("f(");
+        }
+        source.push('a');
+        for _ in 0..depth {
+            source.push(')');
+        }
+        source.push_str(";\n");
+        source
+    }
+
+    fn deeply_nested_type(depth: usize) -> String {
+        let mut source = String::with_capacity(depth * 10 + 32);
+        source.push_str("type T = ");
+        for _ in 0..depth {
+            source.push_str("Box<");
+        }
+        source.push('A');
+        for _ in 0..depth {
+            source.push('>');
+        }
+        source.push_str(";\n");
+        source
+    }
+
+    #[test]
+    fn walk_for_calls_deep_tree_does_not_overflow_bounded_stack() {
+        // Regression for the inspect-thread stack overflow / SIGABRT: a
+        // pathologically deep expression (here ~6000 nested calls, far past
+        // MAX_AST_WALK_DEPTH) must not recurse unbounded. Run on a bounded-stack
+        // worker to prove the guard, not the main thread's larger stack.
+        let source = deeply_nested_calls(6_000);
+        let tree = parse_typescript(&source);
+        let call_kinds = call_node_kinds(LangId::TypeScript);
+        let mut results = Vec::new();
+
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                walk_for_calls(
+                    tree.root_node(),
+                    &source,
+                    0,
+                    source.len(),
+                    &call_kinds,
+                    &mut results,
+                );
+            })
+            .expect("spawn bounded-stack worker")
+            .join()
+            .expect("deep call walk must not overflow the bounded stack");
+    }
+
+    #[test]
+    fn collect_type_references_deep_tree_does_not_overflow_bounded_stack() {
+        // Regression for the inspect-thread stack overflow / SIGABRT in the
+        // dead-code type-reference side channel. Deep generated type chains are
+        // treated as opaque past MAX_AST_WALK_DEPTH instead of recursing until
+        // the worker stack overflows.
+        let source = deeply_nested_type(6_000);
+        let tree = parse_typescript(&source);
+        let mut results = BTreeSet::new();
+
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                collect_type_references(
+                    tree.root_node(),
+                    &source,
+                    0,
+                    source.len(),
+                    LangId::TypeScript,
+                    &mut results,
+                );
+            })
+            .expect("spawn bounded-stack worker")
+            .join()
+            .expect("deep type-reference walk must not overflow the bounded stack");
     }
 }
