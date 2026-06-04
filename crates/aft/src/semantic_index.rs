@@ -356,6 +356,34 @@ fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
     error.is_connect()
 }
 
+/// Whether a send-time error means the backend is *unreachable or temporarily
+/// failing* (vs. a real misconfiguration). Broader than the in-request retry
+/// predicate: a per-request timeout is transient for the build/refresh layer
+/// (the model may still be cold-loading) but we don't burn the 3 fast
+/// in-request attempts on it — the build-level retry rides it out instead.
+fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+/// Stable machine marker prefixed onto embedding error strings whose root cause
+/// is transient — the backend is down, timing out, or returning 5xx/429, not
+/// misconfigured. The build and corpus-refresh layers key retry-vs-give-up on
+/// this marker (see [`embedding_failure_is_transient`]) instead of re-parsing
+/// error text, so transience stays authoritative at the one site that knows it.
+/// Stripped before any user-facing display via [`strip_transient_embedding_marker`].
+pub const TRANSIENT_EMBEDDING_MARKER: &str = "[transient] ";
+
+/// True when an embedding error carries the transient marker — i.e. retrying
+/// once the backend recovers is the right move, not surfacing a hard failure.
+pub fn embedding_failure_is_transient(error: &str) -> bool {
+    error.contains(TRANSIENT_EMBEDDING_MARKER)
+}
+
+/// Remove the machine transient marker so the message is clean for display.
+pub fn strip_transient_embedding_marker(error: &str) -> String {
+    error.replace(TRANSIENT_EMBEDDING_MARKER, "")
+}
+
 fn sleep_before_embedding_retry(attempt_index: usize) {
     if let Some(delay_ms) = EMBEDDING_REQUEST_BACKOFF_MS.get(attempt_index) {
         std::thread::sleep(Duration::from_millis(*delay_ms));
@@ -376,7 +404,15 @@ where
                     sleep_before_embedding_retry(attempt_index);
                     continue;
                 }
-                return Err(format!("{backend_label} request failed: {error}"));
+                // Connect/timeout failures mean the backend is unreachable or
+                // cold-loading — mark transient so the build layer rides it out
+                // and self-heals instead of parking the index in `Failed`.
+                let marker = if embedding_send_error_is_transient(&error) {
+                    TRANSIENT_EMBEDDING_MARKER
+                } else {
+                    ""
+                };
+                return Err(format!("{marker}{backend_label} request failed: {error}"));
             }
         };
 
@@ -401,8 +437,16 @@ where
             continue;
         }
 
+        // 5xx / 429 are server-side and transient — the backend is overloaded
+        // or briefly unavailable, not misconfigured. 4xx (auth, bad request,
+        // model-not-found) is a real error the user must fix; no marker.
+        let marker = if is_retryable_embedding_status(status) {
+            TRANSIENT_EMBEDDING_MARKER
+        } else {
+            ""
+        };
         return Err(format!(
-            "{backend_label} request failed (HTTP {}): {}",
+            "{marker}{backend_label} request failed (HTTP {}): {}",
             status, raw
         ));
     }
@@ -2963,6 +3007,49 @@ mod tests {
                 "{file} should be semantic-index eligible"
             );
         }
+    }
+
+    #[test]
+    fn transient_marker_round_trips_and_classifies() {
+        // A marked transient error is recognized and the marker is stripped for
+        // display, leaving a clean message.
+        let marked = format!("{TRANSIENT_EMBEDDING_MARKER}openai compatible request failed: error sending request for url (http://localhost:1234/v1/embeddings)");
+        assert!(embedding_failure_is_transient(&marked));
+        let clean = strip_transient_embedding_marker(&marked);
+        assert!(!clean.contains(TRANSIENT_EMBEDDING_MARKER));
+        assert!(clean.starts_with("openai compatible request failed:"));
+
+        // Permanent errors (HTTP 4xx, dimension mismatch) carry no marker and
+        // are not classified transient — they must fail fast.
+        for permanent in [
+            "openai compatible request failed (HTTP 401): Unauthorized",
+            "embedding dimension mismatch: index has 384, model returned 768",
+            "too many files (>20000) for semantic indexing (max 20000)",
+        ] {
+            assert!(
+                !embedding_failure_is_transient(permanent),
+                "{permanent:?} must not be transient"
+            );
+            // Stripping a marker-free string is a no-op.
+            assert_eq!(strip_transient_embedding_marker(permanent), permanent);
+        }
+    }
+
+    #[test]
+    fn send_error_transience_separates_connect_timeout_from_4xx() {
+        // 5xx / 429 are transient; other client errors are not.
+        assert!(is_retryable_embedding_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_retryable_embedding_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!is_retryable_embedding_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!is_retryable_embedding_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
     }
 
     fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)

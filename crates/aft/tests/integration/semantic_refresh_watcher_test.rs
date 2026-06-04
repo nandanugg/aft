@@ -228,6 +228,127 @@ fn status(aft: &mut AftProcess) -> Value {
     )
 }
 
+/// A mock embedding endpoint that starts "down" (returns HTTP 503, a transient
+/// status) and flips to serving real embeddings once `bring_up()` is called.
+/// Used to prove the build-level retry rides out a transient backend outage and
+/// self-heals — instead of parking the index in `Failed` forever.
+struct FlakyEmbeddingServer {
+    base_url: String,
+    addr: SocketAddr,
+    running: Arc<AtomicBool>,
+    up: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl FlakyEmbeddingServer {
+    fn start_down() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind flaky embedding server");
+        let addr = listener.local_addr().expect("flaky embedding server addr");
+        let running = Arc::new(AtomicBool::new(true));
+        let up = Arc::new(AtomicBool::new(false));
+        let running_for_thread = Arc::clone(&running);
+        let up_for_thread = Arc::clone(&up);
+        let handle = thread::spawn(move || {
+            while running_for_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let serve = up_for_thread.load(Ordering::SeqCst);
+                        let _ = handle_flaky_request(&mut stream, serve);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            addr,
+            running,
+            up,
+            handle: Some(handle),
+        }
+    }
+
+    fn bring_up(&self) {
+        self.up.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for FlakyEmbeddingServer {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("flaky embedding server thread");
+        }
+    }
+}
+
+fn handle_flaky_request(stream: &mut TcpStream, serve: bool) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if header_end.is_none() {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                for line in String::from_utf8_lossy(&buf[..pos + 4]).lines() {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(end) = header_end {
+            if buf.len() >= end + content_length {
+                break;
+            }
+        }
+    }
+
+    if !serve {
+        // 503 is a server error -> classified transient -> the build keeps
+        // retrying with backoff instead of failing.
+        let response =
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        return stream.write_all(response.as_bytes());
+    }
+
+    let body = header_end
+        .and_then(|end| buf.get(end..end + content_length))
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .unwrap_or_else(|| json!({ "input": [] }));
+    let inputs = match &body["input"] {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>(),
+        Value::String(value) => vec![value.clone()],
+        _ => Vec::new(),
+    };
+    let data = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| json!({ "embedding": embedding_for(input), "index": index }))
+        .collect::<Vec<_>>();
+    let body = json!({ "data": data }).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())
+}
+
 fn wait_for_semantic_status<F>(aft: &mut AftProcess, label: &str, predicate: F) -> Value
 where
     F: Fn(&Value) -> bool,
@@ -558,4 +679,73 @@ fn watcher_deleted_alias_path_invalidates_canonical_search_and_semantic_entries(
         0,
         "deleted alias path should invalidate canonical semantic entries"
     );
+}
+
+#[test]
+fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
+    // Regression for the "Semantic Index: failed (won't recover)" report: a
+    // transient backend outage during the initial build must NOT park the index
+    // in `Failed` (a state nothing re-triggers short of a restart). The build
+    // rides it out, showing a "waiting_for_embedding_backend" building stage,
+    // and goes Ready the moment the backend returns.
+    let project = setup_project(&[(
+        "src/a.rs",
+        "pub fn alpha_anchor() -> &'static str {\n    \"alpha anchor\"\n}\n",
+    )]);
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let server = FlakyEmbeddingServer::start_down();
+    // Shrink the retry backoff so the test doesn't wait the real 15s schedule.
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_SEMANTIC_RETRY_BACKOFF_MS",
+        std::ffi::OsStr::new("200"),
+    )]);
+
+    let configure =
+        configure_semantic_openai(&mut aft, project.path(), storage.path(), &server.base_url);
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    // While the backend is down, the index must stay "loading" (the Building
+    // state, shown as "loading" in the snapshot) with a waiting stage, NOT flip
+    // to "failed". Observe the waiting stage explicitly.
+    let waiting = wait_for_semantic_status(&mut aft, "waiting for backend", |response| {
+        response["semantic_index"]["status"] == "loading"
+            && response["semantic_index"]["stage"]
+                .as_str()
+                .is_some_and(|stage| stage.contains("waiting_for_embedding_backend"))
+    });
+    assert_eq!(waiting["semantic_index"]["status"], "loading");
+    // It must never have gone to "failed" while merely waiting.
+    assert_ne!(waiting["semantic_index"]["status"], "failed");
+
+    // Bring the backend up: the in-flight retry loop's next attempt succeeds.
+    server.bring_up();
+
+    let ready = wait_for_semantic_status(&mut aft, "recovered ready", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["entries"].as_u64().unwrap_or(0) >= 1
+    });
+    assert_eq!(ready["semantic_index"]["status"], "ready");
+
+    // And search actually works against the recovered index.
+    let search = send(
+        &mut aft,
+        json!({
+            "id": "recovered-search",
+            "command": "semantic_search",
+            "query": "alpha anchor",
+            "hint": "semantic",
+            "top_k": 5,
+        }),
+    );
+    assert_eq!(
+        search["success"], true,
+        "semantic search should succeed after recovery: {search:?}"
+    );
+    assert_eq!(search["status"], "ready");
+
+    let status = aft.shutdown();
+    assert!(status.success());
 }

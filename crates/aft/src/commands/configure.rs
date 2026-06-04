@@ -104,6 +104,26 @@ fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
     let _ = install_project_watcher_with(ctx, root_path, create_project_watcher);
 }
 
+/// Backoff for build-level retries when the embedding backend is unreachable.
+/// Ramps 15s -> 30s -> 60s then holds at 60s. Keeps the retry cadence cheap
+/// (the build re-walks files each attempt) while recovering within a minute of
+/// the backend returning.
+fn semantic_build_retry_backoff(attempt: usize) -> Duration {
+    // Test seam: shrink the schedule to a fixed small interval so recovery
+    // integration tests don't wait real 15s+ windows. Not a user-facing knob.
+    if let Ok(raw) = std::env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    const SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
+    let secs = SCHEDULE_SECS
+        .get(attempt)
+        .copied()
+        .unwrap_or(*SCHEDULE_SECS.last().unwrap());
+    Duration::from_secs(secs)
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -1966,8 +1986,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 // `semantic.max_files` (default 20k); remote backends that embed
                 // server-side can raise it freely.
                 let max_semantic_files = semantic_config.max_files;
+                let mut semantic_retry_attempt: usize = 0;
 
-                let build_result = catch_unwind(AssertUnwindSafe(
+                let build_once =
                     || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "initializing_embedding_model".to_string(),
@@ -2171,8 +2192,59 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         }
 
                         Ok((index, model))
-                    },
-                ));
+                    };
+
+                // Build-level retry: if the embedding backend is unreachable or
+                // briefly failing (connection refused, timeout, 5xx/429), riding
+                // it out beats parking the index in `Failed` forever — a state
+                // nothing re-triggers short of a bridge restart. We keep retrying
+                // with capped backoff, surfacing an honest "waiting for backend"
+                // building-state so the sidebar shows recovery-in-progress, not a
+                // red failure. The moment the backend returns, the build
+                // succeeds and the index goes Ready.
+                //
+                // Permanent errors (dimension mismatch, too-many-files, 4xx auth)
+                // are NOT marked transient and fail fast with the real message.
+                //
+                // Supersession is automatic: a reconfigure replaces the bridge's
+                // semantic receiver, so the next `tx`/`tx_progress.send` returns
+                // Err (receiver dropped) and this thread exits without competing
+                // with the fresh build.
+                let build_result = loop {
+                    let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
+                    match attempt_result {
+                        Ok(Err(ref error))
+                            if crate::semantic_index::embedding_failure_is_transient(error) =>
+                        {
+                            let clean =
+                                crate::semantic_index::strip_transient_embedding_marker(error);
+                            let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
+                            semantic_retry_attempt += 1;
+                            slog_warn!(
+                                "semantic index build: embedding backend unavailable ({}); retrying in {}s",
+                                clean,
+                                backoff.as_secs(),
+                            );
+                            // Surface "waiting for backend" as a building stage so
+                            // the sidebar shows recovery-in-progress. If the
+                            // receiver is gone (reconfigure superseded us), bail.
+                            if tx_progress
+                                .send(SemanticIndexEvent::Progress {
+                                    stage: format!("waiting_for_embedding_backend: {clean}"),
+                                    files: None,
+                                    entries_done: None,
+                                    entries_total: None,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            thread::sleep(backoff);
+                            continue;
+                        }
+                        other => break other,
+                    }
+                };
 
                 let event = match build_result {
                     Ok(Ok((index, model))) => {
@@ -2313,7 +2385,7 @@ mod tests {
 
     use super::{
         install_project_watcher_with, parse_lsp_paths_extra, parse_semantic_config,
-        validate_storage_dir, WATCHER_GENERATION,
+        semantic_build_retry_backoff, validate_storage_dir, WATCHER_GENERATION,
     };
     use crate::config::{Config, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -2322,6 +2394,16 @@ mod tests {
 
     fn test_context() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    }
+
+    #[test]
+    fn semantic_build_retry_backoff_ramps_then_holds() {
+        assert_eq!(semantic_build_retry_backoff(0), Duration::from_secs(15));
+        assert_eq!(semantic_build_retry_backoff(1), Duration::from_secs(30));
+        assert_eq!(semantic_build_retry_backoff(2), Duration::from_secs(60));
+        // Holds at the cap for all later attempts.
+        assert_eq!(semantic_build_retry_backoff(3), Duration::from_secs(60));
+        assert_eq!(semantic_build_retry_backoff(99), Duration::from_secs(60));
     }
 
     fn configure_request(project_root: serde_json::Value) -> RawRequest {

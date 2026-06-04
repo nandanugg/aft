@@ -410,6 +410,14 @@ fn drain_inspect_events(ctx: &AppContext) {
             // the last-known value rather than fabricating a `0` (#1).
             let stale = ctx.inspect_manager().tier2_any_in_flight();
             ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, stale);
+            // Push the refreshed snapshot so the sidebar reflects the new Tier-2
+            // counts immediately. `update_status_bar_tier2` only mutates the
+            // in-memory counts (which the agent status bar reads live on each
+            // tool result); the push-driven sidebar would otherwise keep showing
+            // the pre-population snapshot — where `status_bar` was null and the
+            // Code Health section stayed hidden — until some unrelated event
+            // happened to emit a status frame.
+            ctx.status_emitter().signal(ctx.build_status_snapshot());
         }
     }
 }
@@ -1536,11 +1544,38 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
                 }
             }
             SemanticRefreshEvent::CorpusFailed { error } => {
-                aft::slog_warn!("semantic corpus refresh failed: {}", error);
-                let _ = ctx.take_pending_semantic_index_paths();
-                *ctx.semantic_index().borrow_mut() = None;
-                *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
-                status_changed = true;
+                // A transient backend blip during a corpus refresh must NOT
+                // destroy the working index — the prior index is still valid and
+                // serving. Keep it Ready and let the next watcher/ignore change
+                // re-trigger the refresh, rather than nuking everything to
+                // `Failed` over a connection hiccup (the same park-forever trap
+                // the initial build now rides out). Permanent errors (dimension
+                // mismatch, too-many-files) still drop the index and surface the
+                // real failure.
+                if aft::semantic_index::embedding_failure_is_transient(&error) {
+                    let clean = aft::semantic_index::strip_transient_embedding_marker(&error);
+                    let _ = ctx.take_pending_semantic_index_paths();
+                    let has_index = ctx.semantic_index().borrow().is_some();
+                    if has_index {
+                        aft::slog_warn!(
+                            "semantic corpus refresh hit a transient backend error ({}); keeping the existing index",
+                            clean,
+                        );
+                        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+                    } else {
+                        // No index to fall back on — surface the clean message.
+                        aft::slog_warn!("semantic corpus refresh failed: {}", clean);
+                        *ctx.semantic_index_status().borrow_mut() =
+                            SemanticIndexStatus::Failed(clean);
+                    }
+                    status_changed = true;
+                } else {
+                    aft::slog_warn!("semantic corpus refresh failed: {}", error);
+                    let _ = ctx.take_pending_semantic_index_paths();
+                    *ctx.semantic_index().borrow_mut() = None;
+                    *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Failed(error);
+                    status_changed = true;
+                }
             }
         }
     }
