@@ -1264,11 +1264,22 @@ impl RefreshSummary {
 
 #[derive(Debug, Default)]
 pub struct InvalidatedFilesRefresh {
+    /// Full replacement entries for `completed_paths`, not just newly embedded
+    /// chunks. `apply_refresh_update` removes completed paths before extending
+    /// this set, so reused chunks must travel in this delta too.
     pub added_entries: Vec<EmbeddingEntry>,
     pub updated_metadata: Vec<(PathBuf, FileFreshness)>,
     pub completed_paths: Vec<PathBuf>,
     pub summary: RefreshSummary,
 }
+
+#[derive(Debug, Clone)]
+struct ReusableEmbedding {
+    embed_text: String,
+    vector: Vec<f32>,
+}
+
+type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbedding>>>;
 
 /// Search result from a semantic query
 #[derive(Debug, Clone)]
@@ -1372,6 +1383,122 @@ impl SemanticIndex {
         );
 
         (chunks, file_metadata)
+    }
+
+    fn build_chunk_reuse_map(&self, files: &[PathBuf]) -> ChunkReuseMap {
+        let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+        let mut reuse_map: ChunkReuseMap = HashMap::new();
+
+        for entry in &self.entries {
+            if !requested.contains(entry.chunk.file.as_path()) {
+                continue;
+            }
+
+            // `embed_text` is already persisted in the current on-disk format,
+            // so refresh-time reuse can hash it in memory and confirm the exact
+            // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
+            // user through a full rebuild.
+            let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
+            reuse_map
+                .entry(entry.chunk.file.clone())
+                .or_default()
+                .entry(hash)
+                .or_default()
+                .push(ReusableEmbedding {
+                    embed_text: entry.chunk.embed_text.clone(),
+                    vector: entry.vector.clone(),
+                });
+        }
+
+        reuse_map
+    }
+
+    fn reusable_vector_for_chunk(
+        reuse_map: &ChunkReuseMap,
+        chunk: &SemanticChunk,
+    ) -> Option<Vec<f32>> {
+        let hash = blake3::hash(chunk.embed_text.as_bytes());
+        reuse_map
+            .get(&chunk.file)?
+            .get(&hash)?
+            .iter()
+            .find(|candidate| candidate.embed_text == chunk.embed_text)
+            .map(|candidate| candidate.vector.clone())
+    }
+
+    fn entries_for_chunks_with_reuse<F, P>(
+        chunks: Vec<SemanticChunk>,
+        reuse_map: &ChunkReuseMap,
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        initial_observed_dimension: Option<usize>,
+        refresh_label: &str,
+        progress: &mut P,
+    ) -> Result<(Vec<EmbeddingEntry>, Option<usize>), String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+    {
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+
+        let mut entries_by_chunk: Vec<Option<EmbeddingEntry>> = vec![None; total_chunks];
+        let mut misses: Vec<(usize, SemanticChunk)> = Vec::new();
+
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry { chunk, vector });
+            } else {
+                misses.push((chunk_index, chunk));
+            }
+        }
+
+        let mut completed = total_chunks.saturating_sub(misses.len());
+        if completed > 0 {
+            progress(completed, total_chunks);
+        }
+
+        let batch_size = max_batch_size.max(1);
+        let mut observed_dimension = initial_observed_dimension;
+
+        for batch_start in (0..misses.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(misses.len());
+            let batch_texts: Vec<String> = misses[batch_start..batch_end]
+                .iter()
+                .map(|(_, chunk)| chunk.embed_text.clone())
+                .collect();
+
+            let vectors = embed_fn(batch_texts)?;
+            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
+
+            if let Some(dim) = vectors.first().map(|vector| vector.len()) {
+                match observed_dimension {
+                    None => observed_dimension = Some(dim),
+                    Some(expected) if dim != expected => {
+                        return Err(format!(
+                            "embedding dimension changed during {refresh_label}: \
+                             cached index uses {expected}, new vectors use {dim}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            for (i, vector) in vectors.into_iter().enumerate() {
+                let (chunk_index, chunk) = misses[batch_start + i].clone();
+                entries_by_chunk[chunk_index] = Some(EmbeddingEntry { chunk, vector });
+            }
+
+            completed += batch_end - batch_start;
+            progress(completed, total_chunks);
+        }
+
+        let entries = entries_by_chunk
+            .into_iter()
+            .map(|entry| entry.expect("semantic refresh accounted for every chunk"))
+            .collect();
+
+        Ok((entries, observed_dimension))
     }
 
     fn build_from_chunks<F, P>(
@@ -1652,6 +1779,7 @@ impl SemanticIndex {
             });
         }
 
+        let reuse_map = self.build_chunk_reuse_map(&changed);
         let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed);
         let changed_set: HashSet<&Path> = changed.iter().map(PathBuf::as_path).collect();
         let vanished = to_embed
@@ -1699,53 +1827,22 @@ impl SemanticIndex {
             });
         }
 
-        // 4. Embed in batches and dimension-check against the existing index.
-        let total_chunks = chunks.len();
-        progress(0, total_chunks);
-        let batch_size = max_batch_size.max(1);
+        // 4. Build the full replacement set, reusing cached vectors for chunks
+        //    whose embed_text is unchanged and embedding only cache misses.
         let existing_dimension = if self.entries.is_empty() {
             None
         } else {
             Some(self.dimension)
         };
-        let mut new_entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
-        let mut observed_dimension: Option<usize> = existing_dimension;
-
-        for batch_start in (0..chunks.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(chunks.len());
-            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
-                .iter()
-                .map(|c| c.embed_text.clone())
-                .collect();
-
-            let vectors = embed_fn(batch_texts)?;
-            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
-
-            if let Some(dim) = vectors.first().map(|v| v.len()) {
-                match observed_dimension {
-                    None => observed_dimension = Some(dim),
-                    Some(expected) if dim != expected => {
-                        // Refuse to mix dimensions in one index. Caller should
-                        // fall back to a full rebuild.
-                        return Err(format!(
-                            "embedding dimension changed during incremental refresh: \
-                             cached index uses {expected}, new vectors use {dim}"
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            for (i, vector) in vectors.into_iter().enumerate() {
-                let chunk_idx = batch_start + i;
-                new_entries.push(EmbeddingEntry {
-                    chunk: chunks[chunk_idx].clone(),
-                    vector,
-                });
-            }
-
-            progress(new_entries.len(), total_chunks);
-        }
+        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
+            chunks,
+            &reuse_map,
+            embed_fn,
+            max_batch_size,
+            existing_dimension,
+            "incremental refresh",
+            progress,
+        )?;
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
         for file in &successful_files {
@@ -1824,6 +1921,7 @@ impl SemanticIndex {
             .filter(|path| self.file_mtimes.contains_key(*path))
             .cloned()
             .collect();
+        let reuse_map = self.build_chunk_reuse_map(&requested_paths);
 
         // The watcher path has already invalidated these files in the request
         // thread's live index. Mirror that behavior here before inserting any
@@ -1943,49 +2041,21 @@ impl SemanticIndex {
             });
         }
 
-        let total_chunks = chunks.len();
-        progress(0, total_chunks);
-        let batch_size = max_batch_size.max(1);
-        let mut observed_dimension = if self.entries.is_empty() && previously_indexed.is_empty() {
+        let initial_observed_dimension = if self.entries.is_empty() && previously_indexed.is_empty()
+        {
             None
         } else {
             Some(self.dimension)
         };
-        let mut new_entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
-
-        for batch_start in (0..chunks.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(chunks.len());
-            let batch_texts: Vec<String> = chunks[batch_start..batch_end]
-                .iter()
-                .map(|chunk| chunk.embed_text.clone())
-                .collect();
-
-            let vectors = embed_fn(batch_texts)?;
-            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
-
-            if let Some(dim) = vectors.first().map(|vector| vector.len()) {
-                match observed_dimension {
-                    None => observed_dimension = Some(dim),
-                    Some(expected) if dim != expected => {
-                        return Err(format!(
-                            "embedding dimension changed during invalidated-file refresh: \
-                             cached index uses {expected}, new vectors use {dim}"
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            for (i, vector) in vectors.into_iter().enumerate() {
-                let chunk_idx = batch_start + i;
-                new_entries.push(EmbeddingEntry {
-                    chunk: chunks[chunk_idx].clone(),
-                    vector,
-                });
-            }
-
-            progress(new_entries.len(), total_chunks);
-        }
+        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
+            chunks,
+            &reuse_map,
+            embed_fn,
+            max_batch_size,
+            initial_observed_dimension,
+            "invalidated-file refresh",
+            progress,
+        )?;
 
         let added_entries = new_entries.clone();
         self.entries.extend(new_entries);
@@ -2024,6 +2094,9 @@ impl SemanticIndex {
         updated_metadata: Vec<(PathBuf, FileFreshness)>,
         completed_paths: &[PathBuf],
     ) {
+        // `added_entries` is the complete replacement set for completed paths:
+        // freshly embedded misses plus reused chunks carrying refreshed metadata.
+        // Removing first is safe only because producers include both kinds.
         self.remove_indexed_files(completed_paths);
 
         let observed_dimension = added_entries.first().map(|entry| entry.vector.len());
@@ -3353,6 +3426,413 @@ Connection: close
         index
             .file_hashes
             .insert(file.to_path_buf(), cache_freshness::zero_hash());
+    }
+
+    #[derive(Default)]
+    struct RecordingEmbedder {
+        calls: Vec<Vec<String>>,
+    }
+
+    impl RecordingEmbedder {
+        fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+            let vectors = texts
+                .iter()
+                .map(|text| deterministic_test_vector(text))
+                .collect();
+            self.calls.push(texts);
+            Ok(vectors)
+        }
+
+        fn total_embedded_texts(&self) -> usize {
+            self.calls.iter().map(Vec::len).sum()
+        }
+
+        fn embedded_texts(&self) -> Vec<&str> {
+            self.calls
+                .iter()
+                .flat_map(|batch| batch.iter().map(String::as_str))
+                .collect()
+        }
+    }
+
+    fn deterministic_test_vector(text: &str) -> Vec<f32> {
+        let hash = blake3::hash(text.as_bytes());
+        let bytes = hash.as_bytes();
+        vec![
+            1.0,
+            bytes[0] as f32 / 255.0,
+            bytes[1] as f32 / 255.0,
+            bytes[2] as f32 / 255.0,
+        ]
+    }
+
+    fn build_recorded_test_index(project_root: &Path, files: &[PathBuf]) -> SemanticIndex {
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        SemanticIndex::build(project_root, files, &mut embed, 16).unwrap()
+    }
+
+    fn force_stale(index: &mut SemanticIndex, file: &Path) {
+        set_file_metadata(index, file, SystemTime::UNIX_EPOCH, 0);
+    }
+
+    fn write_source(path: &Path, source: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, source).unwrap();
+    }
+
+    fn entries_for_file<'a>(index: &'a SemanticIndex, file: &Path) -> Vec<&'a EmbeddingEntry> {
+        index
+            .entries
+            .iter()
+            .filter(|entry| entry.chunk.file == file)
+            .collect()
+    }
+
+    fn entry_by_name<'a>(index: &'a SemanticIndex, file: &Path, name: &str) -> &'a EmbeddingEntry {
+        index
+            .entries
+            .iter()
+            .find(|entry| entry.chunk.file == file && entry.chunk.name == name)
+            .unwrap_or_else(|| panic!("missing semantic entry {name} in {}", file.display()))
+    }
+
+    fn file_summary_entry<'a>(index: &'a SemanticIndex, file: &Path) -> &'a EmbeddingEntry {
+        index
+            .entries
+            .iter()
+            .find(|entry| entry.chunk.file == file && entry.chunk.kind == SymbolKind::FileSummary)
+            .unwrap_or_else(|| panic!("missing file-summary entry in {}", file.display()))
+    }
+
+    #[test]
+    fn refresh_stale_line_shift_reuses_all_chunks_and_retains_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        let original = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
+        write_source(&file, original);
+
+        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let original_entry_count = index.entries.len();
+        let original_alpha_vector = entry_by_name(&index, &file, "alpha").vector.clone();
+
+        write_source(&file, &format!("\n{original}"));
+        force_stale(&mut index, &file);
+
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        let summary = index
+            .refresh_stale_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                16,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(summary.changed, 1);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert_eq!(index.entries.len(), original_entry_count);
+        let shifted_alpha = entry_by_name(&index, &file, "alpha");
+        assert_eq!(shifted_alpha.chunk.start_line, 1);
+        assert_eq!(shifted_alpha.vector, original_alpha_vector);
+    }
+
+    #[test]
+    fn refresh_invalidated_line_shift_emits_full_replacement_delta_for_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        let original = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
+        write_source(&file, original);
+
+        let mut worker_index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let mut serving_index = worker_index.clone();
+        let original_entry_count = worker_index.entries.len();
+
+        write_source(&file, &format!("\n{original}"));
+
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        let update = worker_index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert_eq!(update.added_entries.len(), original_entry_count);
+        assert_eq!(worker_index.entries.len(), original_entry_count);
+
+        serving_index.apply_refresh_update(
+            update.added_entries,
+            update.updated_metadata,
+            &update.completed_paths,
+        );
+
+        assert_eq!(serving_index.entries.len(), original_entry_count);
+        assert_eq!(
+            entries_for_file(&serving_index, &file).len(),
+            original_entry_count
+        );
+        assert_eq!(
+            entry_by_name(&serving_index, &file, "alpha")
+                .chunk
+                .start_line,
+            1
+        );
+    }
+
+    #[test]
+    fn refresh_invalidated_one_symbol_edit_embeds_only_changed_symbol() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        write_source(
+            &file,
+            "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n",
+        );
+
+        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let original_entry_count = index.entries.len();
+        let beta_vector = entry_by_name(&index, &file, "beta").vector.clone();
+
+        write_source(
+            &file,
+            "pub fn alpha() -> i32 {\n    10\n}\n\npub fn beta() -> i32 {\n    2\n}\n",
+        );
+
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        let update = index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(embedder.total_embedded_texts(), 1);
+        assert!(embedder.embedded_texts()[0].contains("name:alpha"));
+        assert_eq!(update.added_entries.len(), original_entry_count);
+        assert_eq!(entry_by_name(&index, &file, "beta").vector, beta_vector);
+    }
+
+    #[test]
+    fn refresh_reuses_one_old_vector_for_two_byte_identical_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/dupe.js");
+        let one_duplicate = "function duplicate() {\n  return 1;\n}\n";
+        write_source(&file, one_duplicate);
+
+        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let original_vector = entry_by_name(&index, &file, "duplicate").vector.clone();
+
+        write_source(&file, &format!("{one_duplicate}\n{one_duplicate}"));
+
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+
+        let duplicate_entries = index
+            .entries
+            .iter()
+            .filter(|entry| entry.chunk.file == file && entry.chunk.name == "duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_entries.len(), 2);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert_eq!(duplicate_entries[0].vector, original_vector);
+        assert_eq!(duplicate_entries[1].vector, original_vector);
+    }
+
+    #[test]
+    fn file_summary_reuses_on_body_edit_and_misses_on_leading_doc_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        write_source(
+            &file,
+            "//! module docs v1\n\npub fn alpha() -> i32 {\n    1\n}\n",
+        );
+
+        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let summary_before = file_summary_entry(&index, &file).vector.clone();
+
+        write_source(
+            &file,
+            "//! module docs v1\n\npub fn alpha() -> i32 {\n    2\n}\n",
+        );
+        let mut body_embedder = RecordingEmbedder::default();
+        let mut body_embed = |texts: Vec<String>| body_embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut body_embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+        assert_eq!(body_embedder.total_embedded_texts(), 1);
+        assert!(body_embedder.embedded_texts()[0].contains("name:alpha"));
+        assert_eq!(file_summary_entry(&index, &file).vector, summary_before);
+
+        write_source(
+            &file,
+            "//! module docs v2\n\npub fn alpha() -> i32 {\n    2\n}\n",
+        );
+        let mut doc_embedder = RecordingEmbedder::default();
+        let mut doc_embed = |texts: Vec<String>| doc_embedder.embed(texts);
+        index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut doc_embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(doc_embedder.total_embedded_texts(), 1);
+        assert!(doc_embedder.embedded_texts()[0].contains("kind:file-summary"));
+        assert_ne!(file_summary_entry(&index, &file).vector, summary_before);
+    }
+
+    #[test]
+    fn refresh_invalidated_deleted_file_drops_entries_without_embedding() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        write_source(&file, "pub fn alpha() -> i32 {\n    1\n}\n");
+
+        let mut worker_index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let mut serving_index = worker_index.clone();
+        fs::remove_file(&file).unwrap();
+
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        let update = worker_index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(update.summary.deleted, 1);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert!(worker_index.entries.is_empty());
+
+        serving_index.apply_refresh_update(
+            update.added_entries,
+            update.updated_metadata,
+            &update.completed_paths,
+        );
+        assert!(serving_index.entries.is_empty());
+    }
+
+    #[test]
+    fn watcher_collect_failure_does_not_resurrect_stale_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let file = project_root.join("src/lib.rs");
+        write_source(&file, "pub fn alpha() -> i32 {\n    1\n}\n");
+
+        let mut worker_index = build_recorded_test_index(project_root, std::slice::from_ref(&file));
+        let mut serving_index = worker_index.clone();
+        fs::write(&file, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        let update = worker_index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&file),
+                &mut embed,
+                16,
+                100,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert!(update.added_entries.is_empty());
+        assert!(worker_index.entries.is_empty());
+        assert!(!worker_index.file_mtimes.contains_key(&file));
+
+        serving_index.apply_refresh_update(
+            update.added_entries,
+            update.updated_metadata,
+            &update.completed_paths,
+        );
+        assert!(serving_index.entries.is_empty());
+        assert!(!serving_index.file_mtimes.contains_key(&file));
+    }
+
+    #[test]
+    fn refresh_invalidated_cap_deferral_remains_file_count_based() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path();
+        let indexed = project_root.join("src/a.rs");
+        let deferred = project_root.join("src/b.rs");
+        write_source(&indexed, "pub fn alpha() -> i32 {\n    1\n}\n");
+        write_source(&deferred, "pub fn beta() -> i32 {\n    2\n}\n");
+
+        let mut index = build_recorded_test_index(project_root, std::slice::from_ref(&indexed));
+        let mut embedder = RecordingEmbedder::default();
+        let mut embed = |texts: Vec<String>| embedder.embed(texts);
+        let mut progress = |_done: usize, _total: usize| {};
+        let update = index
+            .refresh_invalidated_files(
+                project_root,
+                std::slice::from_ref(&deferred),
+                &mut embed,
+                16,
+                1,
+                &mut progress,
+            )
+            .unwrap();
+
+        assert_eq!(update.summary.total_processed, 1);
+        assert_eq!(update.summary.added, 0);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert_eq!(index.indexed_file_count(), 1);
+        assert!(index.deferred_files.contains(&deferred));
+        assert!(entries_for_file(&index, &deferred).is_empty());
     }
 
     #[test]
