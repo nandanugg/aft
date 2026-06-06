@@ -14,16 +14,19 @@ describe("Pi buildWorkflowHints", () => {
     });
     expect(out).not.toBeNull();
     expect(out).toContain("## Prefer AFT tools for token efficiency");
+    expect(out).toContain("**Parallel tool calls**");
+    expect(out).toContain("emit them in ONE response instead of serializing");
     expect(out).toContain("**Web/URL access**");
     expect(out).toContain('`aft_outline({ target: "<url>" })`');
     expect(out).not.toContain("aft_outline({ url })");
     expect(out).toContain("**Code exploration**");
     expect(out).toContain("`aft_search` is the primary code-search tool");
     expect(out).toContain('`hint: "regex"`');
-    expect(out).toContain("auto-routes by query shape");
-    // Generic anti-bash-batch code-search steer must be present (parity).
-    expect(out).toContain("the raw-bash batch is unranked");
-    expect(out).toContain("in parallel when the lookups are independent");
+    expect(out).toContain("auto-routes concepts, identifiers, regex");
+    // Imperative anti-bash-grep + parallel-wave steer must be present (parity).
+    expect(out).toContain("fire independent lookups in ONE parallel tool-call wave");
+    expect(out).toContain("DO NOT run `grep`/`rg`/`find` through `bash` to locate code");
+    expect(out).toContain("the bash path is unindexed, unranked, serial");
     expect(out).toContain("Use `aft_callgraph`");
     expect(out).toContain("**Codebase health & diagnostics**");
     expect(out).toContain("`aft_inspect`");
@@ -96,6 +99,8 @@ describe("Pi buildWorkflowHints", () => {
       bashBackgroundEnabled: false,
       absentTools: new Set(["aft_outline", "aft_zoom"]),
     });
+    // null proves the parallel-tool-call frame is never emitted on its own
+    // (unshift runs only when sections already have content).
     expect(out).toBeNull();
   });
 });

@@ -62,16 +62,18 @@ describe("maybeAppendConflictsHint", () => {
 });
 
 describe("maybeAppendGrepHint", () => {
-  test("appends hint when first line is a rg invocation", () => {
+  test("redirects to the grep tool when aft_search is unavailable", () => {
     const output = "rg -n 'pattern' src/\nsrc/foo.ts:42:match\n";
     const result = maybeAppendGrepHint(output);
-    expect(result).toContain("[Hint] Use the grep tool");
+    expect(result).toContain("[Hint] DO NOT search code by running grep/rg in bash");
+    expect(result).toContain("Use the `grep` tool");
   });
 
-  test("appends hint when first line is a grep invocation", () => {
+  test("redirects to aft_search when available (no grep-tool mention)", () => {
     const output = "grep -rn 'pattern' src/\nsrc/foo.ts:42:match\n";
-    const result = maybeAppendGrepHint(output);
-    expect(result).toContain("[Hint] Use the grep tool");
+    const result = maybeAppendGrepHint(output, undefined, true);
+    expect(result).toContain("Use `aft_search`");
+    expect(result).not.toContain("grep` tool");
   });
 
   test("does NOT fire when grep token appears only on a later line", () => {

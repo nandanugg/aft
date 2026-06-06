@@ -266,6 +266,14 @@ function getBashSpawnHook(pi: ExtensionAPI): BashSpawnHook | undefined {
 
 export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
   const spawnHook = getBashSpawnHook(pi);
+  // aft_search is registered (and thus the right redirect target) when semantic
+  // search is on AND the surface isn't minimal AND it isn't disabled — mirror
+  // the registration gate in index.ts (surface.semantic). When unavailable the
+  // grep-redirect hint points at the grep tool instead.
+  const aftSearchAvailable =
+    (ctx.config.tool_surface ?? "recommended") !== "minimal" &&
+    ctx.config.semantic_search === true &&
+    !(ctx.config.disabled_tools ?? []).includes("aft_search");
 
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
@@ -380,13 +388,16 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
             throw new Error((status.message as string | undefined) ?? "bash_status failed");
           }
           if (isTerminalStatus(status.status)) {
-            return bashResult(withBashHints(formatForegroundResult(status), params.command), {
-              exit_code: status.exit_code as number | undefined,
-              duration_ms: status.duration_ms as number | undefined,
-              truncated: status.output_truncated as boolean | undefined,
-              output_path: status.output_path as string | undefined,
-              task_id: taskId,
-            });
+            return bashResult(
+              withBashHints(formatForegroundResult(status), params.command, aftSearchAvailable),
+              {
+                exit_code: status.exit_code as number | undefined,
+                duration_ms: status.duration_ms as number | undefined,
+                truncated: status.output_truncated as boolean | undefined,
+                output_path: status.output_path as string | undefined,
+                task_id: taskId,
+              },
+            );
           }
           if (Date.now() - startedAt >= waitTimeoutMs) {
             const promoted = await callBashBridge(
@@ -416,7 +427,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       };
 
       const output = (response.output as string | undefined) ?? "";
-      return bashResult(withBashHints(output, params.command), details);
+      return bashResult(withBashHints(output, params.command, aftSearchAvailable), details);
     },
     renderCall(args, theme, context) {
       return renderBashCall(args?.command, args?.description, theme, context);
@@ -472,9 +483,9 @@ function formatSeconds(ms: number): string {
  * `tool.execute.after` nudges; only fires on terminal bash output (not
  * background-spawn/promotion messages, which have no real output yet).
  */
-function withBashHints(output: string, command: string): string {
+function withBashHints(output: string, command: string, aftSearchAvailable: boolean): string {
   let result = maybeAppendConflictsHint(output);
-  result = maybeAppendGrepHint(result, command);
+  result = maybeAppendGrepHint(result, command, aftSearchAvailable);
   return result;
 }
 

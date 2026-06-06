@@ -49,22 +49,18 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     );
   }
 
+  // See the OpenCode copy for the rationale — kept byte-identical for parity.
+  // Lead imperatively (DO NOT) with the two reflexes agents get wrong:
+  // serializing independent lookups, and shelling out to grep for code search.
+  // aft_search is named alone when available (it auto-routes literals too);
+  // only when absent do we point at the grep TOOL.
   if (hasOutline && hasZoom && (hasGrep || hasSearch)) {
-    let codeExploration: string;
-    if (hasSearch) {
-      const grepFallback = hasGrep
-        ? ` Use \`${grepName}\` directly only when you need exhaustive enumeration of literal text (every TODO, every import of X) without ranking.`
-        : "";
-      codeExploration = `**Code exploration**: \`aft_search\` is the primary code-search tool. It auto-routes by query shape — exact identifiers, regex, error messages, natural language all use the same call. Very short queries fall back to literal scans; pass \`hint: "regex"\` / \`hint: "literal"\` / \`hint: "semantic"\` to override routing if needed. Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).${grepFallback}`;
-    } else {
-      codeExploration = `**Code exploration**: \`${grepName}\` to locate → \`aft_outline\` for structure → \`aft_zoom\` for symbol(s).`;
-    }
-    // Generic anti-pattern steer (all models): locating code by batching
-    // grep/find/sed in one bash call is unranked and routinely picks the wrong
-    // hit. Route discovery through the AFT tools, fired in parallel.
-    codeExploration +=
-      " For code discovery, call these AFT tools (in parallel when the lookups are independent) rather than batching `grep`/`find`/`sed` in one `bash` call: the raw-bash batch is unranked and routinely surfaces the wrong code. Keep `bash` for shell facts (git state, file metadata, running commands).";
-    sections.push(codeExploration);
+    const locate = hasSearch
+      ? '`aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals (pass `hint: "regex"`/`"literal"`/`"semantic"` to force a lane).'
+      : `\`${grepName}\` (the tool — indexed and ranked) locates code.`;
+    sections.push(
+      `**Code exploration**: fire independent lookups in ONE parallel tool-call wave — do NOT serialize them. ${locate} Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s). DO NOT run \`grep\`/\`rg\`/\`find\` through \`bash\` to locate code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep \`bash\` for shell facts (git state, file metadata, processes).`,
+    );
   }
 
   if (hasInspect) {
@@ -101,6 +97,13 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   if (sections.length === 0) {
     return null;
   }
+
+  // Parallel-tool-call discipline frames the whole block (parity with OpenCode):
+  // firing independent read-only calls together is the single biggest efficiency
+  // win. Prepended so it leads, and only when there's real content below it.
+  sections.unshift(
+    "**Parallel tool calls**: when several read-only operations are independent, emit them in ONE response instead of serializing — file reads, structure and symbol lookups, code search, diagnostics, and git status/diff/log. Sequence only when a call depends on a prior result or when a command mutates state.",
+  );
 
   return `${HEADING}\n\n${sections.join("\n\n")}`;
 }

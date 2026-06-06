@@ -1045,9 +1045,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         if (stored.metadata) output.metadata = { ...output.metadata, ...stored.metadata };
       }
       // Bash output hints — see shared/bash-hints.ts for the gating logic.
+      // The grep redirect points at aft_search when it's actually registered
+      // (semantic on + recommended+ surface), else at the grep tool.
       if (toolInput.tool === "bash" && output.output) {
         output.output = maybeAppendConflictsHint(output.output);
-        output.output = maybeAppendGrepHint(output.output);
+        output.output = maybeAppendGrepHint(
+          output.output,
+          undefined,
+          registeredTools.has("aft_search"),
+        );
       }
       // Use cached session directory so bg-completion drains target the
       // right project bridge after `opencode -s` from another cwd.
