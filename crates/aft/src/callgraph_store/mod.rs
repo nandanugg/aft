@@ -22,6 +22,7 @@ const SCHEMA_VERSION: i64 = 1;
 const BACKEND_TREESITTER: &str = "treesitter";
 const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
 const PROVENANCE_NAME_MATCH: &str = "name_match";
+const PROVENANCE_TYPE_MATCH: &str = "type_match";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -208,6 +209,13 @@ impl StoreCallSite {
     pub fn resolved_by(&self) -> &str {
         &self.provenance
     }
+
+    pub fn supplemental_resolution(&self) -> Option<&str> {
+        match self.provenance.as_str() {
+            PROVENANCE_NAME_MATCH | PROVENANCE_TYPE_MATCH => Some(self.provenance.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +378,8 @@ struct NameMatchRef {
     ref_id: String,
     caller_node: String,
     caller_file: String,
+    caller_symbol: String,
+    caller_signature: Option<String>,
     receiver: String,
     method_name: String,
     colon_dispatch: bool,
@@ -688,7 +698,7 @@ impl CallGraphStore {
         for resolved in &resolved_refs {
             insert_resolved_ref(&tx, resolved)?;
         }
-        let name_match_edge_count = insert_name_match_edges(&tx, None)?;
+        let supplemental_edge_count = insert_method_dispatch_edges(&tx, None)?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
         phase!("sqlite_insert", t);
@@ -697,7 +707,7 @@ impl CallGraphStore {
             files: extracts.len(),
             nodes: node_count,
             refs: ref_count,
-            edges: edge_count + name_match_edge_count,
+            edges: edge_count + supplemental_edge_count,
             failed_files: failures
                 .into_iter()
                 .map(|failure| failure.rel_path)
@@ -828,7 +838,8 @@ impl CallGraphStore {
             }
         }
 
-        insert_name_match_edges(&tx, Some(&own_refresh))?;
+        delete_method_dispatch_edges_for_callers(&tx, &own_refresh)?;
+        insert_method_dispatch_edges(&tx, Some(&own_refresh))?;
 
         tx.commit()?;
         Ok(IncrementalStats {
@@ -1960,9 +1971,9 @@ fn schema_fingerprint() -> String {
     // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
     // edge sources, broader call extraction) even if the table SHAPE is
     // unchanged, so existing on-disk stores rebuild and pick up the new edges.
-    // v4 -> v5: name-match method-dispatch edges (provenance=name_match) +
-    // C/C++/C#/Zig call extraction.
-    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v5");
+    // v5 -> v6: receiver-type method-dispatch edges (provenance=type_match) +
+    // stdlib denylisted name-match fallback.
+    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v6");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
@@ -3426,7 +3437,7 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
     Ok(())
 }
 
-fn insert_name_match_edges(
+fn insert_method_dispatch_edges(
     tx: &Transaction<'_>,
     caller_files: Option<&BTreeSet<String>>,
 ) -> Result<usize> {
@@ -3447,42 +3458,96 @@ fn insert_name_match_edges(
                 entry.insert(candidates)
             }
         };
+
+        if let Some(receiver_type) = infer_receiver_type(&reference) {
+            let Some(candidate) =
+                select_type_match_candidate(&reference, candidates.as_slice(), &receiver_type)
+            else {
+                continue;
+            };
+            insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_TYPE_MATCH)?;
+            inserted += 1;
+            continue;
+        }
+
+        if method_name_match_denylisted(&reference.method_name) {
+            continue;
+        }
+
         let Some(candidate) = select_name_match_candidate(&reference, candidates.as_slice()) else {
             continue;
         };
-        tx.execute(
-            "INSERT OR REPLACE INTO edges(
-                edge_id, ref_id, source_node, target_node, target_file, target_symbol,
-                kind, line, provenance
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
-            params![
-                ref_id(&[&reference.ref_id, "name_match_edge"]),
-                reference.ref_id,
-                reference.caller_node,
-                candidate.node_id,
-                candidate.file_path,
-                candidate.scoped_name,
-                reference.line as i64,
-                PROVENANCE_NAME_MATCH,
-            ],
-        )?;
+        insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_NAME_MATCH)?;
         inserted += 1;
     }
     Ok(inserted)
+}
+
+fn insert_method_dispatch_edge(
+    tx: &Transaction<'_>,
+    reference: &NameMatchRef,
+    candidate: &NameMatchCandidate,
+    provenance: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO edges(
+            edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+            kind, line, provenance
+        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
+        params![
+            ref_id(&[&reference.ref_id, provenance, "edge"]),
+            &reference.ref_id,
+            &reference.caller_node,
+            &candidate.node_id,
+            &candidate.file_path,
+            &candidate.scoped_name,
+            reference.line as i64,
+            provenance,
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_method_dispatch_edges_for_callers(
+    tx: &Transaction<'_>,
+    caller_files: &BTreeSet<String>,
+) -> Result<()> {
+    if caller_files.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = tx.prepare(
+        "DELETE FROM edges
+         WHERE provenance IN (?1, ?2)
+           AND ref_id IN (SELECT ref_id FROM refs WHERE caller_file = ?3)",
+    )?;
+    for caller_file in caller_files {
+        stmt.execute(params![
+            PROVENANCE_NAME_MATCH,
+            PROVENANCE_TYPE_MATCH,
+            caller_file
+        ])?;
+    }
+    Ok(())
 }
 
 fn load_name_match_refs(
     tx: &Transaction<'_>,
     caller_files: Option<&BTreeSet<String>>,
 ) -> Result<Vec<NameMatchRef>> {
-    let base_sql = "SELECT r.ref_id, r.caller_node, r.caller_file, r.short_name, r.full_ref,
-                           r.line, f.lang
-                    FROM refs r JOIN files f ON f.path = r.caller_file
+    let base_sql = "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,
+                           n.signature, r.short_name, r.full_ref, r.line, f.lang
+                    FROM refs r
+                    JOIN files f ON f.path = r.caller_file
+                    JOIN nodes n ON n.id = r.caller_node
                     WHERE r.kind = 'call'
                       AND r.status = 'unresolved'
                       AND r.caller_node IS NOT NULL
                       AND r.full_ref IS NOT NULL
-                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%')";
+                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call'
+                      )";
     let mut references = Vec::new();
 
     if let Some(caller_files) = caller_files {
@@ -3499,18 +3564,32 @@ fn load_name_match_refs(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             })?;
             for row in rows {
-                let (ref_id, caller_node, caller_file, short_name, full_ref, line, lang) = row?;
+                let (
+                    ref_id,
+                    caller_node,
+                    caller_file,
+                    caller_symbol,
+                    caller_signature,
+                    short_name,
+                    full_ref,
+                    line,
+                    lang,
+                ) = row?;
                 if let Some(reference) = name_match_ref_from_parts(
                     ref_id,
                     caller_node,
                     caller_file,
+                    caller_symbol,
+                    caller_signature,
                     short_name,
                     full_ref,
                     line,
@@ -3530,18 +3609,32 @@ fn load_name_match_refs(
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, String>(8)?,
         ))
     })?;
     for row in rows {
-        let (ref_id, caller_node, caller_file, short_name, full_ref, line, lang) = row?;
+        let (
+            ref_id,
+            caller_node,
+            caller_file,
+            caller_symbol,
+            caller_signature,
+            short_name,
+            full_ref,
+            line,
+            lang,
+        ) = row?;
         if let Some(reference) = name_match_ref_from_parts(
             ref_id,
             caller_node,
             caller_file,
+            caller_symbol,
+            caller_signature,
             short_name,
             full_ref,
             line,
@@ -3553,10 +3646,13 @@ fn load_name_match_refs(
     Ok(references)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn name_match_ref_from_parts(
     ref_id: String,
     caller_node: Option<String>,
     caller_file: String,
+    caller_symbol: String,
+    caller_signature: Option<String>,
     short_name: Option<String>,
     full_ref: Option<String>,
     line: i64,
@@ -3574,6 +3670,8 @@ fn name_match_ref_from_parts(
         ref_id,
         caller_node,
         caller_file,
+        caller_symbol,
+        caller_signature,
         receiver,
         method_name,
         colon_dispatch,
@@ -3642,6 +3740,252 @@ fn load_name_match_candidates(
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn infer_receiver_type(reference: &NameMatchRef) -> Option<String> {
+    if reference.lang != "rust" {
+        return None;
+    }
+    infer_rust_receiver_type(reference)
+}
+
+fn infer_rust_receiver_type(reference: &NameMatchRef) -> Option<String> {
+    if matches!(reference.receiver.as_str(), "self" | "Self") {
+        return enclosing_type_from_scoped_name(&reference.caller_symbol);
+    }
+
+    if reference.colon_dispatch && rust_receiver_looks_type_like(&reference.receiver) {
+        return Some(reference.receiver.clone());
+    }
+
+    reference
+        .caller_signature
+        .as_deref()
+        .and_then(|signature| rust_parameter_type(signature, &reference.receiver))
+}
+
+fn rust_receiver_looks_type_like(receiver: &str) -> bool {
+    receiver
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_uppercase())
+}
+
+fn enclosing_type_from_scoped_name(scoped_name: &str) -> Option<String> {
+    scoped_name
+        .rsplit_once("::")
+        .map(|(enclosing, _)| enclosing)
+        .filter(|enclosing| !enclosing.is_empty() && *enclosing != TOP_LEVEL_SYMBOL)
+        .map(ToString::to_string)
+}
+
+fn rust_parameter_type(signature: &str, receiver: &str) -> Option<String> {
+    let params = signature_parameter_text(signature)?;
+    for param in split_top_level_commas(params) {
+        let Some((pattern, type_text)) = param.split_once(':') else {
+            continue;
+        };
+        let Some(name) = rust_parameter_name(pattern) else {
+            continue;
+        };
+        if name == receiver {
+            return normalize_rust_receiver_type(type_text);
+        }
+    }
+    None
+}
+
+fn signature_parameter_text(signature: &str) -> Option<&str> {
+    let open = signature.find('(')?;
+    let mut depth = 0usize;
+    for (offset, ch) in signature[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&signature[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut angle_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ',' if angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 => {
+                let part = value[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let part = value[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+fn rust_parameter_name(pattern: &str) -> Option<&str> {
+    let mut pattern = pattern.trim();
+    if let Some(stripped) = pattern.strip_prefix("mut ") {
+        pattern = stripped.trim_start();
+    }
+    pattern
+        .rsplit(|ch: char| !is_rust_ident_char(ch))
+        .find(|part| !part.is_empty())
+}
+
+fn normalize_rust_receiver_type(type_text: &str) -> Option<String> {
+    let mut ty = strip_leading_rust_type_modifiers(type_text);
+    let owned_inner;
+    if let Some(inner) = single_outer_generic_arg(ty) {
+        owned_inner = inner.trim().to_string();
+        ty = strip_leading_rust_type_modifiers(&owned_inner);
+    }
+    rust_base_type_ident(ty)
+}
+
+fn strip_leading_rust_type_modifiers(mut ty: &str) -> &str {
+    loop {
+        ty = ty.trim_start();
+        if let Some(stripped) = ty.strip_prefix('&') {
+            ty = stripped.trim_start();
+            if let Some(stripped) = strip_leading_lifetime(ty) {
+                ty = stripped.trim_start();
+            }
+            if let Some(stripped) = ty.strip_prefix("mut ") {
+                ty = stripped.trim_start();
+            }
+            continue;
+        }
+        if let Some(stripped) = ty.strip_prefix("mut ") {
+            ty = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = ty.strip_prefix("dyn ") {
+            ty = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = ty.strip_prefix("impl ") {
+            ty = stripped.trim_start();
+            continue;
+        }
+        break ty.trim();
+    }
+}
+
+fn strip_leading_lifetime(value: &str) -> Option<&str> {
+    let mut chars = value.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '\'' {
+        return None;
+    }
+    for (index, ch) in chars {
+        if !(ch == '_' || ch.is_ascii_alphanumeric()) {
+            return Some(&value[index..]);
+        }
+    }
+    Some("")
+}
+
+fn single_outer_generic_arg(ty: &str) -> Option<&str> {
+    let ty = ty.trim();
+    let open = ty.find('<')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (index, ch) in ty.char_indices().skip_while(|(index, _)| *index < open) {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    if !ty[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let inner = &ty[open + 1..close];
+    let args = split_top_level_commas(inner);
+    match args.as_slice() {
+        [arg] => Some(*arg),
+        _ => None,
+    }
+}
+
+fn rust_base_type_ident(ty: &str) -> Option<String> {
+    let ty = ty.trim();
+    let head = ty
+        .split([' ', '+', '='])
+        .find(|part| !part.is_empty())
+        .unwrap_or(ty);
+    let head = head.split('<').next().unwrap_or(head).trim();
+    let ident = head
+        .rsplit("::")
+        .next()
+        .unwrap_or(head)
+        .trim_matches(|ch: char| !is_rust_ident_char(ch));
+    if ident.is_empty() || ident.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        None
+    } else {
+        Some(ident.to_string())
+    }
+}
+
+fn is_rust_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn select_type_match_candidate(
+    reference: &NameMatchRef,
+    candidates: &[NameMatchCandidate],
+    receiver_type: &str,
+) -> Option<NameMatchCandidate> {
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.node_id != reference.caller_node)
+        .filter(|candidate| {
+            type_candidate_matches(candidate, receiver_type, &reference.method_name)
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [candidate] => Some((**candidate).clone()),
+        _ => None,
+    }
+}
+
+fn type_candidate_matches(
+    candidate: &NameMatchCandidate,
+    receiver_type: &str,
+    method_name: &str,
+) -> bool {
+    let normalized_type = receiver_type.replace('.', "::");
+    let suffix = format!("{normalized_type}::{method_name}");
+    candidate.scoped_name == suffix || candidate.scoped_name.ends_with(&format!("::{suffix}"))
 }
 
 fn select_name_match_candidate(
@@ -3720,6 +4064,91 @@ fn select_scored_name_match_candidate(
     } else {
         None
     }
+}
+
+fn method_name_match_denylisted(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        "and_then"
+            | "as_bytes"
+            | "as_deref"
+            | "as_mut"
+            | "as_ref"
+            | "as_str"
+            | "borrow"
+            | "borrow_mut"
+            | "clear"
+            | "clone"
+            | "collect"
+            | "contains"
+            | "contains_key"
+            | "count"
+            | "dedup"
+            | "default"
+            | "drain"
+            | "ends_with"
+            | "entry"
+            | "err"
+            | "expect"
+            | "extend"
+            | "filter"
+            | "filter_map"
+            | "find"
+            | "from"
+            | "get"
+            | "get_mut"
+            | "insert"
+            | "into"
+            | "into_iter"
+            | "is_empty"
+            | "is_err"
+            | "is_none"
+            | "is_ok"
+            | "is_some"
+            | "iter"
+            | "iter_mut"
+            | "join"
+            | "len"
+            | "lock"
+            | "map"
+            | "map_err"
+            | "max"
+            | "min"
+            | "new"
+            | "next"
+            | "ok"
+            | "or_default"
+            | "or_else"
+            | "or_insert"
+            | "or_insert_with"
+            | "parse"
+            | "pop"
+            | "position"
+            | "push"
+            | "read"
+            | "recv"
+            | "remove"
+            | "replace"
+            | "retain"
+            | "send"
+            | "sort"
+            | "sort_by"
+            | "split"
+            | "starts_with"
+            | "sum"
+            | "take"
+            | "to_owned"
+            | "to_string"
+            | "trim"
+            | "try_from"
+            | "try_into"
+            | "unwrap"
+            | "unwrap_or"
+            | "unwrap_or_default"
+            | "unwrap_or_else"
+            | "with_capacity"
+            | "write"
+    )
 }
 
 fn split_camel_case(value: &str) -> Vec<String> {

@@ -14,7 +14,7 @@ pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
 
 #[derive(Debug, Clone, Default)]
 struct EdgeMarker {
-    approximate: bool,
+    approximate: Option<bool>,
     resolved_by: Option<String>,
 }
 
@@ -39,8 +39,8 @@ pub struct StoreCallerGroup {
 pub struct StoreCallerEntry {
     pub symbol: String,
     pub line: u32,
-    #[serde(skip_serializing_if = "is_false")]
-    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
 }
@@ -53,8 +53,8 @@ pub struct StoreCallTreeNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub resolved: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
     pub children: Vec<StoreCallTreeNode>,
@@ -87,8 +87,8 @@ pub struct StoreImpactCaller {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_expression: Option<String>,
     pub parameters: Vec<String>,
-    #[serde(skip_serializing_if = "is_false")]
-    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
 }
@@ -101,8 +101,8 @@ pub struct StoreTraceHop {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub is_entry_point: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
 }
@@ -128,8 +128,8 @@ pub struct StoreTraceToSymbolHop {
     pub symbol: String,
     pub file: String,
     pub line: u32,
-    #[serde(skip_serializing_if = "is_false")]
-    pub approximate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
 }
@@ -186,27 +186,23 @@ struct TraceElem {
     edge: EdgeMarker,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 fn edge_marker(site: &StoreCallSite) -> EdgeMarker {
-    if site.approximate() {
+    if let Some(resolved_by) = site.supplemental_resolution() {
         EdgeMarker {
-            approximate: true,
-            resolved_by: Some(site.resolved_by().to_string()),
+            approximate: Some(site.approximate()),
+            resolved_by: Some(resolved_by.to_string()),
         }
     } else {
         EdgeMarker::default()
     }
 }
 
-fn edge_approximate(site: &StoreCallSite) -> bool {
-    site.approximate()
+fn edge_approximate(site: &StoreCallSite) -> Option<bool> {
+    site.supplemental_resolution().map(|_| site.approximate())
 }
 
 fn edge_resolved_by(site: &StoreCallSite) -> Option<String> {
-    site.approximate().then(|| site.resolved_by().to_string())
+    site.supplemental_resolution().map(ToString::to_string)
 }
 
 pub fn callers_result(
@@ -767,7 +763,7 @@ fn call_tree_inner(
             line: node.line,
             signature: node.signature.clone(),
             resolved: true,
-            approximate: false,
+            approximate: None,
             resolved_by: None,
             children: Vec::new(),
             depth_limited: false,
@@ -825,7 +821,7 @@ fn call_tree_inner(
                     line: call.line,
                     signature: None,
                     resolved: false,
-                    approximate: false,
+                    approximate: None,
                     resolved_by: None,
                     children: Vec::new(),
                     depth_limited: false,
@@ -845,7 +841,7 @@ fn call_tree_inner(
         line: node.line,
         signature: node.signature.clone(),
         resolved: true,
-        approximate: false,
+        approximate: None,
         resolved_by: None,
         children,
         depth_limited,
