@@ -1957,7 +1957,12 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 }
 
 fn schema_fingerprint() -> String {
-    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v4");
+    // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
+    // edge sources, broader call extraction) even if the table SHAPE is
+    // unchanged, so existing on-disk stores rebuild and pick up the new edges.
+    // v4 -> v5: name-match method-dispatch edges (provenance=name_match) +
+    // C/C++/C#/Zig call extraction.
+    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v5");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
