@@ -98,6 +98,12 @@ function childEnv(configDir: string): Record<string, string> {
     join(REPO_ROOT, "target", "debug"),
     result.PATH ?? "",
   ].join(sep);
+  // Store-backed callgraph ops (e.g. trace_to_symbol) build the persisted store
+  // in the background and return `callgraph_building` until it lands. Tests
+  // assert the real JSON result, so block the op until the store is ready
+  // instead of racing the background build. Matches the determinism knob the
+  // other e2e harnesses use; see AppContext::callgraph_build_wait_window.
+  result.AFT_CALLGRAPH_BUILD_WAIT_MS = "15000";
   return result;
 }
 
