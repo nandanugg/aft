@@ -214,7 +214,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(String(response.output)).toContain("Prefer `read` tool over bash.");
   });
 
-  skipOnWindows("rewrites grep -r to grep tool with footer hint when enabled", async () => {
+  skipOnWindows("rewrites grep -r to grep tool with enforced code-search footer", async () => {
     const h = await harness({ experimental_bash_rewrite: true });
     await mkdir(h.path("src"));
     await writeFile(h.path("src", "lib.ts"), "needle\nhaystack\n", "utf8");
@@ -226,7 +226,9 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     expect(response.success).toBe(true);
     expect(String(response.output)).toContain("needle");
-    expect(String(response.output)).toContain("Prefer `grep` tool over bash.");
+    // aft_search_registered defaults false here → footer points at the grep tool.
+    expect(String(response.output)).toContain("DO NOT search code by running grep/rg in bash");
+    expect(String(response.output)).toContain("Use the `grep` tool instead");
   });
 
   skipOnWindows("rewriter disabled runs cat as raw bash without footer", async () => {

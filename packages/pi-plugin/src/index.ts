@@ -636,6 +636,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   };
   pool = new BridgePool(binaryPath, poolOptions, configOverrides);
   pool.setConfigureOverride("harness", "pi");
+  // Tell Rust whether `aft_search` is registered for this surface so the
+  // grep-rewrite footer steers there (vs the grep tool). Set before the eager
+  // warmup spawn below so even the first bridge configures with the flag.
+  // `resolveToolSurface` is pure; `.semantic` is the same predicate the tool
+  // registration uses (ok("aft_search") && semantic_search === true).
+  pool.setConfigureOverride("aft_search_registered", resolveToolSurface(config).semantic);
   const ctx: PluginContext = { pool, config, storageDir };
 
   // Settle the ONNX runtime download promise (started above) and patch the

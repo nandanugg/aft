@@ -120,6 +120,12 @@ pub struct Config {
     pub search_index: bool,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
+    /// Whether the plugin registered the `aft_search` tool for this surface
+    /// (default: false). Forwarded by the plugin's resolved registration
+    /// predicate (semantic on + not minimal + not disabled). Used only to pick
+    /// the grep-rewrite footer: when true the footer steers to `aft_search`,
+    /// otherwise to the `grep` tool. Not a capability gate.
+    pub aft_search_registered: bool,
     /// Enable the persisted callgraph store substrate (default: false).
     pub callgraph_store: bool,
     /// Enable experimental bash command rewriting (default: false).
@@ -207,6 +213,7 @@ impl Default for Config {
             restrict_to_project_root: false,
             search_index: false,
             semantic_search: false,
+            aft_search_registered: false,
             callgraph_store: false,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,

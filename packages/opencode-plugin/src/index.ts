@@ -44,7 +44,7 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
-import { maybeAppendConflictsHint, maybeAppendGrepHint } from "./shared/bash-hints.js";
+import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
 import { probeServerReachable, setLiveServerWakeAvailable } from "./shared/live-server-client.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
@@ -920,6 +920,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "bash_status",
   ];
   const registeredTools = new Set(Object.keys(allTools));
+  // Tell Rust whether `aft_search` is registered for this surface so the
+  // grep-rewrite footer can steer to it (vs the grep tool). The pool holds
+  // configOverrides by reference and bridges spawn lazily, so a late set here
+  // reaches every bridge — same pattern as `_ort_dylib_dir`/`lsp_paths_extra`.
+  pool.setConfigureOverride("aft_search_registered", registeredTools.has("aft_search"));
   const hintsAbsentTools = new Set<string>();
   for (const name of HINTS_TOOL_NAMES) {
     if (!registeredTools.has(name)) hintsAbsentTools.add(name);
@@ -1044,16 +1049,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         if (stored.title) output.title = stored.title;
         if (stored.metadata) output.metadata = { ...output.metadata, ...stored.metadata };
       }
-      // Bash output hints — see shared/bash-hints.ts for the gating logic.
-      // The grep redirect points at aft_search when it's actually registered
-      // (semantic on + recommended+ surface), else at the grep tool.
+      // Bash output hints — see shared/bash-hints.ts. The grep/rg code-search
+      // redirect is emitted by the Rust bash rewriter (it owns the rewrite and
+      // now reads `aft_search_registered` from config), so the plugin only adds
+      // the conflicts hint here.
       if (toolInput.tool === "bash" && output.output) {
         output.output = maybeAppendConflictsHint(output.output);
-        output.output = maybeAppendGrepHint(
-          output.output,
-          undefined,
-          registeredTools.has("aft_search"),
-        );
       }
       // Use cached session directory so bg-completion drains target the
       // right project bridge after `opencode -s` from another cwd.

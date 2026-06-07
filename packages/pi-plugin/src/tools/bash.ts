@@ -3,7 +3,6 @@ import {
   type BinaryBridge,
   type BridgeRequestOptions,
   maybeAppendConflictsHint,
-  maybeAppendGrepHint,
   maybeStripCompressorPipe,
 } from "@cortexkit/aft-bridge";
 import type {
@@ -267,15 +266,6 @@ function getBashSpawnHook(pi: ExtensionAPI): BashSpawnHook | undefined {
 
 export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
   const spawnHook = getBashSpawnHook(pi);
-  // aft_search is registered (and thus the right redirect target) when semantic
-  // search is on AND the surface isn't minimal AND it isn't disabled — mirror
-  // the registration gate in index.ts (surface.semantic). When unavailable the
-  // grep-redirect hint points at the grep tool instead.
-  const aftSearchAvailable =
-    (ctx.config.tool_surface ?? "recommended") !== "minimal" &&
-    ctx.config.semantic_search === true &&
-    !(ctx.config.disabled_tools ?? []).includes("aft_search");
-
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
     label: "bash",
@@ -395,10 +385,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
           }
           if (isTerminalStatus(status.status)) {
             return bashResult(
-              appendPipeStripNote(
-                withBashHints(formatForegroundResult(status), bridgeCommand, aftSearchAvailable),
-                pipeStrip.note,
-              ),
+              appendPipeStripNote(withBashHints(formatForegroundResult(status)), pipeStrip.note),
               {
                 exit_code: status.exit_code as number | undefined,
                 duration_ms: status.duration_ms as number | undefined,
@@ -436,13 +423,7 @@ export function registerBashTool(pi: ExtensionAPI, ctx: PluginContext): void {
       };
 
       const output = (response.output as string | undefined) ?? "";
-      return bashResult(
-        appendPipeStripNote(
-          withBashHints(output, bridgeCommand, aftSearchAvailable),
-          pipeStrip.note,
-        ),
-        details,
-      );
+      return bashResult(appendPipeStripNote(withBashHints(output), pipeStrip.note), details);
     },
     renderCall(args, theme, context) {
       return renderBashCall(args?.command, args?.description, theme, context);
@@ -502,10 +483,11 @@ function formatSeconds(ms: number): string {
  * `tool.execute.after` nudges; only fires on terminal bash output (not
  * background-spawn/promotion messages, which have no real output yet).
  */
-function withBashHints(output: string, command: string, aftSearchAvailable: boolean): string {
-  let result = maybeAppendConflictsHint(output);
-  result = maybeAppendGrepHint(result, command, aftSearchAvailable);
-  return result;
+function withBashHints(output: string): string {
+  // The grep/rg code-search redirect is emitted by the Rust bash rewriter
+  // (it reads `aft_search_registered` from config). Here we only add the
+  // conflicts hint, which keys off git-merge markers in the output.
+  return maybeAppendConflictsHint(output);
 }
 
 function formatForegroundResult(data: Record<string, unknown>): string {

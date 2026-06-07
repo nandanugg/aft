@@ -10,7 +10,7 @@
 // --- logger contract ---
 export { setActiveLogger } from "./active-logger.js";
 // --- bash output hints (shared by both plugin hosts) ---
-export { maybeAppendConflictsHint, maybeAppendGrepHint } from "./bash-hints.js";
+export { maybeAppendConflictsHint } from "./bash-hints.js";
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,

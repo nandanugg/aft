@@ -37,6 +37,19 @@ fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     )
 }
 
+fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> AppContext {
+    AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.to_path_buf()),
+            experimental_bash_rewrite: true,
+            restrict_to_project_root: true,
+            aft_search_registered,
+            ..Config::default()
+        },
+    )
+}
+
 fn request(command: &str, params: Value) -> RawRequest {
     RawRequest {
         id: "test".to_string(),
@@ -85,15 +98,42 @@ fn rewrites_grep_and_rejects_pipes() {
     fs::write(dir.path().join("src/lib.rs"), "fn Needle() {}\n").unwrap();
     let ctx = context(dir.path(), true);
 
-    let data = assert_rewritten(
+    let data = rewrite(
         &format!("grep -ni needle {}", dir.path().join("src").display()),
         &ctx,
-        "grep",
+    )
+    .expect("grep should rewrite");
+    // grep/rg use the enforced code-search footer, not the generic "Prefer" one.
+    assert!(
+        output(&data).contains("DO NOT search code by running grep/rg in bash"),
+        "missing enforced grep footer: {data:?}"
     );
     assert_eq!(data["success"], Value::Null);
     assert!(output(&data).contains("Needle"));
     assert!(rewrite("grep needle src | wc -l", &ctx).is_none());
     assert!(rewrite("grep -x needle src", &ctx).is_none());
+}
+
+#[test]
+fn grep_footer_steers_to_aft_search_when_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn needle() {}\n").unwrap();
+    let target = format!("grep -ni needle {}", dir.path().join("src").display());
+
+    // Registered → footer names `aft_search`, not the grep tool.
+    let registered = context_with_search(dir.path(), true);
+    let data = rewrite(&target, &registered).expect("grep should rewrite");
+    let out = output(&data);
+    assert!(out.contains("Use the `aft_search` tool instead"), "{out}");
+    assert!(!out.contains("Use the `grep` tool instead"), "{out}");
+
+    // Not registered → footer falls back to the indexed grep tool.
+    let not_registered = context_with_search(dir.path(), false);
+    let data = rewrite(&target, &not_registered).expect("grep should rewrite");
+    let out = output(&data);
+    assert!(out.contains("Use the `grep` tool instead"), "{out}");
+    assert!(!out.contains("Use the `aft_search` tool instead"), "{out}");
 }
 
 #[test]
@@ -112,7 +152,12 @@ fn rewrites_rg_and_rejects_chains() {
     fs::write(dir.path().join("notes.txt"), "alpha beta\n").unwrap();
     let ctx = context(dir.path(), true);
 
-    let data = assert_rewritten(&format!("rg alpha {}", dir.path().display()), &ctx, "grep");
+    let data =
+        rewrite(&format!("rg alpha {}", dir.path().display()), &ctx).expect("rg should rewrite");
+    assert!(
+        output(&data).contains("DO NOT search code by running grep/rg in bash"),
+        "missing enforced rg footer: {data:?}"
+    );
     assert!(output(&data).contains("alpha beta"));
     assert!(rewrite("rg alpha . && echo done", &ctx).is_none());
 }

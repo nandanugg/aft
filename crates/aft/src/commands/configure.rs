@@ -1516,6 +1516,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic_search = v;
     }
     if let Some(v) = params
+        .get("aft_search_registered")
+        .and_then(|v| v.as_bool())
+    {
+        next_config.aft_search_registered = v;
+    }
+    if let Some(v) = params
         .get(crate::callgraph_store::CALLGRAPH_STORE_FLAG)
         .and_then(|v| v.as_bool())
     {
