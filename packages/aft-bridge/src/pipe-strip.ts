@@ -50,7 +50,7 @@ export function maybeStripCompressorPipe(
   return {
     command: rebuilt,
     stripped: true,
-    note: `[AFT removed \`| ${filters}\`; the output compressor already keeps failures + summary. Pass compressed:false to keep your pipe.]`,
+    note: `[AFT dropped \`| ${filters}\` (compressed:false to keep)]`,
   };
 }
 

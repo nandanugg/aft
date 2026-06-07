@@ -236,7 +236,7 @@ describe("OpenCode bash adapter", () => {
 
     expect(calls[0].params.command).toBe("bun test");
     expect(output).toContain("failure details");
-    expect(output).toContain("[AFT removed `| grep fail`");
+    expect(output).toContain("[AFT dropped `| grep fail`");
   });
 
   test("keeps filter pipes when compressed:false", async () => {
@@ -253,7 +253,7 @@ describe("OpenCode bash adapter", () => {
     );
 
     expect(calls[0].params.command).toBe("bun test | grep fail");
-    expect(output).not.toContain("AFT removed");
+    expect(output).not.toContain("AFT dropped");
   });
 
   test("transport timeout is bounded by wait-window, not user-supplied task budget", async () => {

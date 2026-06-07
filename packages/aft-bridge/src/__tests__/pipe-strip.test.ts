@@ -7,7 +7,7 @@ describe("maybeStripCompressorPipe", () => {
     expect(result).toEqual({
       command: "bun test",
       stripped: true,
-      note: "[AFT removed `| grep fail`; the output compressor already keeps failures + summary. Pass compressed:false to keep your pipe.]",
+      note: "[AFT dropped `| grep fail` (compressed:false to keep)]",
     });
   });
 

@@ -192,7 +192,7 @@ describe("bash tool adapter", () => {
     const callArgs = calls[0] as [string, Record<string, unknown>];
     expect(callArgs[1].command).toBe("bun test");
     expect(result.content[0].text).toContain("failure details");
-    expect(result.content[0].text).toContain("[AFT removed `| grep fail`");
+    expect(result.content[0].text).toContain("[AFT dropped `| grep fail`");
   });
 
   test("keeps filter pipes when compressed:false", async () => {
@@ -214,7 +214,7 @@ describe("bash tool adapter", () => {
 
     const callArgs = calls[0] as [string, Record<string, unknown>];
     expect(callArgs[1].command).toBe("bun test | grep fail");
-    expect(result.content[0].text).not.toContain("AFT removed");
+    expect(result.content[0].text).not.toContain("AFT dropped");
   });
 
   test("background bash forwards user kill cap and uses 30s baseline transport budget", async () => {
