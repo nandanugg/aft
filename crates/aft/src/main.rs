@@ -2234,14 +2234,16 @@ mod watcher_filter_tests {
     use notify::EventKind;
     use tempfile::TempDir;
 
-    /// Generous wait for an async dispatch (semantic-refresh request / status
-    /// frame) that the worker thread produces on a separate thread. These waits
-    /// return the instant the value arrives, so the budget is zero-cost on the
-    /// happy path and only matters when CI thread-scheduling is starved under
-    /// full-suite parallel load. A tight budget (100-250ms) was the source of
-    /// `semantic refresh request: Timeout` flakes on Linux CI. Negative waits
-    /// (asserting *absence* of a value) must stay short and are NOT this const.
-    const RECV_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Wait budget for an async dispatch (semantic-refresh request / status
+    /// frame) the worker produces on a freshly-spawned thread. The dispatch
+    /// thread does `spawn -> sleep(backoff) -> send`, so under CI load the spawn
+    /// + wakeup can briefly exceed a tight budget. The wait returns the instant
+    /// the value arrives, so this is zero-cost on the happy path. This is only
+    /// headroom for thread scheduling; the actual cross-test flake (the request
+    /// never arriving at all) was a process-global breaker-state race, fixed by
+    /// serializing breaker tests via `semantic_breaker_test_lock`. Negative
+    /// waits (asserting *absence*) must stay short and are NOT this const.
+    const RECV_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn make_ctx_with_root(root: &std::path::Path) -> AppContext {
         AppContext::new(
@@ -2334,11 +2336,43 @@ mod watcher_filter_tests {
         }
     }
 
-    fn with_semantic_retry_backoff_ms<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+    /// Shared serialization lock for every test that touches the process-global
+    /// semantic-refresh breaker state (`SEMANTIC_REFRESH_CIRCUIT_OPEN` /
+    /// `PROBE_READY` / `PROBE_IN_FLIGHT` / `CONSECUTIVE_TRANSIENT_FAILURES`).
+    ///
+    /// The breaker is intentionally one-per-process in production (a single
+    /// embedding backend per process), so the globals are correct there. But
+    /// the test harness runs these tests in parallel against that shared state,
+    /// and they corrupt each other: e.g. a concurrent breaker test that leaves
+    /// `PROBE_READY + CIRCUIT_OPEN` true makes another test's
+    /// `drain_semantic_refresh_events -> maybe_fire_semantic_refresh_probe`
+    /// spuriously fire and consume that test's per-ctx pending paths. EVERY
+    /// breaker-touching test MUST hold this lock (via `with_semantic_retry_backoff_ms`
+    /// or `with_semantic_breaker_isolation`) so only one runs at a time.
+    fn semantic_breaker_test_lock() -> &'static std::sync::Mutex<()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK
-            .get_or_init(|| Mutex::new(()))
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Reset the breaker globals and run `f` serialized against every other
+    /// breaker-touching test. For tests that touch the breaker but do not need
+    /// the retry-backoff override.
+    fn with_semantic_breaker_isolation<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = semantic_breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_semantic_refresh_retry_state_for_test();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        reset_semantic_refresh_retry_state_for_test();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn with_semantic_retry_backoff_ms<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+        let _guard = semantic_breaker_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_semantic_refresh_retry_state_for_test();
@@ -2742,25 +2776,29 @@ mod watcher_filter_tests {
 
     #[test]
     fn semantic_refresh_disconnect_after_started_cancels_refreshing_paths() {
-        let tmp = TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let file = root.join("lib.rs");
-        std::fs::write(&file, "fn main() {}\n").unwrap();
+        // Drains refresh events (-> maybe_fire probe touches global breaker), so
+        // serialize against the other breaker tests.
+        with_semantic_breaker_isolation(|| {
+            let tmp = TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let file = root.join("lib.rs");
+            std::fs::write(&file, "fn main() {}\n").unwrap();
 
-        let ctx = make_ctx_with_root(&root);
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
-        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
-        event_tx
-            .send(SemanticRefreshEvent::Started {
-                paths: vec![file.clone()],
-            })
-            .unwrap();
-        drop(event_tx);
+            let ctx = make_ctx_with_root(&root);
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
+            let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+            event_tx
+                .send(SemanticRefreshEvent::Started {
+                    paths: vec![file.clone()],
+                })
+                .unwrap();
+            drop(event_tx);
 
-        drain_semantic_refresh_events(&ctx);
+            drain_semantic_refresh_events(&ctx);
 
-        assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
-        assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 0);
+            assert!(ctx.semantic_refresh_event_rx().borrow().is_none());
+            assert_eq!(ctx.semantic_index_status().borrow().refreshing_count(), 0);
+        });
     }
 
     #[test]
@@ -3010,39 +3048,45 @@ mod watcher_filter_tests {
 
     #[test]
     fn transient_corpus_failure_preserves_pending_semantic_paths() {
-        let tmp = TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let file = root.join("pending.vue");
-        std::fs::write(&file, "<template />").unwrap();
+        // Touches the process-global breaker via drain -> maybe_fire probe, so
+        // it must serialize against the other breaker tests (otherwise a
+        // concurrent test's leaked PROBE_READY+CIRCUIT_OPEN makes our drain
+        // spuriously fire the probe and consume our pending paths).
+        with_semantic_breaker_isolation(|| {
+            let tmp = TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let file = root.join("pending.vue");
+            std::fs::write(&file, "<template />").unwrap();
 
-        let ctx = make_ctx_with_root(&root);
-        *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
-        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
-            stage: "refreshing_corpus".into(),
-            files: Some(1),
-            entries_done: None,
-            entries_total: None,
-        };
-        ctx.add_pending_semantic_index_paths(vec![file.clone()]);
-        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+            let ctx = make_ctx_with_root(&root);
+            *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
+            *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+                stage: "refreshing_corpus".into(),
+                files: Some(1),
+                entries_done: None,
+                entries_total: None,
+            };
+            ctx.add_pending_semantic_index_paths(vec![file.clone()]);
+            let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
 
-        event_tx
-            .send(SemanticRefreshEvent::CorpusFailed {
-                error: format!(
-                    "{}backend unavailable",
-                    aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
-                ),
-            })
-            .unwrap();
+            event_tx
+                .send(SemanticRefreshEvent::CorpusFailed {
+                    error: format!(
+                        "{}backend unavailable",
+                        aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
+                    ),
+                })
+                .unwrap();
 
-        drain_semantic_refresh_events(&ctx);
+            drain_semantic_refresh_events(&ctx);
 
-        let pending = ctx.take_pending_semantic_index_paths();
-        assert_eq!(pending, vec![file]);
-        assert!(matches!(
-            &*ctx.semantic_index_status().borrow(),
-            SemanticIndexStatus::Ready { .. }
-        ));
+            let pending = ctx.take_pending_semantic_index_paths();
+            assert_eq!(pending, vec![file]);
+            assert!(matches!(
+                &*ctx.semantic_index_status().borrow(),
+                SemanticIndexStatus::Ready { .. }
+            ));
+        });
     }
 
     #[test]
