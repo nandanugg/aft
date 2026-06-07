@@ -681,14 +681,21 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // synthetic "not_initialized" status so the sidebar shows something
     // sensible without triggering project indexing.
     //
-    // Try the session-stored directory first (fixes `opencode -s` from a
-    // different cwd), then fall back to the plugin-init cwd.
+    // Prefer THIS server's own project (the plugin-init cwd) first, then fall
+    // back to the session-stored directory. Order matters: in OpenCode Desktop a
+    // single process hosts one RPC server per open project, all sharing this
+    // process's session-dir cache. Resolving the session-cached dir first let
+    // project A's server serve project B's bridge when the cache mapped this
+    // session elsewhere ("another session's data" in the sidebar). Serving our
+    // own directory first removes that cross-project bleed; the session-dir
+    // fallback still fixes `opencode -s` from a different cwd, where the
+    // plugin-init cwd has no bridge and the real project lives in the cache.
     const cachedDir = getSessionDirectoryCached(sessionID);
     const candidateDirs = new Set<string>();
+    candidateDirs.add(input.directory);
     if (typeof cachedDir === "string" && cachedDir.length > 0) {
       candidateDirs.add(cachedDir);
     }
-    candidateDirs.add(input.directory);
     let bridge: ReturnType<typeof pool.getActiveBridgeForRoot> = null;
     for (const dir of candidateDirs) {
       bridge = pool.getActiveBridgeForRoot(dir);
