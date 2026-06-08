@@ -1949,6 +1949,15 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         }
     }
 
+    // `by_language` is a project-wide breakdown computed before scope filtering.
+    // Leaving it in a scoped payload contradicts the recomputed in-scope `count`
+    // (e.g. count: 3 alongside `(rust 214, ts 143)`). The filtered items don't
+    // carry per-item language, so we can't faithfully recompute it — drop it so
+    // the scoped summary doesn't render a misleading project-wide breakdown.
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("by_language");
+    }
+
     payload
 }
 
@@ -2075,6 +2084,33 @@ mod guard_tests {
             snapshot.is_some(),
             "3 files with max=5000 must build the snapshot"
         );
+    }
+
+    // A scoped payload must not carry the project-wide `by_language` breakdown
+    // alongside the recomputed in-scope count — that contradiction renders as
+    // e.g. "Dead code: 1 (rust 214, ts 143)".
+    #[test]
+    fn scoped_filter_drops_project_wide_by_language() {
+        let scope = JobScope::from_roots("/proj", vec![PathBuf::from("/proj/src/a")]);
+        assert!(
+            !scope.is_project_wide(),
+            "scope must be non-project for test"
+        );
+        let payload = serde_json::json!({
+            "count": 99,
+            "by_language": { "rust": 214, "typescript": 143 },
+            "items": [
+                { "file": "/proj/src/a/x.rs", "symbol": "live" },
+                { "file": "/proj/src/other/y.rs", "symbol": "out" },
+            ],
+        });
+        let filtered = filter_payload_for_scope(payload, &scope);
+        assert!(
+            filtered.get("by_language").is_none(),
+            "scoped payload must drop project-wide by_language: {filtered}"
+        );
+        // Count is recomputed to the in-scope items (only x.rs under src/a).
+        assert_eq!(filtered.get("count").and_then(|v| v.as_u64()), Some(1));
     }
 }
 
