@@ -124,7 +124,7 @@ describe("searchTools", () => {
           "  42: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
           "  80: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
           "",
-          "Found 2 match(es) across 1 file(s). [index: ready]",
+          "Found 2 match across 1 file",
         ].join("\n"),
       }),
     );
@@ -149,7 +149,7 @@ describe("searchTools", () => {
         "  42: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
         "  80: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
         "",
-        "Found 2 match(es) across 1 file(s). [index: ready]",
+        "Found 2 match across 1 file",
       ].join("\n"),
     );
   });

@@ -318,7 +318,7 @@ fn grep_text_uses_relative_paths_and_compact_format() {
     // No "Line" prefix, no indentation
     assert!(text.contains("1: fn alpha()"));
     assert!(text.contains("1: fn beta()"));
-    assert!(text.ends_with("Found 2 match(es) across 2 file(s). [index: fallback]"));
+    assert!(text.ends_with("Found 2 match across 2 file [index: fallback]"));
 
     let status = aft.shutdown();
     assert!(status.success());

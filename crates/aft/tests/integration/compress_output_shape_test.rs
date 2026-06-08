@@ -44,7 +44,9 @@ fn bun_output_shape_matches_real_bun_test_output() {
     let compressed = compress("npm test", &output);
 
     assert!(compressed.contains("(fail) fails [0.2ms]"));
-    assert!(compressed.contains("Ran 2 tests across 1 file. [1.00ms]"));
+    // Ran-summary kept, its [Xms] duration stripped.
+    assert!(compressed.contains("Ran 2 tests across 1 file."));
+    assert!(!compressed.contains("[1.00ms]"));
     assert!(!compressed.contains("(pass) passes"));
 }
 
@@ -55,7 +57,8 @@ fn bun_run_cwd_test_routes_by_bun_test_output_shape() {
     let compressed = compress("bun run --cwd packages/foo test", &output);
 
     assert!(compressed.contains("(fail) fails [0.2ms]"));
-    assert!(compressed.contains("Ran 2 tests across 1 file. [1.00ms]"));
+    assert!(compressed.contains("Ran 2 tests across 1 file."));
+    assert!(!compressed.contains("[1.00ms]"));
     assert!(!compressed.contains("(pass) passes"));
 }
 
@@ -66,7 +69,8 @@ fn bun_run_test_routes_by_bun_test_output_shape_plural_summary() {
     let compressed = compress("bun run test", &output);
 
     assert!(compressed.contains("(fail) fails [0.2ms]"));
-    assert!(compressed.contains("Ran 5 tests across 3 files. [2.00ms]"));
+    assert!(compressed.contains("Ran 5 tests across 3 files."));
+    assert!(!compressed.contains("[2.00ms]"));
     assert!(!compressed.contains("(pass) passes"));
 }
 

@@ -48,7 +48,7 @@ function formatGrepOutput(response: GrepResponse): string {
   const filesWithMatches = response.files_with_matches ?? new Set(matches.map((m) => m.file)).size;
 
   if (matches.length === 0) {
-    return `Found ${totalMatches} match(es) in ${filesWithMatches} file(s).`;
+    return `Found ${totalMatches} match across ${filesWithMatches} file`;
   }
 
   const body = matches
@@ -60,7 +60,7 @@ function formatGrepOutput(response: GrepResponse): string {
     })
     .join("\n");
 
-  return `${body}\n\nFound ${totalMatches} match(es) in ${filesWithMatches} file(s).`;
+  return `${body}\n\nFound ${totalMatches} match across ${filesWithMatches} file`;
 }
 
 /** Ensure glob patterns match files in subdirectories — prefix with **\/ if no path separator. */

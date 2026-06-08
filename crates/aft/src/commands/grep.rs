@@ -168,12 +168,24 @@ pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> Stri
         sections.push(section);
     }
 
-    let footer = format!(
-        "Found {} match(es) across {} file(s). [index: {}]",
-        result.total_matches,
-        result.files_with_matches,
-        index_status_label(result.index_status),
-    );
+    // Wholesale-singular ("40 match across 4 file") — the `(es)`/`(s)` plural
+    // parentheticals were pure per-call token tax for zero agent value. The
+    // `[index: ready]` tag is dropped on the common ready path (absence == ready,
+    // mirroring the aft_search precedent); non-ready states keep a label because
+    // "building"/"fallback"/"disabled" is a real completeness signal the agent
+    // needs (results may be partial).
+    let footer = match result.index_status {
+        IndexStatus::Ready => format!(
+            "Found {} match across {} file",
+            result.total_matches, result.files_with_matches
+        ),
+        other => format!(
+            "Found {} match across {} file [index: {}]",
+            result.total_matches,
+            result.files_with_matches,
+            index_status_label(other)
+        ),
+    };
 
     if sections.is_empty() {
         footer
@@ -348,7 +360,8 @@ mod tests {
         assert!(text.contains("116: aaaaaaa"));
         assert!(text.contains("…"));
         assert!(text.contains("crates/aft/src/main.rs\n"));
-        assert!(text.ends_with("Found 3 match(es) across 2 file(s). [index: ready]"));
+        // Ready path drops the [index] tag (absence == ready); wholesale-singular.
+        assert!(text.ends_with("Found 3 match across 2 file"));
     }
 
     #[test]
@@ -373,10 +386,9 @@ mod tests {
 
         let text = format_grep_text(&result, &root());
 
-        assert_eq!(
-            text,
-            "Found 0 match(es) across 0 file(s). [index: fallback]"
-        );
+        // Non-ready (fallback) keeps the index label as a completeness signal;
+        // wholesale-singular phrasing.
+        assert_eq!(text, "Found 0 match across 0 file [index: fallback]");
     }
 
     // Issue #33 regression: brace-aware include/exclude splitting at the Rust

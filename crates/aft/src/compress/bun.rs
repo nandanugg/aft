@@ -164,9 +164,9 @@ fn compress_test(output: &str) -> CompressionResult {
             continue;
         }
 
-        // Bun version header — always keep.
+        // Bun version header — keep, minus the noisy version + commit hash.
         if is_bun_test_header(line) {
-            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+            blocks.push(ClassifiedBlock::unclassified(render_bun_header(line)));
             index += 1;
             continue;
         }
@@ -191,9 +191,9 @@ fn compress_test(output: &str) -> CompressionResult {
             continue;
         }
 
-        // Summary tail — always keep.
+        // Summary tail — always keep (Ran line minus its [Xms] duration).
         if is_summary_line(line) {
-            blocks.push(ClassifiedBlock::unclassified(line.to_string()));
+            blocks.push(ClassifiedBlock::unclassified(render_summary_line(line)));
             // The `Ran N tests across M files. [Xms]` line marks the
             // boundary between bun-test output and any chained-command
             // output that follows. (Bun uses `file. [` singular when
@@ -280,8 +280,10 @@ fn compress_test_pass_only(lines: &[&str]) -> String {
             result.push((*line).to_string());
             continue;
         }
-        if is_bun_test_header(line) || is_summary_line(line) {
-            result.push((*line).to_string());
+        if is_bun_test_header(line) {
+            result.push(render_bun_header(line));
+        } else if is_summary_line(line) {
+            result.push(render_summary_line(line));
             // The `Ran N tests across M files. [Xms]` line is the LAST line
             // bun emits for the test run itself. Everything after must be
             // from a chained command (`&& other_cmd`).
@@ -311,6 +313,29 @@ where
 
 fn is_bun_test_header(line: &str) -> bool {
     line.starts_with("bun test v")
+}
+
+/// Render the bun banner without the noisy version + commit hash:
+/// `bun test v1.3.14 (0d9b296a)` -> `bun test`. The version/hash is pure
+/// per-call token tax with no agent value.
+fn render_bun_header(line: &str) -> String {
+    match line.find(" v") {
+        Some(idx) => line[..idx].to_string(),
+        None => line.to_string(),
+    }
+}
+
+/// Strip the trailing ` [Xms]` wall-clock duration from the
+/// `Ran N tests across M files. [Xms]` line — noise for the common case and
+/// recoverable via `compressed:false`. Other summary lines (`N pass` etc.) and
+/// non-Ran lines pass through unchanged.
+fn render_summary_line(line: &str) -> String {
+    if is_ran_summary_line(line.trim_start()) {
+        if let Some(idx) = line.rfind(" [") {
+            return line[..idx].to_string();
+        }
+    }
+    line.to_string()
 }
 
 fn is_file_section_header(line: &str) -> bool {

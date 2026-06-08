@@ -84,7 +84,7 @@ describe("semanticTools", () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
     const bridgeResponse = {
       success: true,
-      text: "src/auth.ts\nvalidateToken [function] lines 10-32\n\nFound 1 result(s). [index: ready]",
+      text: "src/auth.ts\nvalidateToken [function] lines 10-32\n\nFound 1 result(s).",
       interpreted_as: "hybrid",
       semantic_status: "ready",
       more_available: true,
@@ -150,7 +150,7 @@ describe("semanticTools", () => {
     const { tools } = createMockSemanticHarness({}, () => ({
       success: true,
       // Rust text already carries the count + "more results available" note.
-      text: "partial results\n\nFound 2 result(s). [index: ready] More results available; raise topK to see more.",
+      text: "partial results\n\nFound 2 result(s). More results available; raise topK to see more.",
       more_available: true,
       engine_capped: true,
       fully_degraded: true,

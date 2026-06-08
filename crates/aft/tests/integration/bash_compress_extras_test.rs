@@ -210,10 +210,15 @@ fn bun_test_pass_only_keeps_header_and_summary() {
     let output = "bun test v1.3.14 (0d9b296a)\n\nsrc/__tests__/foo.test.ts:\n\n 12 pass\n 0 fail\n 24 expect() calls\nRan 12 tests across 1 file. [42.00ms]\n";
 
     let compressed = BunCompressor.compress("bun test", output);
-    assert!(compressed.contains("bun test v1.3.14"));
+    // Header kept but version + commit hash stripped (per-call token tax).
+    assert!(compressed.contains("bun test"));
+    assert!(!compressed.contains("v1.3.14"));
+    assert!(!compressed.contains("0d9b296a"));
     assert!(compressed.contains("12 pass"));
     assert!(compressed.contains("0 fail"));
-    assert!(compressed.contains("Ran 12 tests across 1 file. [42.00ms]"));
+    // Ran-summary kept but its [Xms] duration stripped.
+    assert!(compressed.contains("Ran 12 tests across 1 file."));
+    assert!(!compressed.contains("[42.00ms]"));
 }
 
 #[test]
@@ -251,9 +256,10 @@ fn bun_test_preserves_single_failure_block_when_middle_truncation_would_hit() {
     assert!(compressed.contains("at <anonymous>"));
     // Must preserve the file section header that owns the failure.
     assert!(compressed.contains("src/failing.test.ts:"));
-    // Must preserve the summary tail.
+    // Must preserve the summary tail (duration stripped).
     assert!(compressed.contains("1 fail"));
-    assert!(compressed.contains("Ran 50 tests across 50 files. [142.00ms]"));
+    assert!(compressed.contains("Ran 50 tests across 50 files."));
+    assert!(!compressed.contains("[142.00ms]"));
 
     // Pass-only section headers should be dropped (no failure beneath them).
     assert!(!compressed.contains("src/pass_only_0.test.ts:"));
@@ -300,7 +306,7 @@ fn bun_test_multiple_failures_all_preserved_under_cap() {
         );
     }
     assert!(compressed.contains("3 fail"));
-    assert!(compressed.contains("Ran 3 tests across 1 file. [12.00ms]"));
+    assert!(compressed.contains("Ran 3 tests across 1 file."));
     assert!(!compressed.contains("+0 more failures"));
 }
 
@@ -349,7 +355,7 @@ fn bun_test_catastrophic_failure_count_is_capped() {
     );
     // Summary intact.
     assert!(compressed.contains(&format!("{total} fail")));
-    assert!(compressed.contains(&format!("Ran {total} tests across 1 file. [12.00ms]")));
+    assert!(compressed.contains(&format!("Ran {total} tests across 1 file.")));
 }
 
 #[test]
@@ -373,7 +379,7 @@ fn bun_test_dispatch_routes_through_test_compressor_not_generic() {
     assert!(compressed.contains("(fail) c case"));
     // Summary tail preserved.
     assert!(compressed.contains("1 fail"));
-    assert!(compressed.contains("Ran 1 tests across 3 files. [3.00ms]"));
+    assert!(compressed.contains("Ran 1 tests across 3 files."));
 }
 
 // ---------------------------------------------------------------------------
@@ -395,10 +401,12 @@ fn bun_test_pass_only_preserves_chained_command_output() {
     let output = "bun test v1.3.14 (0d9b296a)\n\n 12 pass\n 0 fail\n 24 expect() calls\nRan 12 tests across 1 file. [42.00ms]\ndone\ntotal 16\n-rw-r--r--  1 user  staff  4096 May 22 19:00 bundle.js\n-rw-r--r--  1 user  staff   512 May 22 19:00 styles.css\n";
 
     let compressed = BunCompressor.compress("bun test", output);
-    // bun test header + summary preserved as before
-    assert!(compressed.contains("bun test v1.3.14"));
+    // bun test header + summary preserved (version/hash + [Xms] stripped)
+    assert!(compressed.contains("bun test"));
+    assert!(!compressed.contains("v1.3.14"));
     assert!(compressed.contains("12 pass"));
-    assert!(compressed.contains("Ran 12 tests across 1 file. [42.00ms]"));
+    assert!(compressed.contains("Ran 12 tests across 1 file."));
+    assert!(!compressed.contains("[42.00ms]"));
     // Chained command output (echo, ls) must survive
     assert!(
         compressed.contains("done"),
@@ -422,8 +430,9 @@ fn bun_test_with_failures_preserves_chained_command_output() {
     // failure block preserved
     assert!(compressed.contains("error: expect(received).toBe(expected)"));
     assert!(compressed.contains("(fail) foo case"));
-    // summary preserved
-    assert!(compressed.contains("Ran 1 tests across 1 files. [42.00ms]"));
+    // summary preserved (duration stripped)
+    assert!(compressed.contains("Ran 1 tests across 1 files."));
+    assert!(!compressed.contains("[42.00ms]"));
     // Chained command output after `Ran ...` preserved
     assert!(
         compressed.contains("always runs"),

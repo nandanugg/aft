@@ -144,7 +144,9 @@ maybeDescribe("e2e semantic search tool", () => {
     if (isCI) {
       expect(isBuilding || isUnavailable || isDisabled).toBe(false);
       expect(output).toContain("Found ");
-      expect(output).toContain("[index: ready]");
+      // The ready path no longer carries an [index: ready] tag (absence == ready,
+      // for both the semantic and lexical lanes) — it was per-call token tax.
+      expect(output).not.toContain("[index: ready]");
       expect(output).toContain("src/");
       return;
     }
@@ -155,7 +157,7 @@ maybeDescribe("e2e semantic search tool", () => {
     }
 
     expect(output).toContain("Found ");
-    expect(output).toContain("[index: ready]");
+    expect(output).not.toContain("[index: ready]");
     expect(output).toContain("src/");
   });
 });
