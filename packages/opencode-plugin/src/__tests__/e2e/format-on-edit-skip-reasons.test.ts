@@ -463,13 +463,6 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     expect(data.format_skipped_reason).not.toBe("formatter_excluded_path");
   });
 
-  test("error edge: formatter exits 0 but leaves invalid file cannot repro cleanly", () => {
-    // AFT trusts a zero-exit formatter as formatted=true; syntax diagnostics are
-    // a separate validation side effect. There is no documented path that maps
-    // "exit 0 + invalid output" to format_skipped_reason="error".
-    expect(true).toBe(true);
-  });
-
   test("honest reporting: success=true still carries top-level format_skipped_reason", async () => {
     const h = await formatHarness(BIOME_TS_PRESET);
     const { data } = await writeAndExpectSkip(

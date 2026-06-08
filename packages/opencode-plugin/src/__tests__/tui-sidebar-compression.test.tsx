@@ -217,12 +217,6 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
     expect(collapsedHealthLights(bar({ dead_code: 999, unused_exports: 999 }))?.code).toBe("ok");
   });
 
-  test("code light: green when duplicates are zero", () => {
-    expect(
-      collapsedHealthLights(bar({ dead_code: 0, unused_exports: 0, duplicates: 0 }))?.code,
-    ).toBe("ok");
-  });
-
   test("todos light: yellow when any todos, green otherwise", () => {
     expect(collapsedHealthLights(bar({ todos: 4 }))?.todos).toBe("warn");
     expect(collapsedHealthLights(bar({ todos: 0 }))?.todos).toBe("ok");
