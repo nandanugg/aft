@@ -90,16 +90,26 @@ fn parse_java_import_declaration(source: &str, node: &Node) -> Option<ImportStat
 pub(crate) fn generate_java_import_line(req: &ImportRequest) -> String {
     let is_static = req.modifiers.iter().any(|m| m == "static");
     let static_prefix = if is_static { "static " } else { "" };
-    let wildcard_suffix = if req.modifiers.iter().any(|m| m == "wildcard") {
-        ".*"
-    } else {
-        ""
-    };
+    let is_wildcard = req.modifiers.iter().any(|m| m == "wildcard");
+    let wildcard_suffix = if is_wildcard { ".*" } else { "" };
 
-    if is_static && wildcard_suffix.is_empty() && req.names.len() == 1 {
-        return format!("import static {}.{};", req.module_path, req.names[0]);
+    // A static member import targets a specific member: `import static Class.member;`.
+    // Java has no grouped import form, so multiple members each need their own
+    // statement (newline-joined). With one name this is identical to the old
+    // single-name path; with several it avoids generating the invalid
+    // `import static Class;` (which drops every requested member).
+    if is_static && !is_wildcard && !req.names.is_empty() {
+        return req
+            .names
+            .iter()
+            .map(|name| format!("import static {}.{};", req.module_path, name))
+            .collect::<Vec<_>>()
+            .join("\n");
     }
 
+    // Remaining shapes: non-static `import pkg.Class;`, static wildcard
+    // `import static pkg.Class.*;`, and the static-member form where the member
+    // is already part of `module_path` (names empty).
     format!(
         "import {static_prefix}{}{wildcard_suffix};",
         req.module_path

@@ -635,6 +635,23 @@ contract C {}
                 import_kind: None,
             }],
         },
+        // Multiple static members from one class: Java has no grouped import, so
+        // each member must get its own `import static` statement. Regression for
+        // the bug where >1 name fell through to the invalid `import static
+        // java.util.Collections;` (dropping every member).
+        Scenario {
+            name: "java_add_static_multiple_members",
+            ext: "java",
+            input: "package com.example;\n\nimport java.util.List;\n\nclass C {}\n",
+            ops: &[Op::AddForm {
+                module: "java.util.Collections",
+                names: &["emptyList", "singletonList"],
+                namespace: None,
+                alias: None,
+                modifiers: &["static"],
+                import_kind: None,
+            }],
+        },
         Scenario {
             name: "java_add_static_wildcard",
             ext: "java",
