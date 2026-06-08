@@ -279,46 +279,23 @@ pub fn validate_base_url_no_ssrf(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns true for IPv4/IPv6 addresses in private/link-local/CGNAT/wildcard
-/// ranges, EXCLUDING loopback (127.0.0.0/8 and ::1). Loopback is considered
-/// safe for SSRF purposes — see [`validate_base_url_no_ssrf`] for rationale.
+/// Returns true for IPv4/IPv6 addresses in private/link-local/CGNAT/benchmark/
+/// multicast/reserved ranges, EXCLUDING loopback (127.0.0.0/8 and ::1). Loopback
+/// is considered safe for SSRF purposes (same-machine, e.g. a local Ollama
+/// endpoint) — see [`validate_base_url_no_ssrf`] for rationale.
+///
+/// Delegates to [`crate::url_fetch::is_private_or_reserved_ip`] so there is one
+/// authoritative reserved-range list (the url_fetch copy is the maintained one;
+/// this used to be a drifting subset that missed e.g. 198.18.0.0/15 and the
+/// multicast/reserved blocks). We only re-add the loopback carve-out the
+/// url_fetch guard deliberately does not make.
 fn is_private_non_loopback_ip(ip: &std::net::IpAddr) -> bool {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            // Note: 127.0.0.0/8 (loopback) is intentionally NOT in this set.
-            // 10.0.0.0/8
-            o[0] == 10
-            // 172.16.0.0/12
-            || (o[0] == 172 && (16..=31).contains(&o[1]))
-            // 192.168.0.0/16
-            || (o[0] == 192 && o[1] == 168)
-            // 169.254.0.0/16 link-local
-            || (o[0] == 169 && o[1] == 254)
-            // 100.64.0.0/10 CGNAT
-            || (o[0] == 100 && (64..=127).contains(&o[1]))
-            // 0.0.0.0/8 wildcard
-            || o[0] == 0
-        }
-        IpAddr::V6(v6) => {
-            // Note: ::1 (loopback) is intentionally NOT in this set.
-            let _ = Ipv6Addr::LOCALHOST; // touch to silence unused-import lints in some builds
-                                         // fe80::/10 link-local
-            (v6.segments()[0] & 0xffc0) == 0xfe80
-            // fc00::/7 unique-local
-            || (v6.segments()[0] & 0xfe00) == 0xfc00
-            // ::ffff:0:0/96 IPv4-mapped — check the embedded IPv4
-            || (v6.segments()[0] == 0 && v6.segments()[1] == 0
-                && v6.segments()[2] == 0 && v6.segments()[3] == 0
-                && v6.segments()[4] == 0 && v6.segments()[5] == 0xffff
-                && {
-                    let [a, b] = v6.segments()[6..8] else { return false; };
-                    let ipv4 = Ipv4Addr::new((a >> 8) as u8, (a & 0xff) as u8, (b >> 8) as u8, (b & 0xff) as u8);
-                    is_private_non_loopback_ip(&IpAddr::V4(ipv4))
-                })
-        }
+    // Canonicalize so an IPv4-mapped loopback (`::ffff:127.0.0.1`) is also
+    // recognized as loopback, matching the prior carve-out.
+    if ip.to_canonical().is_loopback() {
+        return false;
     }
+    crate::url_fetch::is_private_or_reserved_ip(*ip)
 }
 
 fn build_openai_embeddings_endpoint(base_url: &str) -> String {
@@ -2972,6 +2949,17 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Files larger than this are skipped for semantic chunking. The read +
+/// tree-sitter parse is transiently O(file size) (tree-sitter can use several×
+/// the source bytes), and `par_iter` collection parses many files at once, so an
+/// unbounded read here is an OOM vector on a repo with a few multi-MB generated/
+/// vendored/minified files. A file this large yields almost no useful embedding
+/// anyway (each chunk's embed_text is clamped to MAX_EMBED_TEXT_CHARS), so we
+/// track it (0 chunks) instead of reading it — freshness then skips it on later
+/// refreshes. 4 MiB keeps essentially all hand-written source while capping the
+/// pathological tail.
+const MAX_SEMANTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 fn collect_file_chunks(
     project_root: &Path,
     file: &Path,
@@ -2981,6 +2969,11 @@ fn collect_file_chunks(
         return Err("unsupported file extension".to_string());
     }
     let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    // OOM backstop: skip oversized files before the read + parse (tracked with
+    // zero chunks by the caller, so freshness won't re-read them every refresh).
+    if std::fs::metadata(file).is_ok_and(|m| m.len() > MAX_SEMANTIC_FILE_BYTES) {
+        return Ok(Vec::new());
+    }
     let source = std::fs::read_to_string(file).map_err(|error| error.to_string())?;
     let tree = parser_for(parsers, lang)?
         .parse(&source, None)
@@ -4054,6 +4047,29 @@ Connection: close
     }
 
     #[test]
+    fn collect_file_chunks_skips_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("huge.ts");
+        // Just over the cap: a valid TS file that would otherwise yield chunks.
+        let filler = "export const x = 1;\n"
+            .repeat(((MAX_SEMANTIC_FILE_BYTES as usize) / "export const x = 1;\n".len()) + 16);
+        std::fs::write(&big, &filler).unwrap();
+        assert!(big.metadata().unwrap().len() > MAX_SEMANTIC_FILE_BYTES);
+
+        let mut parsers = HashMap::new();
+        // Oversized → tracked with zero chunks, NOT an error (so the caller keeps
+        // the file in metadata and freshness skips re-reading it).
+        let chunks = collect_file_chunks(dir.path(), &big, &mut parsers).unwrap();
+        assert!(chunks.is_empty(), "oversized file must yield no chunks");
+
+        // A small file of the same language still produces chunks.
+        let small = dir.path().join("small.ts");
+        std::fs::write(&small, "export function foo() { return 1; }\n").unwrap();
+        let small_chunks = collect_file_chunks(dir.path(), &small, &mut parsers).unwrap();
+        assert!(!small_chunks.is_empty(), "small file should still chunk");
+    }
+
+    #[test]
     fn rejects_oversized_dimension_during_deserialization() {
         let mut bytes = Vec::new();
         bytes.push(1u8);
@@ -4796,6 +4812,37 @@ Connection: close
         // validate_base_url_no_ssrf does. Tests construct backends directly.
         assert!(normalize_base_url("http://127.0.0.1:9999").is_ok());
         assert!(normalize_base_url("http://localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_reserved_ranges_but_allows_loopback() {
+        use std::net::IpAddr;
+        let blocked = |s: &str| is_private_non_loopback_ip(&s.parse::<IpAddr>().unwrap());
+
+        // Private / link-local / CGNAT — blocked (unchanged behavior).
+        assert!(blocked("10.0.0.1"));
+        assert!(blocked("192.168.1.1"));
+        assert!(blocked("169.254.0.1"));
+        assert!(blocked("100.64.0.1"));
+        // Newly covered by delegating to url_fetch's complete list:
+        assert!(
+            blocked("198.18.0.1"),
+            "RFC2544 benchmark range must be blocked"
+        );
+        assert!(blocked("224.0.0.1"), "multicast must be blocked");
+        assert!(blocked("fc00::1"), "IPv6 ULA must be blocked");
+        assert!(blocked("fe80::1"), "IPv6 link-local must be blocked");
+
+        // Loopback — allowed (local Ollama endpoint), incl. IPv4-mapped form.
+        assert!(!blocked("127.0.0.1"), "loopback must stay allowed");
+        assert!(!blocked("::1"), "IPv6 loopback must stay allowed");
+        assert!(
+            !blocked("::ffff:127.0.0.1"),
+            "IPv4-mapped loopback must stay allowed (matches prior carve-out)"
+        );
+
+        // A public address must NOT be flagged.
+        assert!(!blocked("8.8.8.8"));
     }
 
     /// Pin the user-facing wording of the ONNX version-mismatch error.

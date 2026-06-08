@@ -457,6 +457,15 @@ fn reject_private_ip(host: &str, ip: IpAddr) -> Result<(), UrlFetchError> {
     Ok(())
 }
 
+/// True for any private/link-local/CGNAT/benchmark/multicast/reserved/loopback
+/// address (the full set this module refuses to fetch). Exposed so the semantic
+/// embedding SSRF guard shares one authoritative range list instead of keeping a
+/// drifting copy. Note: this INCLUDES loopback — callers that intentionally
+/// allow loopback (e.g. a local Ollama endpoint) must exclude it themselves.
+pub fn is_private_or_reserved_ip(ip: IpAddr) -> bool {
+    is_private_ip(ip)
+}
+
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => is_private_ipv4(ipv4),
