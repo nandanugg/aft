@@ -289,6 +289,13 @@ impl LspManager {
         self.clients.len()
     }
 
+    /// Apply the configured diagnostic LRU cap (the `lsp.diagnostic_cache_size`
+    /// knob). 0 disables the cap. Called at construction so the documented
+    /// config field actually takes effect instead of always using the default.
+    pub fn set_diagnostic_capacity(&mut self, capacity: usize) {
+        self.diagnostics.set_capacity(capacity);
+    }
+
     /// For testing: override the binary for a server kind.
     pub fn override_binary(&mut self, kind: ServerKind, binary_path: PathBuf) {
         self.binary_overrides.insert(kind, binary_path);
@@ -1309,7 +1316,13 @@ impl LspManager {
             .clients
             .get_mut(key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?;
-        client.send_request::<AftDocumentDiagnosticRequest>(params)
+        // Use the documented 10s pull cap, not the global 30s request timeout —
+        // a stalled pull server must not blow the scoped aft_inspect 8s budget
+        // (or the lsp_diagnostics wait caps) all the way out to 30s.
+        client.send_request_with_timeout::<AftDocumentDiagnosticRequest>(
+            params,
+            Self::PULL_FILE_TIMEOUT,
+        )
     }
 
     /// Store the result of a per-file pull request and return a structured
@@ -1881,6 +1894,24 @@ mod failure_hint_tests {
         let stderr = "Error: Cannot find module '/x/typescript-language-server/lib/cli.mjs'";
         let hint = failure_hint("typescript-language-server", stderr);
         assert!(hint.contains("install -g"), "got: {hint}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_capacity_tests {
+    use super::LspManager;
+
+    // The lsp.diagnostic_cache_size config knob must actually take effect:
+    // set_diagnostic_capacity (called at AppContext construction with the config
+    // value) propagates the cap to the underlying DiagnosticsStore. Before this
+    // wiring the field was parsed but never applied (always the hardcoded 5000).
+    #[test]
+    fn set_diagnostic_capacity_propagates_to_store() {
+        let mut manager = LspManager::new();
+        manager.set_diagnostic_capacity(7);
+        assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 7);
+        manager.set_diagnostic_capacity(0); // 0 = unbounded
+        assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 0);
     }
 }
 

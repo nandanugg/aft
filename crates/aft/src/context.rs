@@ -617,6 +617,9 @@ impl AppContext {
         let lsp_child_registry = crate::lsp::child_registry::LspChildRegistry::new();
         let mut lsp_manager = LspManager::new();
         lsp_manager.set_child_registry(lsp_child_registry.clone());
+        // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
+        // so the documented `lsp.diagnostic_cache_size` knob takes effect.
+        lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         AppContext {
             provider,
             backup: RefCell::new(BackupStore::new()),

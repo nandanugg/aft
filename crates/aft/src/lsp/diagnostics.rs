@@ -126,6 +126,13 @@ impl DiagnosticsStore {
         self.entries.len()
     }
 
+    /// The current LRU cap (0 = unbounded). Test-only accessor used to verify
+    /// the `lsp.diagnostic_cache_size` config wiring.
+    #[cfg(test)]
+    pub fn capacity_for_test(&self) -> usize {
+        self.capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
