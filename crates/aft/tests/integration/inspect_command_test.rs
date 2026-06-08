@@ -184,6 +184,29 @@ fn assert_summary_status(response: &Value, category: &str, status: &str) {
     );
 }
 
+/// Stale-WITH-cache contract: the summary surfaces the real last-known count
+/// (matching the status bar's `~D…`) flagged `stale: true`, NOT a bare
+/// `{status:"stale"}` sentinel. Staleness is still signaled via `stale: true`
+/// and `scanner_state.stale_categories` (asserted separately by callers).
+fn assert_summary_stale_with_counts(response: &Value, category: &str) {
+    let summary = response["summary"][category]
+        .as_object()
+        .unwrap_or_else(|| panic!("{category} summary object: {response:#}"));
+    assert_eq!(
+        summary.get("stale").and_then(Value::as_bool),
+        Some(true),
+        "{category} stale-with-cache summary must be flagged stale: {response:#}"
+    );
+    assert!(
+        summary.get("count").and_then(Value::as_u64).is_some(),
+        "{category} stale-with-cache summary must keep its cached count: {response:#}"
+    );
+    assert!(
+        !summary.contains_key("status"),
+        "{category} stale-with-cache summary must not be a bare status sentinel: {response:#}"
+    );
+}
+
 fn assert_summary_count(response: &Value, category: &str, count: u64) {
     let summary = response["summary"][category]
         .as_object()
@@ -719,7 +742,7 @@ fn inspect_command_tier2_changed_file_surfaces_stale_category() {
         scanner_state_contains(&response, "stale_categories", "duplicates"),
         "changed duplicate source should mark cached aggregate stale: {response:#}"
     );
-    assert_summary_status(&response, "duplicates", "stale");
+    assert_summary_stale_with_counts(&response, "duplicates");
 }
 
 #[test]
@@ -816,7 +839,7 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
         !scanner_state_contains(&after, "pending_categories", "dead_code"),
         "hash-miss fallback should not drop to pending when an aggregate exists: {after:#}"
     );
-    assert_summary_status(&after, "dead_code", "stale");
+    assert_summary_stale_with_counts(&after, "dead_code");
     assert!(
         dead_code_items(&after).contains(&("src/lib.ts".to_string(), "unused".to_string())),
         "stale hash-miss response should retain previous details: {after:#}"
