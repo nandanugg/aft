@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -124,15 +124,26 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if let Some(mut response) =
-        crate::bash_rewrite::try_rewrite(&params.command, req.session_id.as_deref(), ctx)
-    {
-        // Rewriter rules build their own internal request with a placeholder id
-        // (e.g. "bash_rewrite") to call into read/grep/glob handlers. Stamp the
-        // original bash request id back onto the response so the bridge correlates
-        // it with the in-flight `send()` instead of timing out.
-        response.id = req.id.clone();
-        return response;
+    // Rewrite (cat→read, grep→grep tool, append→edit, …) resolves relative
+    // paths via ctx.validate_path, i.e. against the PROJECT ROOT — it has no
+    // notion of the bash cwd. So it's only faithful when the effective workdir
+    // IS the project root. With an explicit different `workdir`, a rewritten
+    // `echo hi >> notes.txt` would write project_root/notes.txt instead of
+    // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
+    // optimization, so skip it and let native bash (which honors cwd) run the
+    // command verbatim when the workdir differs from the project root.
+    if workdir_matches_project_root(&workdir, ctx) {
+        if let Some(mut response) =
+            crate::bash_rewrite::try_rewrite(&params.command, req.session_id.as_deref(), ctx)
+        {
+            // Rewriter rules build their own internal request with a placeholder
+            // id (e.g. "bash_rewrite") to call into read/grep/glob handlers.
+            // Stamp the original bash request id back onto the response so the
+            // bridge correlates it with the in-flight `send()` instead of timing
+            // out.
+            response.id = req.id.clone();
+            return response;
+        }
     }
 
     let workdir = params.workdir.clone();
@@ -223,6 +234,23 @@ fn default_notify_on_completion() -> bool {
     true
 }
 
+/// Is the effective bash workdir the same directory as the project root? Used
+/// to gate command rewriting, which resolves relative paths against the project
+/// root and would otherwise target the wrong file when an explicit workdir
+/// differs. Canonicalizes both sides so a relative workdir or a /var↔/private/var
+/// symlink alias still compares equal; falls back to a plain compare when
+/// canonicalization fails (e.g. a not-yet-existing dir — native bash handles it).
+fn workdir_matches_project_root(workdir: &Path, ctx: &AppContext) -> bool {
+    let Some(root) = ctx.config().project_root.clone() else {
+        // No project root → rewrite handlers resolve against process cwd via
+        // default_workdir, which equals the workdir default here. Only match when
+        // the caller didn't pass a divergent explicit workdir.
+        return workdir == default_workdir(ctx);
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(workdir) == canon(&root) || workdir == root
+}
+
 fn default_workdir(ctx: &AppContext) -> PathBuf {
     // Prefer the configured project root so bash commands run against the
     // user's project rather than the (often unrelated) cwd of the long-lived
@@ -299,6 +327,38 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::windows_shell::WindowsShell;
+
+    fn ctx_with_root(root: &std::path::Path) -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        )
+    }
+
+    // Command rewriting resolves relative paths against the project root, so it
+    // must only run when the effective workdir IS the project root — otherwise a
+    // rewritten `echo hi >> notes.txt` with workdir=subdir writes the wrong file.
+    #[test]
+    fn workdir_gate_matches_root_and_rejects_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sub = root.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let ctx = ctx_with_root(root);
+
+        // Project root itself matches (incl. /var↔/private/var symlink alias via
+        // canonicalize).
+        assert!(workdir_matches_project_root(root, &ctx));
+        assert!(workdir_matches_project_root(
+            &std::fs::canonicalize(root).unwrap(),
+            &ctx
+        ));
+        // A real subdirectory must NOT match → rewrite is skipped, native bash runs.
+        assert!(!workdir_matches_project_root(&sub, &ctx));
+    }
 
     /// Issue #27: `WindowsShell::args` must produce shell-appropriate flags.
     /// PowerShell variants need `-Command <string>`; cmd.exe needs `/D /C

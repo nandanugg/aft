@@ -364,7 +364,17 @@ fn find_request(command: &str) -> Option<Value> {
     if path == "." {
         Some(json!({ "pattern": pattern }))
     } else {
-        Some(json!({ "path": path.trim_end_matches('/'), "pattern": pattern }))
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            // Filesystem root (`find / ...`, `find // ...`): trimming the slash
+            // yields "" which downstream resolves as the PROJECT ROOT — silently
+            // searching the project instead of the whole filesystem. Don't
+            // rewrite; fall through to native `find`, which does what was asked.
+            // (A non-empty absolute path like `/tmp/foo` is preserved as-is.)
+            None
+        } else {
+            Some(json!({ "path": trimmed, "pattern": pattern }))
+        }
     }
 }
 
@@ -520,5 +530,13 @@ mod tests {
             find_request(r#"find /tmp/foo/ -name "*.ts""#),
             Some(json!({ "path": "/tmp/foo", "pattern": "**/*.ts" }))
         );
+    }
+
+    #[test]
+    fn find_filesystem_root_is_not_rewritten() {
+        // `find /` must NOT rewrite — trimming the slash would yield "" which
+        // resolves as the project root, silently searching the wrong scope.
+        assert_eq!(find_request(r#"find / -name "*.rs""#), None);
+        assert_eq!(find_request(r#"find // -name "*.rs""#), None);
     }
 }
