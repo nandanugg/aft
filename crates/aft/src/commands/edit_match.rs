@@ -997,6 +997,26 @@ fn handle_single_file_edit_match(
 
     // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len())
     let (new_source, count) = if replace_all {
+        // Guard against overlapping matches before applying. The fuzzy line
+        // passes (2-4) step line-by-line, so a multi-line needle can match
+        // overlapping regions (e.g. needle "a\na" over "a\na\na" when whitespace
+        // variants defeat the exact pass). Applying overlapping ranges in
+        // reverse would let a later replacement overwrite part of an earlier
+        // one, silently corrupting the file. Fail cleanly instead — mirrors the
+        // `batch` command's overlap guard. (matches are ascending by byte_start.)
+        for pair in fuzzy_matches.windows(2) {
+            let cur_end = pair[0].byte_start + pair[0].byte_len;
+            if cur_end > pair[1].byte_start {
+                return Response::error(
+                    &req.id,
+                    "overlapping_edits",
+                    format!(
+                        "edit: replace_all matches overlap — match at bytes [{}..{}) overlaps with match at bytes [{}..{}). Use a more specific 'match' or edit occurrences individually.",
+                        pair[0].byte_start, cur_end, pair[1].byte_start, pair[1].byte_start + pair[1].byte_len
+                    ),
+                );
+            }
+        }
         let count = fuzzy_matches.len();
         // Apply replacements in reverse order to preserve byte offsets
         let mut result = source.clone();

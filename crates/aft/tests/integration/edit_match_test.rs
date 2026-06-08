@@ -215,6 +215,47 @@ fn edit_match_fuzzy_preserves_trailing_newline() {
     assert!(status.success());
 }
 
+#[test]
+fn edit_match_replace_all_rejects_overlapping_fuzzy_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("over.js");
+    // Trailing spaces defeat the exact (pass 1) matcher and force the fuzzy
+    // line pass, which steps line-by-line. A 2-line needle over three identical
+    // lines yields two OVERLAPPING matches (lines 0-1 and lines 1-2). Applying
+    // them in reverse would silently corrupt the file, so replace_all must
+    // reject with `overlapping_edits` instead.
+    let original = "row \nrow \nrow \n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "replace-all-overlap",
+        "command": "edit_match",
+        "file": file,
+        "match": "row\nrow",
+        "replacement": "X\nX",
+        "replace_all": true
+    });
+    let resp = aft.send(&req.to_string());
+    assert_eq!(
+        resp["success"], false,
+        "overlapping replace_all must fail cleanly: {resp:?}"
+    );
+    assert_eq!(
+        resp["code"], "overlapping_edits",
+        "wrong error code: {resp:?}"
+    );
+    // File must be untouched — no partial/corrupt write.
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "file was modified despite the overlap rejection"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[cfg(unix)]
 fn make_writable(path: &std::path::Path) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
