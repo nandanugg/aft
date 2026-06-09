@@ -26,15 +26,15 @@ const TS_QUERY: &str = r#"
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (arrow_function) @arrow.body)) @arrow.def
+    value: (arrow_function) @arrow.body) @arrow.decl) @arrow.def
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (function_expression) @arrow.body)) @arrow.def
+    value: (function_expression) @arrow.body) @arrow.decl) @arrow.def
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (generator_function) @arrow.body)) @arrow.def
+    value: (generator_function) @arrow.body) @arrow.decl) @arrow.def
 
 ;; anonymous default exports
 (export_statement
@@ -70,7 +70,7 @@ const TS_QUERY: &str = r#"
 ;; top-level const/let variable declarations
 (lexical_declaration
   (variable_declarator
-    name: (identifier) @var.name)) @var.def
+    name: (identifier) @var.name) @var.decl) @var.def
 
 ;; export statement wrappers (top-level only)
 (export_statement) @export.stmt
@@ -85,15 +85,15 @@ const JS_QUERY: &str = r#"
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (arrow_function) @arrow.body)) @arrow.def
+    value: (arrow_function) @arrow.body) @arrow.decl) @arrow.def
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (function_expression) @arrow.body)) @arrow.def
+    value: (function_expression) @arrow.body) @arrow.decl) @arrow.def
 (lexical_declaration
   (variable_declarator
     name: (identifier) @arrow.name
-    value: (generator_function) @arrow.body)) @arrow.def
+    value: (generator_function) @arrow.body) @arrow.decl) @arrow.def
 
 ;; anonymous default exports
 (export_statement
@@ -117,7 +117,7 @@ const JS_QUERY: &str = r#"
 ;; top-level const/let variable declarations
 (lexical_declaration
   (variable_declarator
-    name: (identifier) @var.name)) @var.def
+    name: (identifier) @var.name) @var.decl) @var.def
 
 ;; export statement wrappers (top-level only)
 (export_statement) @export.stmt
@@ -1394,9 +1394,11 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
                 // Include @decorator
                 kind == "decorator"
-                    // Include /** JSDoc */ comments
+                    // Include adjacent /** JSDoc */ comments, but do not let a
+                    // blank line attach file-level docs to the following symbol.
                     || (kind == "comment"
-                        && node_text(source, &prev).starts_with("/**"))
+                        && node_text(source, &prev).starts_with("/**")
+                        && is_adjacent_line(&prev, &current, source))
             }
             LangId::Go | LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {
                 // Include doc comments only if immediately above (no blank line gap)
@@ -1491,6 +1493,15 @@ fn lexical_declaration_has_function_value(node: &Node) -> bool {
     }
 
     false
+}
+
+fn variable_declarator_has_function_value(node: &Node) -> bool {
+    node.child_by_field_name("value").is_some_and(|value| {
+        matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    })
 }
 
 /// Collect byte ranges of all export_statement nodes from query matches.
@@ -1688,6 +1699,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut fn_def_node = None;
         let mut arrow_name_node = None;
         let mut arrow_def_node = None;
+        let mut arrow_decl_node = None;
         let mut class_name_node = None;
         let mut class_def_node = None;
         let mut method_class_name_node = None;
@@ -1701,6 +1713,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut type_alias_def_node = None;
         let mut var_name_node = None;
         let mut var_def_node = None;
+        let mut var_decl_node = None;
         let mut default_body_node = None;
         let mut default_def_node = None;
 
@@ -1713,6 +1726,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "fn.def" => fn_def_node = Some(cap.node),
                 "arrow.name" => arrow_name_node = Some(cap.node),
                 "arrow.def" => arrow_def_node = Some(cap.node),
+                "arrow.decl" => arrow_decl_node = Some(cap.node),
                 "class.name" => class_name_node = Some(cap.node),
                 "class.def" => class_def_node = Some(cap.node),
                 "method.class_name" => method_class_name_node = Some(cap.node),
@@ -1726,9 +1740,9 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "type_alias.def" => type_alias_def_node = Some(cap.node),
                 "var.name" => var_name_node = Some(cap.node),
                 "var.def" => var_def_node = Some(cap.node),
+                "var.decl" => var_decl_node = Some(cap.node),
                 "default.body" => default_body_node = Some(cap.node),
                 "default.def" => default_def_node = Some(cap.node),
-                // var.value/var.decl removed — not needed
                 _ => {}
             }
         }
@@ -1746,12 +1760,13 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             });
         }
 
-        // Arrow function
+        // Arrow/function expression declarator
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
+            let range_node = arrow_decl_node.unwrap_or(def_node);
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators(&range_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -1839,14 +1854,19 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 .parent()
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
-            let is_function_like = lexical_declaration_has_function_value(&def_node);
+            let range_node = var_decl_node.unwrap_or(def_node);
+            let is_function_like = if range_node.kind() == "variable_declarator" {
+                variable_declarator_has_function_value(&range_node)
+            } else {
+                lexical_declaration_has_function_value(&def_node)
+            };
             let name = node_text(source, &name_node).to_string();
             let already_captured = symbols.iter().any(|s| s.name == name);
             if is_top_level && !is_function_like && !already_captured {
                 symbols.push(Symbol {
                     name,
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&def_node, source, lang),
+                    range: node_range_with_decorators(&range_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -1883,6 +1903,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut fn_def_node = None;
         let mut arrow_name_node = None;
         let mut arrow_def_node = None;
+        let mut arrow_decl_node = None;
         let mut class_name_node = None;
         let mut class_def_node = None;
         let mut method_class_name_node = None;
@@ -1892,6 +1913,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut default_def_node = None;
         let mut var_name_node = None;
         let mut var_def_node = None;
+        let mut var_decl_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -1902,6 +1924,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "fn.def" => fn_def_node = Some(cap.node),
                 "arrow.name" => arrow_name_node = Some(cap.node),
                 "arrow.def" => arrow_def_node = Some(cap.node),
+                "arrow.decl" => arrow_decl_node = Some(cap.node),
                 "class.name" => class_name_node = Some(cap.node),
                 "class.def" => class_def_node = Some(cap.node),
                 "method.class_name" => method_class_name_node = Some(cap.node),
@@ -1911,6 +1934,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "default.def" => default_def_node = Some(cap.node),
                 "var.name" => var_name_node = Some(cap.node),
                 "var.def" => var_def_node = Some(cap.node),
+                "var.decl" => var_decl_node = Some(cap.node),
                 _ => {}
             }
         }
@@ -1928,10 +1952,11 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
+            let range_node = arrow_decl_node.unwrap_or(def_node);
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators(&range_node, source, lang),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -1980,14 +2005,19 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 .parent()
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
-            let is_function_like = lexical_declaration_has_function_value(&def_node);
+            let range_node = var_decl_node.unwrap_or(def_node);
+            let is_function_like = if range_node.kind() == "variable_declarator" {
+                variable_declarator_has_function_value(&range_node)
+            } else {
+                lexical_declaration_has_function_value(&def_node)
+            };
             let name = node_text(source, &name_node).to_string();
             let already_captured = symbols.iter().any(|s| s.name == name);
             if is_top_level && !is_function_like && !already_captured {
                 symbols.push(Symbol {
                     name,
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&def_node, source, lang),
+                    range: node_range_with_decorators(&range_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -2194,6 +2224,23 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     Ok(symbols)
 }
 
+fn rust_mod_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" {
+            if let Some(name_node) = parent.child_by_field_name("name") {
+                scopes.push(node_text(source, &name_node).to_string());
+            }
+        }
+        current = parent.parent();
+    }
+
+    scopes.reverse();
+    scopes
+}
+
 /// Extract symbols from Rust source.
 /// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
 fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
@@ -2273,21 +2320,26 @@ fn extract_rs_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             }
         }
 
-        // Free function (not inside impl block — check parent)
+        // Free function (skip impl/trait declaration lists; inline mod bodies are still free fns)
         if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
-            let parent = def_node.parent();
-            let in_impl = parent
-                .map(|p| p.kind() == "declaration_list")
-                .unwrap_or(false);
-            if !in_impl {
+            let declaration_list_owner = def_node
+                .parent()
+                .filter(|parent| parent.kind() == "declaration_list")
+                .and_then(|parent| parent.parent());
+            let in_non_module_declaration_list = declaration_list_owner
+                .as_ref()
+                .is_some_and(|owner| owner.kind() != "mod_item");
+
+            if !in_non_module_declaration_list {
+                let scope_chain = rust_mod_scope_chain(&def_node, source);
                 symbols.push(Symbol {
                     name: node_text(source, &name_node).to_string(),
                     kind: SymbolKind::Function,
                     range: node_range_with_decorators(&def_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
-                    scope_chain: vec![],
+                    scope_chain: scope_chain.clone(),
                     exported: is_pub(&def_node),
-                    parent: None,
+                    parent: scope_chain.last().cloned(),
                 });
             }
         }
@@ -5412,6 +5464,14 @@ fn vue_opening_tag_signature(source: &str, node: &Node) -> Option<String> {
         .map(|tag| node_text(source, &tag).trim().to_string())
 }
 
+fn source_line_end_col(source: &str, line: u32) -> u32 {
+    source
+        .lines()
+        .nth(line as usize)
+        .map(|line| line.len() as u32)
+        .unwrap_or(0)
+}
+
 fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let mut headings: Vec<(u8, Symbol)> = Vec::new();
     collect_html_headings(source, root, &mut headings);
@@ -5430,7 +5490,7 @@ fn extract_html_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
             .unwrap_or_else(|| total_lines.saturating_sub(1));
         headings[i].1.range.end_line = section_end;
         if section_end != headings[i].1.range.start_line {
-            headings[i].1.range.end_col = 0;
+            headings[i].1.range.end_col = source_line_end_col(source, section_end);
         }
     }
 
@@ -5538,6 +5598,21 @@ fn extract_element_text(source: &str, node: &Node) -> String {
     text
 }
 
+fn markdown_atx_heading_level(line: &str) -> Option<u8> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+
+    let rest = &trimmed[level..];
+    let marker_is_closed = match rest.chars().next() {
+        Some(ch) => ch.is_whitespace(),
+        None => true,
+    };
+    marker_is_closed.then_some(level as u8)
+}
+
 /// Extract markdown headings as symbols.
 /// Each heading becomes a symbol with kind `Heading`, and its range covers the entire
 /// section (from the heading to the next heading at the same or higher level, or EOF).
@@ -5603,7 +5678,18 @@ fn extract_md_sections(
                 }
 
                 if !heading_name.is_empty() {
-                    let range = node_range(&child);
+                    let mut range = node_range(&child);
+                    if let Some(next_heading_level) = source
+                        .lines()
+                        .nth(range.end_line as usize)
+                        .and_then(markdown_atx_heading_level)
+                    {
+                        if next_heading_level <= heading_level && range.end_line > range.start_line
+                        {
+                            range.end_line -= 1;
+                            range.end_col = source_line_end_col(source, range.end_line);
+                        }
+                    }
                     let signature = format!(
                         "{} {}",
                         "#".repeat((heading_level as usize).min(6)),
