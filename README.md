@@ -164,6 +164,8 @@ Objective-C `.h` headers continue to use the C grammar in v1, so Objective-C int
 
 Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 
+YAML, TOML, XML, env files, lockfiles, and other plain text/config formats are not code-indexed languages today: they do not have symbol outlines, zoom targets, AST patterns, semantic embeddings, call graphs, imports, or refactors. Use `aft read`, `aft grep`, or `aft glob` for those files. LSP support is separate from code indexing, so YAML diagnostics via `yaml-language-server` do not imply YAML support in `aft_outline`/`aft_zoom`.
+
 ---
 
 ## Architecture

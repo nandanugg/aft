@@ -9,5 +9,5 @@ if [ -f "$GATE" ]; then
     exit 0
 fi
 touch "$GATE"
-echo 'BLOCKED: For code discovery, use AFT semantic tools first: `aft outline <file|dir>` for structure, `aft trace_to`/`aft call_tree`/`aft callers` for behavior questions, `aft zoom <file> <symbol>` to read one symbol, `aft trace_data` for value flow. Fall back to Grep/Glob/Read only for text/config files, or when you are about to Edit a file (native Read required). Retry with the appropriate AFT command, or retry this call if the answer genuinely needs raw search.' >&2
+echo 'BLOCKED: For code discovery, use AFT semantic tools first: `aft outline <file|dir>` for structure, `aft trace_to`/`aft call_tree`/`aft callers` for behavior questions, `aft zoom <file> <symbol>` to read one symbol, `aft trace_data` for value flow. Fall back to Grep/Glob/Read for text/config files and unsupported formats such as YAML/TOML/XML/env/lockfiles, or when you are about to Edit a file (native Read required). YAML LSP diagnostics do not mean YAML is symbol-indexed. Retry with the appropriate AFT command, or retry this call if the answer genuinely needs raw search.' >&2
 exit 2

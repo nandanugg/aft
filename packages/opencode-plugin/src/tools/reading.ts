@@ -65,6 +65,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       description:
         "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
         "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n" +
+        "Unsupported text/config formats such as YAML, TOML, XML, env files, and lockfiles are searchable/readable with the grep/read tools but are not symbol-indexed for aft_outline/aft_zoom.\n\n" +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
