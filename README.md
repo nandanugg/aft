@@ -179,6 +179,8 @@ _Coming soon._
 
 Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`write`, and trigram-indexed `grep`/`glob` covers every text file regardless of language. **AST** is structural `ast_grep_search`/`ast_grep_replace`. **Semantic** is `aft_search` embedding coverage. **Refactor** is symbol move plus function extract and inline; *partial* means extract and inline only, without cross-file move.
 
+YAML, TOML, XML, env files, lockfiles, and other plain text/config formats are not code-indexed languages today: they do not have symbol outlines, zoom targets, AST patterns, semantic embeddings, call graphs, imports, or refactors. Use `aft read`, `aft grep`, or `aft glob` for those files. LSP support is separate from code indexing, so YAML diagnostics via `yaml-language-server` do not imply YAML support in `aft_outline`/`aft_zoom`.
+
 ---
 
 ## Architecture
