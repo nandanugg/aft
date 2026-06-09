@@ -76,6 +76,10 @@ aft grep <pattern> [path]              # Trigram-indexed search (ERE syntax: use
 aft glob <pattern> [path]              # File pattern matching
 ```
 
+### Coverage note
+
+`aft outline`, `aft zoom`, call graph, AST, semantic search, imports, and refactors only understand AFT's supported code/document languages. YAML, TOML, XML, env files, lockfiles, and other plain text/config formats are searchable/readable text, not symbol-indexed languages. Use `aft read`, `aft grep`, or `aft glob` for those files; YAML diagnostics or LSP availability do not make `aft_outline`/`aft_zoom` work on YAML.
+
 ## Decision Tree
 
 ```

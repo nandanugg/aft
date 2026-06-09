@@ -24,6 +24,10 @@ Every code question is either **structure** or **behavior**. Pick the AFT comman
 
 `aft grep` is fine for "does this exact string appear?" questions. Reach for the semantic commands when the answer depends on behavior, not spelling.
 
+## Coverage Note
+
+`aft outline`, `aft zoom`, call graph, AST, semantic search, imports, and refactors only understand AFT's supported code/document languages. YAML, TOML, XML, env files, lockfiles, and other plain text/config formats are searchable/readable text, not symbol-indexed languages. Use `aft read`, `aft grep`, or `aft glob` for those files; do not expect YAML diagnostics or LSP availability to make `aft_outline`/`aft_zoom` work on YAML.
+
 ## Commands
 
 ```bash
