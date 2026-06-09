@@ -205,7 +205,9 @@ fn acquire_with_config(
                     since_heartbeat,
                     cross_host_stale_ms
                 );
-                remove_lock_file(path)?;
+                // Compare-and-delete: only remove if it's still the SAME stale
+                // owner (a fresh owner may have acquired it in the gap).
+                reclaim_lock_file(path, &metadata)?;
                 continue;
             }
             sleep_until_retry(deadline, config.poll_interval_ms)?;
@@ -218,7 +220,10 @@ fn acquire_with_config(
                 path.display(),
                 metadata.pid
             );
-            remove_lock_file(path)?;
+            // Compare-and-delete: only remove if it's still this dead owner's
+            // lock. A fresh owner could have written a new lock (with a recycled
+            // or different PID) between our liveness check and the unlink.
+            reclaim_lock_file(path, &metadata)?;
             continue;
         }
 
@@ -622,6 +627,37 @@ fn remove_lock_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Reclaim (delete) a lock file we judged stale/dead, but ONLY if it still holds
+/// the SAME owner identity we evaluated. Between reading the metadata and
+/// deleting, the stale owner could release and a FRESH owner acquire — blindly
+/// `remove_file` would then delete the fresh owner's lock, allowing split-brain
+/// writers. Re-read immediately before the unlink and bail if the identity
+/// (pid, hostname, created_at_ms) changed or the file vanished. POSIX has no
+/// atomic compare-and-unlink, so a microscopic residual race remains, but this
+/// shrinks the window from the whole judgment/poll duration to a couple of
+/// syscalls — the standard mitigation. Returns true if we removed it.
+fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<bool> {
+    match read_lock_metadata(path) {
+        Ok(current) => {
+            if current.pid == judged.pid
+                && current.hostname == judged.hostname
+                && current.created_at_ms == judged.created_at_ms
+            {
+                remove_lock_file(path)?;
+                Ok(true)
+            } else {
+                // A different owner acquired it in the gap — do NOT delete.
+                Ok(false)
+            }
+        }
+        // Already gone (released/reclaimed by someone else) — nothing to do.
+        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        // Malformed now (mid-write by a new owner) — don't delete; retry next poll.
+        Err(ReadLockError::Malformed(_)) => Ok(false),
+        Err(ReadLockError::Io(error)) => Err(error),
+    }
+}
+
 fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result<(), AcquireError> {
     let poll = Duration::from_millis(poll_interval_ms);
     let sleep_for = match deadline {
@@ -792,6 +828,39 @@ mod tests {
 
         drop(guard);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn reclaim_refuses_to_delete_a_different_owners_lock() {
+        let (_dir, path) = test_lock_path();
+
+        // A lock currently owned by "owner B".
+        let owner_b = synthetic_metadata(4242, "host-b".to_string(), now_ms());
+        create_lock_file_atomically(&path, &owner_b).expect("write owner B lock");
+
+        // We judged a DIFFERENT (older) owner A as stale. Reclaiming must NOT
+        // delete B's lock (the TOCTOU split-brain guard).
+        let judged_a = synthetic_metadata(1111, "host-a".to_string(), now_ms() - 1_000_000);
+        let removed = reclaim_lock_file(&path, &judged_a).expect("reclaim");
+        assert!(!removed, "must not remove a different owner's lock");
+        assert!(path.exists(), "owner B's lock must survive");
+        let still = read_lock_metadata(&path).expect("still readable");
+        assert_eq!(still.pid, 4242, "owner B's lock intact");
+    }
+
+    #[test]
+    fn reclaim_deletes_when_identity_still_matches() {
+        let (_dir, path) = test_lock_path();
+        let owner = synthetic_metadata(1111, "host-a".to_string(), 5_000);
+        create_lock_file_atomically(&path, &owner).expect("write lock");
+
+        // Same identity we judged → safe to remove.
+        let removed = reclaim_lock_file(&path, &owner).expect("reclaim");
+        assert!(removed, "matching-identity stale lock should be removed");
+        assert!(!path.exists());
+
+        // Reclaiming a now-absent lock is a no-op, not an error.
+        assert!(!reclaim_lock_file(&path, &owner).expect("reclaim missing"));
     }
 
     #[test]
