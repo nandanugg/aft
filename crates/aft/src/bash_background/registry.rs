@@ -26,7 +26,7 @@ use std::os::windows::process::CommandExt;
 use super::buffer::{combine_streams, BgBuffer, StreamKind, TokenCountInput};
 use super::output::{
     cap_completion_output, cap_completion_output_with_marker, cap_final_output,
-    cap_final_output_with_marker, json_output_pointer, quote_path, COMPLETION_OUTPUT_PREVIEW_BYTES,
+    cap_final_output_with_marker, completion_preview_threshold, json_output_pointer, quote_path,
     COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
     FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
     RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
@@ -57,10 +57,6 @@ const STALE_RUNNING_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Completion previews are derived from the per-task terminal render cache using
-/// a small char-boundary-safe head+tail cap. Keep this bounded: completion
-/// reminders may batch multiple tasks into one prompt injection.
-const BG_COMPLETION_PREVIEW_BYTES: usize = COMPLETION_OUTPUT_PREVIEW_BYTES;
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -1177,7 +1173,7 @@ impl BgTaskRegistry {
 
             let completion = self
                 .remove_pending_completion(&task_id)
-                .or_else(|| self.completion_snapshot_for_task(&task, BG_COMPLETION_PREVIEW_BYTES));
+                .or_else(|| self.completion_snapshot_for_task(&task));
             if terminal_matches.is_empty() {
                 if let Some(completion) = completion.as_ref() {
                     self.emit_bash_watch_exit(completion);
@@ -1763,11 +1759,7 @@ impl BgTaskRegistry {
         completions.remove(idx)
     }
 
-    fn completion_snapshot_for_task(
-        &self,
-        task: &Arc<BgTask>,
-        _preview_bytes: usize,
-    ) -> Option<BgCompletion> {
+    fn completion_snapshot_for_task(&self, task: &Arc<BgTask>) -> Option<BgCompletion> {
         let snapshot = self.snapshot_with_terminal_cache(task, RUNNING_OUTPUT_PREVIEW_BYTES);
         if !snapshot.info.status.is_terminal() {
             return None;
@@ -1776,7 +1768,7 @@ impl BgTaskRegistry {
             (String::new(), false)
         } else {
             self.ensure_terminal_output_cache(task)
-                .map(|cache| completion_preview_for_cache(&cache))
+                .map(|cache| completion_preview_for_cache(&cache, snapshot.exit_code))
                 .unwrap_or_else(|| (String::new(), false))
         };
         Some(BgCompletion {
@@ -2289,9 +2281,10 @@ impl BgTaskRegistry {
         let render = terminal_render.or(owned_render.as_ref());
 
         // Completion reminders use the already-rendered terminal output and a
-        // smaller head+tail cap. They never invoke the compressor themselves.
+        // smaller, exit-aware head+tail cap. They never invoke the compressor
+        // themselves.
         let (output_preview, output_truncated) = render
-            .map(completion_preview_for_cache)
+            .map(|cache| completion_preview_for_cache(cache, metadata.exit_code))
             .unwrap_or_else(|| (String::new(), false));
 
         let token_counts = self.completion_token_counts(
@@ -3050,10 +3043,15 @@ fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
     }
 }
 
-fn completion_preview_for_cache(cache: &TerminalOutputCache) -> (String, bool) {
-    if cache.kind == TerminalOutputKind::Structured
-        && cache.output_preview.len() > BG_COMPLETION_PREVIEW_BYTES
-    {
+fn completion_preview_for_cache(
+    cache: &TerminalOutputCache,
+    exit_code: Option<i32>,
+) -> (String, bool) {
+    // Reminder previews are sized by exit status: success gets a short tail,
+    // failure keeps head+tail context (see output.rs completion caps).
+    let exit_ok = exit_code == Some(0);
+    let threshold = completion_preview_threshold(exit_ok);
+    if cache.kind == TerminalOutputKind::Structured && cache.output_preview.len() > threshold {
         if let Some(path) = cache.output_path.as_deref() {
             return (
                 json_output_pointer(cache.output_preview.len() as u64, path),
@@ -3064,19 +3062,19 @@ fn completion_preview_for_cache(cache: &TerminalOutputCache) -> (String, bool) {
     }
 
     if let Some(recovery) = cache.recovery.as_ref() {
-        if cache.output_preview.len() <= BG_COMPLETION_PREVIEW_BYTES {
+        if cache.output_preview.len() <= threshold {
             return (cache.output_preview.clone(), cache.output_truncated);
         }
         let body = strip_recovery_marker_lines(&cache.output_preview);
         let mut completion_recovery = recovery.clone();
         completion_recovery.byte_truncated = true;
         if let Some(marker) = recovery_marker(&completion_recovery) {
-            let capped = cap_completion_output_with_marker(&body, &marker);
+            let capped = cap_completion_output_with_marker(&body, &marker, exit_ok);
             return (capped.text, true);
         }
     }
 
-    let capped = cap_completion_output(&cache.output_preview);
+    let capped = cap_completion_output(&cache.output_preview, exit_ok);
     (capped.text, cache.output_truncated || capped.truncated)
 }
 
@@ -4055,7 +4053,11 @@ mod tests {
     }
 
     #[test]
-    fn completion_preview_uses_head_and_tail_not_blind_tail() {
+    fn completion_preview_success_keeps_tail_only() {
+        // Exit-aware completion previews: a SUCCESSFUL task's reminder keeps a
+        // short tail only — head context is noise when the command worked
+        // (regression: the uniform 4 KiB head+tail cap flooded reminders with
+        // ~1K tokens of build noise per completed task).
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let output = format!("HEAD-SIGNAL\n{}TAIL-SIGNAL\n", "middle\n".repeat(2_000));
@@ -4066,12 +4068,46 @@ mod tests {
         let completions = registry.drain_completions_for_session(Some("session"));
         assert_eq!(completions.len(), 1);
         let preview = &completions[0].output_preview;
+        assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
+        assert!(!preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
+        assert!(completions[0].output_truncated);
+    }
+
+    #[test]
+    fn completion_preview_failure_keeps_head_and_tail() {
+        // A FAILED task keeps a small head (first error / command banner) plus
+        // a larger tail (tracebacks and summaries land at the end).
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!("HEAD-SIGNAL\n{}TAIL-SIGNAL\n", "middle\n".repeat(2_000));
+        let task_id = format!("bash-test-{}", random_slug());
+        let paths = task_paths(dir.path(), "session", &task_id);
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(&paths.stdout, &output).unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "cat big.log".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Failed, Some(1), None);
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .expect("insert terminal task");
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        registry.post_terminal_transition(&task, true).unwrap();
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+        let preview = &completions[0].output_preview;
         assert!(preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
         assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
-        assert!(
-            preview.contains("...<truncated "),
-            "preview was {preview:?}"
-        );
     }
 
     #[test]
