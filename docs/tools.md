@@ -640,21 +640,12 @@ Parameters: `pattern` (required), `path` (optional — scope to subdirectory or 
 
 ### aft_search
 
-Find symbols by **concept** when grep keywords fall short. Returns ranked code matches with
-similarity scores plus provenance (semantic, lexical, or hybrid). Requires
-`semantic_search: true` and [ONNX Runtime](https://onnxruntime.ai/) installed on the system
-when using the default `fastembed` backend.
-
-**When to use it:**
-- Exploring an unfamiliar area: *"where is rate limiting handled"*
-- Concept doesn't appear as a literal string: *"retry logic"*, *"cache invalidation"*
-- After grep attempts came back empty or noisy
-- You know roughly what the function does but not its name
-
-**When NOT to use it:**
-- Error message or stack trace → use grep
-- File/module structure → use `aft_outline`
-- Following a call chain → use `aft_callgraph`
+The primary code-search tool: concepts, identifiers, error strings, regex, literals, and
+filenames are auto-routed to the right engine and returned ranked. Works even when you only
+know what the code does, not what it's named (*"where is rate limiting handled"*, *"retry
+logic"*, `^export`, `Cargo.lock`). Requires `semantic_search: true` and
+[ONNX Runtime](https://onnxruntime.ai/) installed on the system when using the default
+`fastembed` backend.
 
 **How it works — hybrid retrieval:** AFT classifies each query by shape (identifier, path,
 error-code, mixed, natural-language) and routes through two lanes:
