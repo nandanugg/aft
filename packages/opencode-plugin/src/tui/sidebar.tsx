@@ -259,6 +259,38 @@ export function shouldSuppressUninitializedDowngrade(
   return incomingCacheRole === "not_initialized" && haveInitializedForContext;
 }
 
+/**
+ * Cross-project contamination belt. The RPC layer can (rarely) hand back a
+ * snapshot describing a DIFFERENT project than the one this sidebar asked
+ * about — e.g. a multi-project host whose status handler resolved another
+ * project's warm bridge. Rendering it shows another repo's indexes/health in
+ * this window. A snapshot for a different project_root is acceptable ONLY in
+ * the `opencode -s` resume case, where the polled session genuinely lives in
+ * that other directory — which we can recognize because Rust echoes the
+ * session id it computed the snapshot for (`snapshot.session.id`).
+ *
+ * Rules:
+ *  - placeholder/synthetic snapshots (no project_root) → accept (not data)
+ *  - project_root (or canonical_root) matches the sidebar directory → accept
+ *  - mismatched root AND snapshot.session.id === the session we polled for →
+ *    accept (resume case: this session's real project lives elsewhere)
+ *  - otherwise → reject (cross-project stray)
+ */
+export function isSnapshotForContext(
+  snapshot: AftStatusSnapshot,
+  directory: string,
+  sessionID: string,
+): boolean {
+  const stripSlash = (p: string) => p.replace(/\/+$/, "");
+  const roots = [snapshot.project_root, snapshot.canonical_root].filter(
+    (r): r is string => typeof r === "string" && r.length > 0,
+  );
+  if (roots.length === 0) return true; // placeholder / synthetic
+  const dir = stripSlash(directory);
+  if (roots.some((r) => stripSlash(r) === dir)) return true;
+  return snapshot.session?.id === sessionID;
+}
+
 const SidebarContent = (props: {
   api: TuiPluginApi;
   sessionID: () => string;
@@ -336,6 +368,9 @@ const SidebarContent = (props: {
       if (currentDirectory() !== directory || props.sessionID() !== sid) return;
       if (response && (response as Record<string, unknown>).success !== false) {
         const snapshot = coerceAftStatus(response as Record<string, unknown>);
+        // Belt: never render a snapshot describing another project (see
+        // isSnapshotForContext). Keep whatever we currently show instead.
+        if (!isSnapshotForContext(snapshot, directory, sid)) return;
         // Stale-while-revalidate: keep the last-good snapshot instead of
         // flickering to the lazy-bridge placeholder on a transient
         // not_initialized. See shouldSuppressUninitializedDowngrade.

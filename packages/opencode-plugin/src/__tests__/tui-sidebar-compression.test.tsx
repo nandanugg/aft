@@ -33,6 +33,7 @@ const {
   collapsedCompressionValue,
   collapsedHealthLights,
   formatCompressionSidebarRows,
+  isSnapshotForContext,
   resolveTuiStorageDir,
   scopedSidebarSnapshot,
   shouldSuppressUninitializedDowngrade,
@@ -220,5 +221,49 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
   test("todos light: yellow when any todos, green otherwise", () => {
     expect(collapsedHealthLights(bar({ todos: 4 }))?.todos).toBe("warn");
     expect(collapsedHealthLights(bar({ todos: 0 }))?.todos).toBe("ok");
+  });
+});
+
+describe("isSnapshotForContext (cross-project contamination belt)", () => {
+  const snap = (overrides: Record<string, unknown> = {}) =>
+    ({
+      project_root: "/work/aft",
+      canonical_root: "/work/aft",
+      session: { id: "ses_a", tracked_files: 0, checkpoints: 0 },
+      ...overrides,
+    }) as any;
+
+  test("accepts a snapshot whose project_root matches the sidebar directory", () => {
+    expect(isSnapshotForContext(snap(), "/work/aft", "ses_a")).toBe(true);
+    // trailing slash tolerance
+    expect(isSnapshotForContext(snap(), "/work/aft/", "ses_a")).toBe(true);
+  });
+
+  test("accepts via canonical_root when project_root differs (symlink aliasing)", () => {
+    const s = snap({ project_root: "/private/work/aft", canonical_root: "/work/aft" });
+    expect(isSnapshotForContext(s, "/work/aft", "ses_a")).toBe(true);
+  });
+
+  test("REJECTS another project's snapshot (the magic-context contamination case)", () => {
+    const stray = snap({
+      project_root: "/work/magic-context",
+      canonical_root: "/work/magic-context",
+      session: { id: "ses_other", tracked_files: 0, checkpoints: 0 },
+    });
+    expect(isSnapshotForContext(stray, "/work/aft", "ses_a")).toBe(false);
+  });
+
+  test("accepts a mismatched root when the snapshot was computed for OUR session (opencode -s resume)", () => {
+    const resume = snap({
+      project_root: "/real/project/elsewhere",
+      canonical_root: "/real/project/elsewhere",
+      session: { id: "ses_a", tracked_files: 1, checkpoints: 2 },
+    });
+    expect(isSnapshotForContext(resume, "/launch/cwd", "ses_a")).toBe(true);
+  });
+
+  test("accepts placeholder/synthetic snapshots with no roots", () => {
+    const placeholder = snap({ project_root: null, canonical_root: null });
+    expect(isSnapshotForContext(placeholder, "/work/aft", "ses_a")).toBe(true);
   });
 });

@@ -51,6 +51,7 @@ import { AftRpcServer } from "./shared/rpc-server.js";
 import {
   getSessionDirectory,
   getSessionDirectoryCached,
+  verifySessionDirectory,
   warmSessionDirectory,
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
@@ -681,25 +682,26 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // synthetic "not_initialized" status so the sidebar shows something
     // sensible without triggering project indexing.
     //
-    // Prefer THIS server's own project (the plugin-init cwd) first, then fall
-    // back to the session-stored directory. Order matters: in OpenCode Desktop a
-    // single process hosts one RPC server per open project, all sharing this
-    // process's session-dir cache. Resolving the session-cached dir first let
-    // project A's server serve project B's bridge when the cache mapped this
-    // session elsewhere ("another session's data" in the sidebar). Serving our
-    // own directory first removes that cross-project bleed; the session-dir
-    // fallback still fixes `opencode -s` from a different cwd, where the
-    // plugin-init cwd has no bridge and the real project lives in the cache.
-    const cachedDir = getSessionDirectoryCached(sessionID);
-    const candidateDirs = new Set<string>();
-    candidateDirs.add(input.directory);
-    if (typeof cachedDir === "string" && cachedDir.length > 0) {
-      candidateDirs.add(cachedDir);
-    }
-    let bridge: ReturnType<typeof pool.getActiveBridgeForRoot> = null;
-    for (const dir of candidateDirs) {
-      bridge = pool.getActiveBridgeForRoot(dir);
-      if (bridge) break;
+    // Prefer THIS server's own project (the plugin-init cwd) first — that
+    // bridge is always safe to serve from this server instance.
+    //
+    // The cross-project fallback (the `opencode -s` resume case, where the
+    // plugin-init cwd has no bridge and the session's real project lives
+    // elsewhere) must NOT trust the process-wide session-dir warm cache: in a
+    // multi-project host (Desktop / `opencode serve`) all plugin instances
+    // share that cache, and a fallback-seeded or stale entry made project A's
+    // server happily serve project B's warm bridge — the sidebar then rendered
+    // another project's data the moment the window opened (RPC contamination).
+    // Instead, only serve a cross-project bridge when a FRESH SDK lookup
+    // confirms the polled session really lives in that directory, and never
+    // attempt the fallback for placeholder/empty session ids.
+    let bridge = pool.getActiveBridgeForRoot(input.directory);
+    const realSessionID = (params.sessionID as string) || "";
+    if (!bridge && realSessionID) {
+      const verifiedDir = await verifySessionDirectory(input.client, realSessionID);
+      if (verifiedDir && verifiedDir !== input.directory) {
+        bridge = pool.getActiveBridgeForRoot(verifiedDir);
+      }
     }
     if (!bridge) {
       return {
