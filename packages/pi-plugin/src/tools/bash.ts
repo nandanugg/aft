@@ -681,7 +681,6 @@ export function createBashWatchTool(ctx: PluginContext) {
       // notification still arrives, and return text explaining the conversion.
       if (data.waited?.reason === "user_message") {
         const convertedText = await convertToAsyncWatchOnAbort(
-          ctx,
           bridge,
           extCtx,
           params.task_id,
@@ -709,7 +708,6 @@ export function createBashWatchTool(ctx: PluginContext) {
  * already handles exit notifications, so just return the conversion message.
  */
 async function convertToAsyncWatchOnAbort(
-  ctx: PluginContext,
   bridge: BinaryBridge,
   extCtx: ExtensionContext,
   taskId: string,

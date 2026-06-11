@@ -1006,7 +1006,7 @@ describe("bash_status tool", () => {
     __resetSyncWatchAbortForTests();
     const sessionId = "s-abort-no-pattern";
     let pollCount = 0;
-    const { calls, watchTool } = makeCtx((cmd) => {
+    const { calls, watchTool } = makeCtx(() => {
       pollCount++;
       if (pollCount === 1) signalSyncWatchAbort(sessionId);
       return { success: true, status: "running", mode: "pipes" };
