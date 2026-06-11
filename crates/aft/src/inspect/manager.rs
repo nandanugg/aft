@@ -14,7 +14,7 @@ use super::freshness::ContributionFreshness;
 use super::job::{
     normalize_path, CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot, FileContribution,
     InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
-    JobOutcome, JobScope, DISPATCHED_CALLEE_SEPARATOR,
+    JobOutcome, JobScope, CALLGRAPH_PROVENANCE_TREESITTER, DISPATCHED_CALLEE_SEPARATOR,
 };
 use super::scanners::DEFAULT_EXPORT_MARKER_KIND;
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
@@ -1314,6 +1314,7 @@ fn build_tier2_callgraph_snapshot(
                     caller_symbol: caller_symbol.clone(),
                     target,
                     line: call.line,
+                    provenance: CALLGRAPH_PROVENANCE_TREESITTER.to_string(),
                 });
             }
         }

@@ -131,7 +131,8 @@ fn outbound_calls_from_store(
                 r.status,
                 COALESCE(r.target_file, e.target_file),
                 COALESCE(r.target_symbol, e.target_symbol),
-                r.line
+                r.line,
+                COALESCE(e.provenance, r.provenance)
          FROM refs r
          LEFT JOIN nodes n ON n.id = r.caller_node
          LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = 'call'
@@ -149,6 +150,7 @@ fn outbound_calls_from_store(
             target_file: row.get(6)?,
             target_symbol: row.get(7)?,
             line: row.get::<_, i64>(8)? as u32,
+            provenance: row.get(9)?,
         })
     })?;
 
@@ -190,6 +192,7 @@ fn outbound_calls_from_store(
             caller_symbol,
             target,
             line: row.line,
+            provenance: row.provenance,
         });
     }
     Ok(calls)
@@ -264,16 +267,78 @@ struct OutboundRow {
     target_file: Option<String>,
     target_symbol: Option<String>,
     line: u32,
+    provenance: String,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        CallGraphStore, PROVENANCE_NAME_MATCH, PROVENANCE_TREESITTER, PROVENANCE_TYPE_MATCH,
+    };
     use super::*;
+    use std::fs;
 
     fn assert_send<T: Send>() {}
 
     #[test]
     fn projection_result_is_send() {
         assert_send::<Result<CallgraphSnapshot>>();
+    }
+
+    #[test]
+    fn outbound_rows_carry_store_provenance_for_each_tier() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let source = src_dir.join("lib.rs");
+        fs::write(
+            &source,
+            r#"struct TypedTarget;
+impl TypedTarget {
+    fn typed_edge(&self) {}
+}
+
+struct NamedTarget;
+impl NamedTarget {
+    fn named_edge(&self) {}
+}
+
+fn run(typed: &TypedTarget) {
+    local_target();
+    typed.typed_edge();
+    unknown.named_edge();
+}
+
+fn local_target() {}
+"#,
+        )
+        .expect("write provenance fixture");
+
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&source))
+            .expect("cold build provenance fixture");
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+
+        assert_call_with_provenance(&snapshot, "local_target", PROVENANCE_TREESITTER);
+        assert_call_with_provenance(&snapshot, "typed_edge", PROVENANCE_TYPE_MATCH);
+        assert_call_with_provenance(&snapshot, "named_edge", PROVENANCE_NAME_MATCH);
+    }
+
+    fn assert_call_with_provenance(
+        snapshot: &CallgraphSnapshot,
+        target_fragment: &str,
+        expected_provenance: &str,
+    ) {
+        assert!(
+            snapshot.outbound_calls.iter().any(|call| {
+                call.target.contains(target_fragment) && call.provenance == expected_provenance
+            }),
+            "expected projected call containing {target_fragment:?} with provenance \
+             {expected_provenance:?}; calls: {:#?}",
+            snapshot.outbound_calls
+        );
     }
 }
