@@ -5,7 +5,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
@@ -13,6 +13,9 @@ use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
     is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
+};
+use crate::inspect::oxc_engine::{
+    LivenessVerdict, OxcEngineResult, OxcFileVerdicts, OXC_PROVENANCE,
 };
 use crate::inspect::{
     CallgraphOutboundCall, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
@@ -33,8 +36,21 @@ struct ImportedExportLiveness {
 }
 
 pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
-    let started = Instant::now();
+    run_dead_code_scan_with_oxc_started(job, None, Instant::now())
+}
 
+pub(crate) fn run_dead_code_scan_with_oxc(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+) -> InspectResult {
+    run_dead_code_scan_with_oxc_started(job, oxc_result, Instant::now())
+}
+
+fn run_dead_code_scan_with_oxc_started(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    started: Instant,
+) -> InspectResult {
     let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
         let success = InspectScanSuccess {
             scanned_files: job.scope_files.clone(),
@@ -52,6 +68,35 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
     let public_api_files = collect_public_api_files(&job.project_root);
     let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
         exported_symbol_indexes(job, snapshot);
+    let oxc_by_file = oxc_result
+        .map(|result| {
+            result
+                .files
+                .iter()
+                .cloned()
+                .map(|file| (relative_path(&job.project_root, &file.file), file))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let oxc_parse_errors_by_file = oxc_result
+        .map(|result| {
+            result.errors.iter().fold(
+                BTreeMap::<String, Vec<String>>::new(),
+                |mut errors, error| {
+                    errors
+                        .entry(relative_path(&job.project_root, &error.file))
+                        .or_default()
+                        .push(error.message.clone());
+                    errors
+                },
+            )
+        })
+        .unwrap_or_default();
+    let oxc_skipped_files = oxc_result
+        .map(|result| oxc_skipped_files_payload(&job.project_root, result))
+        .unwrap_or_default();
+    let oxc_resolver_config_fingerprint =
+        oxc_result.map(OxcEngineResult::resolver_config_fingerprint);
 
     let contributions = job
         .scope_files
@@ -66,6 +111,10 @@ pub fn run_dead_code_scan(job: &InspectJob) -> InspectResult {
                 &default_export_symbols_by_file,
                 &liveness_root_files,
                 &public_api_files,
+                &oxc_by_file,
+                &oxc_parse_errors_by_file,
+                &oxc_skipped_files,
+                oxc_resolver_config_fingerprint,
             )
         })
         .collect::<Vec<_>>();
@@ -126,23 +175,33 @@ fn gather_file_contribution(
     default_export_symbols_by_file: &BTreeMap<String, String>,
     liveness_root_files: &BTreeSet<String>,
     public_api_files: &BTreeSet<String>,
+    oxc_by_file: &BTreeMap<String, OxcFileVerdicts>,
+    oxc_parse_errors_by_file: &BTreeMap<String, Vec<String>>,
+    oxc_skipped_files: &[Value],
+    oxc_resolver_config_fingerprint: Option<&str>,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
     let is_liveness_root_file = liveness_root_files.contains(&file_name);
     let is_public_api_file = public_api_files.contains(&file_name);
-    let mut exports = snapshot
-        .exported_symbols
-        .iter()
-        .filter(|export| same_file(&job.project_root, &export.file, file))
-        .filter(|export| export.kind != DEFAULT_EXPORT_MARKER_KIND)
-        .map(|export| ExportContribution {
-            symbol: export.symbol.clone(),
-            kind: export.kind.clone(),
-            line: export.line,
-            is_type_like: is_type_like_kind(&export.kind),
-            is_entry_point: false,
-        })
-        .collect::<Vec<_>>();
+    let oxc_file = oxc_by_file.get(&file_name);
+    let mut exports = oxc_file.map(oxc_export_contributions).unwrap_or_else(|| {
+        snapshot
+            .exported_symbols
+            .iter()
+            .filter(|export| same_file(&job.project_root, &export.file, file))
+            .filter(|export| export.kind != DEFAULT_EXPORT_MARKER_KIND)
+            .map(|export| ExportContribution {
+                symbol: export.symbol.clone(),
+                kind: export.kind.clone(),
+                line: export.line,
+                is_type_like: is_type_like_kind(&export.kind),
+                is_entry_point: false,
+                verdict: None,
+                reason: None,
+                provenance: None,
+            })
+            .collect::<Vec<_>>()
+    });
 
     let mut internal_calls = snapshot
         .outbound_calls
@@ -187,12 +246,16 @@ fn gather_file_contribution(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let imported_export_liveness = imported_export_liveness_roots(
-        &job.project_root,
-        file,
-        exported_symbols_by_file,
-        default_export_symbols_by_file,
-    );
+    let imported_export_liveness = if oxc_file.is_some() {
+        ImportedExportLiveness::default()
+    } else {
+        imported_export_liveness_roots(
+            &job.project_root,
+            file,
+            exported_symbols_by_file,
+            default_export_symbols_by_file,
+        )
+    };
     let type_ref_names = collect_type_ref_names(file);
 
     let liveness_roots = liveness_roots_for_file(
@@ -219,6 +282,15 @@ fn gather_file_contribution(
                 });
                 if export.is_type_like {
                     value["is_type_like"] = json!(true);
+                }
+                if let Some(verdict) = export.verdict {
+                    value["verdict"] = json!(verdict);
+                }
+                if let Some(reason) = &export.reason {
+                    value["reason"] = json!(reason);
+                }
+                if let Some(provenance) = &export.provenance {
+                    value["provenance"] = json!(provenance);
                 }
                 value
             })
@@ -258,6 +330,23 @@ fn gather_file_contribution(
             }))
             .collect::<Vec<_>>());
     }
+    if let Some(fingerprint) = oxc_resolver_config_fingerprint {
+        if oxc_file.is_some() {
+            payload["resolver_config_fingerprint"] = json!(fingerprint);
+        }
+    }
+    if let Some(parse_errors) = oxc_parse_errors_by_file.get(&file_name) {
+        payload["parse_errors"] = json!(parse_errors
+            .iter()
+            .map(|message| json!({
+                "file": file_name,
+                "message": message,
+            }))
+            .collect::<Vec<_>>());
+    }
+    if oxc_file.is_some() && !oxc_skipped_files.is_empty() {
+        payload["skipped_files"] = Value::Array(oxc_skipped_files.to_vec());
+    }
 
     FileContribution::new(
         InspectCategory::DeadCode,
@@ -266,6 +355,35 @@ fn gather_file_contribution(
         payload,
     )
     .with_type_ref_names(type_ref_names)
+}
+
+fn oxc_export_contributions(file: &OxcFileVerdicts) -> Vec<ExportContribution> {
+    file.exports
+        .iter()
+        .map(|export| ExportContribution {
+            symbol: export.symbol.clone(),
+            kind: export.kind.clone(),
+            line: export.line,
+            is_type_like: is_type_like_kind(&export.kind),
+            is_entry_point: matches!(export.verdict, LivenessVerdict::Used),
+            verdict: Some(export.verdict),
+            reason: Some(export.reason.clone()),
+            provenance: Some(export.provenance.clone()),
+        })
+        .collect()
+}
+
+fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) -> Vec<Value> {
+    oxc_result
+        .skipped_outside_root
+        .iter()
+        .map(|path| {
+            json!({
+                "file": relative_path(project_root, path),
+                "reason": "outside_project_root",
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
@@ -316,8 +434,8 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
     let mut dead_items = Vec::new();
-    let uncertain_count = 0usize;
-    let uncertain_items: Vec<serde_json::Value> = Vec::new();
+    let mut uncertain_count = 0usize;
+    let mut uncertain_items: Vec<serde_json::Value> = Vec::new();
     for contribution in &parsed {
         // Test-support files (fixtures, corpora, mock data) are consumed by
         // path, never imported, so their exports always look dead. Skip
@@ -327,18 +445,39 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         }
         let is_public_api_file = public_api_files.contains(&contribution.file);
         for export in &contribution.exports {
-            let node = (contribution.file.clone(), export.symbol.clone());
-            if reachable.contains(&node)
-                || is_public_api_file
-                || dispatched_method_names.contains(symbol_liveness_name(&export.symbol))
-            {
-                continue;
-            }
+            if export_uses_oxc(export) {
+                match export.verdict.unwrap_or(LivenessVerdict::Unused) {
+                    LivenessVerdict::Used => continue,
+                    LivenessVerdict::Uncertain => {
+                        uncertain_count += 1;
+                        if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                            uncertain_items.push(json!({
+                                "file": contribution.file,
+                                "symbol": export.symbol,
+                                "kind": export.kind,
+                                "line": export.line,
+                                "reason": export.reason.as_deref().unwrap_or("oxc_uncertain"),
+                                "provenance": export.provenance.as_deref().unwrap_or(OXC_PROVENANCE),
+                            }));
+                        }
+                        continue;
+                    }
+                    LivenessVerdict::Unused => {}
+                }
+            } else {
+                let node = (contribution.file.clone(), export.symbol.clone());
+                if reachable.contains(&node)
+                    || is_public_api_file
+                    || dispatched_method_names.contains(symbol_liveness_name(&export.symbol))
+                {
+                    continue;
+                }
 
-            if (export.is_type_like || is_type_like_kind(&export.kind))
-                && referenced_type_names.contains(symbol_liveness_name(&export.symbol))
-            {
-                continue;
+                if (export.is_type_like || is_type_like_kind(&export.kind))
+                    && referenced_type_names.contains(symbol_liveness_name(&export.symbol))
+                {
+                    continue;
+                }
             }
 
             count += 1;
@@ -348,12 +487,16 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
             // Collect ALL items here; rank by signal tier and truncate below so
             // product findings survive the cap instead of being eaten by
             // alphabetically-first benchmark/tooling files.
-            dead_items.push(json!({
+            let mut item = json!({
                 "file": contribution.file,
                 "symbol": export.symbol,
                 "kind": export.kind,
                 "line": export.line,
-            }));
+            });
+            if let Some(provenance) = &export.provenance {
+                item["provenance"] = json!(provenance);
+            }
+            dead_items.push(item);
         }
     }
 
@@ -361,7 +504,8 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         crate::inspect::entry_points::rank_and_truncate_items(dead_items, roles, drill_down_limit);
     let top = crate::inspect::entry_points::top_preview_symbols(&dead_items);
 
-    json!({
+    let (parse_errors, skipped_files) = dead_code_honesty_fields(&parsed);
+    let mut aggregate = json!({
         "count": count,
         "items": dead_items,
         "top": top,
@@ -371,7 +515,41 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
         "uncertain_items": uncertain_items,
         "callgraph_available": true,
         "scanned_files": contributions.len(),
-    })
+        "complete": parse_errors.is_empty() && skipped_files.is_empty(),
+    });
+    if !parse_errors.is_empty() {
+        aggregate["parse_errors"] = Value::Array(parse_errors);
+    }
+    if !skipped_files.is_empty() {
+        aggregate["skipped_files"] = Value::Array(skipped_files);
+    }
+    aggregate
+}
+
+fn export_uses_oxc(export: &ExportContribution) -> bool {
+    export.verdict.is_some() || export.provenance.as_deref() == Some(OXC_PROVENANCE)
+}
+
+fn dead_code_honesty_fields(parsed: &[DeadCodeContribution]) -> (Vec<Value>, Vec<Value>) {
+    let mut parse_error_keys = BTreeSet::new();
+    let mut parse_errors = Vec::new();
+    let mut skipped_file_keys = BTreeSet::new();
+    let mut skipped_files = Vec::new();
+    for contribution in parsed {
+        for value in &contribution.parse_errors {
+            let key = value.to_string();
+            if parse_error_keys.insert(key) {
+                parse_errors.push(value.clone());
+            }
+        }
+        for value in &contribution.skipped_files {
+            let key = value.to_string();
+            if skipped_file_keys.insert(key) {
+                skipped_files.push(value.clone());
+            }
+        }
+    }
+    (parse_errors, skipped_files)
 }
 
 fn edges_by_source(
@@ -1681,6 +1859,10 @@ struct DeadCodeContribution {
     dispatched_method_names: Vec<String>,
     #[serde(default)]
     type_ref_names: Vec<String>,
+    #[serde(default)]
+    parse_errors: Vec<Value>,
+    #[serde(default)]
+    skipped_files: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1698,6 +1880,12 @@ struct ExportContribution {
     is_type_like: bool,
     #[serde(default)]
     is_entry_point: bool,
+    #[serde(default)]
+    verdict: Option<LivenessVerdict>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

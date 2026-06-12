@@ -33,6 +33,10 @@ const FACTS_FORMAT_VERSION: u32 = 2;
 pub struct AnalyzeOptions {
     pub entry_points: Vec<PathBuf>,
     pub public_api_files: Vec<PathBuf>,
+    /// When true, imports/re-exports only make targets live after execution is
+    /// reachable from entry/public files. Used by dead_code; unused_exports keeps
+    /// the default import-usage semantics.
+    pub entry_reachability: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -176,6 +180,7 @@ pub fn analyze_files_with_cache(
         &resolved_modules,
         &entry_points,
         &public_api_files,
+        options.entry_reachability,
     );
     let resolved_edges = edges
         .iter()

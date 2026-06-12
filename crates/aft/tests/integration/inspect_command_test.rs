@@ -1107,6 +1107,118 @@ fn unused_export_items(response: &Value) -> Vec<(String, String)> {
 }
 
 #[test]
+fn inspect_command_oxc_unused_exports_workspace_reports_dead_export_despite_dynamic_import() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "package.json",
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    );
+    write_file(
+        &root,
+        "packages/lib/package.json",
+        r#"{"name":"@scope/lib","exports":"./src/index.ts"}"#,
+    );
+    write_file(
+        &root,
+        "packages/lib/src/index.ts",
+        "export { consumed } from './api';\n",
+    );
+    write_file(
+        &root,
+        "packages/lib/src/api.ts",
+        "export function consumed() { return 1; }\nexport function genuinelyDead() { return 2; }\n",
+    );
+    write_file(&root, "packages/app/package.json", r#"{"name":"app"}"#);
+    write_file(
+        &root,
+        "packages/app/src/consumer.ts",
+        "import { consumed } from '@scope/lib';\nconsole.log(consumed());\n",
+    );
+    write_file(
+        &root,
+        "packages/app/src/dynamic.ts",
+        "const name = './optional-plugin';\nexport async function loadOptional() { return import(name); }\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+
+    tier2_run(&ctx, &["unused_exports"]);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-unused-oxc-workspace",
+            "command": "inspect",
+            "sections": "unused_exports",
+            "topK": 20,
+        }),
+    );
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let items = unused_export_items(&response);
+
+    assert!(
+        !items.contains(&(
+            "packages/lib/src/api.ts".to_string(),
+            "consumed".to_string()
+        )),
+        "barrel-export imported through a workspace package should be live: {response:#}",
+    );
+    assert!(
+        items.contains(&(
+            "packages/lib/src/api.ts".to_string(),
+            "genuinelyDead".to_string()
+        )),
+        "genuinely dead export should still be reported: {response:#}",
+    );
+    let dead_item = response["details"]["unused_exports"]
+        .as_array()
+        .expect("unused export details")
+        .iter()
+        .find(|item| item["file"] == "packages/lib/src/api.ts" && item["symbol"] == "genuinelyDead")
+        .expect("dead export detail");
+    assert_eq!(dead_item["provenance"], "oxc");
+}
+
+#[test]
+fn inspect_command_oxc_dead_code_keeps_same_file_schema_composition_live() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/index.ts",
+        "import { UserSchema } from './schema';\nconsole.log(UserSchema);\n",
+    );
+    write_file(
+        &root,
+        "src/schema.ts",
+        "const z = { object: () => ({ extend: () => ({}) }) };\nexport const BaseSchema = z.object({});\nexport const UserSchema = BaseSchema.extend({});\nexport const TrulyDeadSchema = z.object({});\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+
+    tier2_run(&ctx, &["dead_code"]);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-dead-oxc-same-file",
+            "command": "inspect",
+            "sections": "dead_code",
+            "topK": 20,
+        }),
+    );
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let items = dead_code_items(&response);
+
+    assert!(
+        !items.contains(&("src/schema.ts".to_string(), "BaseSchema".to_string())),
+        "schema composed via same-file value reference should not be dead: {response:#}",
+    );
+    assert!(
+        items.contains(&("src/schema.ts".to_string(), "TrulyDeadSchema".to_string())),
+        "genuinely dead schema export should still be reported: {response:#}",
+    );
+}
+
+#[test]
 fn inspect_command_dead_code_uses_cargo_manifest_targets_not_nested_main_files() {
     let (_temp_dir, root) = fixture_project();
     write_file(

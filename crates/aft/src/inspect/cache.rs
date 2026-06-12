@@ -97,7 +97,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// cached per-file contribution payloads and aggregate roll-up inputs.
 /// v13: dead_code callgraph snapshots are projected from the persisted
 /// CallgraphStore; per-row provenance now reflects store resolution tiers.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 13;
+/// v14: TS/JS dead_code and unused_exports contributions carry oxc verdicts,
+/// provenance, and oxc honesty metadata.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 14;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1070,7 +1072,44 @@ fn contribution_set_hash_with_conn(
         hasher.update(b"\0");
     }
     update_manifest_fingerprint_hash(&mut hasher, project_root)?;
+    if matches!(
+        category,
+        InspectCategory::DeadCode | InspectCategory::UnusedExports
+    ) {
+        update_resolver_config_fingerprint_hash(&mut hasher, project_root)?;
+    }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn update_resolver_config_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    project_root: &Path,
+) -> Result<(), InspectCacheError> {
+    let manifest_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    hasher.update(b"ts-js-resolver-configs\0");
+    let mut configs = crate::callgraph::walk_project_files(project_root)
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "tsconfig.json")
+        })
+        .collect::<Vec<_>>();
+    configs.sort();
+    configs.dedup();
+    for config in configs {
+        let relative_path = config
+            .strip_prefix(&manifest_root)
+            .unwrap_or(config.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content_hash = blake3::hash(&fs::read(&config)?);
+        hasher.update(relative_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(content_hash.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(())
 }
 
 fn update_manifest_fingerprint_hash(
@@ -1356,6 +1395,6 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 13);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 14);
     }
 }

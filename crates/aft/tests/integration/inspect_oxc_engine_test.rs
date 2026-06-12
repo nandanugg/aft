@@ -379,6 +379,29 @@ fn oxc_engine_genuine_dead_exports_remain_unused() {
 }
 
 #[test]
+fn oxc_engine_computed_dynamic_import_does_not_demote_unrelated_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/unrelated.ts",
+            "export function genuinelyDead() { return 1; }\n",
+        ),
+        (
+            "src/computed.ts",
+            "const name = './anything';\nawait import(name);\n",
+        ),
+    ]);
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(
+        &result,
+        "src/unrelated.ts",
+        "genuinelyDead",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
 fn oxc_engine_dynamic_imports_demote_to_uncertain_never_dead() {
     let (_temp, root, paths) = fixture_project(&[
         (
