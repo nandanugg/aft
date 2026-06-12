@@ -489,6 +489,9 @@ fn severity_counts(diagnostics: &[StoredDiagnostic]) -> (usize, usize, usize, us
     let mut hints = 0;
 
     for diagnostic in diagnostics {
+        if crate::lsp::environmental::is_environmental_diagnostic(diagnostic) {
+            continue;
+        }
         match diagnostic.severity {
             DiagnosticSeverity::Error => errors += 1,
             DiagnosticSeverity::Warning => warnings += 1,
@@ -520,4 +523,43 @@ fn display_path(snapshot: &InspectSnapshot, path: &Path) -> String {
 
 fn server_id(key: &ServerKey) -> String {
     key.kind.id_str().to_string()
+}
+
+#[cfg(test)]
+mod environmental_count_tests {
+    use std::path::PathBuf;
+
+    use super::severity_counts;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+
+    fn diag(line: u32, message: &str) -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: PathBuf::from("/repo/src/mixed.ts"),
+            line,
+            column: 1,
+            end_line: line,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: message.into(),
+            code: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn severity_counts_exclude_environmental_on_same_file() {
+        let diagnostics = vec![
+            diag(1, "Cannot find name 'x'."),
+            diag(
+                2,
+                "Failed to load schema from https://example.com/schema.json",
+            ),
+        ];
+        let (errors, warnings, _, _) = severity_counts(&diagnostics);
+        assert_eq!(
+            errors, 1,
+            "inspect summary must count only non-environmental errors"
+        );
+        assert_eq!(warnings, 0);
+    }
 }
