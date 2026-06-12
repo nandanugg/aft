@@ -487,12 +487,16 @@ pub(crate) fn aggregate_dead_code_contributions_with_limit(
             // Collect ALL items here; rank by signal tier and truncate below so
             // product findings survive the cap instead of being eaten by
             // alphabetically-first benchmark/tooling files.
-            dead_items.push(json!({
+            let mut item = json!({
                 "file": contribution.file,
                 "symbol": export.symbol,
                 "kind": export.kind,
                 "line": export.line,
-            }));
+            });
+            if let Some(provenance) = &export.provenance {
+                item["provenance"] = json!(provenance);
+            }
+            dead_items.push(item);
         }
     }
 

@@ -1107,23 +1107,38 @@ fn unused_export_items(response: &Value) -> Vec<(String, String)> {
 }
 
 #[test]
-fn inspect_command_oxc_unused_exports_keeps_package_barrel_import_live_and_reports_dead_export() {
+fn inspect_command_oxc_unused_exports_workspace_reports_dead_export_despite_dynamic_import() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
         "package.json",
-        r#"{"name":"@scope/bridge","exports":"./src/index.ts"}"#,
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
     );
-    write_file(&root, "src/index.ts", "export { used } from './impl';\n");
     write_file(
         &root,
-        "src/impl.ts",
-        "export function used() { return 1; }\nexport function genuinelyDead() { return 2; }\n",
+        "packages/lib/package.json",
+        r#"{"name":"@scope/lib","exports":"./src/index.ts"}"#,
     );
+    write_file(
+        &root,
+        "packages/lib/src/index.ts",
+        "export { consumed } from './api';\n",
+    );
+    write_file(
+        &root,
+        "packages/lib/src/api.ts",
+        "export function consumed() { return 1; }\nexport function genuinelyDead() { return 2; }\n",
+    );
+    write_file(&root, "packages/app/package.json", r#"{"name":"app"}"#);
     write_file(
         &root,
         "packages/app/src/consumer.ts",
-        "import { used } from '@scope/bridge';\nconsole.log(used());\n",
+        "import { consumed } from '@scope/lib';\nconsole.log(consumed());\n",
+    );
+    write_file(
+        &root,
+        "packages/app/src/dynamic.ts",
+        "const name = './optional-plugin';\nexport async function loadOptional() { return import(name); }\n",
     );
     let ctx = configured_context_with_callgraph_store(&root, true);
 
@@ -1132,7 +1147,7 @@ fn inspect_command_oxc_unused_exports_keeps_package_barrel_import_live_and_repor
     let response = inspect(
         &ctx,
         json!({
-            "id": "inspect-unused-oxc-barrel",
+            "id": "inspect-unused-oxc-workspace",
             "command": "inspect",
             "sections": "unused_exports",
             "topK": 20,
@@ -1142,13 +1157,26 @@ fn inspect_command_oxc_unused_exports_keeps_package_barrel_import_live_and_repor
     let items = unused_export_items(&response);
 
     assert!(
-        !items.contains(&("src/impl.ts".to_string(), "used".to_string())),
-        "barrel-export imported through the package entry should be live: {response:#}",
+        !items.contains(&(
+            "packages/lib/src/api.ts".to_string(),
+            "consumed".to_string()
+        )),
+        "barrel-export imported through a workspace package should be live: {response:#}",
     );
     assert!(
-        items.contains(&("src/impl.ts".to_string(), "genuinelyDead".to_string())),
+        items.contains(&(
+            "packages/lib/src/api.ts".to_string(),
+            "genuinelyDead".to_string()
+        )),
         "genuinely dead export should still be reported: {response:#}",
     );
+    let dead_item = response["details"]["unused_exports"]
+        .as_array()
+        .expect("unused export details")
+        .iter()
+        .find(|item| item["file"] == "packages/lib/src/api.ts" && item["symbol"] == "genuinelyDead")
+        .expect("dead export detail");
+    assert_eq!(dead_item["provenance"], "oxc");
 }
 
 #[test]

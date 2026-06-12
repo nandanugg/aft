@@ -265,13 +265,6 @@ impl<'a> GraphBuilder<'a> {
                         enqueue_module(target, &mut live_modules, &mut queue);
                         self.enqueue_status_live_modules(&mut live_modules, &mut queue);
                     }
-                } else {
-                    for state in &mut self.states {
-                        for export in &mut state.exports {
-                            mark_uncertain(export, "dynamic_import_nonliteral");
-                        }
-                    }
-                    self.enqueue_status_live_modules(&mut live_modules, &mut queue);
                 }
             }
         }
@@ -364,7 +357,6 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn apply_dynamic_imports(&mut self) {
-        let mut has_non_literal = false;
         let mut literal_targets = Vec::new();
         for module in self.modules {
             for dynamic in &module.dynamic_imports {
@@ -372,21 +364,12 @@ impl<'a> GraphBuilder<'a> {
                     if let Some(target) = dynamic.target {
                         literal_targets.push(target);
                     }
-                } else {
-                    has_non_literal = true;
                 }
             }
         }
         for target in literal_targets {
             let mut visited = BTreeSet::new();
             self.mark_all_uncertain(target, "dynamic_import", &mut visited);
-        }
-        if has_non_literal {
-            for state in &mut self.states {
-                for export in &mut state.exports {
-                    mark_uncertain(export, "dynamic_import_nonliteral");
-                }
-            }
         }
     }
 

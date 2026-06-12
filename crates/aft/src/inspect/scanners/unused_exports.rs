@@ -264,6 +264,7 @@ fn run_unused_exports_oxc_scan(
                         "symbol": export.symbol,
                         "kind": export.kind,
                         "line": export.line,
+                        "provenance": export.provenance,
                     }));
                 }
             }

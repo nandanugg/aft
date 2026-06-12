@@ -1734,12 +1734,16 @@ fn roll_up_unused_exports_contributions(
 
             count += 1;
             // Collect uncapped; rank by signal tier and truncate below.
-            items.push(json!({
+            let mut item = json!({
                 "file": scan.file,
                 "symbol": export.symbol,
                 "kind": export.kind,
                 "line": export.line,
-            }));
+            });
+            if let Some(provenance) = &export.provenance {
+                item["provenance"] = json!(provenance);
+            }
+            items.push(item);
         }
     }
 
