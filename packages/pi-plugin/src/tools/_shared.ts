@@ -19,7 +19,11 @@ export function coerceOptionalInt(
   max: number,
 ): number | undefined {
   if (v === undefined || v === null || v === "") return undefined;
-  if (typeof v === "number" && (v === 0 || !Number.isFinite(v))) return undefined;
+  // 0 is an empty-param sentinel ONLY when 0 is out of bounds anyway. For
+  // 0-indexed params (edit's `occurrence`, min=0) it is the most common legal
+  // value — dropping it sent agents into an ambiguous_match loop that told
+  // them to pass the param they had just passed.
+  if (typeof v === "number" && (!Number.isFinite(v) || (v === 0 && min > 0))) return undefined;
   const n = typeof v === "string" ? Number(v) : v;
   if (typeof n !== "number" || !Number.isInteger(n)) {
     throw new Error(`${paramName} must be an integer between ${min} and ${max}`);
