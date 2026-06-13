@@ -26,7 +26,10 @@
 set -euo pipefail
 
 TAG=""
-MAX_WAIT="${MAX_WAIT_SECONDS:-2100}"
+# Full release span = test matrix + 7 platform builds + npm/crates/GitHub
+# publishes, which runs 60-90 min. 2100s (35m) expired mid-build during the
+# v0.38.0 release; 5400s (90m) covers a normal run with headroom.
+MAX_WAIT="${MAX_WAIT_SECONDS:-5400}"
 REPO="cortexkit/aft"
 INTERVAL=5
 FAIL_FAST=1
