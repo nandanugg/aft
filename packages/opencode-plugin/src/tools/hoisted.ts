@@ -15,7 +15,7 @@ import { coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
-import { applyUpdateChunks, parsePatch } from "../patch-parser.js";
+import { applyUpdateChunks, type Hunk as PatchHunk, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
@@ -27,6 +27,7 @@ import { createBashKillTool, createBashStatusTool, createBashTool } from "./bash
 import { createBashWatchTool } from "./bash_watch.js";
 import { createBashWriteTool } from "./bash_write.js";
 import {
+  askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
   runAsk,
@@ -350,6 +351,120 @@ function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
   return ctx.config.lsp?.diagnostics_on_edit ?? false;
 }
 
+async function readCurrentFileForPreview(filePath: string): Promise<string> {
+  try {
+    return await fs.promises.readFile(filePath, "utf-8");
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: string }).code === "ENOENT"
+    ) {
+      return "";
+    }
+    throw error;
+  }
+}
+
+function previewDiffFromResponse(data: Record<string, unknown>, filePath: string): string {
+  const previewDiff = data.preview_diff;
+  if (typeof previewDiff === "string") return previewDiff;
+
+  const diff = data.diff as { before?: unknown; after?: unknown } | undefined;
+  if (typeof diff?.before === "string" && typeof diff.after === "string") {
+    return buildUnifiedDiff(filePath, diff.before, diff.after);
+  }
+
+  return "";
+}
+
+function virtualPatchContent(
+  virtualFiles: Map<string, string | null>,
+  filePath: string,
+): string | null | undefined {
+  return virtualFiles.has(filePath) ? (virtualFiles.get(filePath) ?? null) : undefined;
+}
+
+async function readPatchPreviewContent(
+  virtualFiles: Map<string, string | null>,
+  filePath: string,
+  action: "delete" | "update",
+  patchPath: string,
+): Promise<string> {
+  const virtualContent = virtualPatchContent(virtualFiles, filePath);
+  if (virtualContent !== undefined) {
+    if (virtualContent === null) {
+      throw new Error(`Failed to ${action} ${patchPath}: file not found: ${filePath}`);
+    }
+    return virtualContent;
+  }
+
+  try {
+    return await fs.promises.readFile(filePath, "utf-8");
+  } catch (error) {
+    throw new Error(`Failed to ${action} ${patchPath}: ${formatError(error)}`);
+  }
+}
+
+async function buildApplyPatchPreview(
+  hunks: PatchHunk[],
+  projectRoot: string,
+): Promise<{ filepath: string; diff: string }> {
+  const virtualFiles = new Map<string, string | null>();
+  const patches: string[] = [];
+  let firstFilePath = "";
+
+  for (const hunk of hunks) {
+    const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
+    if (!firstFilePath) firstFilePath = filePath;
+
+    switch (hunk.type) {
+      case "add": {
+        const virtualContent = virtualPatchContent(virtualFiles, filePath);
+        const exists =
+          virtualContent !== undefined ? virtualContent !== null : fs.existsSync(filePath);
+        if (exists) {
+          throw new Error(
+            `Failed to create ${hunk.path}: file already exists. Use *** Update File: to modify, or *** Delete File: first if you want to replace it entirely.`,
+          );
+        }
+        const after = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
+        patches.push(buildUnifiedDiff(filePath, "", after));
+        virtualFiles.set(filePath, after);
+        break;
+      }
+
+      case "delete": {
+        const before = await readPatchPreviewContent(virtualFiles, filePath, "delete", hunk.path);
+        patches.push(buildUnifiedDiff(filePath, before, ""));
+        virtualFiles.set(filePath, null);
+        break;
+      }
+
+      case "update": {
+        const before = await readPatchPreviewContent(virtualFiles, filePath, "update", hunk.path);
+        let after: string;
+        try {
+          after = applyUpdateChunks(before, filePath, hunk.chunks);
+        } catch (error) {
+          throw new Error(`Failed to update ${hunk.path}: ${formatError(error)}`);
+        }
+
+        const targetPath = hunk.move_path
+          ? resolvePathFromProjectRoot(projectRoot, hunk.move_path)
+          : filePath;
+        patches.push(buildUnifiedDiff(targetPath, before, after));
+        if (hunk.move_path) virtualFiles.set(filePath, null);
+        virtualFiles.set(targetPath, after);
+        break;
+      }
+    }
+  }
+
+  return { filepath: firstFilePath || projectRoot, diff: patches.join("\n") };
+}
+
 // ---------------------------------------------------------------------------
 // Tool descriptions focus on behavior, modes, and return values.
 // Parameter docs live in Zod .describe() and reach the LLM via JSON Schema.
@@ -563,15 +678,14 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         if (denial) return permissionDeniedResponse(denial);
       }
 
-      // Permission check
-      await runAsk(
-        context.ask({
-          permission: "edit",
-          patterns: [relPath],
-          always: ["*"],
-          metadata: { filepath: filePath },
-        }),
-      );
+      const currentContent = await readCurrentFileForPreview(filePath);
+      const previewDiff = buildUnifiedDiff(filePath, currentContent, content);
+
+      const denial = await askEditPermission(context, [relPath], {
+        filepath: filePath,
+        diff: previewDiff,
+      });
+      if (denial) return permissionDeniedResponse(denial);
 
       const data = await callBridge(ctx, context, "write", {
         file: filePath,
@@ -780,15 +894,6 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         if (denial) return permissionDeniedResponse(denial);
       }
 
-      await runAsk(
-        context.ask({
-          permission: "edit",
-          patterns: [relPath],
-          always: ["*"],
-          metadata: { filepath: filePath },
-        }),
-      );
-
       const params: Record<string, unknown> = { file: filePath };
 
       // Route to appropriate Rust command
@@ -844,6 +949,22 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
             : " Provide 'oldString' (+ optional 'newString'), 'symbol' + 'content', or an 'edits' array.";
         throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
       }
+
+      const previewData = await callBridge(ctx, context, command, {
+        ...params,
+        preview: true,
+        include_diff_content: true,
+      });
+      if (previewData.success === false) {
+        throw new Error((previewData.message as string) || "edit preview failed");
+      }
+
+      const previewDiff = previewDiffFromResponse(previewData, filePath);
+      const denial = await askEditPermission(context, [relPath], {
+        filepath: filePath,
+        diff: previewDiff,
+      });
+      if (denial) return permissionDeniedResponse(denial);
 
       params.diagnostics = diagnosticsOnEditDefault(ctx);
       // Request diff from Rust for UI metadata (avoids extra file reads in TS)
@@ -1012,7 +1133,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
       if (!patchText) throw new Error("'patchText' is required");
 
       // Parse the patch
-      let hunks: import("../patch-parser.js").Hunk[];
+      let hunks: PatchHunk[];
       try {
         hunks = parsePatch(patchText);
       } catch (e) {
@@ -1068,14 +1189,12 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      await runAsk(
-        context.ask({
-          permission: "edit",
-          patterns: relPaths,
-          always: ["*"],
-          metadata: {},
-        }),
-      );
+      const preview = await buildApplyPatchPreview(hunks, projectRoot);
+      const denial = await askEditPermission(context, relPaths, {
+        filepath: preview.filepath,
+        diff: preview.diff,
+      });
+      if (denial) return permissionDeniedResponse(denial);
 
       // Pre-patch checkpoint covers files that exist pre-patch (so the
       // agent can `aft_safety` undo if they want to abort after seeing a
@@ -1769,14 +1888,17 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
             if (denial) return permissionDeniedResponse(denial);
           }
 
-          await runAsk(
-            context.ask({
-              permission: "edit",
-              patterns: [relPath],
-              always: ["*"],
-              metadata: { filepath: filePath },
-            }),
+          const currentContent = await readCurrentFileForPreview(filePath);
+          const previewDiff = buildUnifiedDiff(
+            filePath,
+            currentContent,
+            normalizedArgs.content as string,
           );
+          const denial = await askEditPermission(context, [relPath], {
+            filepath: filePath,
+            diff: previewDiff,
+          });
+          if (denial) return permissionDeniedResponse(denial);
           const writeParams: Record<string, unknown> = {
             file: filePath,
             content: normalizedArgs.content as string,
