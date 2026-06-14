@@ -158,6 +158,80 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    /// Phase-3 gating benchmark: stat-all (non-strict verify_file) vs hash-all
+    /// (strict verify_file_strict) cost across a real repo's file set, with NO
+    /// file changed (the steady-state warm freshness pass). Decides Option B:
+    /// if stat-all is cheap even at large file counts, replace the per-edit
+    /// hash-all with stat-diff-first.
+    ///
+    ///   AFT_BENCH_REPO=/path/to/repo cargo test -p agent-file-tools --lib \
+    ///     --release -- --ignored --nocapture --test-threads=1 \
+    ///     freshness_stat_vs_hash_benchmark
+    #[test]
+    #[ignore = "manual benchmark; needs AFT_BENCH_REPO"]
+    fn freshness_stat_vs_hash_benchmark() {
+        use std::time::Instant;
+        let Ok(repo) = std::env::var("AFT_BENCH_REPO") else {
+            eprintln!("AFT_BENCH_REPO unset; skipping");
+            return;
+        };
+        let root = std::path::PathBuf::from(&repo);
+        let files: Vec<std::path::PathBuf> = crate::callgraph::walk_project_files(&root).collect();
+
+        // Cold pass: collect freshness records (this is the cold-build cost, not
+        // what we're optimizing — just needed to seed the warm comparison).
+        let records: Vec<(std::path::PathBuf, FileFreshness)> = files
+            .iter()
+            .filter_map(|p| collect(p).ok().map(|f| (p.clone(), f)))
+            .collect();
+
+        eprintln!(
+            "\n=== freshness stat-vs-hash benchmark ===\nrepo: {}\nfiles walked: {}  freshness records: {}",
+            root.display(),
+            files.len(),
+            records.len()
+        );
+
+        // 3 iterations each, report medians. Interleave to share cache effects.
+        let mut stat_ms = Vec::new();
+        let mut hash_ms = Vec::new();
+        for _ in 0..3 {
+            let t = Instant::now();
+            let mut stat_hot = 0usize;
+            for (path, cached) in &records {
+                // Non-strict: stat only; hashes ONLY if (mtime,size) differ.
+                // With no file changed, this is pure stat — the Option B cost.
+                if matches!(verify_file(path, cached), FreshnessVerdict::HotFresh) {
+                    stat_hot += 1;
+                }
+            }
+            stat_ms.push(t.elapsed().as_micros());
+
+            let t = Instant::now();
+            let mut hash_hot = 0usize;
+            for (path, cached) in &records {
+                // Strict: stat + content-hash every file (today's per-edit cost).
+                if matches!(verify_file_strict(path, cached), FreshnessVerdict::HotFresh) {
+                    hash_hot += 1;
+                }
+            }
+            hash_ms.push(t.elapsed().as_micros());
+
+            eprintln!("  iter: stat_hot={stat_hot} hash_hot={hash_hot}");
+        }
+        stat_ms.sort_unstable();
+        hash_ms.sort_unstable();
+        let stat_med = stat_ms[1] as f64 / 1000.0;
+        let hash_med = hash_ms[1] as f64 / 1000.0;
+        eprintln!(
+            "SUMMARY  files={}  stat_all_median={:.2}ms  hash_all_median={:.2}ms  speedup={:.1}x",
+            records.len(),
+            stat_med,
+            hash_med,
+            hash_med / stat_med.max(0.001)
+        );
+    }
+
     #[test]
     fn hot_fresh_when_mtime_size_match() {
         let dir = tempfile::tempdir().unwrap();
