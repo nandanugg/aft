@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
+use aft::cache_freshness;
 use aft::callgraph_store::CallGraphStore;
 use aft::config::Config;
 use aft::inspect::{
@@ -208,7 +210,7 @@ fn aggregate_contains_symbol(
 
 #[test]
 fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
-    let (_temp_dir, root, mutated_file) = build_fixture();
+    let (temp_dir, root, mutated_file) = build_fixture();
     let inspect_dir = root.join(".aft-cache").join("inspect");
 
     let first_manager = InspectManager::new();
@@ -216,6 +218,8 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
     assert_eq!(first.scanned_files.len(), 32);
     assert!(first.aggregate["groups_count"].as_u64().unwrap_or(0) > 0);
 
+    #[cfg(debug_assertions)]
+    cache_freshness::reset_hash_file_if_small_count_for_debug();
     let second_manager = InspectManager::new();
     let (second, _t2) = run_reuse(&second_manager, snapshot(&root, &inspect_dir));
     // Cache reuse is proven behaviorally: a fully-fresh second run rescans
@@ -224,6 +228,12 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
     // no signal beyond the scanned_files/aggregate checks below.)
     assert!(second.scanned_files.is_empty());
     assert_eq!(second.aggregate, first.aggregate);
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        cache_freshness::hash_file_if_small_count_for_debug(),
+        0,
+        "fully fresh quick reuse must be stat-only and avoid source hashing"
+    );
 
     fs::write(&mutated_file, changed_source()).expect("mutate one fixture file");
 
@@ -234,12 +244,68 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
         vec!["src/file_07.ts"]
     );
     assert_ne!(third.aggregate, first.aggregate);
+
+    let cold_inspect_dir = temp_dir.path().join("inspect-cold-duplicates-after-edit");
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse(&cold_manager, snapshot(&root, &cold_inspect_dir));
+    assert_eq!(
+        third.aggregate, cold.aggregate,
+        "stat-diff incremental aggregate must match a cold hash-all scan after an mtime-advancing edit"
+    );
 }
 
 #[test]
-fn inspect_tier2_reuse_rescans_same_size_content_change_with_restored_mtime() {
+fn inspect_tier2_reuse_rescans_mtime_advancing_same_size_change_and_matches_cold() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let root = temp_dir.path().join("project");
+    let root = temp_dir.path().join("project-mtime-advancing");
+    fs::create_dir_all(&root).expect("create project");
+    let source = write_file(&root, "src/export.ts", "export function one() {}\n");
+    let initial_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(&source, initial_mtime).expect("set initial mtime");
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+
+    let warm_manager = InspectManager::new();
+    let (first, _t1) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert_eq!(first.scanned_files.len(), 1);
+    assert_eq!(first.aggregate["items"][0]["symbol"], "one");
+
+    fs::write(&source, "export function two() {}\n").expect("same-size mutate");
+    let advanced_mtime = filetime::FileTime::from_unix_time(1_700_000_001, 0);
+    filetime::set_file_mtime(&source, advanced_mtime).expect("advance mtime");
+
+    let (warm, _t2) = run_reuse_category(
+        &warm_manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert_eq!(
+        relative_paths(&root, &warm.scanned_files),
+        vec!["src/export.ts"]
+    );
+    assert_eq!(warm.aggregate["items"][0]["symbol"], "two");
+    assert_ne!(warm.aggregate, first.aggregate);
+
+    let cold_inspect_dir = temp_dir.path().join("inspect-cold-mtime-advancing");
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::UnusedExports,
+    );
+    assert_eq!(
+        warm.aggregate, cold.aggregate,
+        "stat-diff incremental aggregate must match a cold hash-all scan for normal mtime-advancing edits"
+    );
+}
+
+#[test]
+fn inspect_tier2_reuse_treats_mtime_preserving_same_size_change_as_fresh_until_ceiling() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project-mtime-preserving");
     fs::create_dir_all(&root).expect("create project");
     let source = write_file(&root, "src/export.ts", "export function one() {}\n");
     let fixed_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
@@ -265,12 +331,26 @@ fn inspect_tier2_reuse_rescans_same_size_content_change_with_restored_mtime() {
         InspectCategory::UnusedExports,
     );
 
-    assert_eq!(
-        relative_paths(&root, &second.scanned_files),
-        vec!["src/export.ts"]
+    // Accepted stat-diff residual: same-size content changed while mtime was
+    // preserved looks fresh, trading rare stale advisory Code Health for a
+    // stat-only per-edit path. The 30-minute staleness ceiling's strict pass
+    // heals this case; do not reintroduce per-edit hash-all to catch it here.
+    assert!(second.scanned_files.is_empty());
+    assert_eq!(second.aggregate, first.aggregate);
+    assert_eq!(second.aggregate["items"][0]["symbol"], "one");
+
+    let cold_inspect_dir = temp_dir.path().join("inspect-cold-mtime-preserving");
+    let cold_manager = InspectManager::new();
+    let (cold, _cold_elapsed) = run_reuse_category(
+        &cold_manager,
+        snapshot(&root, &cold_inspect_dir),
+        InspectCategory::UnusedExports,
     );
-    assert_eq!(second.aggregate["items"][0]["symbol"], "two");
-    assert_ne!(second.aggregate, first.aggregate);
+    assert_eq!(cold.aggregate["items"][0]["symbol"], "two");
+    assert_ne!(
+        second.aggregate, cold.aggregate,
+        "cold scan proves the preserved-mtime edit changed content even though stat-diff reused the cached aggregate"
+    );
 }
 
 fn unused_contribution_payloads(

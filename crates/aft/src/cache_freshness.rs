@@ -1,4 +1,6 @@
 use rayon::prelude::*;
+#[cfg(debug_assertions)]
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
@@ -9,6 +11,10 @@ pub const CONTENT_HASH_SIZE_CAP: u64 = 4 * 1024 * 1024;
 
 #[cfg(debug_assertions)]
 static STRICT_VERIFY_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
+thread_local! {
+    static HASH_FILE_IF_SMALL_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileFreshness {
@@ -36,7 +42,16 @@ pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blak
     if size > CONTENT_HASH_SIZE_CAP {
         return Ok(None);
     }
+    #[cfg(debug_assertions)]
+    HASH_FILE_IF_SMALL_CALLS.with(|calls| calls.set(calls.get() + 1));
     fs::read(path).map(|bytes| Some(hash_bytes(&bytes)))
+}
+
+pub fn metadata_matches(path: &Path, cached: &FileFreshness) -> std::io::Result<bool> {
+    let metadata = fs::metadata(path)?;
+    let new_size = metadata.len();
+    let new_mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
+    Ok(new_size == cached.size && new_mtime == cached.mtime)
 }
 
 pub fn zero_hash() -> blake3::Hash {
@@ -113,6 +128,18 @@ pub fn reset_verify_file_strict_count_for_debug() {
 #[doc(hidden)]
 pub fn verify_file_strict_count_for_debug() -> usize {
     STRICT_VERIFY_FILE_CALLS.load(Ordering::Relaxed)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_hash_file_if_small_count_for_debug() {
+    HASH_FILE_IF_SMALL_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn hash_file_if_small_count_for_debug() -> usize {
+    HASH_FILE_IF_SMALL_CALLS.with(Cell::get)
 }
 
 fn verify_file_inner(
@@ -258,6 +285,9 @@ mod tests {
         write(&path, b"bravo");
         filetime::set_file_mtime(&path, original_mtime).unwrap();
 
+        // Stat-diff freshness intentionally treats same-size, same-mtime edits as
+        // fresh; Tier-2's staleness ceiling heals this accepted residual with a
+        // periodic strict pass instead of hashing every file on each edit.
         assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
         assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
     }
@@ -274,6 +304,8 @@ mod tests {
 
         assert_eq!(fresh.size, CONTENT_HASH_SIZE_CAP + 1);
         assert_eq!(fresh.content_hash, zero_hash());
+        // Non-strict stat-diff trusts unchanged metadata for over-cap files and
+        // avoids strict's needless rescan of large unchanged files.
         assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
         assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
     }
