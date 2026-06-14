@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 use serde::Deserialize;
@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
-use super::freshness::ContributionFreshness;
+use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
     normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
     InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
@@ -42,13 +42,6 @@ struct CachedContributionFreshness {
 struct InspectCacheIdentity {
     sqlite_path: PathBuf,
     project_root: PathBuf,
-}
-
-#[derive(PartialEq, Eq)]
-struct ContributionFingerprint {
-    count: usize,
-    set_hash: String,
-    hash_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -692,10 +685,27 @@ impl InspectManager {
         job: &InspectJob,
         cache: &InspectCache,
     ) -> Result<Option<InspectScanSuccess>, String> {
-        let cached = load_contribution_fingerprint(cache, job.category)?;
-        let current = current_file_fingerprint(&job.project_root, &job.scope_files)?;
-        if !cached.hash_complete || !current.hash_complete || cached != current {
+        let cached_records = load_contribution_freshness(cache, job.category)?;
+        let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
+        if cached_records.len() != current_by_relative.len() {
             return Ok(None);
+        }
+        for record in &cached_records {
+            let relative = freshness_record_relative_key(record);
+            let Some(current_file) = current_by_relative.get(&relative) else {
+                return Ok(None);
+            };
+            match cache_freshness::metadata_matches(current_file, &record.freshness) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(format!(
+                        "failed to stat {} for tier2 quick reuse: {error}",
+                        current_file.display()
+                    ));
+                }
+            }
         }
 
         let contribution_set_hash = cache
@@ -748,7 +758,7 @@ impl InspectManager {
             };
 
             let absolute = job.project_root.join(&record.file_path);
-            match verify_contribution_file_strict(&absolute, &record.freshness) {
+            match verify_contribution_file(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh {
                     metadata_changed,
                     freshness,
@@ -1210,7 +1220,7 @@ fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutc
 /// Exists to self-attribute pathological scans (note #263 class: a 100ms
 /// unused_exports pass once took 677s under release-gate machine load) without
 /// needing a lucky live `sample`. Logged as ONE info line per pass, only when
-/// real work happened (scan/snapshot/rollup), so quiet reuse passes stay silent.
+/// real work happened (freshness/scan/snapshot/rollup/db), so quiet reuse passes stay silent.
 #[derive(Default)]
 struct Tier2PhaseTimings {
     /// Freshness verification of cached contributions (file stat + hash reads).
@@ -1228,7 +1238,7 @@ struct Tier2PhaseTimings {
 
 impl Tier2PhaseTimings {
     fn log(&self, category: InspectCategory) {
-        let worked = self.scan + self.snapshot + self.rollup + self.db;
+        let worked = self.freshness + self.scan + self.snapshot + self.rollup + self.db;
         if worked < Duration::from_millis(50) {
             return;
         }
@@ -1394,76 +1404,6 @@ fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
-fn load_contribution_fingerprint(
-    cache: &InspectCache,
-    category: InspectCategory,
-) -> Result<ContributionFingerprint, String> {
-    let (count, set_hash, hash_complete) = cache
-        .contribution_fingerprint(category)
-        .map_err(|error| error.to_string())?;
-    Ok(ContributionFingerprint {
-        count,
-        set_hash,
-        hash_complete,
-    })
-}
-
-fn current_file_fingerprint(
-    project_root: &Path,
-    files: &[PathBuf],
-) -> Result<ContributionFingerprint, String> {
-    let mut entries = Vec::with_capacity(files.len());
-    let mut hash_complete = true;
-    for file in files {
-        let freshness = cache_freshness::collect(file)
-            .map_err(|error| format!("failed to fingerprint {}: {error}", file.display()))?;
-        let relative_path = relative_cache_key(project_root, file);
-        let mtime_ns = system_time_to_ns_i64(freshness.mtime);
-        if freshness.content_hash == cache_freshness::zero_hash() {
-            hash_complete = false;
-        }
-        entries.push((
-            relative_path,
-            mtime_ns,
-            freshness.size,
-            freshness.content_hash.to_hex().to_string(),
-        ));
-    }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut hasher = blake3::Hasher::new();
-    for (relative_path, mtime_ns, file_size, file_hash) in &entries {
-        update_contribution_fingerprint_hash(
-            &mut hasher,
-            relative_path,
-            *mtime_ns,
-            *file_size,
-            file_hash,
-        );
-    }
-
-    Ok(ContributionFingerprint {
-        count: entries.len(),
-        set_hash: hasher.finalize().to_hex().to_string(),
-        hash_complete,
-    })
-}
-
-fn update_contribution_fingerprint_hash(
-    hasher: &mut blake3::Hasher,
-    relative_path: &str,
-    mtime_ns: i64,
-    file_size: u64,
-    file_hash: &str,
-) {
-    hasher.update(relative_path.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(&mtime_ns.to_le_bytes());
-    hasher.update(&file_size.to_le_bytes());
-    hasher.update(&[0]);
-    hasher.update(file_hash.as_bytes());
-}
-
 fn verify_contribution_file_strict(path: &Path, cached: &FileFreshness) -> ContributionFreshness {
     match cache_freshness::verify_file_strict(path, cached) {
         FreshnessVerdict::HotFresh => ContributionFreshness::Fresh {
@@ -1506,14 +1446,6 @@ fn load_contribution_freshness(
 
 fn freshness_record_relative_key(record: &CachedContributionFreshness) -> String {
     record.file_path.to_string_lossy().to_string()
-}
-
-fn system_time_to_ns_i64(time: SystemTime) -> i64 {
-    let nanos = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_nanos();
-    nanos.min(i64::MAX as u128) as i64
 }
 
 fn relative_cache_key(project_root: &Path, path: &Path) -> String {
