@@ -452,7 +452,12 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           if (isTerminalStatus(status.status)) {
             return bashResult(
               appendPipeStripNote(
-                withBashHints(formatForegroundResult(status), bridgeCommand, aftSearchRegistered),
+                withBashHints(
+                  formatForegroundResult(status),
+                  bridgeCommand,
+                  aftSearchRegistered,
+                  extCtx.cwd,
+                ),
                 pipeStrip.note,
               ),
               {
@@ -498,7 +503,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       const output = (response.output as string | undefined) ?? "";
       return bashResult(
         appendPipeStripNote(
-          withBashHints(output, bridgeCommand, aftSearchRegistered),
+          withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
           pipeStrip.note,
         ),
         details,
@@ -553,8 +558,18 @@ function formatPromotionMessage(
  * `tool.execute.after` nudges; only fires on terminal bash output (not
  * background-spawn/promotion messages, which have no real output yet).
  */
-function withBashHints(output: string, command: string, aftSearchRegistered: boolean): string {
-  return maybeAppendGrepSearchHint(maybeAppendConflictsHint(output), command, aftSearchRegistered);
+function withBashHints(
+  output: string,
+  command: string,
+  aftSearchRegistered: boolean,
+  projectRoot: string,
+): string {
+  return maybeAppendGrepSearchHint(
+    maybeAppendConflictsHint(output),
+    command,
+    aftSearchRegistered,
+    projectRoot,
+  );
 }
 
 export function createBashStatusTool(ctx: PluginContext) {

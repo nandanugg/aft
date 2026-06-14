@@ -344,6 +344,7 @@ export function createBashTool(
               appendPipeStripNote(formatForegroundResult(status), pipeStrip.note),
               command,
               aftSearchRegistered,
+              projectRootFor(context),
             );
             const metadataPayload = foregroundMetadata(description, status, rendered);
             metadata?.(metadataPayload);

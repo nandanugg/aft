@@ -1,3 +1,6 @@
+import * as os from "node:os";
+import * as path from "node:path";
+
 // Pure helpers for the bash-output hint nudges appended to bash tool results.
 //
 // Shared across harnesses (OpenCode applies it in `tool.execute.after`; Pi
@@ -78,13 +81,87 @@ export function maybeAppendGrepSearchHint(
   output: string,
   command: string,
   aftSearchRegistered: boolean,
+  projectRoot?: string,
 ): string {
   if (output === "") return output;
   if (!commandInvokesCodeSearch(command)) return output;
   if (output.includes(GREP_SEARCH_HINT_PREFIX)) return output;
+  if (shouldSuppressGrepSearchHint(command, projectRoot)) return output;
 
   const hint = aftSearchRegistered ? GREP_SEARCH_AFT_SEARCH_HINT : GREP_SEARCH_GREP_HINT;
   return `${output}\n\n${hint}`;
+}
+
+function shouldSuppressGrepSearchHint(command: string, projectRoot: string | undefined): boolean {
+  const root = projectRoot?.trim();
+  if (!root) return false;
+
+  const statements = splitTopLevelStatements(command);
+  if (statements === null) return false;
+
+  let sawCodeSearchStatement = false;
+  for (const statement of statements) {
+    const firstStage = firstPipelineStage(statement);
+    if (firstStage === null) continue;
+    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
+    if (firstToken === null) continue;
+    if (firstToken.token !== "grep" && firstToken.token !== "rg") continue;
+
+    sawCodeSearchStatement = true;
+    const operands = collectPathOperands(firstStage, firstToken.end);
+    if (operands.length === 0) return false;
+    for (const operand of operands) {
+      if (isPathInsideProject(root, operand)) return false;
+    }
+  }
+
+  return sawCodeSearchStatement;
+}
+
+function collectPathOperands(firstStage: string, startAfterCommand: number): string[] {
+  const operands: string[] = [];
+  let index = skipSpaces(firstStage, startAfterCommand);
+
+  while (index < firstStage.length) {
+    const tokenResult = readShellToken(firstStage, index);
+    if (tokenResult === null) break;
+    const { token, end } = tokenResult;
+    index = skipSpaces(firstStage, end);
+
+    if (token.startsWith("-")) continue;
+    if (looksLikePathOperand(token)) operands.push(token);
+  }
+
+  return operands;
+}
+
+function looksLikePathOperand(token: string): boolean {
+  return (
+    token.includes("/") ||
+    token.startsWith("~") ||
+    token.startsWith("./") ||
+    token.startsWith("../")
+  );
+}
+
+function expandTilde(target: string): string {
+  if (!target.startsWith("~")) return target;
+  if (target === "~" || target.startsWith("~/")) {
+    return path.join(os.homedir(), target.slice(1));
+  }
+  return target;
+}
+
+function resolvePathOperand(projectRoot: string, operand: string): string {
+  const expanded = expandTilde(operand);
+  return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(projectRoot, expanded);
+}
+
+function isPathInsideProject(projectRoot: string, operand: string): boolean {
+  const root = path.resolve(projectRoot);
+  const resolved = resolvePathOperand(root, operand);
+  const rel = path.relative(root, resolved);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 /**
