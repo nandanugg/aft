@@ -441,6 +441,7 @@ fn attach_bg_completions(
             | "bash_status"
             | "bash_write"
             | "bash_promote"
+            | "bash_regex_match"
             | "bash_drain_completions"
             | "bash_notify"
             | "bash_unnotify"
@@ -499,6 +500,7 @@ fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
             | "bash_status"
             | "bash_write"
             | "bash_promote"
+            | "bash_regex_match"
             | "bash_drain_completions"
             | "bash_notify"
             | "bash_unnotify"
@@ -555,6 +557,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
         "bash_unnotify" => aft::commands::bash_notify::handle_unnotify(&req, ctx),
         "bash_promote" => aft::commands::bash_promote::handle(&req, ctx),
+        "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
         "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
         "bash_write" => aft::commands::bash_write::handle(&req, ctx),
         "db_get_state" => aft::commands::state::handle_db_get_state(&req, ctx),
