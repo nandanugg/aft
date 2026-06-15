@@ -879,6 +879,7 @@ fn execute_degraded_grep_fallback(
         truncated,
         fully_degraded: true,
         engine_capped,
+        walk_truncated: false,
     })
 }
 

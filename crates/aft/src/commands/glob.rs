@@ -3,13 +3,19 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
+use crate::grep_executor::bounded_fallback_walk_files;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, has_any_project_file_from, resolve_search_scope, sort_paths_by_mtime_desc,
-    walk_project_files_from,
 };
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
+
+#[derive(Debug)]
+struct GlobDiscovery {
+    files: Vec<PathBuf>,
+    walk_truncated: bool,
+}
 
 const MAX_GLOB_RESULTS: usize = 100;
 const GLOB_TRUNCATED_MESSAGE: &str =
@@ -75,39 +81,49 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         .iter()
         .any(|root| scope_has_files(&project_root, root));
 
-    let mut files = if search_roots.len() == 1 {
-        glob_root(
+    let (mut files, walk_truncated) = if search_roots.len() == 1 {
+        let discovery = glob_root(
             ctx,
             &project_root,
             &search_roots[0],
             pattern,
             MAX_GLOB_RESULTS + 1,
-        )
+        );
+        (discovery.files, discovery.walk_truncated)
     } else {
-        merge_glob_files(
-            search_roots
-                .iter()
-                .flat_map(|root| glob_root(ctx, &project_root, root, pattern, MAX_GLOB_RESULTS + 1))
-                .collect(),
-        )
+        let discoveries: Vec<GlobDiscovery> = search_roots
+            .iter()
+            .map(|root| glob_root(ctx, &project_root, root, pattern, MAX_GLOB_RESULTS + 1))
+            .collect();
+        let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
+        let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
+        (files, walk_truncated)
     };
     let total = files.len();
-    let truncated = total > MAX_GLOB_RESULTS;
-    if truncated {
+    let result_truncated = total > MAX_GLOB_RESULTS;
+    if result_truncated {
         files.truncate(MAX_GLOB_RESULTS);
     }
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "text": format_glob_text(&files, pattern, &project_root, truncated),
-            "complete": true,
-            "no_files_matched_scope": !scope_has_files,
-            "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-            "total": total,
-            "truncated": truncated,
-        }),
-    )
+    let mut body = serde_json::json!({
+        "text": format_glob_text(&files, pattern, &project_root, result_truncated),
+        "complete": !walk_truncated,
+        "no_files_matched_scope": !scope_has_files,
+        "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "total": total,
+        "truncated": result_truncated,
+    });
+    if walk_truncated {
+        body["walk_truncated"] = serde_json::Value::Bool(true);
+        let note = "(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)";
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n{}",
+            body["text"].as_str().unwrap_or_default(),
+            note
+        ));
+    }
+
+    Response::success(&req.id, body)
 }
 
 fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {
@@ -121,20 +137,24 @@ fn glob_root(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
-) -> Vec<PathBuf> {
+) -> GlobDiscovery {
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
     let search_index = ctx.search_index().borrow();
     match search_index.as_ref() {
-        Some(index) if index.ready && search_scope.use_index => {
-            index.glob(pattern, &search_scope.root)
-        }
+        Some(index) if index.ready && search_scope.use_index => GlobDiscovery {
+            files: index.glob(pattern, &search_scope.root),
+            walk_truncated: false,
+        },
         _ => {
             if !search_scope.use_index {
-                if let Some(rg_files) =
+                if let Some(outcome) =
                     super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)
                 {
-                    return rg_files;
+                    return GlobDiscovery {
+                        files: outcome.files,
+                        walk_truncated: outcome.walk_truncated,
+                    };
                 }
             }
             fallback_glob(project_root, &search_scope.root, pattern)
@@ -158,16 +178,18 @@ fn fallback_glob(
     project_root: &std::path::Path,
     search_root: &std::path::Path,
     pattern: &str,
-) -> Vec<std::path::PathBuf> {
+) -> GlobDiscovery {
     let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
     let filter_root = if search_root.starts_with(project_root) {
         project_root
     } else {
         search_root
     };
-    let mut files = walk_project_files_from(filter_root, search_root, &filters);
-    sort_paths_by_mtime_desc(&mut files);
-    files
+    let outcome = bounded_fallback_walk_files(filter_root, search_root, &filters);
+    GlobDiscovery {
+        files: outcome.files,
+        walk_truncated: outcome.walk_truncated,
+    }
 }
 
 fn format_glob_text(

@@ -20,7 +20,10 @@ use crate::lsp::position::path_to_uri;
 use crate::lsp::registry::ServerKind;
 use crate::lsp::{transport, LspError};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for interactive LSP requests (hover, goto-def, references, rename).
+const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Longer budget for one-shot handshake requests (initialize, shutdown).
+const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STDERR_TAIL_LINES: usize = 64;
@@ -403,9 +406,10 @@ impl LspClient {
 
         let params = serde_json::from_value::<lsp_types::InitializeParams>(params_value)?;
 
-        let result_value = self.send_request_value(
+        let result_value = self.send_request_value_with_timeout(
             <lsp_types::request::Initialize as lsp_types::request::Request>::METHOD,
             params,
+            HANDSHAKE_REQUEST_TIMEOUT,
         )?;
         let result: lsp_types::InitializeResult = serde_json::from_value(result_value.clone())?;
 
@@ -500,7 +504,7 @@ impl LspClient {
     where
         P: serde::Serialize,
     {
-        self.send_request_value_with_timeout(method, params, REQUEST_TIMEOUT)
+        self.send_request_value_with_timeout(method, params, INTERACTIVE_REQUEST_TIMEOUT)
     }
 
     fn send_request_value_with_timeout<P>(
@@ -591,7 +595,10 @@ impl LspClient {
             return Ok(());
         }
 
-        if let Err(err) = self.send_request::<lsp_types::request::Shutdown>(()) {
+        if let Err(err) = self.send_request_with_timeout::<lsp_types::request::Shutdown>(
+            (),
+            HANDSHAKE_REQUEST_TIMEOUT,
+        ) {
             self.state = ServerState::ShuttingDown;
             if self.child.try_wait()?.is_some() {
                 self.state = ServerState::Exited;
@@ -922,6 +929,16 @@ mod tests {
         let caps = parse_diagnostic_capabilities(&value);
         assert!(caps.pull_diagnostics);
         assert!(!caps.workspace_diagnostics);
+    }
+
+    #[test]
+    fn interactive_request_timeout_is_eight_seconds() {
+        assert_eq!(INTERACTIVE_REQUEST_TIMEOUT, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn handshake_request_timeout_remains_thirty_seconds() {
+        assert_eq!(HANDSHAKE_REQUEST_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]

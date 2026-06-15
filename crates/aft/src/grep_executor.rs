@@ -3,7 +3,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use ignore::WalkBuilder;
 use rayon::prelude::*;
 
 use crate::commands::multi_path::{
@@ -13,10 +15,21 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, for_each_walk_project_file_from, has_any_project_file_from,
-    read_searchable_text, resolve_search_scope, sort_grep_matches_by_mtime_desc,
-    walk_project_files_from, GrepMatch, GrepResult, IndexStatus,
+    build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
+    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, GrepMatch, GrepResult, IndexStatus,
+    PathFilters,
 };
+
+/// Maximum files enumerated during grep/glob index-unavailable fallback walks.
+pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
+/// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
+pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug)]
+pub struct FallbackWalkOutcome {
+    pub files: Vec<PathBuf>,
+    pub walk_truncated: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct GrepParams {
@@ -301,6 +314,7 @@ fn grep_explicit_file(
         truncated: truncated.load(Ordering::Relaxed),
         fully_degraded: false,
         engine_capped: engine_capped.load(Ordering::Relaxed),
+        walk_truncated: false,
     }
 }
 
@@ -317,6 +331,7 @@ pub fn merge_grep_results(
     let mut any_child_truncated = false;
     let mut fully_degraded = false;
     let mut engine_capped = false;
+    let mut walk_truncated = false;
     let mut seen_match_keys = HashSet::new();
 
     for result in results {
@@ -327,6 +342,7 @@ pub fn merge_grep_results(
         any_child_truncated |= result.truncated;
         fully_degraded |= result.fully_degraded;
         engine_capped |= result.engine_capped;
+        walk_truncated |= result.walk_truncated;
 
         for grep_match in result.matches {
             let file_key = canonical_key(&grep_match.file);
@@ -351,7 +367,149 @@ pub fn merge_grep_results(
         truncated: any_child_truncated || total_matches > max_results,
         fully_degraded,
         engine_capped,
+        walk_truncated,
     }
+}
+
+fn fallback_project_walk_builder(search_root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(search_root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                return !matches!(
+                    name.as_ref(),
+                    "node_modules"
+                        | "target"
+                        | "venv"
+                        | ".venv"
+                        | ".git"
+                        | "__pycache__"
+                        | ".tox"
+                        | "dist"
+                        | "build"
+                );
+            }
+            true
+        });
+    builder
+}
+
+/// Bounded project walk used when the trigram index is unavailable (grep/glob fallback).
+pub(crate) fn bounded_fallback_walk_files(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+) -> FallbackWalkOutcome {
+    bounded_fallback_walk_files_with_limits(
+        filter_root,
+        search_root,
+        filters,
+        MAX_FALLBACK_WALK_FILES,
+        FALLBACK_WALK_BUDGET,
+    )
+}
+
+fn bounded_fallback_walk_files_with_limits(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: usize,
+    budget: Duration,
+) -> FallbackWalkOutcome {
+    let started = Instant::now();
+    let mut files = Vec::new();
+    let mut walk_truncated = false;
+    let builder = fallback_project_walk_builder(search_root);
+
+    for entry in builder.build().filter_map(|entry| entry.ok()) {
+        if started.elapsed() >= budget {
+            walk_truncated = true;
+            break;
+        }
+        if !entry
+            .file_type()
+            .map_or(false, |file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.into_path();
+        if filters.matches(filter_root, &path) {
+            files.push(path);
+            if files.len() > max_files {
+                walk_truncated = true;
+                files.truncate(max_files);
+                break;
+            }
+        }
+    }
+
+    sort_paths_by_mtime_desc(&mut files);
+    FallbackWalkOutcome {
+        files,
+        walk_truncated,
+    }
+}
+
+pub(crate) fn for_each_bounded_fallback_walk_file<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    mut on_file: F,
+) -> bool
+where
+    F: FnMut(&PathBuf),
+{
+    for_each_bounded_fallback_walk_file_with_limits(
+        filter_root,
+        search_root,
+        filters,
+        MAX_FALLBACK_WALK_FILES,
+        FALLBACK_WALK_BUDGET,
+        &mut on_file,
+    )
+}
+
+fn for_each_bounded_fallback_walk_file_with_limits<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: usize,
+    budget: Duration,
+    on_file: &mut F,
+) -> bool
+where
+    F: FnMut(&PathBuf),
+{
+    let started = Instant::now();
+    let mut files_seen = 0usize;
+    let builder = fallback_project_walk_builder(search_root);
+
+    for entry in builder.build().filter_map(|entry| entry.ok()) {
+        if started.elapsed() >= budget {
+            return true;
+        }
+        if !entry
+            .file_type()
+            .map_or(false, |file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.into_path();
+        if filters.matches(filter_root, &path) {
+            files_seen += 1;
+            if files_seen > max_files {
+                return true;
+            }
+            on_file(&path);
+        }
+    }
+    false
 }
 
 pub fn weakest_index_status(left: IndexStatus, right: IndexStatus) -> IndexStatus {
@@ -443,15 +601,16 @@ fn fallback_grep(
         matches.extend(partial);
     };
 
-    for_each_walk_project_file_from(filter_root, search_root, &filters, |path| {
-        if stop_scan.load(Ordering::Relaxed) {
-            return;
-        }
-        batch.push(path.clone());
-        if batch.len() >= 256 {
-            flush_batch(&mut batch, &mut matches);
-        }
-    });
+    let walk_truncated =
+        for_each_bounded_fallback_walk_file(filter_root, search_root, &filters, |path| {
+            if stop_scan.load(Ordering::Relaxed) {
+                return;
+            }
+            batch.push(path.clone());
+            if batch.len() >= 256 {
+                flush_batch(&mut batch, &mut matches);
+            }
+        });
     flush_batch(&mut batch, &mut matches);
 
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
@@ -465,6 +624,7 @@ fn fallback_grep(
         truncated: truncated.load(Ordering::Relaxed),
         fully_degraded: true,
         engine_capped: engine_capped.load(Ordering::Relaxed),
+        walk_truncated,
     }
 }
 
@@ -615,11 +775,11 @@ pub(crate) fn ripgrep_glob(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
-) -> Option<Vec<PathBuf>> {
+) -> Option<FallbackWalkOutcome> {
     let filters = build_path_filters(&[pattern.to_string()], &[]).ok()?;
-    let mut files = walk_project_files_from(search_root, search_root, &filters);
-    files.truncate(max_results);
-    Some(files)
+    let mut outcome = bounded_fallback_walk_files(search_root, search_root, &filters);
+    outcome.files.truncate(max_results);
+    Some(outcome)
 }
 
 fn current_index_status(ctx: &AppContext) -> IndexStatus {
@@ -688,6 +848,7 @@ mod tests {
             truncated,
             fully_degraded: false,
             engine_capped: false,
+            walk_truncated: false,
         }
     }
 
@@ -727,6 +888,38 @@ mod tests {
 
         assert!(scope.multi_root);
         assert_eq!(scope.per_root_max, 20);
+    }
+
+    #[test]
+    fn bounded_fallback_walk_truncates_at_file_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for i in 0..25 {
+            let path = root.join(format!("file_{i:03}.txt"));
+            std::fs::write(path, "needle\n").expect("write");
+        }
+        let filters = build_path_filters(&["**/*.txt".to_string()], &[]).expect("filters");
+        let outcome = bounded_fallback_walk_files_with_limits(
+            root,
+            root,
+            &filters,
+            20,
+            Duration::from_secs(60),
+        );
+        assert!(outcome.walk_truncated);
+        assert_eq!(outcome.files.len(), 20);
+    }
+
+    #[test]
+    fn bounded_fallback_walk_small_tree_not_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "x\n").expect("write");
+        std::fs::write(root.join("b.txt"), "x\n").expect("write");
+        let filters = build_path_filters(&["**/*.txt".to_string()], &[]).expect("filters");
+        let outcome = bounded_fallback_walk_files(root, root, &filters);
+        assert!(!outcome.walk_truncated);
+        assert_eq!(outcome.files.len(), 2);
     }
 
     #[test]

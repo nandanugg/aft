@@ -112,6 +112,32 @@ fn canonical_path_string(path: &Path) -> String {
         .to_string()
 }
 
+#[test]
+fn glob_fallback_small_tree_has_no_walk_truncated() {
+    let project = setup_project(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "glob-no-walk-trunc",
+            "command": "glob",
+            "pattern": "src/**/*.rs",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "glob should succeed: {response:?}"
+    );
+    assert_eq!(response["complete"], true);
+    assert!(response.get("walk_truncated").is_none() || response["walk_truncated"] == false);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 fn rg_available() -> bool {
     std::process::Command::new("rg")
         .arg("--version")
@@ -147,6 +173,8 @@ fn grep_fallback_returns_relative_paths_and_counts() {
     assert_eq!(response["total_matches"], 2);
     assert_eq!(response["files_with_matches"], 2);
     assert_eq!(response["files_searched"], 2);
+    assert_eq!(response["complete"], true);
+    assert!(response.get("walk_truncated").is_none() || response["walk_truncated"] == false);
 
     let matches = response["matches"].as_array().expect("matches array");
     assert_eq!(matches.len(), 2);

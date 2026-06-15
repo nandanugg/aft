@@ -98,21 +98,27 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let text = format_grep_text(&result, &project_root);
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "text": text,
-            "complete": true,
-            "no_files_matched_scope": !scope_has_files,
-            "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
-            "total_matches": result.total_matches,
-            "files_searched": result.files_searched,
-            "files_with_matches": result.files_with_matches,
-            "index_status": result.index_status.as_str(),
-            "truncated": result.truncated,
-            "search_ms": (search_ms * 1000.0).round() / 1000.0,
-        }),
-    )
+    let mut body = serde_json::json!({
+        "text": text,
+        "complete": !result.walk_truncated,
+        "no_files_matched_scope": !scope_has_files,
+        "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
+        "total_matches": result.total_matches,
+        "files_searched": result.files_searched,
+        "files_with_matches": result.files_with_matches,
+        "index_status": result.index_status.as_str(),
+        "truncated": result.truncated,
+        "search_ms": (search_ms * 1000.0).round() / 1000.0,
+    });
+    if result.walk_truncated {
+        body["walk_truncated"] = serde_json::Value::Bool(true);
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
+            text
+        ));
+    }
+
+    Response::success(&req.id, body)
 }
 
 pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> String {
@@ -324,6 +330,7 @@ mod tests {
             truncated,
             fully_degraded: false,
             engine_capped: false,
+            walk_truncated: false,
         }
     }
 

@@ -208,6 +208,8 @@ pub struct GrepResult {
     pub truncated: bool,
     pub fully_degraded: bool,
     pub engine_capped: bool,
+    /// True when a fallback directory walk stopped early due to file-count or time budget.
+    pub walk_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -692,6 +694,7 @@ impl SearchIndex {
             truncated: truncated.load(Ordering::Relaxed),
             fully_degraded,
             engine_capped: engine_capped.load(Ordering::Relaxed),
+            walk_truncated: false,
         }
     }
 
@@ -709,6 +712,7 @@ impl SearchIndex {
             truncated: false,
             fully_degraded: false,
             engine_capped: false,
+            walk_truncated: false,
         }
     }
 
@@ -1766,29 +1770,6 @@ pub(crate) fn walk_project_files_from(
         .expect("unbounded project walk cannot exceed a file limit")
 }
 
-pub(crate) fn for_each_walk_project_file_from<F>(
-    filter_root: &Path,
-    search_root: &Path,
-    filters: &PathFilters,
-    mut on_file: F,
-) where
-    F: FnMut(&PathBuf),
-{
-    let builder = project_walk_builder(search_root);
-    for entry in builder.build().filter_map(|entry| entry.ok()) {
-        if !entry
-            .file_type()
-            .map_or(false, |file_type| file_type.is_file())
-        {
-            continue;
-        }
-        let path = entry.into_path();
-        if filters.matches(filter_root, &path) {
-            on_file(&path);
-        }
-    }
-}
-
 pub(crate) fn has_any_project_file_from(
     filter_root: &Path,
     search_root: &Path,
@@ -2221,7 +2202,7 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
 }
 
 impl PathFilters {
-    fn matches(&self, root: &Path, path: &Path) -> bool {
+    pub(crate) fn matches(&self, root: &Path, path: &Path) -> bool {
         let relative = to_glob_path(&relative_to_root(root, path));
         if self
             .includes
