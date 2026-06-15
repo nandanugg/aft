@@ -55,6 +55,8 @@ interface RenderContextLike {
   isError: boolean;
 }
 
+type SearchPathArgSplit = { paths: string[]; missing: string[] };
+
 function containsPath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
@@ -73,6 +75,66 @@ function expandTilde(path: string): string {
     return resolve(homedir(), path.slice(2));
   }
   return path;
+}
+
+function absoluteSearchPath(cwd: string, target: string): string {
+  const expanded = expandTilde(target);
+  return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+}
+
+async function searchPathExists(cwd: string, target: string): Promise<boolean> {
+  try {
+    await stat(absoluteSearchPath(cwd, target));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function splitSearchPathArg(cwd: string, raw: string): Promise<SearchPathArgSplit> {
+  if ((await searchPathExists(cwd, raw)) || !/\s/.test(raw)) {
+    return { paths: [raw], missing: [] };
+  }
+
+  const fragments = raw.trim().split(/\s+/).filter(Boolean);
+  if (fragments.length < 2) {
+    return { paths: [raw], missing: [] };
+  }
+
+  const existing: string[] = [];
+  const missing: string[] = [];
+  for (const fragment of fragments) {
+    if (await searchPathExists(cwd, fragment)) {
+      existing.push(fragment);
+    } else {
+      missing.push(fragment);
+    }
+  }
+
+  if (existing.length === 0) {
+    return { paths: [raw], missing: [] };
+  }
+
+  return { paths: existing, missing };
+}
+
+async function bridgeSearchPathArg(cwd: string, split: SearchPathArgSplit): Promise<string> {
+  if (split.paths.length === 1 && split.missing.length === 0) {
+    return await resolvePathArg(cwd, split.paths[0]);
+  }
+  return split.paths.map((target) => absoluteSearchPath(cwd, target)).join(" ");
+}
+
+function formatSkippedSearchPaths(missing: string[]): string | undefined {
+  if (missing.length === 0) return undefined;
+  const noun = missing.length === 1 ? "path" : "paths";
+  return `Skipped ${missing.length} ${noun} not found: ${missing.join(", ")}`;
+}
+
+function appendSkippedSearchPaths(text: string, missing: string[]): string {
+  const note = formatSkippedSearchPaths(missing);
+  if (!note) return text;
+  return text.length > 0 ? `${text}\n\n${note}` : note;
 }
 
 /**
@@ -461,18 +523,33 @@ export function registerHoistedTools(
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { pattern: params.pattern };
+        let pathSplit: SearchPathArgSplit | undefined;
         if (params.path) {
-          await assertExternalDirectoryPermission(extCtx, params.path, "search", {
-            restrictToProjectRoot: surface.restrictToProjectRoot,
-          });
-          req.path = await resolvePathArg(extCtx.cwd, params.path);
+          pathSplit = await splitSearchPathArg(extCtx.cwd, params.path);
+          for (const target of pathSplit.paths) {
+            await assertExternalDirectoryPermission(
+              extCtx,
+              absoluteSearchPath(extCtx.cwd, target),
+              "search",
+              {
+                restrictToProjectRoot: surface.restrictToProjectRoot,
+              },
+            );
+          }
+          req.path = await bridgeSearchPathArg(extCtx.cwd, pathSplit);
         }
         if (params.include) req.include = splitIncludeGlobs(params.include);
         if (params.caseSensitive !== undefined) req.case_sensitive = params.caseSensitive;
 
         const response = await callBridge(bridge, "grep", req, extCtx);
-        const text = (response.text as string | undefined) ?? "";
-        return textResult(text);
+        if (pathSplit && pathSplit.missing.length > 0) {
+          response.complete = false;
+        }
+        const text = appendSkippedSearchPaths(
+          (response.text as string | undefined) ?? "",
+          pathSplit?.missing ?? [],
+        );
+        return textResult(text, response);
       },
     });
   }
@@ -727,7 +804,7 @@ function shortenPath(path: string): string {
 /** Resolve a path argument to an absolute path if it exists, expanding `~`. */
 export async function resolvePathArg(cwd: string, path: string): Promise<string> {
   const expanded = expandTilde(path);
-  const abs = isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+  const abs = absoluteSearchPath(cwd, path);
   try {
     await stat(abs);
     return abs;

@@ -287,6 +287,234 @@ describe("searchTools", () => {
     }
   });
 
+  test("grep searches existing fragments and reports skipped missing paths", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const src = path.join(project, "src");
+      const missing = path.join(project, "test");
+      fs.mkdirSync(src, { recursive: true });
+      const bridgeResponse = {
+        success: true,
+        complete: true,
+        text: "src/hit.ts:1: const value = 'needle';\n\nFound 1 match across 1 file",
+      };
+      const { sendCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => bridgeResponse,
+      );
+
+      const output = await tools.grep.execute(
+        { pattern: "needle", path: `${src} ${missing}` },
+        createMockSdkContext(project),
+      );
+
+      expect(sendCalls[0]?.params.path).toBe(src);
+      expect(output).toContain("src/hit.ts:1");
+      expect(output).toContain(`Skipped 1 path not found: ${missing}`);
+      expect(bridgeResponse.complete).toBe(false);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("grep keeps all-valid multi-path searches complete", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const src = path.join(project, "src");
+      const e2e = path.join(project, "e2e");
+      fs.mkdirSync(src, { recursive: true });
+      fs.mkdirSync(e2e, { recursive: true });
+      const bridgeResponse = { success: true, complete: true, text: "ok" };
+      const { sendCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => bridgeResponse,
+      );
+
+      const output = await tools.grep.execute(
+        { pattern: "needle", path: `${src} ${e2e}` },
+        createMockSdkContext(project),
+      );
+
+      expect(sendCalls[0]?.params.path).toBe(`${src} ${e2e}`);
+      expect(output).toBe("ok");
+      expect(output).not.toContain("Skipped");
+      expect(bridgeResponse.complete).toBe(true);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("grep falls through to path_not_found when every fragment is missing", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      fs.mkdirSync(project, { recursive: true });
+      const missingA = path.join(project, "missing-a");
+      const missingB = path.join(project, "missing-b");
+      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+        success: false,
+        code: "path_not_found",
+        message: "path_not_found",
+      }));
+
+      let thrown: unknown;
+      try {
+        await tools.grep.execute(
+          { pattern: "needle", path: `${missingA} ${missingB}` },
+          createMockSdkContext(project),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toBe("path_not_found");
+      expect(sendCalls[0]?.params.path).toBe(`${missingA} ${missingB}`);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("grep treats an existing single path containing a space as one path", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const spaced = path.join(project, "with space");
+      fs.mkdirSync(spaced, { recursive: true });
+      const bridgeResponse = { success: true, complete: true, text: "ok" };
+      const { sendCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => bridgeResponse,
+      );
+
+      const output = await tools.grep.execute(
+        { pattern: "needle", path: "with space" },
+        createMockSdkContext(project),
+      );
+
+      expect(sendCalls[0]?.params.path).toBe(fs.realpathSync(spaced));
+      expect(output).toBe("ok");
+      expect(output).not.toContain("Skipped");
+      expect(bridgeResponse.complete).toBe(true);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob reports skipped missing fragments while searching existing paths", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const src = path.join(project, "src");
+      const missing = path.join(project, "test");
+      fs.mkdirSync(src, { recursive: true });
+      const bridgeResponse = { success: true, complete: true, text: "src/hit.ts" };
+      const { sendCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => bridgeResponse,
+      );
+
+      const output = await tools.glob.execute(
+        { pattern: "**/*.ts", path: `${src} ${missing}` },
+        createMockSdkContext(project),
+      );
+
+      expect(sendCalls[0]?.params.path).toBe(src);
+      expect(output).toContain("src/hit.ts");
+      expect(output).toContain(`Skipped 1 path not found: ${missing}`);
+      expect(bridgeResponse.complete).toBe(false);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob keeps all-valid multi-path searches complete", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const src = path.join(project, "src");
+      const e2e = path.join(project, "e2e");
+      fs.mkdirSync(src, { recursive: true });
+      fs.mkdirSync(e2e, { recursive: true });
+      const bridgeResponse = { success: true, complete: true, text: "src/a.ts\ne2e/b.ts" };
+      const { sendCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => bridgeResponse,
+      );
+
+      const output = await tools.glob.execute(
+        { pattern: "**/*.ts", path: `${src} ${e2e}` },
+        createMockSdkContext(project),
+      );
+
+      expect(sendCalls[0]?.params.path).toBe(`${src} ${e2e}`);
+      expect(output).toBe("src/a.ts\ne2e/b.ts");
+      expect(output).not.toContain("Skipped");
+      expect(bridgeResponse.complete).toBe(true);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob falls through to path_not_found when every fragment is missing", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      fs.mkdirSync(project, { recursive: true });
+      const missingA = path.join(project, "missing-a");
+      const missingB = path.join(project, "missing-b");
+      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+        success: false,
+        code: "path_not_found",
+        message: "path_not_found",
+      }));
+
+      let thrown: unknown;
+      try {
+        await tools.glob.execute(
+          { pattern: "**/*.ts", path: `${missingA} ${missingB}` },
+          createMockSdkContext(project),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toBe("path_not_found");
+      expect(sendCalls[0]?.params.path).toBe(`${missingA} ${missingB}`);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("glob treats an existing single path containing a space as one path", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    try {
+      const project = path.join(tmpRoot, "project");
+      const spaced = path.join(project, "with space");
+      fs.mkdirSync(spaced, { recursive: true });
+      const bridgeResponse = { success: true, complete: true, text: "with space/a.ts" };
+      const { sendCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => bridgeResponse,
+      );
+
+      const output = await tools.glob.execute(
+        { pattern: "**/*.ts", path: "with space" },
+        createMockSdkContext(project),
+      );
+
+      expect(sendCalls[0]?.params.path).toBe(fs.realpathSync(spaced));
+      expect(output).toBe("with space/a.ts");
+      expect(output).not.toContain("Skipped");
+      expect(bridgeResponse.complete).toBe(true);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   test("glob splits exact absolute file patterns into path and basename", async () => {
     const project = "/tmp/search-tests";
     const absoluteFile = path.join(project, "src", "exact.ts");

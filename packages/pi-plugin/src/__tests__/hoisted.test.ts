@@ -206,6 +206,132 @@ describe("hoisted tool adapters", () => {
     expect(calls[0].params).toEqual({ pattern: "oauth", path: home });
   });
 
+  test("grep searches existing fragments and reports skipped missing paths", async () => {
+    const root = await tempRoot();
+    await mkdir(join(root, "src"));
+    const missing = join(root, "test");
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      complete: true,
+      text: "src/app.ts:1: console.log('x');",
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: true,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(
+      tools.get("grep")!,
+      { pattern: "console", path: `${join(root, "src")} ${missing}` },
+      { cwd: root } as never,
+    )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
+
+    expect(calls[0].command).toBe("grep");
+    expect(calls[0].params.path).toBe(join(root, "src"));
+    expect(result.content[0].text).toContain("src/app.ts:1");
+    expect(result.content[0].text).toContain(`Skipped 1 path not found: ${missing}`);
+    expect(result.details.complete).toBe(false);
+  });
+
+  test("grep keeps all-valid multi-path searches complete", async () => {
+    const root = await tempRoot();
+    await mkdir(join(root, "src"));
+    await mkdir(join(root, "e2e"));
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      complete: true,
+      text: "ok",
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: true,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(
+      tools.get("grep")!,
+      { pattern: "console", path: `${join(root, "src")} ${join(root, "e2e")}` },
+      { cwd: root } as never,
+    )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
+
+    expect(calls[0].command).toBe("grep");
+    expect(calls[0].params.path).toBe(`${join(root, "src")} ${join(root, "e2e")}`);
+    expect(result.content[0].text).toBe("ok");
+    expect(result.content[0].text).not.toContain("Skipped");
+    expect(result.details.complete).toBe(true);
+  });
+
+  test("grep falls through to path_not_found when every fragment is missing", async () => {
+    const root = await tempRoot();
+    const missingA = join(root, "missing-a");
+    const missingB = join(root, "missing-b");
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: false,
+      code: "path_not_found",
+      message: "grep: search path does not exist",
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: true,
+      restrictToProjectRoot: true,
+    });
+
+    let thrown: unknown;
+    try {
+      await executeTool(
+        tools.get("grep")!,
+        { pattern: "console", path: `${missingA} ${missingB}` },
+        { cwd: root } as never,
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as { code?: string }).code).toBe("path_not_found");
+    expect(calls[0].params.path).toBe(`${missingA} ${missingB}`);
+  });
+
+  test("grep treats an existing single path containing a space as one path", async () => {
+    const root = await tempRoot();
+    await mkdir(join(root, "with space"));
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      complete: true,
+      text: "ok",
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: true,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(
+      tools.get("grep")!,
+      { pattern: "console", path: "with space" },
+      { cwd: root } as never,
+    )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
+
+    expect(calls[0].command).toBe("grep");
+    expect(calls[0].params.path).toBe(join(root, "with space"));
+    expect(result.content[0].text).toBe("ok");
+    expect(result.content[0].text).not.toContain("Skipped");
+    expect(result.details.complete).toBe(true);
+  });
+
   test("write defaults diagnostics off and asks Rust for a diff", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));

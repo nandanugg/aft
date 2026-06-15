@@ -19,6 +19,7 @@ import {
 type ToolArg = ToolDefinition["args"][string];
 type SearchPathKind = "file" | "directory";
 type SearchPathTarget = { target: string; kind: SearchPathKind };
+type SearchPathArgSplit = { paths: string[]; missing: string[] };
 
 type GrepMatch = {
   file?: string;
@@ -79,20 +80,47 @@ function searchPathExists(projectRoot: string, target: string): boolean {
   return fs.existsSync(absoluteSearchPath(projectRoot, target));
 }
 
-function splitSearchPathArg(projectRoot: string, raw: string): string[] {
+function splitSearchPathArg(projectRoot: string, raw: string): SearchPathArgSplit {
   if (searchPathExists(projectRoot, raw) || !/\s/.test(raw)) {
-    return [raw];
+    return { paths: [raw], missing: [] };
   }
 
   const fragments = raw.trim().split(/\s+/).filter(Boolean);
-  if (
-    fragments.length < 2 ||
-    !fragments.every((fragment) => searchPathExists(projectRoot, fragment))
-  ) {
-    return [raw];
+  if (fragments.length < 2) {
+    return { paths: [raw], missing: [] };
   }
 
-  return fragments;
+  const existing: string[] = [];
+  const missing: string[] = [];
+  for (const fragment of fragments) {
+    if (searchPathExists(projectRoot, fragment)) {
+      existing.push(fragment);
+    } else {
+      missing.push(fragment);
+    }
+  }
+
+  if (existing.length === 0) {
+    return { paths: [raw], missing: [] };
+  }
+
+  return { paths: existing, missing };
+}
+
+function bridgeSearchPathArg(projectRoot: string, split: SearchPathArgSplit): string {
+  return split.paths.map((target) => absoluteSearchPath(projectRoot, target)).join(" ");
+}
+
+function formatSkippedSearchPaths(missing: string[]): string | undefined {
+  if (missing.length === 0) return undefined;
+  const noun = missing.length === 1 ? "path" : "paths";
+  return `Skipped ${missing.length} ${noun} not found: ${missing.join(", ")}`;
+}
+
+function appendSkippedSearchPaths(text: string, missing: string[]): string {
+  const note = formatSkippedSearchPaths(missing);
+  if (!note) return text;
+  return text.length > 0 ? `${text}\n\n${note}` : note;
 }
 
 function searchPathKind(
@@ -113,10 +141,10 @@ function searchPathKind(
 
 function searchPathTargets(
   projectRoot: string,
-  raw: string,
+  split: SearchPathArgSplit,
   defaultKind: SearchPathKind,
 ): SearchPathTarget[] {
-  return splitSearchPathArg(projectRoot, raw).map((target) => {
+  return split.paths.map((target) => {
     const absoluteTarget = absoluteSearchPath(projectRoot, target);
     return {
       target: absoluteTarget,
@@ -187,8 +215,9 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       const projectRoot = await resolveProjectRoot(ctx, context);
       const pattern = String(args.pattern);
       const includeArg = args.include ? String(args.include) : undefined;
-      const pathArg = args.path ? expandTilde(String(args.path)) : undefined;
-      const bridgePath = pathArg ? absoluteSearchPath(projectRoot, pathArg) : undefined;
+      const pathArg = args.path ? String(args.path) : undefined;
+      const pathSplit = pathArg ? splitSearchPathArg(projectRoot, pathArg) : undefined;
+      const bridgePath = pathSplit ? bridgeSearchPathArg(projectRoot, pathSplit) : undefined;
 
       // Match OpenCode native ordering: grep permission first (on the raw
       // pattern + path the agent typed), then external_directory check on
@@ -199,8 +228,8 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       });
       if (grepDenied) return permissionDeniedResponse(grepDenied);
 
-      if (pathArg) {
-        for (const target of searchPathTargets(projectRoot, pathArg, "file")) {
+      if (pathSplit) {
+        for (const target of searchPathTargets(projectRoot, pathSplit, "file")) {
           const externalDenied = await assertExternalDirectoryPermission(context, target.target, {
             kind: target.kind,
           });
@@ -222,7 +251,14 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         throw new Error((response.message as string) || "grep failed");
       }
 
-      return formatGrepOutput(response as GrepResponse);
+      if (pathSplit && pathSplit.missing.length > 0) {
+        response.complete = false;
+      }
+
+      return appendSkippedSearchPaths(
+        formatGrepOutput(response as GrepResponse),
+        pathSplit?.missing ?? [],
+      );
     },
   };
 
@@ -245,7 +281,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       // Handle absolute paths embedded in the pattern (e.g. "/abs/path/src/**/*.ts")
       // Split into path (directory prefix) and pattern (glob suffix)
       let globPattern = expandTilde(String(args.pattern));
-      let globPath = args.path ? expandTilde(String(args.path)) : undefined;
+      let globPath = args.path ? String(args.path) : undefined;
 
       if (!globPath && globPattern.startsWith("/")) {
         // Find the last directory component before any glob metacharacters.
@@ -264,16 +300,17 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         }
       }
 
+      const pathSplit = globPath ? splitSearchPathArg(projectRoot, globPath) : undefined;
+      const bridgePath = pathSplit ? bridgeSearchPathArg(projectRoot, pathSplit) : undefined;
+
       // Match OpenCode native ordering: glob permission first, then
       // external_directory check on the resolved search root if it's
       // outside the project.
-      const globDenied = await askGlobPermission(context, globPattern, { path: globPath });
+      const globDenied = await askGlobPermission(context, globPattern, { path: bridgePath });
       if (globDenied) return permissionDeniedResponse(globDenied);
 
-      const bridgePath = globPath ? absoluteSearchPath(projectRoot, globPath) : undefined;
-
-      if (globPath) {
-        for (const target of searchPathTargets(projectRoot, globPath, "directory")) {
+      if (pathSplit) {
+        for (const target of searchPathTargets(projectRoot, pathSplit, "directory")) {
           const externalDenied = await assertExternalDirectoryPermission(context, target.target, {
             kind: target.kind,
           });
@@ -290,15 +327,22 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         throw new Error((response.message as string) || "glob failed");
       }
 
+      if (pathSplit && pathSplit.missing.length > 0) {
+        response.complete = false;
+      }
+
       if (typeof response.text === "string") {
-        return response.text;
+        return appendSkippedSearchPaths(response.text, pathSplit?.missing ?? []);
       }
 
       if (Array.isArray(response.files)) {
-        return response.files.join("\n");
+        return appendSkippedSearchPaths(response.files.join("\n"), pathSplit?.missing ?? []);
       }
 
-      return (response.text as string) || JSON.stringify(response);
+      return appendSkippedSearchPaths(
+        (response.text as string) || JSON.stringify(response),
+        pathSplit?.missing ?? [],
+      );
     },
   };
 
