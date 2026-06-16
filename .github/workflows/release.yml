@@ -199,11 +199,7 @@ jobs:
 
   build-linux-x64:
     name: Build Linux x64
-    # Build on Ubuntu 22.04 to link against GLIBC 2.35 — compatible with
-    # Ubuntu 22.04 LTS (supported until 2027), Pop!OS 22.04, Debian 12+,
-    # and any distro with GLIBC >= 2.35. Using ubuntu-latest (24.04) would
-    # require GLIBC 2.39 and break older LTS users.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     needs: [unit, e2e]
     steps:
       - uses: actions/checkout@v5
@@ -216,16 +212,19 @@ jobs:
 
       - name: Sync versions from tag
         run: node scripts/version-sync.mjs --from-tag
+      
+      - name: Install cross
+        run: cargo install cross --version 0.2.5 --locked
 
-      # Native x64 build on Ubuntu runner — no cross-compilation needed.
-      # Uses gnu target (not musl) so dlopen works for ONNX Runtime loading.
+      # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
+      # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        run: cargo build --release
+        run: cross build --release --target x86_64-unknown-linux-gnu
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64
-          path: target/release/aft
+          path: target/x86_64-unknown-linux-gnu/release/aft
           if-no-files-found: error
 
   build-win32-x64:
