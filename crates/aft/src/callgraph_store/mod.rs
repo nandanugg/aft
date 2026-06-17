@@ -7049,6 +7049,34 @@ export function leaf() {}
         );
     }
 
+    // Perf A/B bench (not a gate): measures cold_build wall time at a given
+    // chunk size against a real repo. Driven by env so the same binary can A/B
+    // chunk=0 vs chunk=N in clean isolation. Reusable for the deferred DB-spill
+    // memory work. Run:
+    //   AFT_PERF_REPO=/path AFT_PERF_CHUNK=0 cargo test -p agent-file-tools \
+    //     --release --lib bench_cold_build_chunk -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_cold_build_chunk() {
+        let repo = std::env::var("AFT_PERF_REPO").expect("AFT_PERF_REPO");
+        let chunk: usize = std::env::var("AFT_PERF_CHUNK")
+            .expect("AFT_PERF_CHUNK")
+            .parse()
+            .expect("AFT_PERF_CHUNK must be a non-negative integer");
+        let project_root = fs::canonicalize(&repo).expect("canonical repo root");
+        let files = callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+        let dir = tempdir().expect("temp dir");
+        let store = CallGraphStore::open(dir.path().join(".store"), project_root.clone())
+            .expect("open store");
+        let started = Instant::now();
+        let stats = store.cold_build_chunked(&files, chunk).expect("cold build");
+        let ms = started.elapsed().as_millis();
+        println!(
+            "BENCH_COLD_BUILD chunk={chunk} files={} nodes={} refs={} edges={} ms={ms}",
+            stats.files, stats.nodes, stats.refs, stats.edges
+        );
+    }
+
     #[test]
     fn incremental_barrel_refresh_matches_per_ref_lookup_and_cold_rebuild() {
         let dir = tempdir().expect("temp dir");
