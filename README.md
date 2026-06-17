@@ -149,7 +149,7 @@ _Coming soon._
 | Lua / Perl | ✓ | ✓ | ✓ | | ✓ | |
 | Zig | ✓ | ✓ | ✓ | ✓ | | |
 | Bash | ✓ | ✓ | | ✓ | | |
-| HTML / Markdown | ✓ | ✓ | | | | |
+| HTML / Markdown (incl. Quarto / R-Markdown) | ✓ | ✓ | | | | |
 | YAML (incl. Kubernetes) | ✓ | ✓ | | ✓ | | |
 | JSON | ✓ | ✓ | ✓ | | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |

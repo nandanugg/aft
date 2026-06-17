@@ -660,7 +660,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "cs" => Some(LangId::CSharp),
         "sh" | "bash" | "zsh" => Some(LangId::Bash),
         "html" | "htm" => Some(LangId::Html),
-        "md" | "markdown" | "mdx" => Some(LangId::Markdown),
+        "md" | "markdown" | "mdx" | "qmd" | "Qmd" | "rmd" | "Rmd" => Some(LangId::Markdown),
         "sol" => Some(LangId::Solidity),
         "scss" => Some(LangId::Scss),
         "vue" => Some(LangId::Vue),
@@ -6149,127 +6149,172 @@ fn extract_element_text(source: &str, node: &Node) -> String {
     text
 }
 
-fn markdown_atx_heading_level(line: &str) -> Option<u8> {
-    let trimmed = line.trim_start();
-    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
-    if !(1..=6).contains(&level) {
-        return None;
-    }
+struct RawHeading {
+    name: String,
+    level: u8,
+    range: Range,
+}
 
-    let rest = &trimmed[level..];
-    let marker_is_closed = match rest.chars().next() {
-        Some(ch) => ch.is_whitespace(),
-        None => true,
-    };
-    marker_is_closed.then_some(level as u8)
+fn parse_atx_heading(source: &str, node: &Node) -> Option<(String, u8)> {
+    let mut heading_level = 1;
+    let mut heading_name = String::new();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            let kind = child.kind();
+            if kind.starts_with("atx_h") && kind.ends_with("_marker") {
+                heading_level = kind
+                    .strip_prefix("atx_h")
+                    .and_then(|s| s.strip_suffix("_marker"))
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+            } else if kind == "inline" {
+                heading_name = node_text(source, &child).trim().to_string();
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    if heading_name.is_empty() {
+        None
+    } else {
+        Some((heading_name, heading_level))
+    }
+}
+
+fn parse_setext_heading(source: &str, node: &Node) -> Option<(String, u8)> {
+    let mut heading_level = 1;
+    let mut heading_name = String::new();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            let kind = child.kind();
+            if kind.starts_with("setext_h") && kind.ends_with("_underline") {
+                heading_level = kind
+                    .strip_prefix("setext_h")
+                    .and_then(|s| s.strip_suffix("_underline"))
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+            } else if kind == "paragraph" {
+                heading_name = node_text(source, &child).trim().to_string();
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    if heading_name.is_empty() {
+        None
+    } else {
+        Some((heading_name, heading_level))
+    }
+}
+
+fn collect_headings(source: &str, node: &Node, headings: &mut Vec<RawHeading>) {
+    let kind = node.kind();
+    if kind == "atx_heading" {
+        if let Some((name, level)) = parse_atx_heading(source, node) {
+            headings.push(RawHeading {
+                name,
+                level,
+                range: node_range(node),
+            });
+        }
+    } else if kind == "setext_heading" {
+        if let Some((name, level)) = parse_setext_heading(source, node) {
+            headings.push(RawHeading {
+                name,
+                level,
+                range: node_range(node),
+            });
+        }
+    } else {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                collect_headings(source, &cursor.node(), headings);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Extract markdown headings as symbols.
 /// Each heading becomes a symbol with kind `Heading`, and its range covers the entire
 /// section (from the heading to the next heading at the same or higher level, or EOF).
 fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut raw_headings = Vec::new();
+    collect_headings(source, root, &mut raw_headings);
+
     let mut symbols = Vec::new();
-    extract_md_sections(source, root, &mut symbols, &[]);
-    Ok(symbols)
-}
+    let total_lines = source.lines().count() as u32;
 
-/// Recursively walk `section` nodes to build the heading hierarchy.
-fn extract_md_sections(
-    source: &str,
-    node: &Node,
-    symbols: &mut Vec<Symbol>,
-    scope_chain: &[String],
-) {
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return;
-    }
+    let mut active_headings: Vec<Option<String>> = vec![None; 7];
 
-    loop {
-        let child = cursor.node();
-        match child.kind() {
-            "section" => {
-                // A section contains an atx_heading as its first child,
-                // followed by content and possibly nested sections.
-                let mut section_cursor = child.walk();
-                let mut heading_name = String::new();
-                let mut heading_level: u8 = 0;
+    for i in 0..raw_headings.len() {
+        let h = &raw_headings[i];
+        let level = h.level as usize;
 
-                if section_cursor.goto_first_child() {
-                    loop {
-                        let section_child = section_cursor.node();
-                        if section_child.kind() == "atx_heading" {
-                            // Extract heading level from marker type
-                            let mut h_cursor = section_child.walk();
-                            if h_cursor.goto_first_child() {
-                                loop {
-                                    let h_child = h_cursor.node();
-                                    let kind = h_child.kind();
-                                    if kind.starts_with("atx_h") && kind.ends_with("_marker") {
-                                        // "atx_h1_marker" → level 1, "atx_h2_marker" → level 2, etc.
-                                        heading_level = kind
-                                            .strip_prefix("atx_h")
-                                            .and_then(|s| s.strip_suffix("_marker"))
-                                            .and_then(|s| s.parse::<u8>().ok())
-                                            .unwrap_or(1);
-                                    } else if h_child.kind() == "inline" {
-                                        heading_name =
-                                            node_text(source, &h_child).trim().to_string();
-                                    }
-                                    if !h_cursor.goto_next_sibling() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if !section_cursor.goto_next_sibling() {
-                            break;
-                        }
-                    }
-                }
-
-                if !heading_name.is_empty() {
-                    let mut range = node_range(&child);
-                    if let Some(next_heading_level) = source
-                        .lines()
-                        .nth(range.end_line as usize)
-                        .and_then(markdown_atx_heading_level)
-                    {
-                        if next_heading_level <= heading_level && range.end_line > range.start_line
-                        {
-                            range.end_line -= 1;
-                            range.end_col = source_line_end_col(source, range.end_line);
-                        }
-                    }
-                    let signature = format!(
-                        "{} {}",
-                        "#".repeat((heading_level as usize).min(6)),
-                        heading_name
-                    );
-
-                    symbols.push(Symbol {
-                        name: heading_name.clone(),
-                        kind: SymbolKind::Heading,
-                        range,
-                        signature: Some(signature),
-                        scope_chain: scope_chain.to_vec(),
-                        exported: false,
-                        parent: scope_chain.last().cloned(),
-                    });
-
-                    // Recurse into the section for nested headings
-                    let mut new_scope = scope_chain.to_vec();
-                    new_scope.push(heading_name);
-                    extract_md_sections(source, &child, symbols, &new_scope);
-                }
+        // Build scope chain from active headings of lower levels
+        let mut scope_chain = Vec::new();
+        for l in 1..level {
+            if let Some(ref name) = active_headings[l] {
+                scope_chain.push(name.clone());
             }
-            _ => {}
         }
 
-        if !cursor.goto_next_sibling() {
-            break;
+        // Update active headings
+        active_headings[level] = Some(h.name.clone());
+        for l in (level + 1)..7 {
+            active_headings[l] = None;
         }
+
+        // Determine the section range
+        let start_line = h.range.start_line;
+        let start_col = h.range.start_col;
+
+        // Find the next heading of the same or higher level (level <= h.level)
+        let mut end_line = total_lines.saturating_sub(1);
+        let mut end_col = if total_lines > 0 {
+            source_line_end_col(source, end_line)
+        } else {
+            0
+        };
+
+        for j in (i + 1)..raw_headings.len() {
+            if raw_headings[j].level <= h.level {
+                // The section ends before this heading starts
+                let next_start_line = raw_headings[j].range.start_line;
+                end_line = next_start_line.saturating_sub(1).max(start_line);
+                end_col = source_line_end_col(source, end_line);
+                break;
+            }
+        }
+
+        let signature = format!("{} {}", "#".repeat((h.level as usize).min(6)), h.name);
+
+        symbols.push(Symbol {
+            name: h.name.clone(),
+            kind: SymbolKind::Heading,
+            range: Range {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            },
+            signature: Some(signature),
+            scope_chain: scope_chain.clone(),
+            exported: false,
+            parent: scope_chain.last().cloned(),
+        });
     }
+
+    Ok(symbols)
 }
 
 /// Remove duplicate symbols based on (name, kind, start_line).
