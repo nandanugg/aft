@@ -109,12 +109,19 @@ describe("AFT Pi tools (real Pi RPC)", () => {
     );
 
     expect(toolEnd.isError).toBe(false);
-    const response = JSON.parse(resultText(toolEnd)) as {
-      complete: boolean;
-      path: Array<{ symbol: string }>;
-    };
-    expect(response.complete).toBe(true);
-    expect(response.path.map((hop) => hop.symbol)).toEqual(["source", "middle", "target"]);
+    // aft_callgraph returns flat text to the agent (structured data is carried
+    // in `details` for richer renderers). Assert on the flat output.
+    const text = resultText(toolEnd);
+    const hopMatch = text.match(/(\d+) hops?/);
+    expect(hopMatch).not.toBeNull();
+    expect(Number(hopMatch?.[1])).toBe(3);
+    // Hop order: source → middle → target, in that sequence.
+    const sourceIdx = text.indexOf("source");
+    const middleIdx = text.indexOf("middle");
+    const targetIdx = text.indexOf("target");
+    expect(sourceIdx).toBeGreaterThanOrEqual(0);
+    expect(middleIdx).toBeGreaterThan(sourceIdx);
+    expect(targetIdx).toBeGreaterThan(middleIdx);
   }, 120_000);
 
   test("aft_outline files mode returns directory file metadata", async () => {
