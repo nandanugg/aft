@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::compress::generic::{dedup_consecutive, middle_truncate, GenericCompressor};
 use crate::compress::{CompressionResult, Compressor};
 
@@ -8,7 +6,7 @@ const STATUS_KEEP_PER_SECTION: usize = 10;
 const DIFF_MAX_FILES: usize = 5;
 const DIFF_MAX_HUNKS: usize = 20;
 const HUNK_KEEP_LINES: usize = 30;
-const LOG_KEEP_COMMITS: usize = 20;
+const LOG_SHORT_HASH_LEN: usize = 12;
 const BLAME_KEEP_LINES: usize = 50;
 const GIT_WRITE_KEEP_LINES: usize = 50;
 const GIT_ADD_KEEP_PATHS: usize = 5;
@@ -540,36 +538,185 @@ fn count_hunks(lines: &[String]) -> usize {
 }
 
 fn compress_log(output: &str) -> String {
-    let mut commits = 0usize;
-    let mut omitted = 0usize;
+    if output.lines().any(|line| line.starts_with("commit ")) {
+        compress_full_format_log(output)
+    } else {
+        compress_oneline_log(output)
+    }
+}
+
+fn compress_full_format_log(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut blocks: Vec<usize> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.starts_with("commit ") {
+            blocks.push(index);
+        }
+    }
+    if blocks.is_empty() {
+        return trim_trailing_lines(output);
+    }
+
     let mut result = Vec::new();
-    let mut seen_authors = HashSet::new();
+    for (block_index, &start) in blocks.iter().enumerate() {
+        let end = blocks.get(block_index + 1).copied().unwrap_or(lines.len());
+        let block = &lines[start..end];
+        if let Some(compact) = format_log_commit_block(block) {
+            result.push(compact);
+        }
+    }
 
-    for line in output.lines() {
-        let is_commit = line.starts_with("commit ") || looks_like_oneline_commit(line);
-        if is_commit {
-            commits += 1;
-            if commits > LOG_KEEP_COMMITS {
-                omitted += 1;
-                continue;
+    trim_trailing_lines(&result.join("\n"))
+}
+
+fn format_log_commit_block(block: &[&str]) -> Option<String> {
+    let first = block.first()?;
+    let full_hash = first.strip_prefix("commit ")?.trim();
+    let short_hash = abbreviate_log_hash(full_hash);
+
+    let mut merge_parents: Option<String> = None;
+    let mut author: Option<String> = None;
+    let mut date_compact: Option<String> = None;
+    let mut header_end = 1usize;
+
+    for (offset, line) in block.iter().enumerate().skip(1) {
+        if line.starts_with("Merge: ") {
+            let rest = line.strip_prefix("Merge: ").unwrap_or("");
+            let parents: Vec<String> = rest.split_whitespace().map(abbreviate_log_hash).collect();
+            merge_parents = Some(format!("Merge: {}", parents.join(" ")));
+            header_end = offset + 1;
+        } else if let Some(rest) = line.strip_prefix("Author: ") {
+            author = Some(format_author_compact(rest.trim()));
+            header_end = offset + 1;
+        } else if let Some(rest) = line.strip_prefix("Date: ") {
+            date_compact = Some(compact_git_log_date(rest.trim()));
+            header_end = offset + 1;
+        } else if line.trim().is_empty() {
+            header_end = offset + 1;
+            break;
+        } else {
+            break;
+        }
+    }
+
+    let mut body_iter = block[header_end..].iter().copied();
+    let mut subject = String::new();
+    let mut body_rest = Vec::new();
+    if let Some(first_body) = body_iter.next() {
+        subject = first_body.trim().to_string();
+        for line in body_iter {
+            body_rest.push(normalize_log_body_line(line));
+        }
+    }
+
+    let author = author.unwrap_or_default();
+    let date_compact = date_compact.unwrap_or_default();
+    let mut header = format!("{short_hash} {subject}");
+    if let Some(merge) = merge_parents {
+        header = format!("{short_hash} {merge} {subject}");
+    }
+    if !author.is_empty() {
+        header.push_str(&format!("  {author}"));
+    }
+    if !date_compact.is_empty() {
+        header.push(' ');
+        header.push_str(&date_compact);
+    }
+
+    let mut out = header;
+    for line in collapse_log_body_blank_runs(&body_rest) {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    Some(out)
+}
+
+fn normalize_log_body_line(line: &str) -> String {
+    if line.starts_with(' ') || line.starts_with('\t') {
+        format!("    {}", line.trim_start())
+    } else {
+        format!("    {line}")
+    }
+}
+
+fn collapse_log_body_blank_runs(body: &[String]) -> Vec<String> {
+    body.iter()
+        .filter(|line| !line.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+fn format_author_compact(author: &str) -> String {
+    if let Some((name, email)) = author.split_once('<') {
+        let name = name.trim();
+        let email = email.trim_end_matches('>').trim();
+        format!("<{name} {email}>")
+    } else {
+        format!("<{author}>")
+    }
+}
+
+fn abbreviate_log_hash(hash: &str) -> String {
+    let hash = hash.trim();
+    if hash.len() <= LOG_SHORT_HASH_LEN {
+        hash.to_string()
+    } else {
+        hash[..LOG_SHORT_HASH_LEN].to_string()
+    }
+}
+
+fn compact_git_log_date(date_field: &str) -> String {
+    let parts: Vec<&str> = date_field.split_whitespace().collect();
+    if parts.len() < 5 {
+        return date_field.to_string();
+    }
+    let month = parts[1];
+    let day = parts[2];
+    let time = parts[3];
+    let year = parts[4];
+    let month_num = match month {
+        "Jan" => "01",
+        "Feb" => "02",
+        "Mar" => "03",
+        "Apr" => "04",
+        "May" => "05",
+        "Jun" => "06",
+        "Jul" => "07",
+        "Aug" => "08",
+        "Sep" => "09",
+        "Oct" => "10",
+        "Nov" => "11",
+        "Dec" => "12",
+        _ => return date_field.to_string(),
+    };
+    let day_padded = if day.len() == 1 {
+        format!("0{day}")
+    } else {
+        day.to_string()
+    };
+    format!("{year}-{month_num}-{day_padded} {time}")
+}
+
+fn compress_oneline_log(output: &str) -> String {
+    let result: Vec<String> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            if looks_like_oneline_commit(line) {
+                let mut parts = line.splitn(2, ' ');
+                let hash = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("");
+                let short = abbreviate_log_hash(hash);
+                if rest.is_empty() {
+                    short
+                } else {
+                    format!("{short} {rest}")
+                }
+            } else {
+                line.trim_end().to_string()
             }
-        }
-
-        if commits > LOG_KEEP_COMMITS {
-            continue;
-        }
-
-        if line.starts_with("Author: ") && !seen_authors.insert(line.to_string()) {
-            continue;
-        }
-
-        result.push(line.to_string());
-    }
-
-    if omitted > 0 {
-        result.push(format!("... {} more commits", omitted));
-    }
-
+        })
+        .collect();
     trim_trailing_lines(&result.join("\n"))
 }
 
@@ -736,5 +883,61 @@ mod tests {
         let compressed_error = compress("git stash apply", error);
         assert!(compressed_error.contains("error: Your local changes"));
         assert!(compressed_error.contains("README.md"));
+    }
+
+    #[test]
+    fn test_log_merge_commit_keeps_parents() {
+        let raw = "commit cccccccccccccccccccccccccccccccccccc\nMerge: dddddddddddddddddddddddddddddddddddd eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nAuthor: Merger <merge@example.com>\nDate:   Mon Jan 01 12:00:00 2024 +0000\n\n    Merge branch 'feature'\n";
+        let compressed = compress("git log", raw);
+        assert!(compressed.contains("Merge: dddddddddddd eeeeeeeeeeee"));
+        assert!(compressed.contains("Merge branch 'feature'"));
+    }
+
+    #[test]
+    fn test_log_format_collapse_short_log() {
+        let raw = "commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nAuthor: Alice Example <alice@example.com>\nDate:   Thu Jun 18 17:39:12 2026 +0200\n\n    first subject\n    detail one\n\ncommit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nAuthor: Bob Example <bob@example.com>\nDate:   Wed Jun 17 10:00:00 2026 +0000\n\n    second subject\n";
+        let compressed = compress("git log", raw);
+        assert!(!compressed.contains("commit "));
+        assert!(!compressed.contains("Author:"));
+        assert!(!compressed.contains("Date:"));
+        assert!(compressed.contains("aaaaaaaaaaaa first subject"));
+        assert!(compressed.contains("<Alice Example alice@example.com>"));
+        assert!(compressed.contains("2026-06-18 17:39:12"));
+        assert!(compressed.contains("detail one"));
+        assert!(compressed.contains("bbbbbbbbbbbb second subject"));
+        assert!(!compressed.contains(" ago"));
+        assert!(compressed.len() < raw.len());
+    }
+
+    #[test]
+    fn test_log_compress_is_deterministic() {
+        let raw = "commit 1111111111111111111111111111111111111111\nAuthor: x <x@y.com>\nDate:   Thu Jun 18 17:39:12 2026 +0200\n\n    subject\n    body\n";
+        let a = compress_log(raw);
+        let b = compress_log(raw);
+        assert_eq!(a, b);
+        assert!(a.contains("111111111111"));
+        assert!(a.contains("2026-06-18 17:39:12"));
+    }
+
+    #[test]
+    fn test_log_oneline_abbreviates_hash_keeps_all_lines() {
+        let raw = "e4e8f7e1234567890abcdef1234567890abcdef (HEAD -> main) chore\n9c4aa18abcdef1234567890abcdef1234567890 feat\n";
+        let compressed = compress("git log --oneline", raw);
+        assert!(compressed.contains("e4e8f7e12345"));
+        assert!(compressed.contains("(HEAD -> main) chore"));
+        assert!(compressed.contains("9c4aa18abcde"));
+        assert!(compressed.contains("feat"));
+        assert!(!compressed.contains("... more commits"));
+    }
+
+    #[test]
+    fn test_log_deep_needle_survives_without_drop_line() {
+        let raw = include_str!("../../tests/fixtures/git_log_deep_needle.txt");
+        let compressed = compress("git log", raw);
+        assert!(compressed.contains("feedfacefeed"));
+        assert!(compressed.contains("NEEDLE_GIT_auth_bypass"));
+        assert!(compressed.contains("UNIQUE_BODY_MARKER_needle_xyz"));
+        assert!(!compressed.contains("... more commits"));
+        assert!(compressed.len() < raw.len());
     }
 }
