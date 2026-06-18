@@ -119,6 +119,121 @@ describe("formatCallgraphSections", () => {
     expect(text).toContain("x");
   });
 
+  test("callers marks name_match edges with ~ and leaves exact unmarked", () => {
+    const text = formatCallgraphSections("callers", {
+      total_callers: 2,
+      callers: [
+        {
+          file: "/repo/a.ts",
+          callers: [
+            { symbol: "exactFn", line: 10 },
+            { symbol: "maybeFn", line: 20, resolved_by: "name_match" },
+          ],
+        },
+      ],
+    }).join("\n");
+    expect(text).toContain("↳ exactFn:10");
+    expect(text).not.toMatch(/↳ exactFn:10 ~/);
+    expect(text).toContain("↳ maybeFn:20 ~");
+  });
+
+  test("callers does not mark type_match edges", () => {
+    const text = formatCallgraphSections("callers", {
+      total_callers: 1,
+      callers: [
+        {
+          file: "/repo/a.ts",
+          callers: [{ symbol: "typedFn", line: 5, resolved_by: "type_match" }],
+        },
+      ],
+    }).join("\n");
+    expect(text).toContain("↳ typedFn:5");
+    expect(text).not.toMatch(/↳ typedFn:5 ~/);
+  });
+
+  test("impact and trace_to_symbol mark name_match on edge lines", () => {
+    const impactText = formatCallgraphSections("impact", {
+      total_affected: 2,
+      affected_files: 1,
+      callers: [
+        { caller_symbol: "exactCaller", caller_file: "/repo/a.ts", line: 1 },
+        {
+          caller_symbol: "nameCaller",
+          caller_file: "/repo/a.ts",
+          line: 2,
+          resolved_by: "name_match",
+        },
+      ],
+    }).join("\n");
+    expect(impactText).toContain("↳ exactCaller");
+    expect(impactText).not.toContain("↳ exactCaller ~");
+    expect(impactText).toContain("↳ nameCaller ~");
+
+    const traceText = formatCallgraphSections("trace_to_symbol", {
+      path: [
+        { symbol: "hopExact", file: "/repo/a.ts", line: 1 },
+        { symbol: "hopName", file: "/repo/b.ts", line: 2, resolved_by: "name_match" },
+      ],
+    }).join("\n");
+    expect(traceText).toContain("hopExact");
+    expect(traceText).not.toMatch(/hopExact.*~/);
+    expect(traceText).toMatch(/hopName.*~/);
+  });
+
+  test("name_match marker uses theme fg warning", () => {
+    const roles: string[] = [];
+    const theme: CallgraphTheme = {
+      fg: (role, text) => {
+        roles.push(`${role}:${text}`);
+        return `[${role}]${text}`;
+      },
+    };
+    const text = formatCallgraphSections(
+      "callers",
+      {
+        total_callers: 1,
+        callers: [
+          {
+            file: "/repo/a.ts",
+            callers: [{ symbol: "fn", line: 1, resolved_by: "name_match" }],
+          },
+        ],
+      },
+      theme,
+    ).join("\n");
+    expect(text).toContain("[warning]~");
+    expect(roles).toContain("warning:~");
+  });
+
+  test("call_tree keeps [unresolved] independent of name_match marker", () => {
+    const text = formatCallgraphSections("call_tree", {
+      name: "entry",
+      file: "/repo/a.ts",
+      line: 1,
+      resolved: true,
+      children: [
+        {
+          name: "nameOnly",
+          file: "/repo/b.ts",
+          line: 9,
+          resolved: true,
+          resolved_by: "name_match",
+          children: [],
+        },
+        {
+          name: "missing",
+          file: "/repo/a.ts",
+          line: 3,
+          resolved: false,
+          children: [],
+        },
+      ],
+    }).join("\n");
+    expect(text).toContain("nameOnly [/repo/b.ts:9] ~");
+    expect(text).toContain("missing [/repo/a.ts:3] [unresolved]");
+    expect(text).not.toContain("[unresolved] ~");
+  });
+
   test("custom theme fg is invoked", () => {
     const roles: string[] = [];
     const theme: CallgraphTheme = {

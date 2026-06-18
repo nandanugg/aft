@@ -49,6 +49,11 @@ function treeLine(depth: number, text: string): string {
   return `${"  ".repeat(depth)}${depth === 0 ? "" : "↳ "}${text}`;
 }
 
+/** Marks edges resolved purely by callee name (may be the wrong homonym). */
+function nameMatchEdgeMarker(record: Record<string, unknown>, theme: CallgraphTheme): string {
+  return asString(record.resolved_by) === "name_match" ? ` ${theme.fg("warning", "~")}` : "";
+}
+
 function renderCallTreeNode(
   node: Record<string, unknown>,
   depth: number,
@@ -63,8 +68,9 @@ function renderCallTreeNode(
   // Mark it so the agent doesn't read the callsite as the definition location.
   // Only when explicitly false (resolved/legacy nodes omit the field).
   const unresolved = node.resolved === false ? ` ${theme.fg("warning", "[unresolved]")}` : "";
+  const nameMatch = nameMatchEdgeMarker(node, theme);
   const location = line !== undefined ? `[${file}:${line}]` : `[${file}]`;
-  lines.push(treeLine(depth, `${name} ${location}${unresolved}`));
+  lines.push(treeLine(depth, `${name} ${location}${unresolved}${nameMatch}`));
   asRecords(node.children).forEach((child) => {
     renderCallTreeNode(child, depth + 1, lines, theme);
   });
@@ -83,17 +89,23 @@ function depthWarning(
   return theme.fg("warning", `(depth limited${detail})`);
 }
 
-function renderTracePath(path: Record<string, unknown>, index: number, lines: string[]): void {
+function renderTracePath(
+  path: Record<string, unknown>,
+  index: number,
+  lines: string[],
+  theme: CallgraphTheme,
+): void {
   lines.push(`Path ${index + 1}`);
   asRecords(path.hops).forEach((hop, hopIndex) => {
     const symbol = asString(hop.symbol) ?? "(unknown)";
     const file = shortenPath(asString(hop.file) ?? "(unknown file)");
     const line = asNumber(hop.line);
     const entry = hop.is_entry_point === true ? " [entry]" : "";
+    const nameMatch = nameMatchEdgeMarker(hop, theme);
     lines.push(
       treeLine(
         hopIndex + 1,
-        `${symbol}${entry} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}`,
+        `${symbol}${entry} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}${nameMatch}`,
       ),
     );
   });
@@ -104,20 +116,25 @@ function renderCallersGroupLines(group: Record<string, unknown>, theme: Callgrap
   const lines = [theme.fg("accent", file)];
   const callers = asRecords(group.callers);
 
-  const bySymbol = new Map<string, number[]>();
+  const bySymbolProvenance = new Map<string, number[]>();
   for (const caller of callers) {
     const symbol = asString(caller.symbol) ?? "(unknown)";
+    const provenanceKey =
+      asString(caller.resolved_by) === "name_match" ? `${symbol}\0name_match` : `${symbol}\0exact`;
     const line = asNumber(caller.line);
-    const bucket = bySymbol.get(symbol) ?? [];
+    const bucket = bySymbolProvenance.get(provenanceKey) ?? [];
     if (line !== undefined) bucket.push(line);
-    bySymbol.set(symbol, bucket);
+    bySymbolProvenance.set(provenanceKey, bucket);
   }
 
-  const symbols = [...bySymbol.keys()].sort((a, b) => a.localeCompare(b));
-  for (const symbol of symbols) {
-    const lineNums = (bySymbol.get(symbol) ?? []).sort((a, b) => a - b);
+  const keys = [...bySymbolProvenance.keys()].sort((a, b) => a.localeCompare(b));
+  for (const key of keys) {
+    const symbol = key.split("\0")[0] ?? "(unknown)";
+    const isNameMatch = key.endsWith("\0name_match");
+    const lineNums = (bySymbolProvenance.get(key) ?? []).sort((a, b) => a - b);
     const linePart = lineNums.length > 0 ? lineNums.map(String).join(", ") : "?";
-    lines.push(`  ↳ ${symbol}:${linePart}`);
+    const marker = isNameMatch ? ` ${theme.fg("warning", "~")}` : "";
+    lines.push(`  ↳ ${symbol}:${linePart}${marker}`);
   }
 
   return lines;
@@ -170,8 +187,12 @@ export function formatCallgraphSections(
       const symbol = asString(hop.symbol) ?? "(unknown)";
       const file = shortenPath(asString(hop.file) ?? "(unknown file)");
       const line = asNumber(hop.line);
+      const nameMatch = nameMatchEdgeMarker(hop, theme);
       lines.push(
-        treeLine(index + 1, `${symbol} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}`),
+        treeLine(
+          index + 1,
+          `${symbol} ${line !== undefined ? `[${file}:${line}]` : `[${file}]`}${nameMatch}`,
+        ),
       );
     });
     return lines;
@@ -192,7 +213,7 @@ export function formatCallgraphSections(
     if (paths.length === 0) sections.push(theme.fg("muted", "No entry paths found."));
     paths.forEach((path, index) => {
       const lines: string[] = [];
-      renderTracePath(path, index, lines);
+      renderTracePath(path, index, lines, theme);
       sections.push(lines.join("\n"));
     });
     return sections;
@@ -216,6 +237,7 @@ export function formatCallgraphSections(
       const symbol = asString(caller.caller_symbol) ?? "(unknown)";
       const line = asNumber(caller.line) ?? 0;
       const entry = caller.is_entry_point === true ? ` ${theme.fg("warning", "[entry]")}` : "";
+      const nameMatch = nameMatchEdgeMarker(caller, theme);
       const expression = asString(caller.call_expression);
       const params = Array.isArray(caller.parameters)
         ? caller.parameters.map(String).join(", ")
@@ -223,7 +245,7 @@ export function formatCallgraphSections(
       sections.push(
         [
           `${theme.fg("accent", file)}:${line}`,
-          `  ↳ ${symbol}${entry}`,
+          `  ↳ ${symbol}${entry}${nameMatch}`,
           expression ? `  ${theme.fg("muted", expression)}` : undefined,
           params ? `  ${theme.fg("muted", `params: ${params}`)}` : undefined,
         ]
@@ -248,10 +270,11 @@ export function formatCallgraphSections(
     const variable = asString(hop.variable) ?? "(unknown)";
     const line = asNumber(hop.line) ?? 0;
     const approximate = hop.approximate === true ? ` ${theme.fg("warning", "[approx]")}` : "";
+    const nameMatch = nameMatchEdgeMarker(hop, theme);
     sections.push(
       treeLine(
         index,
-        `${variable} ${theme.fg("muted", `${asString(hop.flow_type) ?? "flow"}`)} ${symbol} [${file}:${line}]${approximate}`,
+        `${variable} ${theme.fg("muted", `${asString(hop.flow_type) ?? "flow"}`)} ${symbol} [${file}:${line}]${approximate}${nameMatch}`,
       ),
     );
   });
