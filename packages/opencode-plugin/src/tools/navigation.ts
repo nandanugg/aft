@@ -94,7 +94,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         for (const target of [filePath, ...(toFile !== undefined ? [toFile] : [])]) {
           if (checked.has(target)) continue;
           checked.add(target);
-          const denial = await assertExternalDirectoryPermission(context, target);
+          const denial = await assertExternalDirectoryPermission(ctx, context, target);
           if (denial) return permissionDeniedResponse(denial);
         }
 

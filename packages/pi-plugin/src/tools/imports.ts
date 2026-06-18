@@ -166,7 +166,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
         throw new Error(`op='${params.op}' requires 'module'`);
       }
       const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
-      await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
+      await assertExternalDirectoryPermission(extCtx, filePath, {
         restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
       });
       const bridge = bridgeFor(ctx, extCtx.cwd);

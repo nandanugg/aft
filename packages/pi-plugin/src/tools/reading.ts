@@ -97,7 +97,7 @@ async function assertReadPathPermissions(
   for (const target of targets) {
     if (!target || checked.has(target)) continue;
     checked.add(target);
-    await assertExternalDirectoryPermission(extCtx, target, "read", {
+    await assertExternalDirectoryPermission(extCtx, target, {
       restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
     });
   }

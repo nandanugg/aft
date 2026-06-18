@@ -145,7 +145,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         for (const file of files) {
           if (checked.has(file)) continue;
           checked.add(file);
-          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+          await assertExternalDirectoryPermission(extCtx, file, {
             restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
           });
         }
@@ -212,7 +212,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         const destination = await resolvePathArg(extCtx.cwd, params.destination);
         const checked = new Set([filePath, destination]);
         for (const file of checked) {
-          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+          await assertExternalDirectoryPermission(extCtx, file, {
             restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
           });
         }

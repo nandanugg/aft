@@ -69,13 +69,14 @@ async function resolveAstPaths(
 }
 
 async function checkAstPathsPermission(
+  ctx: PluginContext,
   context: Parameters<ToolDefinition["execute"]>[1],
   paths: string[] | undefined,
 ): Promise<string | undefined> {
   if (paths === undefined) return undefined;
   const uniquePaths = Array.from(new Set(paths));
   for (const p of uniquePaths) {
-    const denial = await assertExternalDirectoryPermission(context, p, { kind: "directory" });
+    const denial = await assertExternalDirectoryPermission(ctx, context, p, { kind: "directory" });
     if (denial) return denial;
   }
   return undefined;
@@ -113,7 +114,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     },
     execute: async (args, context): Promise<string> => {
       const paths = await resolveAstPaths(ctx, context, args.paths);
-      const externalDenied = await checkAstPathsPermission(context, paths);
+      const externalDenied = await checkAstPathsPermission(ctx, context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       const params: Record<string, unknown> = {
@@ -228,14 +229,14 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       const isDryRun = args.dryRun === true;
       const paths = await resolveAstPaths(ctx, context, args.paths);
 
-      const externalDenied = await checkAstPathsPermission(context, paths);
+      const externalDenied = await checkAstPathsPermission(ctx, context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       if (!isDryRun) {
         // External-directory check first (mirrors opencode-native grep/glob directory checks).
         if (!Array.isArray(args.paths)) {
           const targetPath = await resolvePathArg(ctx, context, ".");
-          const denial = await assertExternalDirectoryPermission(context, targetPath, {
+          const denial = await assertExternalDirectoryPermission(ctx, context, targetPath, {
             kind: "directory",
           });
           if (denial) return permissionDeniedResponse(denial);

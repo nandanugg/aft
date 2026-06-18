@@ -176,7 +176,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       for (const target of permissionTargets) {
         if (checked.has(target)) continue;
         checked.add(target);
-        await assertExternalDirectoryPermission(extCtx, target, "modify", {
+        await assertExternalDirectoryPermission(extCtx, target, {
           restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
         });
       }

@@ -87,7 +87,7 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
         // Gate the repo/worktree path like Pi's other path-taking tools (only
         // prompts when restrict_to_project_root is true), and resolve tilde/
         // relative the same way Rust will.
-        await assertExternalDirectoryPermission(extCtx, path, "inspect", {
+        await assertExternalDirectoryPermission(extCtx, path, {
           restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
         });
         reqParams.path = await resolvePathArg(extCtx.cwd, path);

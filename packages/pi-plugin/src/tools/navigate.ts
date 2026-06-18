@@ -133,7 +133,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       for (const target of [filePath, ...(toFile !== undefined ? [toFile] : [])]) {
         if (checked.has(target)) continue;
         checked.add(target);
-        await assertExternalDirectoryPermission(extCtx, target, "read", {
+        await assertExternalDirectoryPermission(extCtx, target, {
           restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
         });
       }

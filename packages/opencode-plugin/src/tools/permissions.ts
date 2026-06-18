@@ -1,10 +1,58 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { sendIgnoredMessage } from "../shared/ignored-message.js";
+import type { PluginContext } from "../types.js";
 import { projectRootFor } from "./_shared.js";
 
 const UNSUPPORTED_ASK_HOST =
   "AFT requires OpenCode 1.15.5 or newer for permission asks; please upgrade OpenCode";
+
+/**
+ * Throttle for the user-facing "restrict_to_project_root blocked this" panel.
+ * An agent that probes several external paths shouldn't spawn a panel per path;
+ * we surface the notice at most once per session per 5 minutes. Keyed by
+ * sessionID. Module-level is acceptable here: this is best-effort UI-noise
+ * suppression, not correctness — a duplicate plugin load worst-cases to one
+ * extra panel, never a missed block (the block + agent denial are independent
+ * of this map).
+ */
+const RESTRICT_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
+const restrictNoticeLastSentAt = new Map<string, number>();
+
+function restrictNoticeWording(target: string): string {
+  return (
+    `AFT blocked access to a path outside the project:\n  ${target}\n` +
+    "`restrict_to_project_root` is enabled (full isolation), so AFT does not access paths " +
+    "outside the project root. To allow external paths, set `restrict_to_project_root: false` " +
+    "in your aft.jsonc."
+  );
+}
+
+/**
+ * Fire the throttled restriction notice to the user (ignored panel, no agent
+ * turn). Best-effort: never throws into the caller's tool path.
+ */
+function notifyRestrictBlocked(ctx: PluginContext, context: ToolContext, target: string): void {
+  const sessionID = context.sessionID;
+  if (!sessionID) return;
+  const now = Date.now();
+  const last = restrictNoticeLastSentAt.get(sessionID);
+  if (last !== undefined && now - last < RESTRICT_NOTICE_THROTTLE_MS) return;
+  restrictNoticeLastSentAt.set(sessionID, now);
+  void sendIgnoredMessage(ctx.client, sessionID, restrictNoticeWording(target)).catch(() => {
+    // UI-only notice; a delivery failure must not affect the block itself.
+  });
+}
+
+/** Agent-facing denial returned when restrict_to_project_root blocks a path. */
+function restrictDenialMessage(target: string): string {
+  return (
+    `Blocked: '${target}' is outside the project root and restrict_to_project_root is enabled ` +
+    "(AFT full isolation). Not overridable per-call; set restrict_to_project_root: false in " +
+    "aft.jsonc to allow external paths."
+  );
+}
 
 /**
  * Execute a `ctx.ask(...)` result.
@@ -178,12 +226,12 @@ export const _permissionsInternalsForTest = { containsPath, normalizePathPattern
  * call short-circuits and the regular permission flow continues normally.
  */
 export async function assertExternalDirectoryPermission(
+  ctx: PluginContext,
   context: ToolContext,
   target: string,
   options?: { kind?: "file" | "directory" },
 ): Promise<string | undefined> {
   if (!target) return undefined;
-  if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
 
   const resolved = resolveAbsolutePath(context, target);
   // Windows: realpath + drive-case normalize so containsPath comparisons line
@@ -208,6 +256,20 @@ export async function assertExternalDirectoryPermission(
   ) {
     return undefined;
   }
+
+  // restrict_to_project_root is AFT's full-isolation knob — deliberately NOT
+  // conflated with OpenCode's external_directory permission. When it's on, an
+  // out-of-root path is hard-blocked at the plugin layer: we do NOT bubble an
+  // external_directory prompt (a grant could never override the Rust-side
+  // boundary anyway — that produced the issue #125 "approved but still fails"
+  // footgun). Instead the agent gets a clear denial and the user gets a
+  // throttled informational panel explaining the restriction.
+  if (ctx.config.restrict_to_project_root === true) {
+    notifyRestrictBlocked(ctx, context, absoluteTarget);
+    return restrictDenialMessage(absoluteTarget);
+  }
+
+  if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
 
   const kind = options?.kind ?? "file";
   const parentDir = kind === "directory" ? absoluteTarget : path.dirname(absoluteTarget);

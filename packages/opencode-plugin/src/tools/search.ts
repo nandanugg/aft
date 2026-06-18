@@ -230,9 +230,14 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
       if (pathSplit) {
         for (const target of searchPathTargets(projectRoot, pathSplit, "file")) {
-          const externalDenied = await assertExternalDirectoryPermission(context, target.target, {
-            kind: target.kind,
-          });
+          const externalDenied = await assertExternalDirectoryPermission(
+            ctx,
+            context,
+            target.target,
+            {
+              kind: target.kind,
+            },
+          );
           if (externalDenied) return permissionDeniedResponse(externalDenied);
         }
       }
@@ -311,9 +316,14 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
       if (pathSplit) {
         for (const target of searchPathTargets(projectRoot, pathSplit, "directory")) {
-          const externalDenied = await assertExternalDirectoryPermission(context, target.target, {
-            kind: target.kind,
-          });
+          const externalDenied = await assertExternalDirectoryPermission(
+            ctx,
+            context,
+            target.target,
+            {
+              kind: target.kind,
+            },
+          );
           if (externalDenied) return permissionDeniedResponse(externalDenied);
         }
       }

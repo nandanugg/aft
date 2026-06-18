@@ -100,7 +100,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
           const previewPaths = Array.from(new Set(responsePaths(preview)));
           for (const filePath of previewPaths) {
-            const denial = await assertExternalDirectoryPermission(context, filePath);
+            const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
             if (denial) return permissionDeniedResponse(denial);
           }
 
@@ -137,7 +137,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
               const parent = path.dirname(abs);
               if (uniqueParents.has(parent)) continue;
               uniqueParents.add(parent);
-              const denial = await assertExternalDirectoryPermission(context, abs, {
+              const denial = await assertExternalDirectoryPermission(ctx, context, abs, {
                 kind: "file",
               });
               if (denial) return permissionDeniedResponse(denial);
@@ -152,7 +152,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           }
 
           for (const filePath of new Set(responsePaths(preview))) {
-            const denial = await assertExternalDirectoryPermission(context, filePath);
+            const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
             if (denial) return permissionDeniedResponse(denial);
           }
 

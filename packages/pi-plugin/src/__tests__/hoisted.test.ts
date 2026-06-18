@@ -444,7 +444,7 @@ describe("hoisted tool adapters", () => {
     expect(editProps.diagnostics).toBeUndefined();
   });
 
-  test("write to external path triggers ui.confirm; denial rejects, approval calls bridge", async () => {
+  test("restrict=true hard-blocks external write (no prompt) before the bridge", async () => {
     const root = await tempRoot();
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
@@ -456,43 +456,19 @@ describe("hoisted tool adapters", () => {
       restrictToProjectRoot: true,
     });
 
-    // The ui.confirm prompt fires unconditionally for external paths, matching
-    // OpenCode's `external_directory` permission rule. Pi users who want to
-    // skip the prompt should rely on Pi's own `extension.permissions` allow-
-    // list, not on AFT's `restrict_to_project_root` flag.
-    let confirmCallCount = 0;
+    // restrict_to_project_root is AFT's full-isolation knob — NOT a per-call
+    // prompt. An external path is hard-blocked with a clear, actionable error
+    // (Pi's tool-result surface) and never reaches the bridge. No ui.confirm.
     const externalPath = join(tmpdir(), `aft-external-${process.pid}-${Date.now()}.txt`);
-    let confirmResponse = false;
-    const extCtx = {
-      cwd: root,
-      hasUI: true,
-      ui: {
-        confirm: (_title: string, _message: string) => {
-          confirmCallCount += 1;
-          return Promise.resolve(confirmResponse);
-        },
-      },
-    };
+    const extCtx = { cwd: root, hasUI: false };
 
     await expect(
       executeTool(tools.get("write")!, { filePath: externalPath, content: "x" }, extCtx as never),
-    ).rejects.toThrow("Permission denied");
-    expect(confirmCallCount).toBe(1);
+    ).rejects.toThrow(/restrict_to_project_root/);
     expect(calls).toEqual([]);
-
-    confirmResponse = true;
-    await executeTool(
-      tools.get("write")!,
-      { filePath: externalPath, content: "x" },
-      extCtx as never,
-    );
-    expect(confirmCallCount).toBe(2);
-    expect(calls).toHaveLength(1);
-    expect(calls[0].command).toBe("write");
-    expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });
   });
 
-  test("external path skips ui.confirm when restrictToProjectRoot is false", async () => {
+  test("external path proceeds to the bridge when restrictToProjectRoot is false", async () => {
     const root = await tempRoot();
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
@@ -502,22 +478,12 @@ describe("hoisted tool adapters", () => {
       hoistEdit: false,
       hoistGrep: false,
       // User opted in to "no restriction" — Pi has no host-level allow-list
-      // to consult, so AFT must defer to Rust without nagging with a prompt.
+      // to consult, so AFT defers to Rust (which accepts the path).
       restrictToProjectRoot: false,
     });
 
-    let confirmCallCount = 0;
     const externalPath = join(tmpdir(), `aft-external-norestrict-${process.pid}-${Date.now()}.txt`);
-    const extCtx = {
-      cwd: root,
-      hasUI: true,
-      ui: {
-        confirm: (_title: string, _message: string) => {
-          confirmCallCount += 1;
-          return Promise.resolve(false);
-        },
-      },
-    };
+    const extCtx = { cwd: root, hasUI: false };
 
     await executeTool(
       tools.get("write")!,
@@ -525,85 +491,9 @@ describe("hoisted tool adapters", () => {
       extCtx as never,
     );
 
-    // Plugin must NOT prompt; Rust accepts the path because the flag forwards
-    // to its own `restrict_to_project_root: false`.
-    expect(confirmCallCount).toBe(0);
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("write");
     expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });
-  });
-
-  test("external path denies immediately when hasUI is false (no confirm hang)", async () => {
-    const root = await tempRoot();
-    const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
-    registerHoistedTools(api, makePluginContext(bridge), {
-      hoistRead: false,
-      hoistWrite: true,
-      hoistEdit: false,
-      hoistGrep: false,
-      restrictToProjectRoot: true,
-    });
-
-    // Without a UI to surface ui.confirm, we MUST deny synchronously rather
-    // than wait on a prompt that nothing will answer — that's the hang the
-    // user reported for grep against ~/Work/... in agent-driven mode.
-    const externalPath = join(tmpdir(), `aft-external-noui-${process.pid}-${Date.now()}.txt`);
-    const extCtx = { cwd: root, hasUI: false };
-
-    await expect(
-      executeTool(tools.get("write")!, { filePath: externalPath, content: "x" }, extCtx as never),
-    ).rejects.toThrow("Permission denied");
-    expect(calls).toEqual([]);
-  });
-
-  test("external path denies on confirm timeout (no bridge wedge)", async () => {
-    const root = await tempRoot();
-    const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
-    registerHoistedTools(api, makePluginContext(bridge), {
-      hoistRead: false,
-      hoistWrite: true,
-      hoistEdit: false,
-      hoistGrep: false,
-      restrictToProjectRoot: true,
-    });
-
-    // confirm returns a Promise that never resolves — exactly the failure mode
-    // observed when Pi can't surface the prompt mid-agent-tool-call. The
-    // hard timeout in assertExternalDirectoryPermission must take over and
-    // throw a deterministic Permission denied so the agent unblocks. We
-    // shrink the prod 30s timeout to 50ms via env override for this test.
-    const previous = process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
-    process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS = "50";
-    try {
-      const externalPath = join(tmpdir(), `aft-external-stuck-${process.pid}-${Date.now()}.txt`);
-      let confirmCallCount = 0;
-      const extCtx = {
-        cwd: root,
-        hasUI: true,
-        ui: {
-          confirm: (_title: string, _message: string) => {
-            confirmCallCount += 1;
-            return new Promise<boolean>(() => {
-              /* never resolves */
-            });
-          },
-        },
-      };
-
-      await expect(
-        executeTool(tools.get("write")!, { filePath: externalPath, content: "x" }, extCtx as never),
-      ).rejects.toThrow(/Permission denied.*timed out/);
-      expect(confirmCallCount).toBe(1);
-      expect(calls).toEqual([]);
-    } finally {
-      if (previous === undefined) {
-        delete process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
-      } else {
-        process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS = previous;
-      }
-    }
   });
 
   test("formatReadFooter only hints when Rust clamped an unbounded read", () => {

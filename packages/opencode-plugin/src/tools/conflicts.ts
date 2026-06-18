@@ -38,7 +38,7 @@ export function conflictTools(ctx: PluginContext): Record<string, ToolDefinition
           const expanded = expandTilde(String(args.path));
           const projectRoot = await resolveProjectRoot(ctx, context);
           const resolved = resolvePathFromProjectRoot(projectRoot, expanded);
-          const denied = await assertExternalDirectoryPermission(context, resolved, {
+          const denied = await assertExternalDirectoryPermission(ctx, context, resolved, {
             kind: "directory",
           });
           if (denied) return permissionDeniedResponse(denied);

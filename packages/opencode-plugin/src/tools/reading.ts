@@ -97,6 +97,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               target.map((entry) => resolvePathArg(ctx, context, entry)),
             );
             const permissionDenied = await assertPathExternalPermissions(
+              ctx,
               context,
               resolvedTargets,
               "directory",
@@ -129,6 +130,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           }
 
           const permissionDenied = await assertPathExternalPermissions(
+            ctx,
             context,
             resolvedPath,
             isDirectory ? "directory" : "file",
@@ -159,7 +161,11 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           const resolvedTargets = await Promise.all(
             (target as string[]).map((entry) => resolvePathArg(ctx, context, entry)),
           );
-          const permissionDenied = await assertPathExternalPermissions(context, resolvedTargets);
+          const permissionDenied = await assertPathExternalPermissions(
+            ctx,
+            context,
+            resolvedTargets,
+          );
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
 
           const response = await callBridge(ctx, context, "outline", {
@@ -188,6 +194,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         }
 
         const permissionDenied = await assertPathExternalPermissions(
+          ctx,
           context,
           resolvedTarget,
           isDirectory ? "directory" : "file",
@@ -339,7 +346,11 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           const resolvedTargets = await Promise.all(
             targets.map((t) => resolvePathArg(ctx, context, t.filePath)),
           );
-          const permissionDenied = await assertPathExternalPermissions(context, resolvedTargets);
+          const permissionDenied = await assertPathExternalPermissions(
+            ctx,
+            context,
+            resolvedTargets,
+          );
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
 
           const responses = await Promise.all(
@@ -376,7 +387,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           ? (args.url as string)
           : await resolvePathArg(ctx, context, args.filePath as string);
         if (!hasUrl) {
-          const permissionDenied = await assertPathExternalPermissions(context, file);
+          const permissionDenied = await assertPathExternalPermissions(ctx, context, file);
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
         }
 
@@ -493,6 +504,7 @@ interface SkippedOutlineFile {
 const MAX_UNCHECKED_FILES_IN_FOOTER = 10;
 
 async function assertPathExternalPermissions(
+  ctx: PluginContext,
   context: ToolContext,
   target: string | string[],
   kind: "file" | "directory" = "file",
@@ -506,7 +518,7 @@ async function assertPathExternalPermissions(
     if (checked.has(key)) continue;
     checked.add(key);
 
-    const denial = await assertExternalDirectoryPermission(context, resolvedPath, { kind });
+    const denial = await assertExternalDirectoryPermission(ctx, context, resolvedPath, { kind });
     if (denial) return denial;
   }
 

@@ -85,9 +85,13 @@ function createBashPermissionHarness(asks: PermissionAskFrame[]) {
   );
 }
 
-function createSdkContext(directory: string, ask: ToolContext["ask"]): ToolContext {
+function createSdkContext(
+  directory: string,
+  ask: ToolContext["ask"],
+  sessionID = "permission-audit-test",
+): ToolContext {
   return {
-    sessionID: "permission-audit-test",
+    sessionID,
     messageID: "message-id",
     agent: "test",
     directory,
@@ -336,13 +340,96 @@ describe("permission audit regressions", () => {
   });
   windowsTest("containsPath rejects Windows cross-drive targets as external", async () => {
     const askCalls: AskCall[] = [];
-    const ctx = createSdkContext("C:\\repo", recordingAsk(askCalls));
+    const context = createSdkContext("C:\\repo", recordingAsk(askCalls));
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
 
-    await assertExternalDirectoryPermission(ctx, "D:\\secret\\file.ts");
+    await assertExternalDirectoryPermission(ctx, context, "D:\\secret\\file.ts");
 
     expect(askCalls).toHaveLength(1);
     expect(askCalls[0]?.permission).toBe("external_directory");
     expect(askCalls[0]?.patterns?.[0]).toContain("D:");
+  });
+
+  test("restrict_to_project_root blocks external paths without bubbling an ask", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const promptCalls: unknown[] = [];
+    const context = createSdkContext(project, recordingAsk(askCalls), "restrict-block-sess");
+    const client = {
+      ...createMockClient(),
+      session: { prompt: (input: unknown) => promptCalls.push(input) },
+    };
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool, client);
+    ctx.config = { restrict_to_project_root: true } as PluginContext["config"];
+
+    const denial = await assertExternalDirectoryPermission(
+      ctx,
+      context,
+      path.join(external, "secret.txt"),
+    );
+
+    // Blocked + agent-facing denial, and NO external_directory prompt bubbled.
+    expect(typeof denial).toBe("string");
+    expect(denial).toContain("restrict_to_project_root");
+    expect(askCalls).toHaveLength(0);
+    // User-facing ignored panel fired once.
+    expect(promptCalls).toHaveLength(1);
+  });
+
+  test("restrict_to_project_root notice is throttled to once per session", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const context = createSdkContext(project, recordingAsk([]), "restrict-throttle-sess");
+    const promptCalls: unknown[] = [];
+    const client = {
+      ...createMockClient(),
+      session: { prompt: (input: unknown) => promptCalls.push(input) },
+    };
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool, client);
+    ctx.config = { restrict_to_project_root: true } as PluginContext["config"];
+
+    const a = await assertExternalDirectoryPermission(ctx, context, path.join(external, "a.txt"));
+    const b = await assertExternalDirectoryPermission(ctx, context, path.join(external, "b.txt"));
+
+    // Both blocked (agent always informed), but the user panel fires once.
+    expect(typeof a).toBe("string");
+    expect(typeof b).toBe("string");
+    expect(promptCalls).toHaveLength(1);
+  });
+
+  test("restrict_to_project_root allows in-root paths untouched", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const context = createSdkContext(project, recordingAsk(askCalls));
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
+    ctx.config = { restrict_to_project_root: true } as PluginContext["config"];
+
+    const denial = await assertExternalDirectoryPermission(
+      ctx,
+      context,
+      path.join(project, "in-root.txt"),
+    );
+
+    expect(denial).toBeUndefined();
+    expect(askCalls).toHaveLength(0);
+  });
+
+  test("restrict false (default) still bubbles the external_directory ask", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const context = createSdkContext(project, recordingAsk(askCalls));
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
+    ctx.config = { restrict_to_project_root: false } as PluginContext["config"];
+
+    const denial = await assertExternalDirectoryPermission(
+      ctx,
+      context,
+      path.join(external, "ok.txt"),
+    );
+
+    // Grant path: ask bubbled, no denial.
+    expect(denial).toBeUndefined();
+    expect(askCalls).toHaveLength(1);
+    expect(askCalls[0]?.permission).toBe("external_directory");
   });
 
   windowsTest(

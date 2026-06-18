@@ -52,7 +52,7 @@ import {
   sendWarning,
 } from "./notifications.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
-import { resolvePromptContext } from "./shared/last-assistant-model.js";
+import { sendIgnoredMessage } from "./shared/ignored-message.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
@@ -139,51 +139,8 @@ function throwSentinel(command: string): never {
 // value pushed into the hooks array — `undefined` returns then crash
 // the host on every `hook.config?.(cfg)` / `hook.provider?.(...)` /
 // etc. iteration. Helpers stay in sibling modules.
-async function sendIgnoredMessage(client: unknown, sessionID: string, text: string): Promise<void> {
-  const typedClient = client as {
-    session?: {
-      prompt?: (input: unknown) => unknown;
-      promptAsync?: (input: unknown) => unknown;
-    };
-  };
-
-  // Resolve the current agent (used by the user in this session) so the
-  // notification renders under that agent in the OpenCode UI. Without
-  // `agent`, OpenCode renders under its default agent — which surfaces
-  // as the "AFT uses non-current agent" bug when users switch agents
-  // via oh-my-openagent. See issue #62. `agent` is honored on the
-  // `noReply: true` path too (no LLM call, just appended as a synthetic
-  // user message recorded under that agent).
-  let agent: string | undefined;
-  try {
-    const ctx = await resolvePromptContext(
-      client as Parameters<typeof resolvePromptContext>[0],
-      sessionID,
-    );
-    agent = ctx?.agent;
-  } catch {
-    agent = undefined;
-  }
-
-  const body: Record<string, unknown> = {
-    noReply: true,
-    parts: [{ type: "text", text, ignored: true }],
-  };
-  if (agent) body.agent = agent;
-  const promptInput = { path: { id: sessionID }, body };
-
-  if (typeof typedClient.session?.prompt === "function") {
-    await Promise.resolve(typedClient.session.prompt(promptInput));
-    return;
-  }
-
-  if (typeof typedClient.session?.promptAsync === "function") {
-    await typedClient.session.promptAsync(promptInput);
-    return;
-  }
-
-  throw new Error("[aft-plugin] client.session.prompt is unavailable");
-}
+// sendIgnoredMessage moved to ./shared/ignored-message.ts so tools/permissions.ts
+// can call it too (index.ts must export only the plugin default).
 
 /** Read the plugin's own version from package.json at build time. */
 const PLUGIN_VERSION: string = (() => {

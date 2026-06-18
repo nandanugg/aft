@@ -138,29 +138,18 @@ function appendSkippedSearchPaths(text: string, missing: string[]): string {
 }
 
 /**
- * Hard upper bound on how long we'll wait for `ui.confirm` before treating
- * the prompt as denied. Without this, an agent-driven tool call from a
- * non-UI Pi context (or any path where the host can't surface the prompt)
- * blocks the bridge round-trip indefinitely — observed as "grep hangs
- * forever". Denial after 30s preserves the security model while letting
- * the agent recover. Overridable for tests via
- * `AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS`.
+ * Enforce AFT's `restrict_to_project_root` isolation for an out-of-root target.
+ *
+ * Pi has no host-level permission/allow-list system to bubble to. So the knob
+ * is binary: when `restrict_to_project_root` is false (Pi default) the path is
+ * allowed (Rust accepts it); when true, the path is hard-blocked with a clear,
+ * actionable error — never a prompt. A per-call grant could never override the
+ * Rust-side boundary anyway, which is exactly the issue #125 footgun this
+ * avoids. The thrown error surfaces as the tool result (Pi's user surface).
  */
-function externalDirectoryPromptTimeoutMs(): number {
-  const raw = process.env.AFT_PI_EXTERNAL_PROMPT_TIMEOUT_MS;
-  if (raw === undefined) return 30_000;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
-}
-
 export async function assertExternalDirectoryPermission(
-  extCtx: {
-    cwd: string;
-    hasUI?: boolean;
-    ui?: { confirm?: (title: string, message: string) => Promise<boolean> };
-  },
+  extCtx: { cwd: string },
   target: string,
-  action = "modify",
   options: { restrictToProjectRoot?: boolean } = {},
 ): Promise<void> {
   if (!target) return;
@@ -175,43 +164,17 @@ export async function assertExternalDirectoryPermission(
   // path because `restrict_to_project_root` is false.
   if (options.restrictToProjectRoot === false) return;
 
-  // No UI available — deny immediately so the agent gets a clear refusal
-  // instead of an unanswerable prompt. This branch is only reachable when
-  // `restrict_to_project_root: true` AND no UI is available, which is
-  // unusual; the right path is to either run Pi interactively or relax
-  // the restriction.
-  const confirmFn = extCtx.ui?.confirm;
-  if (extCtx.hasUI === false || !confirmFn) {
-    throw new Error(
-      `Permission denied: cannot prompt for ${action} outside the project (${absoluteTarget}).`,
-    );
-  }
-
-  // Race the confirm against a hard timeout so a stuck prompt cannot wedge
-  // the bridge dispatch loop.
-  const timeoutMs = externalDirectoryPromptTimeoutMs();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), timeoutMs);
-  });
-  try {
-    const result = await Promise.race([
-      confirmFn(
-        "Allow external directory access?",
-        `AFT wants to ${action} outside the project: ${absoluteTarget}`,
-      ),
-      timeoutPromise,
-    ]);
-    if (result === true) return;
-    if (result === "timeout") {
-      throw new Error(
-        `Permission denied: external directory prompt timed out after ${timeoutMs}ms.`,
-      );
-    }
-    throw new Error("Permission denied: external directory access was cancelled.");
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+  // restrict_to_project_root is AFT's full-isolation knob — NOT a per-call
+  // permission. When it's on, an out-of-root path is hard-blocked: do NOT
+  // prompt (a grant could never override the Rust-side boundary anyway — that
+  // produced issue #125's "approved but still fails"). Throw the clear,
+  // actionable denial; Pi renders it as the tool result, which IS the user
+  // surface here (no separate ignored-panel channel like OpenCode).
+  throw new Error(
+    `Blocked: '${absoluteTarget}' is outside the project root and restrict_to_project_root is ` +
+      "enabled (AFT full isolation). Not overridable per-call; set restrict_to_project_root: false " +
+      "in aft.jsonc to allow external paths.",
+  );
 }
 
 const ReadParams = Type.Object({
@@ -348,7 +311,7 @@ export function registerHoistedTools(
         // check and the bridge. Without this, hoisted read bypassed Pi's
         // external-path prompt/deny layer while write/edit/grep were guarded.
         const filePath = await resolvePathArg(extCtx.cwd, params.path);
-        await assertExternalDirectoryPermission(extCtx, filePath, "read", {
+        await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const req: Record<string, unknown> = {
@@ -405,7 +368,7 @@ export function registerHoistedTools(
         // got the raw `~/...`, which Rust treats literally — creating a literal
         // `~` directory under the project root instead of writing to home.
         const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
-        await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
+        await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -456,7 +419,7 @@ export function registerHoistedTools(
         // permission check and the bridge, so Rust receives the real target
         // instead of a literal `~/...`.
         const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
-        await assertExternalDirectoryPermission(extCtx, filePath, "modify", {
+        await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -530,7 +493,6 @@ export function registerHoistedTools(
             await assertExternalDirectoryPermission(
               extCtx,
               absoluteSearchPath(extCtx.cwd, target),
-              "search",
               {
                 restrictToProjectRoot: surface.restrictToProjectRoot,
               },

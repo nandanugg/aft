@@ -110,7 +110,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
           for (const affectedPath of affectedPaths) {
             if (asked.has(affectedPath)) continue;
             asked.add(affectedPath);
-            const denial = await assertExternalDirectoryPermission(context, affectedPath);
+            const denial = await assertExternalDirectoryPermission(ctx, context, affectedPath);
             if (denial) return permissionDeniedResponse(denial);
           }
         }

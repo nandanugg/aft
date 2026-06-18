@@ -487,7 +487,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       // tool/read.ts:175). Out-of-project paths prompt the user via the
       // separate `external_directory` permission rule.
       {
-        const denial = await assertExternalDirectoryPermission(context, filePath);
+        const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
         if (denial) return permissionDeniedResponse(denial);
       }
 
@@ -638,7 +638,7 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
 
       // External-directory check first (mirrors opencode-native write.ts:43).
       {
-        const denial = await assertExternalDirectoryPermission(context, filePath);
+        const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
         if (denial) return permissionDeniedResponse(denial);
       }
 
@@ -854,7 +854,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
-        const denial = await assertExternalDirectoryPermission(context, filePath);
+        const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
         if (denial) return permissionDeniedResponse(denial);
       }
 
@@ -1162,7 +1162,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
         for (const filePath of multiFileWritePaths) {
           if (asked.has(filePath)) continue;
           asked.add(filePath);
-          const denial = await assertExternalDirectoryPermission(context, filePath);
+          const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
           if (denial) return permissionDeniedResponse(denial);
         }
       }
@@ -1693,7 +1693,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         for (const filePath of absolutePaths) {
           if (asked.has(filePath)) continue;
           asked.add(filePath);
-          const denial = await assertExternalDirectoryPermission(context, filePath);
+          const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
           if (denial) return permissionDeniedResponse(denial);
         }
       }
@@ -1768,12 +1768,12 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
 
       // External-directory check first (mirrors opencode-native edit.ts:68).
       {
-        const sourceDenial = await assertExternalDirectoryPermission(context, filePath, {
+        const sourceDenial = await assertExternalDirectoryPermission(ctx, context, filePath, {
           kind: "file",
         });
         if (sourceDenial) return permissionDeniedResponse(sourceDenial);
         if (destPath !== filePath) {
-          const destDenial = await assertExternalDirectoryPermission(context, destPath);
+          const destDenial = await assertExternalDirectoryPermission(ctx, context, destPath);
           if (destDenial) return permissionDeniedResponse(destDenial);
         }
       }
@@ -1897,7 +1897,7 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
 
           // External-directory check first (mirrors opencode-native write.ts:43).
           {
-            const denial = await assertExternalDirectoryPermission(context, filePath);
+            const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
             if (denial) return permissionDeniedResponse(denial);
           }
 

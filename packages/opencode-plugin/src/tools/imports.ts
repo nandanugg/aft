@@ -92,7 +92,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
         // External-directory check first (mirrors opencode-native edit.ts:68).
         {
-          const denial = await assertExternalDirectoryPermission(context, filePath);
+          const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
           if (denial) return permissionDeniedResponse(denial);
         }
 

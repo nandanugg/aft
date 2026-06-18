@@ -150,11 +150,9 @@ describe("Lane G plugin orchestration regressions", () => {
   });
 
   test("/aft-status ignored-message helper keeps noReply payload model-free but agent-aware (issue #62)", () => {
-    const source = readFileSync(resolve(import.meta.dir, "../index.ts"), "utf-8");
-    const helper = source.slice(
-      source.indexOf("async function sendIgnoredMessage"),
-      source.indexOf("/** Read the plugin's own version"),
-    );
+    // sendIgnoredMessage was extracted to shared/ignored-message.ts so
+    // tools/permissions.ts can reuse it (index.ts exports only the plugin).
+    const helper = readFileSync(resolve(import.meta.dir, "../shared/ignored-message.ts"), "utf-8");
     expect(helper).toContain("noReply: true");
     // Issue #62: agent IS passed so notifications render under the user's
     // current agent. Model/variant remain off this path (no LLM turn fires

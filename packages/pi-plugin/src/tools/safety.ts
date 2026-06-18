@@ -199,7 +199,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         if (filePath) previewReq.file = filePath;
         const preview = await callBridge(bridge, "undo_preview", previewReq, extCtx);
         for (const file of new Set(responsePaths(preview))) {
-          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+          await assertExternalDirectoryPermission(extCtx, file, {
             restrictToProjectRoot,
           });
         }
@@ -211,7 +211,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
           for (const file of checkpointFiles) {
             if (checked.has(file)) continue;
             checked.add(file);
-            await assertExternalDirectoryPermission(extCtx, file, "modify", {
+            await assertExternalDirectoryPermission(extCtx, file, {
               restrictToProjectRoot,
             });
           }
@@ -220,7 +220,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       if (params.op === "restore" && params.name) {
         const preview = await callBridge(bridge, "checkpoint_paths", { name: params.name }, extCtx);
         for (const file of new Set(responsePaths(preview))) {
-          await assertExternalDirectoryPermission(extCtx, file, "modify", {
+          await assertExternalDirectoryPermission(extCtx, file, {
             restrictToProjectRoot,
           });
         }

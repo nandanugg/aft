@@ -77,7 +77,7 @@ async function resolveAndGateScope(
   for (const target of resolved) {
     if (checked.has(target)) continue;
     checked.add(target);
-    await assertExternalDirectoryPermission(extCtx, target, "read", {
+    await assertExternalDirectoryPermission(extCtx, target, {
       restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
     });
   }

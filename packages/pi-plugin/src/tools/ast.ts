@@ -115,7 +115,6 @@ async function resolveAstPaths(
 async function assertAstPathsPermission(
   extCtx: ExtensionContext,
   paths: string[] | undefined,
-  action: "modify" | "search",
   restrictToProjectRoot: boolean,
 ): Promise<void> {
   if (paths === undefined || paths.length === 0) return;
@@ -123,7 +122,7 @@ async function assertAstPathsPermission(
   for (const path of paths) {
     if (checked.has(path)) continue;
     checked.add(path);
-    await assertExternalDirectoryPermission(extCtx, path, action, { restrictToProjectRoot });
+    await assertExternalDirectoryPermission(extCtx, path, { restrictToProjectRoot });
   }
 }
 
@@ -297,12 +296,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         extCtx,
       ) {
         const paths = await resolveAstPaths(extCtx, params.paths);
-        await assertAstPathsPermission(
-          extCtx,
-          paths,
-          "search",
-          ctx.config.restrict_to_project_root ?? false,
-        );
+        await assertAstPathsPermission(extCtx, paths, ctx.config.restrict_to_project_root ?? false);
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = {
@@ -342,12 +336,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         extCtx,
       ) {
         const paths = await resolveAstPaths(extCtx, params.paths);
-        await assertAstPathsPermission(
-          extCtx,
-          paths,
-          params.dryRun === true ? "search" : "modify",
-          ctx.config.restrict_to_project_root ?? false,
-        );
+        await assertAstPathsPermission(extCtx, paths, ctx.config.restrict_to_project_root ?? false);
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = {
