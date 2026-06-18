@@ -38,6 +38,7 @@ pub mod prettier;
 pub mod pytest;
 pub mod ruff;
 pub mod toml_filter;
+pub mod tree;
 pub mod trust;
 pub mod tsc;
 pub mod vitest;
@@ -67,6 +68,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use toml_filter::{apply_filter_with_exit_code, FilterRegistry};
+use tree::TreeCompressor;
 use tsc::TscCompressor;
 use vitest::VitestCompressor;
 
@@ -309,7 +311,7 @@ pub fn compress_with_registry_exit_code(
     let normalized = normalize_command_for_dispatch(command);
     let dispatch_cmd = normalized.as_deref().unwrap_or(command);
 
-    let compressors: [&dyn Compressor; 19] = [
+    let compressors: [&dyn Compressor; 20] = [
         &GitCompressor,
         &CargoCompressor,
         &TscCompressor,
@@ -329,6 +331,7 @@ pub fn compress_with_registry_exit_code(
         &NextCompressor,
         &LsCompressor,
         &FindCompressor,
+        &TreeCompressor,
     ];
 
     // Tier 1a: Specific command compressors win first.
