@@ -13,7 +13,7 @@ import {
   startAimock,
 } from "./helpers";
 
-describe("extension UI permission ask (real Pi RPC)", () => {
+describe("external-directory isolation under restrict_to_project_root (real Pi RPC)", () => {
   let env: PiIsolatedEnv;
   let aimock: AimockHandle;
   let outsideDir: string;
@@ -30,7 +30,7 @@ describe("extension UI permission ask (real Pi RPC)", () => {
     await rm(outsideDir, { recursive: true, force: true });
   });
 
-  test("Pi handles extension_ui_request for external-directory permission ask", async () => {
+  test("restrict_to_project_root hard-blocks an external edit with no ui.confirm prompt (#125)", async () => {
     const outOfProjectFile = join(outsideDir, "outside-project-test.txt");
     await writeFile(outOfProjectFile, "original content\n");
     aimock.registerToolCallFixture({
@@ -55,9 +55,10 @@ describe("extension UI permission ask (real Pi RPC)", () => {
         aftPluginDir: resolvePiPluginDir(),
         configDir: env.configDir,
         workdir: env.workdir,
-        // External-path edit MUST trigger ui.confirm — only happens when
-        // restrict_to_project_root is true. Under the Pi default (false)
-        // the plugin defers to Rust silently.
+        // restrict_to_project_root is the full-isolation knob (#125): an
+        // out-of-root path is hard-blocked at the plugin layer with NO
+        // ui.confirm prompt. Under the Pi default (false) the plugin defers
+        // to Rust, which accepts the path.
         restrictToProjectRoot: true,
       });
       client = spawned.client;
@@ -65,7 +66,6 @@ describe("extension UI permission ask (real Pi RPC)", () => {
       let uiRequestSeen = false;
       client.onExtensionUIRequest((request) => {
         uiRequestSeen = true;
-        expect(["confirm", "select"]).toContain(String(request.method));
         client?.sendExtensionUIResponse({
           id: request.id as string,
           cancelled: true,
@@ -83,9 +83,10 @@ describe("extension UI permission ask (real Pi RPC)", () => {
         (event) => event.type === "tool_execution_end" && event.toolName === "edit",
         30_000,
       );
-      expect(uiRequestSeen).toBe(true);
+      // No prompt — blocked up front, not a cancellable ask.
+      expect(uiRequestSeen).toBe(false);
       expect(toolEnd.isError).toBe(true);
-      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/permission|denied|cancelled/);
+      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/restrict_to_project_root/);
 
       const after = await readFile(outOfProjectFile, "utf8");
       expect(after).toBe("original content\n");

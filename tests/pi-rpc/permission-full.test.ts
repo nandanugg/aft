@@ -22,9 +22,10 @@ async function withPiTool(
     afterTool?: (env: PiIsolatedEnv, toolEnd: Record<string, unknown>) => Promise<void>;
     /**
      * Force `restrict_to_project_root: true` in the generated AFT config.
-     * Required for tests that exercise the `ui.confirm` external-directory
-     * prompt — under the Pi default (false) the plugin defers to Rust
-     * without prompting at all.
+     * Under true, an out-of-root path is hard-blocked at the plugin layer
+     * with NO ui.confirm prompt (issue #125 — the isolation knob is not a
+     * per-call permission). Under the Pi default (false) the plugin defers
+     * to Rust, which accepts the path.
      */
     restrictToProjectRoot?: boolean;
   },
@@ -91,20 +92,16 @@ describe("permission matrix (real Pi RPC)", () => {
     expect(JSON.stringify(toolEnd.result)).toContain("Edited (");
   }, 120_000);
 
-  test("external edit under strict mode prompts then Rust still rejects (defense in depth)", async () => {
-    // Under `restrict_to_project_root: true`, two gates apply in order:
-    //   1. Plugin prompts via ui.confirm (this is what `uiRequestSeen` checks).
-    //   2. Rust enforces the same flag and hard-rejects the path itself.
+  test("external edit under strict mode is hard-blocked at the plugin layer (no prompt)", async () => {
+    // Issue #125: `restrict_to_project_root` is AFT's full-isolation knob,
+    // NOT a per-call permission. Under true, an out-of-root path is blocked
+    // up front at the plugin layer with a clear error and NO ui.confirm
+    // prompt (a grant could never override Rust's boundary anyway — that was
+    // the "approved but still fails" footgun). The file stays unchanged.
     //
-    // Confirming the prompt at the plugin layer does NOT override Rust's
-    // gate — there's no "human override" path in the Rust contract. The
-    // edit therefore fails even when the user clicks confirm. This is the
-    // intended defense-in-depth behavior: the prompt warns the user about
-    // an out-of-root operation, and Rust independently blocks it.
-    //
-    // (Pi users who want external paths to work should set
-    // `restrict_to_project_root: false` — the Pi default — which skips the
-    // prompt and lets Rust accept the path.)
+    // Pi users who want external paths to work should set
+    // `restrict_to_project_root: false` — the Pi default — which lets Rust
+    // accept the path.)
     const outsideDir = await mkdtemp(join(tmpdir(), "aft-pi-rpc-outside-"));
     try {
       const target = join(outsideDir, "confirmed-edit.txt");
@@ -126,10 +123,11 @@ describe("permission matrix (real Pi RPC)", () => {
           },
         },
       );
-      expect(uiRequestSeen).toBe(true);
+      // No prompt under the new contract — blocked up front.
+      expect(uiRequestSeen).toBe(false);
       expect(toolEnd.isError).toBe(true);
-      // Confirming at the plugin layer doesn't override Rust's hard gate;
-      // the file content stays unchanged.
+      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/restrict_to_project_root/);
+      // The file content stays unchanged.
       expect(await readFile(target, "utf8")).toBe("original content\n");
     } finally {
       await rm(outsideDir, { recursive: true, force: true });
@@ -168,10 +166,10 @@ describe("permission matrix (real Pi RPC)", () => {
     }
   }, 120_000);
 
-  test("external write cancellation returns an error and leaves file absent", async () => {
+  test("external write under strict mode is blocked (no prompt) and leaves file absent", async () => {
     const outsideDir = await mkdtemp(join(tmpdir(), "aft-pi-rpc-outside-"));
     try {
-      const target = join(outsideDir, "cancelled-write.txt");
+      const target = join(outsideDir, "blocked-write.txt");
       let uiRequestSeen = false;
       const toolEnd = await withPiTool(
         { name: "write", arguments: { filePath: target, content: "new content\n" } },
@@ -179,23 +177,22 @@ describe("permission matrix (real Pi RPC)", () => {
           message: `Write ${target}.`,
           restrictToProjectRoot: true,
           onClient: (client) => {
-            client.onExtensionUIRequest((request) => {
+            client.onExtensionUIRequest(() => {
               uiRequestSeen = true;
-              client.sendExtensionUIResponse({ id: request.id as string, cancelled: true });
             });
           },
         },
       );
-      expect(uiRequestSeen).toBe(true);
+      expect(uiRequestSeen).toBe(false);
       expect(toolEnd.isError).toBe(true);
-      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/permission|denied|cancelled/);
+      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/restrict_to_project_root/);
       expect(existsSync(target)).toBe(false);
     } finally {
       await rm(outsideDir, { recursive: true, force: true });
     }
   }, 120_000);
 
-  test("external grep cancellation returns an error envelope", async () => {
+  test("external grep under strict mode is blocked (no prompt)", async () => {
     const outsideDir = await mkdtemp(join(tmpdir(), "aft-pi-rpc-outside-"));
     try {
       await writeFile(join(outsideDir, "search.txt"), "needle\n");
@@ -206,16 +203,15 @@ describe("permission matrix (real Pi RPC)", () => {
           message: `Search ${outsideDir}.`,
           restrictToProjectRoot: true,
           onClient: (client) => {
-            client.onExtensionUIRequest((request) => {
+            client.onExtensionUIRequest(() => {
               uiRequestSeen = true;
-              client.sendExtensionUIResponse({ id: request.id as string, cancelled: true });
             });
           },
         },
       );
-      expect(uiRequestSeen).toBe(true);
+      expect(uiRequestSeen).toBe(false);
       expect(toolEnd.isError).toBe(true);
-      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/permission|denied|cancelled/);
+      expect(JSON.stringify(toolEnd.result).toLowerCase()).toMatch(/restrict_to_project_root/);
     } finally {
       await rm(outsideDir, { recursive: true, force: true });
     }
