@@ -182,7 +182,10 @@ pub enum RawToolSurface {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+// Nested objects mirror TS sub-schemas, which are non-strict z.object (unknown
+// keys are silently stripped, the object survives). Only the TOP-LEVEL
+// RawAftConfig is strict (matches AftConfigSchema.strict()). Privileged denylist
+// fields are all top-level, so nested unknowns are harmlessly ignored.
 pub struct RawSemantic {
     pub backend: Option<SemanticBackend>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
@@ -212,7 +215,6 @@ impl RawSemantic {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct RawLsp {
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
     pub servers: Option<BTreeMap<String, RawLspServerEntry>>,
@@ -251,7 +253,7 @@ pub enum RawPythonLsp {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawLspServerEntry {
     #[serde(deserialize_with = "deserialize_opt_lsp_extensions")]
     pub extensions: Option<Vec<String>>,
@@ -273,7 +275,7 @@ pub enum RawBash {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawBashFeatures {
     pub rewrite: Option<bool>,
     pub compress: Option<bool>,
@@ -287,7 +289,7 @@ pub struct RawBashFeatures {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawExperimental {
     pub bash: Option<RawExperimentalBash>,
     pub lsp_ty: Option<bool>,
@@ -300,7 +302,7 @@ impl RawExperimental {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawExperimentalBash {
     pub rewrite: Option<bool>,
     pub compress: Option<bool>,
@@ -325,7 +327,7 @@ impl RawExperimentalBash {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawInspect {
     pub enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_nonnegative_f64")]
@@ -350,7 +352,7 @@ impl RawInspect {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawInspectDuplicates {
     #[serde(deserialize_with = "deserialize_opt_positive_usize")]
     pub lower_bound: Option<usize>,
@@ -366,7 +368,7 @@ impl RawInspectDuplicates {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawInspectAnonymize {
     pub variables: Option<bool>,
     pub fields: Option<bool>,
@@ -386,7 +388,7 @@ impl RawInspectAnonymize {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RawBridge {
     #[serde(deserialize_with = "deserialize_opt_bridge_request_timeout_ms")]
     pub request_timeout_ms: Option<u64>,
@@ -1493,6 +1495,44 @@ mod tests {
             .iter()
             .map(|dropped| dropped.key.clone())
             .collect()
+    }
+
+    /// Security invariant (Oracle drift decision): nested objects are non-strict
+    /// (match TS z.object — unknown nested keys are stripped, object survives),
+    /// but the TOP-LEVEL RawAftConfig stays strict. A privileged process-state
+    /// field is top-level, so a project tier trying to smuggle one still hits the
+    /// strict top-level → that tier fails full parse, and partial-parse drops the
+    /// unknown key. It can NEVER reach Config.
+    #[test]
+    fn nested_unknown_keys_are_stripped_but_top_level_privileged_keys_cannot_smuggle() {
+        // Nested unknown key: stripped, object survives — parity with TS (golden
+        // `bash_unknown_nested_key`). `bash: { unknown_key }` resolves like
+        // `bash: {}` → object form → bash ENABLED (object presence beats the
+        // minimal surface default). The point: the unknown key did not fail the
+        // parse — the object survived and resolved.
+        let nested = resolve_config(&[tier(
+            "user",
+            r#"{ "tool_surface": "minimal", "bash": { "unknown_key": true } }"#,
+        )]);
+        assert!(nested.config.experimental_bash_rewrite);
+        assert!(nested.config.experimental_bash_compress);
+        assert!(nested.config.experimental_bash_background);
+
+        // Top-level privileged process-state field (storage_dir) from a PROJECT
+        // tier: not in RawAftConfig → full parse fails → partial-parse drops it.
+        // It must never appear in Config (Config keeps its default storage_dir).
+        let smuggle = resolve_config(&[
+            tier("user", r#"{ "search_index": true }"#),
+            tier(
+                "project",
+                r#"{ "storage_dir": "/tmp/evil", "bash_permissions": true, "search_index": false }"#,
+            ),
+        ]);
+        // The valid project key (search_index) still applies via partial-parse...
+        assert!(!smuggle.config.search_index);
+        // ...but the smuggled process-state fields never reach Config.
+        assert!(smuggle.config.storage_dir.is_none());
+        assert!(!smuggle.config.bash_permissions);
     }
 
     #[test]

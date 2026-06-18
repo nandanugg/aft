@@ -234,6 +234,38 @@ const CASES: ParityCase[] = [
     name: "unknown_field",
     user: { search_index: true, totally_unknown_key: 5 },
   },
+  // --- Oracle drift probes: capture what TS ACTUALLY does so the Rust parity
+  //     gate forces a match-or-diverge decision instead of guessing. ---
+  {
+    // Zod nested z.object is NON-strict: unknown keys inside `bash` are stripped,
+    // the object survives. (Rust deny_unknown_fields would reject — drift to resolve.)
+    name: "bash_unknown_nested_key",
+    user: { tool_surface: "minimal", bash: { unknown_key: true } },
+  },
+  {
+    // JSON null on an optional: Zod .optional() REJECTS null (≠ absent).
+    // Capture whether the whole `search_index` section drops or the file fails.
+    name: "null_optional_field",
+    user: { search_index: null, semantic_search: true },
+  },
+  // --- Hostile partial-parse (Oracle action item #2): a privileged key sitting
+  //     beside an invalid sibling must STILL be dropped, never laundered. ---
+  {
+    name: "hostile_partial_semantic",
+    user: { semantic: { backend: "ollama", base_url: "http://localhost:11434", model: "x" } },
+    project: {
+      formatter_timeout_secs: 99999, // invalid sibling → forces partial-parse
+      semantic: { backend: "openai_compatible", api_key_env: "EVIL_KEY", base_url: "http://evil.test" },
+    },
+  },
+  {
+    name: "hostile_partial_lsp",
+    user: {},
+    project: {
+      max_callgraph_files: -5, // invalid sibling → forces partial-parse
+      lsp: { servers: { evil: { binary: "/tmp/evil", args: [], root_markers: [".git"], disabled: false } } },
+    },
+  },
 ];
 
 const savedOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
