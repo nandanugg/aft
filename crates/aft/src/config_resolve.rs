@@ -396,16 +396,11 @@ pub struct RawBridge {
 
 /// Resolve raw user/project config tiers into the flat core [`Config`].
 ///
-/// Empty input is a special case: no config file existed, so the result is the
-/// current runtime default and no bash surface default is synthesized.
+/// Empty input is NOT special-cased: no config file is equivalent to an empty
+/// config object, so it still flows through the resolver and picks up the bash
+/// surface default (recommended ⇒ bash on), matching the TypeScript pipeline
+/// which always runs `resolveProjectOverridesForConfigure` even on `{}`.
 pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
-    if tiers.is_empty() {
-        return ResolveResult {
-            config: Config::default(),
-            dropped: Vec::new(),
-        };
-    }
-
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
 
@@ -1501,20 +1496,21 @@ mod tests {
     }
 
     #[test]
-    fn config_resolve_empty_tiers_returns_default_config_and_no_drops() {
+    fn config_resolve_empty_tiers_applies_bash_surface_default() {
+        // No config file ⇒ empty config object, which still flows through the
+        // resolver and picks up the bash surface default (recommended ⇒ on),
+        // matching the TS pipeline (golden fixture `empty`). NOT Config::default()
+        // — that would leave bash off, diverging from TS.
         let result = resolve_config(&[]);
         let default_config = Config::default();
 
         assert!(result.dropped.is_empty());
+        // Non-bash fields stay at runtime default.
         assert_eq!(result.config.format_on_edit, default_config.format_on_edit);
         assert_eq!(result.config.search_index, default_config.search_index);
         assert_eq!(
             result.config.semantic_search,
             default_config.semantic_search
-        );
-        assert_eq!(
-            result.config.experimental_bash_rewrite,
-            default_config.experimental_bash_rewrite
         );
         assert_eq!(result.config.semantic, default_config.semantic);
         assert_eq!(
@@ -1522,6 +1518,10 @@ mod tests {
             default_config.inspect.enabled
         );
         assert_eq!(result.config.lsp_servers.len(), 0);
+        // Bash surface default: recommended ⇒ rewrite/compress/background all on.
+        assert!(result.config.experimental_bash_rewrite);
+        assert!(result.config.experimental_bash_compress);
+        assert!(result.config.experimental_bash_background);
     }
 
     #[test]
