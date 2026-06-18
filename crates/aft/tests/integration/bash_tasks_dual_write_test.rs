@@ -174,7 +174,7 @@ fn assert_row_matches_task(row: &DbTaskRow, task: &PersistedTask, project: &Path
     assert_eq!(row.task_id, task.task_id);
     assert_eq!(
         row.project_key,
-        aft::search_index::project_cache_key(project)
+        aft::path_identity::project_scope_key(project)
     );
     assert_eq!(row.command, task.command);
     assert_eq!(row.cwd, task.workdir.display().to_string());

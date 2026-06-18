@@ -1509,8 +1509,8 @@ fn store_cold_rebuilds_when_concurrent_clone_root_still_exists() {
     );
     assert_ne!(root_a, root_b);
     assert_eq!(
-        aft::search_index::project_cache_key(&root_a),
-        aft::search_index::project_cache_key(&root_b),
+        aft::search_index::artifact_cache_key(&root_a),
+        aft::search_index::artifact_cache_key(&root_b),
         "clone fixture must share the git-root cache key"
     );
 
@@ -1910,7 +1910,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn legacy_sqlite_path_for_root(store_dir: &Path, root: &Path) -> PathBuf {
     store_dir.join(format!(
         "{}.sqlite",
-        aft::search_index::project_cache_key(root)
+        aft::search_index::artifact_cache_key(root)
     ))
 }
 

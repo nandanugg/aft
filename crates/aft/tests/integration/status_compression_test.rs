@@ -6,7 +6,7 @@ use aft::context::AppContext;
 use aft::db::compression_events::{insert_compression_event, CompressionEventRow};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
-use aft::search_index::project_cache_key;
+use aft::path_identity::project_scope_key;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
@@ -40,7 +40,7 @@ fn insert_event(
     original_tokens: u32,
     compressed_tokens: u32,
 ) {
-    let project_key = project_cache_key(project_root);
+    let project_key = project_scope_key(project_root);
     let row = CompressionEventRow {
         harness: harness.as_str(),
         session_id: Some(session_id),

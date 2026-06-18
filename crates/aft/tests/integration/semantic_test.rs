@@ -16,7 +16,7 @@ mod aft {
 
         use sha2::{Digest, Sha256};
 
-        pub fn project_cache_key(project_root: &Path) -> String {
+        pub fn artifact_cache_key(project_root: &Path) -> String {
             let canonical_root =
                 fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
             let mut hasher = Sha256::new();
@@ -27,7 +27,7 @@ mod aft {
     }
 }
 
-use aft::search_index::project_cache_key;
+use aft::search_index::artifact_cache_key;
 use serde_json::{json, Value};
 
 use crate::helpers::AftProcess;
@@ -502,7 +502,7 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
         ),
     ]);
     let storage = tempfile::tempdir().expect("create storage dir");
-    let project_key = project_cache_key(project.path());
+    let project_key = artifact_cache_key(project.path());
     let semantic_file = storage
         .path()
         .join("semantic")

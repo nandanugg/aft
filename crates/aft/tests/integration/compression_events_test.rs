@@ -209,7 +209,7 @@ fn compression_event_has_correct_harness_and_project_key() {
     assert_eq!(event.session_id.as_deref(), Some(SESSION));
     assert_eq!(
         event.project_key,
-        aft::search_index::project_cache_key(project.path())
+        aft::path_identity::project_scope_key(project.path())
     );
     assert_eq!(event.tool, "bash");
     registry.detach();

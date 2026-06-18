@@ -7,12 +7,12 @@
 //! displayed that cross-project total as if it were the current project's
 //! footprint (e.g. a 4 MB project showed 16 GB because a sibling project's
 //! cache was huge). Status must scope to the current project's slice using
-//! `project_cache_key(project_root)`.
+//! `artifact_cache_key(project_root)`.
 
 use std::fs;
 use std::path::PathBuf;
 
-use aft::search_index::project_cache_key;
+use aft::search_index::artifact_cache_key;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -26,7 +26,7 @@ fn write_fake_cache_for_project(
     trigram_bytes: usize,
     semantic_bytes: usize,
 ) {
-    let key = project_cache_key(project_root);
+    let key = artifact_cache_key(project_root);
 
     let trigram_dir = storage_root.join("index").join(&key);
     fs::create_dir_all(&trigram_dir).expect("create trigram dir");
@@ -58,8 +58,8 @@ fn status_disk_bytes_only_count_current_project() {
     // Ensure the two projects have distinct cache keys (they should, because
     // they have distinct canonical paths). Sanity check this — if it ever
     // fails the test logic falls apart.
-    let key_a = project_cache_key(&project_a);
-    let key_b = project_cache_key(&project_b);
+    let key_a = artifact_cache_key(&project_a);
+    let key_b = artifact_cache_key(&project_b);
     assert_ne!(
         key_a, key_b,
         "projects {project_a:?} and {project_b:?} unexpectedly share cache key {key_a}"
@@ -150,10 +150,10 @@ fn status_disk_bytes_zero_when_no_cache_for_project() {
     assert_eq!(status["disk"]["semantic_disk_bytes"], 0);
 }
 
-/// Type-only sanity check that the public `project_cache_key` import path
+/// Type-only sanity check that the public `artifact_cache_key` import path
 /// stays stable. If this stops compiling, callers in `commands/status.rs`
 /// (and downstream callers) need to update.
 #[allow(dead_code)]
 fn _api_compile_check() -> String {
-    project_cache_key(&PathBuf::from("/tmp/whatever"))
+    artifact_cache_key(&PathBuf::from("/tmp/whatever"))
 }
