@@ -4,18 +4,13 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
-import {
-  isPassiveCommand,
-  LONG_RUNNING_COMMAND_TIMEOUT_MS,
-  PASSIVE_COMMAND_TIMEOUT_MS,
-} from "./command-timeouts.js";
-import type { Logger, LogMeta } from "./logger.js";
+import { PASSIVE_COMMAND_TIMEOUT_MS, isPassiveCommand } from "./command-timeouts.js";
+import type { LogMeta, Logger } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
-import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
+import { type StatusBarCounts, parseStatusBarCounts } from "./status-bar.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
-const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 const STDOUT_BUFFER_COMPACT_THRESHOLD = 64 * 1024;
 const TERMINAL_BASH_STATUSES = new Set([
@@ -124,53 +119,6 @@ export function compareSemver(a: string, b: string): number {
     }
   }
   return 0;
-}
-
-export function clampSemanticTimeout(
-  configOverrides: Record<string, unknown>,
-  bridgeTimeoutMs: number,
-): Record<string, unknown> {
-  const semantic = configOverrides.semantic;
-  if (!semantic || typeof semantic !== "object" || Array.isArray(semantic)) {
-    return configOverrides;
-  }
-
-  const timeoutMs = (semantic as { timeout_ms?: unknown }).timeout_ms;
-  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
-    return configOverrides;
-  }
-
-  // The clamp exists so a Rust-side embed request fails BEFORE the transport
-  // gives up on the request that carries it. But `semantic_search` doesn't
-  // run on the bridge default budget — plugins send it with the per-command
-  // override from LONG_RUNNING_COMMAND_TIMEOUT_MS. Clamping against the bare
-  // default (30s) silently cut user-configured cold-load headroom (e.g.
-  // LMStudio 8B: 60s → 25s) and aborted background refresh batches that have
-  // no transport constraint at all. Clamp against the real budget.
-  const semanticTransportBudgetMs = Math.max(
-    bridgeTimeoutMs,
-    LONG_RUNNING_COMMAND_TIMEOUT_MS.semantic_search ?? 0,
-  );
-  const maxSemanticTimeoutMs =
-    semanticTransportBudgetMs > SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
-      ? semanticTransportBudgetMs - SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS
-      : Math.max(1, semanticTransportBudgetMs - 1);
-
-  if (timeoutMs <= maxSemanticTimeoutMs) {
-    return configOverrides;
-  }
-
-  warn(
-    `semantic.timeout_ms=${timeoutMs} exceeds the semantic transport budget; clamping to ${maxSemanticTimeoutMs}ms (budget: ${semanticTransportBudgetMs}ms)`,
-  );
-
-  return {
-    ...configOverrides,
-    semantic: {
-      ...semantic,
-      timeout_ms: maxSemanticTimeoutMs,
-    },
-  };
 }
 
 interface PendingRequest {
@@ -453,7 +401,13 @@ export class BinaryBridge {
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
     this.hangThreshold = options?.hangThreshold ?? BRIDGE_HANG_TIMEOUT_THRESHOLD;
     this.maxRestarts = options?.maxRestarts ?? 3;
-    this.configOverrides = clampSemanticTimeout(configOverrides ?? {}, this.timeoutMs);
+    // P1 config relocation: semantic config now arrives as raw `config` tiers and
+    // is resolved (incl. timeout clamping to MAX_SEMANTIC_TIMEOUT_MS) in AFT-core,
+    // not here. The old bridge-side clampSemanticTimeout keyed off a flat `semantic`
+    // param the plugins no longer send, so it was a dead no-op — removed. If the
+    // query-embed ever needs a transport-budget race-guard it belongs at query time
+    // in Rust, not as a configure-time clamp here.
+    this.configOverrides = configOverrides ?? {};
     this.minVersion = options?.minVersion;
     this.onVersionMismatch = options?.onVersionMismatch;
     this.onConfigureWarnings = options?.onConfigureWarnings;
