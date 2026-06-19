@@ -653,7 +653,7 @@ pub struct AppContext {
     /// Last status-bar payload attached to a tool response for this project root.
     /// Deduping here (not in a process-global static) lets daemon roots emit the
     /// same counts independently.
-    status_bar_last_emitted: RefCell<Option<StatusBarCounts>>,
+    status_bar_last_emitted: RwLock<Option<StatusBarCounts>>,
     bash_background: BgTaskRegistry,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
@@ -681,7 +681,7 @@ pub struct AppContext {
     /// Last-known Tier-2 + todos counts for the agent status bar, refreshed off
     /// the hot path (on `aft_inspect` reads and background Tier-2 completions).
     /// Errors/warnings are read live and not stored here.
-    status_bar_tier2: RefCell<StatusBarTier2>,
+    status_bar_tier2: RwLock<StatusBarTier2>,
     /// Persistent TypeScript-project membership cache for the status-bar E/W
     /// count. The bar reads E/W live on every tool result, so resolving the
     /// nearest tsconfig (read + parse + glob-compile) per drain is too costly;
@@ -799,7 +799,7 @@ impl AppContext {
             configure_warnings_tx,
             configure_warnings_rx,
             status_emitter,
-            status_bar_last_emitted: RefCell::new(None),
+            status_bar_last_emitted: RwLock::new(None),
             bash_background: BgTaskRegistry::new(app.progress_sender()),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
@@ -808,7 +808,7 @@ impl AppContext {
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: Arc::new(std::sync::RwLock::new(None)),
             gitignore_generation: Arc::new(AtomicU64::new(0)),
-            status_bar_tier2: RefCell::new(StatusBarTier2::default()),
+            status_bar_tier2: RwLock::new(StatusBarTier2::default()),
             tsconfig_membership: RefCell::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
             ),
@@ -821,14 +821,28 @@ impl AppContext {
     /// until the Tier-2 cache has been populated at least once, so we never
     /// surface a bar that misleadingly claims "0 dead code" before any scan.
     pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
-        let tier2 = self.status_bar_tier2.borrow();
         // All three Tier-2 categories must hold a real value before the bar is
         // surfaced — otherwise a partially-scanned cold run would render a
-        // fabricated `0` for the not-yet-completed categories (#1).
-        let (Some(dead_code), Some(unused_exports), Some(duplicates)) =
-            (tier2.dead_code, tier2.unused_exports, tier2.duplicates)
-        else {
-            return None;
+        // fabricated `0` for the not-yet-completed categories (#1). Extract the
+        // values under a short read guard, drop it, then compute E/W (which
+        // touches other state) with no status-bar guard held.
+        let (dead_code, unused_exports, duplicates, todos, tier2_stale) = {
+            let tier2 = self
+                .status_bar_tier2
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (Some(dead_code), Some(unused_exports), Some(duplicates)) =
+                (tier2.dead_code, tier2.unused_exports, tier2.duplicates)
+            else {
+                return None;
+            };
+            (
+                dead_code,
+                unused_exports,
+                duplicates,
+                tier2.todos.unwrap_or(0),
+                tier2.stale,
+            )
         };
         let (errors, warnings) = self.status_bar_error_warning_counts();
         Some(StatusBarCounts {
@@ -837,13 +851,16 @@ impl AppContext {
             dead_code,
             unused_exports,
             duplicates,
-            todos: tier2.todos.unwrap_or(0),
-            tier2_stale: tier2.stale,
+            todos,
+            tier2_stale,
         })
     }
 
     pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
-        let mut last = self.status_bar_last_emitted.borrow_mut();
+        let mut last = self
+            .status_bar_last_emitted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if last.as_ref() == Some(counts) {
             return false;
         }
@@ -883,7 +900,10 @@ impl AppContext {
     /// next background scan completes. Returns true only when the visible stale
     /// bit flips. No-op before the first populate.
     pub fn mark_status_bar_tier2_stale(&self) -> bool {
-        let mut tier2 = self.status_bar_tier2.borrow_mut();
+        let mut tier2 = self
+            .status_bar_tier2
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // No-op before the first full populate (nothing real to mark stale).
         if tier2.dead_code.is_some() && tier2.unused_exports.is_some() && tier2.duplicates.is_some()
         {
@@ -907,7 +927,10 @@ impl AppContext {
         todos: Option<usize>,
         stale: bool,
     ) {
-        let mut tier2 = self.status_bar_tier2.borrow_mut();
+        let mut tier2 = self
+            .status_bar_tier2
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(dead_code) = dead_code {
             tier2.dead_code = Some(dead_code);
         }
