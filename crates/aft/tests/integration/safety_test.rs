@@ -3,7 +3,11 @@
 //! Tests exercise the full round-trip through the binary's JSON protocol:
 //! snapshot → checkpoint → modify → restore → verify file contents.
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
+// `user_config` is only used by the #[cfg(unix)] symlink restriction test below;
+// gate the import to match so Windows (-D warnings) doesn't see it as unused.
+#[cfg(unix)]
+use super::helpers::user_config;
 use std::fs;
 
 /// Helper: create a temp directory with a unique name for this test.
