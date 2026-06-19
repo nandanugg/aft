@@ -544,17 +544,18 @@ fn background_feature_flag_disabled_rejects_spawn() {
     );
     assert_eq!(response["success"], false);
     assert_eq!(response["code"], "feature_disabled");
-    // Regression: error message must reference the user-facing nested config
-    // shape (`experimental.bash.background`), not the flat internal key
-    // (`experimental_bash_background`) that v0.18 migrated away from.
+    // Regression: error message must point at the CURRENT user-facing config
+    // surface — top-level `bash: { background: true }` — not the deprecated
+    // `experimental.bash.*` block (legacy-fallback only) nor the flat internal
+    // key (`experimental_bash_background`) that v0.18 migrated away from.
     let message = response["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("experimental.bash.background"),
-        "feature-disabled message should point at the nested config key, got: {message}"
+        message.contains("bash: { background: true }"),
+        "feature-disabled message should point at the top-level bash config, got: {message}"
     );
     assert!(
-        !message.contains("experimental_bash_background"),
-        "feature-disabled message must not reference the migrated flat key, got: {message}"
+        !message.contains("experimental"),
+        "feature-disabled message must not reference the deprecated experimental config, got: {message}"
     );
 
     assert!(aft.shutdown().success());

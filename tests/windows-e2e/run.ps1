@@ -360,18 +360,17 @@ $OpencodeConfig = @"
 "@
 Set-Content -Path (Join-Path $ConfigDir "opencode.json") -Value $OpencodeConfig
 
-# AFT config -- issue #26 reproduction needs ALL bash experimentals on, plus
-# search and semantic enabled, mirroring the user's reported config.
+# AFT config -- issue #26 reproduction needs ALL bash features on, plus
+# search and semantic enabled, mirroring the user's reported config. Bash
+# graduated to the top-level `bash` block (experimental.bash.* is legacy-only).
 $AftConfig = @"
 {
   "search_index": true,
   "semantic_search": true,
-  "experimental": {
-    "bash": {
-      "rewrite": true,
-      "compress": true,
-      "background": true
-    }
+  "bash": {
+    "rewrite": true,
+    "compress": true,
+    "background": true
   }
 }
 "@
@@ -830,7 +829,7 @@ Check "opencode reached scripted turns (not fallback)" {
 #   - Foreground polling is capped at 5s (FOREGROUND_WAIT_WINDOW_MS);
 #     past that, the plugin promotes the task to background and returns
 #     a "promoted to background: bash-XXX" string immediately.
-#   - The bg task survives plugin shutdown when experimental.bash.background
+#   - The bg task survives plugin shutdown when bash.background
 #     is enabled (which this scenario sets in the AFT config).
 #
 # So the harness can't observe a 60s bash *call* anymore — it observes a
@@ -879,7 +878,7 @@ Write-Host "  (S2 wall-clock: $([Math]::Round($S2Duration.TotalSeconds, 1))s)"
 
 # Wait for the detached bg task to complete the marker file. It started
 # during the opencode session (which has already ended) and continues
-# running with experimental.bash.background = true. The 60s sleep plus
+# running with bash.background = true. The 60s sleep plus
 # PowerShell cold-start can take up to ~70s of wall time from when bash
 # was invoked; we already burned ~10-15s of that during the opencode
 # session, so 90s of post-session polling is generous headroom.
