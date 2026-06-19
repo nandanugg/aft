@@ -1,3 +1,4 @@
+import { readConfigTiers } from "@cortexkit/aft-bridge";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -6,7 +7,6 @@ import type { AftRequest, sendAftRequest } from "../lib/aft-bridge.js";
 import { sendAftRequests } from "../lib/aft-bridge.js";
 import { findAftBinary } from "../lib/binary-probe.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
-import { readJsoncFile } from "../lib/jsonc.js";
 import { getAftLspBinariesDir, getAftLspPackagesDir } from "../lib/paths.js";
 import { log } from "../lib/prompts.js";
 import { getSelfVersion } from "../lib/self-version.js";
@@ -235,94 +235,26 @@ function parseFileArg(argv: string[]): string | null {
 }
 
 function buildConfigureParams(adapter: HarnessAdapter, projectRoot: string): AftRequest {
-  const paths = adapter.detectConfigPaths();
-  const userConfig = readJsoncFile(paths.aftConfig).value ?? {};
-  const projectConfig = readProjectConfig(adapter.kind, projectRoot);
-  const merged = mergeConfig(userConfig, projectConfig);
-  const lsp = isRecord(merged.lsp) ? merged.lsp : {};
-  const lspConfig = resolveLspConfig(merged);
+  // P1 config relocation: core config (incl. LSP servers/disabled/python) is now
+  // resolved + trust-stripped in AFT-core from raw `config: [{tier, source, doc}]`
+  // tiers — the flat lsp_servers/disabled_lsp/experimental_lsp_ty params are no
+  // longer read by handle_configure. Send the raw user+project tiers so the user's
+  // custom/disabled LSP settings are honored again (and project-tier LSP settings
+  // are stripped by the resolver, same as the plugins). lsp_paths_extra is
+  // process-state (the install cache dirs) and stays a flat param.
+  const userConfigPath = adapter.detectConfigPaths().aftConfig;
+  const dir = adapter.kind === "pi" ? ".pi" : ".opencode";
+  const projectJsonc = join(projectRoot, dir, "aft.jsonc");
+  const projectJson = join(projectRoot, dir, "aft.json");
+  const projectConfigPath = existsSync(projectJsonc) ? projectJsonc : projectJson;
   return {
     id: "doctor-lsp-configure",
     command: "configure",
     project_root: projectRoot,
     harness: adapter.kind,
-    ...lspConfig,
-    lsp_paths_extra: inferLspPathsExtra(lsp),
+    config: readConfigTiers({ userConfigPath, projectConfigPath }),
+    lsp_paths_extra: inferLspPathsExtra({}),
   };
-}
-
-function readProjectConfig(kind: string, projectRoot: string): Record<string, unknown> {
-  const dir = kind === "pi" ? ".pi" : ".opencode";
-  const jsonc = join(projectRoot, dir, "aft.jsonc");
-  const json = join(projectRoot, dir, "aft.json");
-  if (existsSync(jsonc)) return readJsoncFile(jsonc).value ?? {};
-  if (existsSync(json)) return readJsoncFile(json).value ?? {};
-  return {};
-}
-
-function mergeConfig(
-  userConfig: Record<string, unknown>,
-  projectConfig: Record<string, unknown>,
-): Record<string, unknown> {
-  const userLsp = isRecord(userConfig.lsp) ? userConfig.lsp : {};
-  const projectLsp = isRecord(projectConfig.lsp) ? projectConfig.lsp : {};
-  return {
-    ...userConfig,
-    ...projectConfig,
-    lsp: {
-      ...userLsp,
-      ...projectLsp,
-      ...(isRecord(userLsp.servers) ? { servers: userLsp.servers } : {}),
-      ...(Array.isArray(userLsp.disabled) ? { disabled: userLsp.disabled } : {}),
-    },
-  };
-}
-
-function resolveLspConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const lsp = isRecord(config.lsp) ? config.lsp : {};
-  const disabled = new Set<string>();
-  for (const entry of Array.isArray(lsp.disabled) ? lsp.disabled : []) {
-    if (typeof entry === "string") disabled.add(entry.toLowerCase());
-  }
-
-  let experimentalTy =
-    typeof config.experimental_lsp_ty === "boolean" ? config.experimental_lsp_ty : undefined;
-  if (lsp.python === "ty") {
-    experimentalTy = true;
-    disabled.add("python");
-  } else if (lsp.python === "pyright") {
-    experimentalTy = false;
-    disabled.add("ty");
-  }
-
-  const result: Record<string, unknown> = {};
-  if (experimentalTy !== undefined) result.experimental_lsp_ty = experimentalTy;
-  if (disabled.size > 0) result.disabled_lsp = [...disabled];
-  const servers = resolveCustomServers(lsp.servers);
-  if (servers.length > 0) result.lsp_servers = servers;
-  return result;
-}
-
-function resolveCustomServers(servers: unknown): Record<string, unknown>[] {
-  if (!isRecord(servers)) return [];
-  return Object.entries(servers)
-    .filter(([, server]) => isRecord(server))
-    .map(([id, server]) => {
-      const entry = server as Record<string, unknown>;
-      return {
-        id,
-        extensions: Array.isArray(entry.extensions) ? entry.extensions : [],
-        binary: typeof entry.binary === "string" ? entry.binary : "",
-        args: Array.isArray(entry.args) ? entry.args : [],
-        root_markers: Array.isArray(entry.root_markers) ? entry.root_markers : [".git"],
-        disabled: entry.disabled === true,
-        ...(isRecord(entry.env) ? { env: entry.env } : {}),
-        ...(entry.initialization_options !== undefined
-          ? { initialization_options: entry.initialization_options }
-          : {}),
-      };
-    })
-    .filter((server) => typeof server.binary === "string" && server.binary.length > 0);
 }
 
 function inferLspPathsExtra(_lsp: Record<string, unknown>): string[] {
@@ -382,8 +314,4 @@ function installHint(binaryName: string): string {
   if (binaryName === "ty") return "Install with `uv tool install ty` or `pip install ty`.";
   if (binaryName === "pyright-langserver") return "Install with `npm install -g pyright`.";
   return `Install ${binaryName} and ensure it is on PATH or in lsp_paths_extra.`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -97,8 +97,23 @@ describe("doctor lsp project root detection", () => {
 
     expect(code).toBe(0);
     expect(configure?.project_root).toBe(project);
-    expect(configure?.experimental_lsp_ty).toBe(true);
-    expect(configure?.disabled_lsp).toEqual(expect.arrayContaining(["lua", "python"]));
+    // P1 config relocation: lsp doctor now sends raw config TIERS; AFT-core
+    // resolves lsp.python/disabled (and trust-strips project-tier LSP server/policy
+    // settings). Assert the project tier carries the project's LSP config verbatim,
+    // and no flat-resolved LSP params leak onto the configure request.
+    const tiers = configure?.config as
+      | Array<{ tier: string; source: string; doc: string }>
+      | undefined;
+    expect(Array.isArray(tiers)).toBe(true);
+    const projectTier = tiers?.find((t) => t.tier === "project");
+    expect(projectTier).toBeDefined();
+    expect(projectTier?.source).toBe(join(project, ".opencode", "aft.json"));
+    expect(JSON.parse(projectTier?.doc ?? "{}")).toEqual({
+      lsp: { python: "ty", disabled: ["lua"] },
+    });
+    expect(configure?.experimental_lsp_ty).toBeUndefined();
+    expect(configure?.disabled_lsp).toBeUndefined();
+    expect(configure?.lsp_servers).toBeUndefined();
   });
 
   test("falls back to cwd when no project marker is found", () => {

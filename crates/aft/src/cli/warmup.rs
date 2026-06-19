@@ -255,6 +255,45 @@ fn warmup_storage_dir() -> PathBuf {
     home.join(".cache").join("aft")
 }
 
+/// Build the `configure` params for a warmup run.
+///
+/// P1 config relocation: core config (search_index/semantic_search) is now
+/// resolved exclusively from `config: [{tier, source, doc}]` tiers — the flat
+/// params are no longer read by handle_configure. A synthetic user-tier doc
+/// carries the two flags so warmup actually enables the requested systems
+/// (process-state params like storage_dir/_bypass_size_limits stay flat).
+fn build_warmup_configure_params(
+    root: &std::path::Path,
+    storage_dir: &std::path::Path,
+    areas: WarmupAreas,
+    force: bool,
+) -> serde_json::Value {
+    let warmup_config_doc = json!({
+        "search_index": areas.search,
+        "semantic_search": areas.semantic,
+    })
+    .to_string();
+    let mut params = json!({
+        "project_root": root.display().to_string(),
+        "harness": "opencode",
+        "storage_dir": storage_dir.display().to_string(),
+        "config": [{
+            "tier": "user",
+            "source": "<aft-warmup>",
+            "doc": warmup_config_doc,
+        }],
+    });
+    if force {
+        // Lift the file-count caps (callgraph `max_callgraph_files`, semantic
+        // `semantic.max_files`, and the hardcoded search-index file limit) so a
+        // very large repo is fully indexed for measurement. configure honors
+        // this internal flag by raising the effective caps and skipping the
+        // size-based auto-disable.
+        params["_bypass_size_limits"] = json!(true);
+    }
+    params
+}
+
 fn configure(
     ctx: &AppContext,
     root: &std::path::Path,
@@ -265,21 +304,7 @@ fn configure(
     // The callgraph store has no configure flag of its own (it builds lazily on
     // first op); it's triggered separately after configure. search/semantic are
     // configure-gated, so warm only the requested ones.
-    let mut params = json!({
-        "project_root": root.display().to_string(),
-        "harness": "opencode",
-        "search_index": areas.search,
-        "semantic_search": areas.semantic,
-        "storage_dir": storage_dir.display().to_string(),
-    });
-    if force {
-        // Lift the file-count caps (callgraph `max_callgraph_files`, semantic
-        // `semantic.max_files`, and the hardcoded search-index file limit) so a
-        // very large repo is fully indexed for measurement. configure honors
-        // this internal flag by raising the effective caps and skipping the
-        // size-based auto-disable.
-        params["_bypass_size_limits"] = json!(true);
-    }
+    let params = build_warmup_configure_params(root, storage_dir, areas, force);
     let req = RawRequest {
         id: "warmup-configure".to_string(),
         command: "configure".to_string(),
@@ -695,6 +720,53 @@ mod tests {
         let parsed = WarmupArgs::parse(args(&["--root", "/tmp/x"])).unwrap();
         assert_eq!(parsed.areas, WarmupAreas::all());
         assert!(parsed.areas.search && parsed.areas.semantic && parsed.areas.callgraph);
+    }
+
+    // P1 regression: after the configure flat-read deletion, warmup must carry
+    // search_index/semantic_search in a `config` tier doc (not flat params), or
+    // handle_configure resolves them as disabled and warmup no-ops.
+    #[test]
+    fn warmup_configure_params_enable_requested_systems_via_tier_doc() {
+        let root = std::path::Path::new("/tmp/proj");
+        let storage = std::path::Path::new("/tmp/store");
+        let areas = WarmupAreas {
+            search: true,
+            semantic: true,
+            callgraph: true,
+        };
+        let params = build_warmup_configure_params(root, storage, areas, false);
+
+        // Process-state stays flat.
+        assert_eq!(params["storage_dir"], json!("/tmp/store"));
+        // Core flags are NOT flat params (would be ignored by handle_configure).
+        assert!(params.get("search_index").is_none());
+        assert!(params.get("semantic_search").is_none());
+        // They live in the synthetic user tier doc.
+        let tiers = params["config"].as_array().expect("config tier array");
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0]["tier"], json!("user"));
+        let doc: serde_json::Value =
+            serde_json::from_str(tiers[0]["doc"].as_str().unwrap()).unwrap();
+        assert_eq!(doc["search_index"], json!(true));
+        assert_eq!(doc["semantic_search"], json!(true));
+
+        // --only search → semantic disabled in the doc.
+        let search_only = build_warmup_configure_params(
+            root,
+            storage,
+            WarmupAreas {
+                search: true,
+                semantic: false,
+                callgraph: false,
+            },
+            true,
+        );
+        let doc2: serde_json::Value =
+            serde_json::from_str(search_only["config"][0]["doc"].as_str().unwrap()).unwrap();
+        assert_eq!(doc2["search_index"], json!(true));
+        assert_eq!(doc2["semantic_search"], json!(false));
+        // force → internal bypass flag stays flat.
+        assert_eq!(search_only["_bypass_size_limits"], json!(true));
     }
 
     #[test]
