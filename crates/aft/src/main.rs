@@ -1070,15 +1070,23 @@ fn spawn_search_corpus_refresh(
     root: std::path::PathBuf,
     config: Arc<aft::config::Config>,
 ) {
-    if let Some(index) = ctx.search_index().borrow_mut().as_mut() {
-        index.ready = false;
+    {
+        let mut search_index = ctx
+            .search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = search_index.as_mut() {
+            index.ready = false;
+        }
     }
 
     let (tx, rx): (
         crossbeam_channel::Sender<aft::search_index::SearchIndex>,
         crossbeam_channel::Receiver<aft::search_index::SearchIndex>,
     ) = crossbeam_channel::unbounded();
-    *ctx.search_index_rx().borrow_mut() = Some(rx);
+    *ctx.search_index_rx()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
     ctx.reset_symbol_cache();
 
     let is_worktree_bridge = ctx.is_worktree_bridge();
@@ -1397,7 +1405,14 @@ fn drain_watcher_events(ctx: &AppContext) {
         }
     }
 
-    if !oversized_inline_batch && ctx.search_index_rx().borrow().is_some() {
+    let search_build_in_progress = {
+        let search_index_rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index_rx.is_some()
+    };
+    if !oversized_inline_batch && search_build_in_progress {
         ctx.add_pending_search_index_paths(changed.iter().cloned());
     }
     let semantic_source_paths = changed
@@ -1435,13 +1450,18 @@ fn drain_watcher_events(ctx: &AppContext) {
     if !oversized_inline_batch {
         refresh_callgraph_store_for_watcher(ctx, &changed);
 
-        let mut index_ref = ctx.search_index().borrow_mut();
-        if let Some(index) = index_ref.as_mut() {
-            for path in &changed {
-                if path.exists() {
-                    index.update_file(path);
-                } else {
-                    index.remove_file(path);
+        {
+            let mut index_ref = ctx
+                .search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(index) = index_ref.as_mut() {
+                for path in &changed {
+                    if path.exists() {
+                        index.update_file(path);
+                    } else {
+                        index.remove_file(path);
+                    }
                 }
             }
         }
@@ -1516,7 +1536,10 @@ fn drain_watcher_events(ctx: &AppContext) {
 
 fn drain_search_index_events(ctx: &AppContext) {
     let (latest, disconnected) = {
-        let rx_ref = ctx.search_index_rx().borrow();
+        let rx_ref = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -1543,13 +1566,17 @@ fn drain_search_index_events(ctx: &AppContext) {
         if !pending_paths.is_empty() {
             replay_search_index_pending_updates(ctx, &mut index, pending_paths);
         }
-        *ctx.search_index().borrow_mut() = Some(index);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
         installed_index = true;
         status_changed = true;
     }
 
     if disconnected || installed_index {
-        *ctx.search_index_rx().borrow_mut() = None;
+        *ctx.search_index_rx()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if disconnected && !installed_index {
             let _ = ctx.take_pending_search_index_paths();
         }
@@ -2778,7 +2805,9 @@ mod watcher_filter_tests {
 
         let mut search_index = aft::search_index::SearchIndex::new();
         search_index.ready = true;
-        *ctx.search_index().borrow_mut() = Some(search_index);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(search_index);
 
         *ctx.semantic_index().borrow_mut() = Some(SemanticIndex::new(root.clone(), 3));
         *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::ready();
@@ -2808,12 +2837,16 @@ mod watcher_filter_tests {
             "next callgraph op should start the forced background rebuild and return Building"
         );
         assert!(
-            ctx.search_index_rx().borrow().is_some(),
+            ctx.search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
             "oversized watcher batch should spawn a background search corpus refresh"
         );
         assert!(
             !ctx.search_index()
-                .borrow()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .expect("resident search index")
                 .ready,

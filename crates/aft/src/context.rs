@@ -621,8 +621,8 @@ pub struct AppContext {
     callgraph_store_force_rebuild: RefCell<bool>,
     callgraph_store_rx: RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
     pending_callgraph_store_paths: RefCell<BTreeSet<PathBuf>>,
-    search_index: RefCell<Option<SearchIndex>>,
-    search_index_rx: RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>>,
+    search_index: RwLock<Option<SearchIndex>>,
+    search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     pending_search_index_paths: RefCell<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
@@ -773,8 +773,8 @@ impl AppContext {
             callgraph_store_force_rebuild: RefCell::new(false),
             callgraph_store_rx: RefCell::new(None),
             pending_callgraph_store_paths: RefCell::new(BTreeSet::new()),
-            search_index: RefCell::new(None),
-            search_index_rx: RefCell::new(None),
+            search_index: RwLock::new(None),
+            search_index_rx: RwLock::new(None),
             pending_search_index_paths: RefCell::new(BTreeSet::new()),
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::new()),
@@ -1727,12 +1727,12 @@ impl AppContext {
     }
 
     /// Access the search index.
-    pub fn search_index(&self) -> &RefCell<Option<SearchIndex>> {
+    pub fn search_index(&self) -> &RwLock<Option<SearchIndex>> {
         &self.search_index
     }
 
     /// Access the search-index build receiver.
-    pub fn search_index_rx(&self) -> &RefCell<Option<crossbeam_channel::Receiver<SearchIndex>>> {
+    pub fn search_index_rx(&self) -> &RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>> {
         &self.search_index_rx
     }
 

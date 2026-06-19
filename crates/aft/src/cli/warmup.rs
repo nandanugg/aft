@@ -489,15 +489,24 @@ fn search_index_state(ctx: &AppContext) -> SubsystemState {
     if !ctx.config().search_index {
         return SubsystemState::Disabled;
     }
-    if ctx
-        .search_index()
-        .borrow()
-        .as_ref()
-        .is_some_and(|index| index.ready)
-    {
+    let index_ready = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index.as_ref().is_some_and(|index| index.ready)
+    };
+    if index_ready {
         return SubsystemState::Ready;
     }
-    if ctx.search_index_rx().borrow().is_some() {
+    let build_in_progress = {
+        let search_index_rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index_rx.is_some()
+    };
+    if build_in_progress {
         SubsystemState::Pending("building".to_string())
     } else {
         SubsystemState::Pending("loading".to_string())
@@ -624,7 +633,10 @@ fn callgraph_store_state(
 
 fn drain_search_index_events(ctx: &AppContext) {
     let latest = {
-        let rx_ref = ctx.search_index_rx().borrow();
+        let rx_ref = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
@@ -637,7 +649,9 @@ fn drain_search_index_events(ctx: &AppContext) {
     };
 
     if let Some(index) = latest {
-        *ctx.search_index().borrow_mut() = Some(index);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
     }
 }
 

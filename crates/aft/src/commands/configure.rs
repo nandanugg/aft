@@ -1559,7 +1559,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let search_index_max_file_size = ctx.config().search_index_max_file_size;
     let semantic_config = ctx.config().semantic.clone();
 
-    let search_build_in_progress = ctx.search_index_rx().borrow().is_some();
+    let search_build_in_progress = ctx
+        .search_index_rx()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().borrow().is_some();
     // Note: We intentionally only WARN on rapid reconfigure (rather than tracking
     // JoinHandles to cancel old threads) because:
@@ -1580,8 +1584,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    *ctx.search_index().borrow_mut() = None;
-    *ctx.search_index_rx().borrow_mut() = None;
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *ctx.search_index_rx()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let symbol_cache_generation = ctx.reset_symbol_cache();
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
@@ -1636,13 +1644,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 // grep/glob fall back to a walk, exactly like the cache-miss
                 // branch below. The drain installs the verified, ready index.
                 index.set_ready(false);
-                *ctx.search_index().borrow_mut() = Some(index.clone());
+                *ctx.search_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index.clone());
 
                 let (tx, rx): (
                     crossbeam_channel::Sender<SearchIndex>,
                     crossbeam_channel::Receiver<SearchIndex>,
                 ) = unbounded();
-                *ctx.search_index_rx().borrow_mut() = Some(rx);
+                *ctx.search_index_rx()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
 
                 #[cfg(debug_assertions)]
                 mark_search_rebuild_spawn_for_debug();
@@ -1676,14 +1688,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             mut baseline => {
                 if let Some(index) = baseline.as_mut() {
                     index.set_ready(false);
-                    *ctx.search_index().borrow_mut() = Some(index.clone());
+                    *ctx.search_index()
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index.clone());
                 }
 
                 let (tx, rx): (
                     crossbeam_channel::Sender<SearchIndex>,
                     crossbeam_channel::Receiver<SearchIndex>,
                 ) = unbounded();
-                *ctx.search_index_rx().borrow_mut() = Some(rx);
+                *ctx.search_index_rx()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
 
                 #[cfg(debug_assertions)]
                 mark_search_rebuild_spawn_for_debug();

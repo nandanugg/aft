@@ -140,13 +140,23 @@ fn glob_root(
 ) -> GlobDiscovery {
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
-    let search_index = ctx.search_index().borrow();
-    match search_index.as_ref() {
-        Some(index) if index.ready && search_scope.use_index => GlobDiscovery {
-            files: index.glob(pattern, &search_scope.root),
-            walk_truncated: false,
-        },
-        _ => {
+    let indexed = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match search_index.as_ref() {
+            Some(index) if index.ready && search_scope.use_index => Some(GlobDiscovery {
+                files: index.glob(pattern, &search_scope.root),
+                walk_truncated: false,
+            }),
+            _ => None,
+        }
+    };
+
+    match indexed {
+        Some(discovery) => discovery,
+        None => {
             if !search_scope.use_index {
                 if let Some(outcome) =
                     super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)

@@ -47,7 +47,10 @@ impl AppContext {
 
         // Search index status
         let search_index_info = {
-            let index = self.search_index().borrow();
+            let index = self
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match index.as_ref() {
                 Some(idx) if idx.ready => {
                     let file_count = idx.file_count();
@@ -60,7 +63,7 @@ impl AppContext {
                 }
                 Some(_) => serde_json::json!({ "status": "building" }),
                 None => {
-                    let status = if self.config().search_index {
+                    let status = if config.search_index {
                         "loading"
                     } else {
                         "disabled"

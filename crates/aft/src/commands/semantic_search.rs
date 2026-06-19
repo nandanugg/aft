@@ -1162,15 +1162,6 @@ fn semantic_index_loaded(ctx: &AppContext) -> bool {
 }
 
 fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> LexicalCollection {
-    let search_index = ctx.search_index().borrow();
-    let Some(index) = search_index.as_ref().filter(|index| index.ready) else {
-        return LexicalCollection {
-            files: Vec::new(),
-            ready: false,
-            engine_capped: false,
-        };
-    };
-
     // No `should_use_lexical` gate here: collect_lexical_files is only called
     // when choose_mode picked Hybrid, which already means we want the lexical
     // lane. The shape weight was a second, conflicting gate that suppressed
@@ -1187,12 +1178,27 @@ fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> L
     };
     let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
     let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+
     // No extension filter: the trigram index already covers the project's text
     // files. Gating the lexical candidate set on the *semantic* extension
     // allow-list made named config/doc files (Cargo.toml, README.md,
     // package.json) structurally unreachable in hybrid mode — exactly the
     // literal-filename hits the lexical lane exists to catch.
-    let ranked = index.lexical_rank_with_stats(&query_trigrams, None, LEXICAL_ENUMERATION_LIMIT);
+    let ranked = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = search_index.as_ref().filter(|index| index.ready) else {
+            return LexicalCollection {
+                files: Vec::new(),
+                ready: false,
+                engine_capped: false,
+            };
+        };
+        index.lexical_rank_with_stats(&query_trigrams, None, LEXICAL_ENUMERATION_LIMIT)
+    };
+
     LexicalCollection {
         files: ranked.files,
         ready: true,
@@ -1202,7 +1208,8 @@ fn collect_lexical_files(ctx: &AppContext, query: &str, shape: &QueryShape) -> L
 
 fn search_index_ready(ctx: &AppContext) -> bool {
     ctx.search_index()
-        .borrow()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .is_some_and(|index| index.ready)
 }
@@ -1975,7 +1982,9 @@ mod tests {
         let mut index = SearchIndex::new();
         index.index_file(&source_file, source.as_bytes());
         index.ready = true;
-        *ctx.search_index().borrow_mut() = Some(index);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
         *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
             stage: "embedding".to_string(),
             files: Some(1),

@@ -80,7 +80,9 @@ fn install_lexical_index(ctx: &AppContext, source_file: &Path, source: &str) {
     let mut index = SearchIndex::new();
     index.index_file(source_file, source.as_bytes());
     index.ready = true;
-    *ctx.search_index().borrow_mut() = Some(index);
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
 }
 
 fn project_with_repeated_needle_files(
@@ -109,7 +111,9 @@ fn install_lexical_index_entries(ctx: &AppContext, entries: &[(std::path::PathBu
         index.index_file(source_file, source.as_bytes());
     }
     index.ready = true;
-    *ctx.search_index().borrow_mut() = Some(index);
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
 }
 
 fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {

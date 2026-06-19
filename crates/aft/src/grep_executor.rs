@@ -245,16 +245,26 @@ fn execute_root(
         return grep_explicit_file(&root.search_root, pattern, max_results, index_status);
     }
 
-    let search_index = ctx.search_index().borrow();
-    match search_index.as_ref() {
-        Some(index) if index.ready && root.use_index => index.search_grep(
-            pattern,
-            &params.include,
-            &params.exclude,
-            &root.search_root,
-            max_results,
-        ),
-        _ => {
+    let indexed = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match search_index.as_ref() {
+            Some(index) if index.ready && root.use_index => Some(index.search_grep(
+                pattern,
+                &params.include,
+                &params.exclude,
+                &root.search_root,
+                max_results,
+            )),
+            _ => None,
+        }
+    };
+
+    match indexed {
+        Some(result) => result,
+        None => {
             let index_status = if root.use_index {
                 current_index_status(ctx)
             } else {
@@ -783,14 +793,32 @@ pub(crate) fn ripgrep_glob(
 }
 
 fn current_index_status(ctx: &AppContext) -> IndexStatus {
-    if ctx
-        .search_index()
-        .borrow()
-        .as_ref()
-        .is_some_and(|index| index.ready)
-    {
-        IndexStatus::Ready
-    } else if ctx.search_index_rx().borrow().is_some() || ctx.search_index().borrow().is_some() {
+    let index_ready = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index.as_ref().is_some_and(|index| index.ready)
+    };
+    if index_ready {
+        return IndexStatus::Ready;
+    }
+
+    let build_in_progress = {
+        let search_index_rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index_rx.is_some()
+    };
+    let has_index = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index.is_some()
+    };
+    if build_in_progress || has_index {
         IndexStatus::Building
     } else {
         IndexStatus::Fallback
