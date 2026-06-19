@@ -2769,10 +2769,10 @@ mod tests {
         assert!(response.success, "configure failed: {:?}", response.data);
 
         // Core-resolved field applied: user search_index=true survived.
-        assert_eq!(ctx.config().search_index, true);
+        assert!(ctx.config().search_index);
         // Trust boundary: project tried restrict=false over user restrict=true →
         // user value wins.
-        assert_eq!(ctx.config().restrict_to_project_root, true);
+        assert!(ctx.config().restrict_to_project_root);
         // Project semantic.api_key_env never reached Config.
         assert!(ctx.config().semantic.api_key_env.is_none());
 

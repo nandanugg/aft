@@ -1978,7 +1978,6 @@ impl AppContext {
             return;
         }
 
-        let delay = delay;
         let circuit = Arc::clone(&self.semantic_refresh_circuit);
         let session_id = crate::log_ctx::current_session();
         std::thread::spawn(move || {
