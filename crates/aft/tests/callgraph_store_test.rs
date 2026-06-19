@@ -1231,7 +1231,7 @@ fn app_context_revalidates_to_newer_published_generation() {
     CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &project_files(&root))
         .unwrap();
 
-    fn entry_leaf(access: CallgraphStoreAccess<'_>) -> String {
+    fn entry_leaf(access: CallgraphStoreAccess) -> String {
         match access {
             CallgraphStoreAccess::Ready(store) => store
                 .call_tree(Path::new("main.ts"), "entry", 1)
@@ -1291,13 +1291,13 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
             .expect("main checkout builds store");
         assert!(store.sqlite_path().is_file());
     }
-    let sqlite_path = ctx
-        .callgraph_store()
-        .borrow()
-        .as_ref()
-        .unwrap()
-        .sqlite_path()
-        .to_path_buf();
+    let sqlite_path = {
+        let guard = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref().unwrap().sqlite_path().to_path_buf()
+    };
     let first_mtime = fs::metadata(&sqlite_path).unwrap().modified().unwrap();
     {
         let store = ctx

@@ -1158,8 +1158,17 @@ fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_path
         // to a fresh full rebuild.
         // Mirror the original "act only when the callgraph is actually loaded or
         // building" guard, but reschedule instead of inline-building.
-        if ctx.callgraph_store().borrow().is_some() || ctx.callgraph_store_rx().borrow().is_some() {
-            *ctx.callgraph_store().borrow_mut() = None;
+        let callgraph_store_resident = {
+            let guard = ctx
+                .callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.is_some()
+        };
+        if callgraph_store_resident || ctx.callgraph_store_rx().borrow().is_some() {
+            *ctx.callgraph_store()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             ctx.mark_callgraph_store_force_rebuild();
             status_changed = true;
             aft::slog_info!(
@@ -1241,8 +1250,14 @@ fn refresh_callgraph_store_for_watcher(ctx: &AppContext, changed: &HashSet<std::
     // recorded as pending and replayed against the fresh store (rather than
     // incrementally written into a superseded generation).
     ctx.revalidate_callgraph_store_generation();
-    let mut store_ref = ctx.callgraph_store().borrow_mut();
-    let Some(store) = store_ref.as_mut() else {
+    let store = {
+        let guard = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_ref().map(Arc::clone)
+    };
+    let Some(store) = store else {
         // Store not resident yet. If a cold build is in flight, record the
         // changed paths so they're replayed once the freshly-built store lands
         // (otherwise mid-build edits would be silently lost). If no build is
@@ -1635,7 +1650,9 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                 }
             }
         }
-        *ctx.callgraph_store().borrow_mut() = Some(store);
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
         installed = true;
         status_changed = true;
     }
@@ -2369,8 +2386,16 @@ mod watcher_filter_tests {
         tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
         drain_watcher_events(&ctx);
 
-        let store_ref = ctx.callgraph_store().borrow();
-        let store = store_ref.as_ref().expect("store remains open");
+        let store = {
+            let guard = ctx
+                .callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .map(std::sync::Arc::clone)
+                .expect("store remains open")
+        };
         let tree = store
             .call_tree(std::path::Path::new("main.ts"), "entry", 1)
             .unwrap();
@@ -2749,7 +2774,11 @@ mod watcher_filter_tests {
             .expect("ensure callgraph store");
         assert!(resident.is_some(), "callgraph store should be resident");
         drop(resident);
-        assert!(ctx.callgraph_store().borrow().is_some());
+        assert!(ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
 
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
@@ -2760,7 +2789,10 @@ mod watcher_filter_tests {
 
         // The resident store is dropped (rescheduled), NOT refreshed in place...
         assert!(
-            ctx.callgraph_store().borrow().is_none(),
+            ctx.callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
             "watcher overflow must drop the resident store to reschedule, not refresh inline"
         );
         // ...and the drain itself did NOT spawn a build (no inline cold_build on
@@ -2801,7 +2833,11 @@ mod watcher_filter_tests {
             .expect("ensure callgraph store")
             .expect("callgraph store should build on demand");
         drop(resident);
-        assert!(ctx.callgraph_store().borrow().is_some());
+        assert!(ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
 
         let mut search_index = aft::search_index::SearchIndex::new();
         search_index.ready = true;
@@ -2822,7 +2858,10 @@ mod watcher_filter_tests {
         drain_watcher_events(&ctx);
 
         assert!(
-            ctx.callgraph_store().borrow().is_none(),
+            ctx.callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
             "oversized watcher batch must drop the resident store instead of refreshing inline"
         );
         assert!(

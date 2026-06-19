@@ -109,7 +109,9 @@ fn drain_callgraph_store_for_test(ctx: &AppContext) {
     };
 
     if let Some(store) = latest {
-        *ctx.callgraph_store().borrow_mut() = Some(store);
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
         *ctx.callgraph_store_rx().borrow_mut() = None;
     } else if disconnected {
         *ctx.callgraph_store_rx().borrow_mut() = None;

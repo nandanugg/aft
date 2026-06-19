@@ -1593,7 +1593,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let symbol_cache_generation = ctx.reset_symbol_cache();
     *ctx.semantic_index().borrow_mut() = None;
     *ctx.semantic_index_rx().borrow_mut() = None;
-    *ctx.callgraph_store().borrow_mut() = None;
+    *ctx.callgraph_store()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     if previous_project_root.as_ref() == Some(&root_path) {
         ctx.mark_callgraph_store_force_rebuild();
     }

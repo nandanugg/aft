@@ -601,7 +601,9 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                 let _ = store.mark_files_stale(&pending);
             }
         }
-        *ctx.callgraph_store().borrow_mut() = Some(store);
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
         installed = true;
     }
 
@@ -620,7 +622,12 @@ fn callgraph_store_state(
     if let Some(state) = override_state {
         return state.clone();
     }
-    if ctx.callgraph_store().borrow().is_some() {
+    if ctx
+        .callgraph_store()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
         return SubsystemState::Ready;
     }
     if ctx.callgraph_store_rx().borrow().is_some() {

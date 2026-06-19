@@ -617,7 +617,7 @@ pub struct AppContext {
     /// Empty when the project is healthy / full-featured.
     degraded_reasons: RefCell<Vec<String>>,
     callgraph: RefCell<Option<CallGraph>>,
-    callgraph_store: RefCell<Option<CallGraphStore>>,
+    callgraph_store: RwLock<Option<Arc<CallGraphStore>>>,
     callgraph_store_force_rebuild: RefCell<bool>,
     callgraph_store_rx: RefCell<Option<crossbeam_channel::Receiver<CallGraphStore>>>,
     pending_callgraph_store_paths: RefCell<BTreeSet<PathBuf>>,
@@ -706,9 +706,9 @@ impl Drop for AppContext {
 /// returned so the agent retries, mirroring how semantic search reports a
 /// build in progress. Warm restarts open the on-disk DB synchronously, so
 /// `Building` is only ever seen during a true first cold build.
-pub enum CallgraphStoreAccess<'a> {
+pub enum CallgraphStoreAccess {
     /// Store is resident and queryable.
-    Ready(RefMut<'a, CallGraphStore>),
+    Ready(Arc<CallGraphStore>),
     /// A cold build is in flight (or was just started); retry shortly.
     Building,
     /// Not configured, or a read-only worktree whose store was never built.
@@ -769,7 +769,7 @@ impl AppContext {
             git_common_dir: RefCell::new(None),
             degraded_reasons: RefCell::new(Vec::new()),
             callgraph: RefCell::new(None),
-            callgraph_store: RefCell::new(None),
+            callgraph_store: RwLock::new(None),
             callgraph_store_force_rebuild: RefCell::new(false),
             callgraph_store_rx: RefCell::new(None),
             pending_callgraph_store_paths: RefCell::new(BTreeSet::new()),
@@ -1422,7 +1422,7 @@ impl AppContext {
     }
 
     /// Access the persisted call graph store.
-    pub fn callgraph_store(&self) -> &RefCell<Option<CallGraphStore>> {
+    pub fn callgraph_store(&self) -> &RwLock<Option<Arc<CallGraphStore>>> {
         &self.callgraph_store
     }
 
@@ -1445,50 +1445,68 @@ impl AppContext {
 
     pub fn ensure_callgraph_store(
         &self,
-    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+    ) -> Result<Option<Arc<CallGraphStore>>, CallGraphStoreError> {
         self.ensure_callgraph_store_with_flag(true)
     }
 
     fn ensure_callgraph_store_with_flag(
         &self,
         respect_config_flag: bool,
-    ) -> Result<Option<RefMut<'_, CallGraphStore>>, CallGraphStoreError> {
+    ) -> Result<Option<Arc<CallGraphStore>>, CallGraphStoreError> {
         if respect_config_flag && !self.config().callgraph_store {
             return Ok(None);
         }
-        if self.callgraph_store.borrow().is_none() {
-            let Some(project_root) = self.callgraph_project_root() else {
-                return Ok(None);
-            };
-            let callgraph_dir = self.callgraph_store_dir();
-            let force_rebuild = self.take_callgraph_store_force_rebuild();
-            let store = if self.is_worktree_bridge() {
-                CallGraphStore::open_readonly(callgraph_dir, project_root)?
-            } else if force_rebuild {
-                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
-                    callgraph_dir,
-                    project_root,
-                    &files,
-                    self.config().callgraph_chunk_size,
-                )?;
-                Some(store)
-            } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
-                let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
-                let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
-                    callgraph_dir,
-                    project_root,
-                    &files,
-                    self.config().callgraph_chunk_size,
-                )?;
-                Some(store)
-            } else {
-                Some(CallGraphStore::open(callgraph_dir, project_root)?)
-            };
-            *self.callgraph_store.borrow_mut() = store;
+        if let Some(store) = {
+            let guard = self
+                .callgraph_store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_ref().map(Arc::clone)
+        } {
+            return Ok(Some(store));
         }
-        let borrow = self.callgraph_store.borrow_mut();
-        Ok(RefMut::filter_map(borrow, Option::as_mut).ok())
+
+        let Some(project_root) = self.callgraph_project_root() else {
+            return Ok(None);
+        };
+        let callgraph_dir = self.callgraph_store_dir();
+        let force_rebuild = self.take_callgraph_store_force_rebuild();
+        let store = if self.is_worktree_bridge() {
+            CallGraphStore::open_readonly(callgraph_dir, project_root)?
+        } else if force_rebuild {
+            let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+            let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir,
+                project_root,
+                &files,
+                self.config().callgraph_chunk_size,
+            )?;
+            Some(store)
+        } else if CallGraphStore::needs_cold_build(&callgraph_dir, &project_root)? {
+            let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+            let (store, _stats) = CallGraphStore::ensure_built_with_lease_chunked(
+                callgraph_dir,
+                project_root,
+                &files,
+                self.config().callgraph_chunk_size,
+            )?;
+            Some(store)
+        } else {
+            Some(CallGraphStore::open(callgraph_dir, project_root)?)
+        };
+
+        let Some(store) = store else {
+            return Ok(None);
+        };
+        let store = Arc::new(store);
+        {
+            let mut guard = self
+                .callgraph_store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(Arc::clone(&store));
+        }
+        Ok(Some(store))
     }
 
     /// Resolve the project root used for the callgraph store: prefer the
@@ -1525,27 +1543,35 @@ impl AppContext {
         if self.callgraph_store_rx.borrow().is_some() {
             return;
         }
-        let superseded = self
-            .callgraph_store
-            .borrow()
-            .as_ref()
-            .is_some_and(|store| !store.is_current());
+        let superseded = {
+            let guard = self
+                .callgraph_store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_ref().is_some_and(|store| !store.is_current())
+        };
         if superseded {
-            *self.callgraph_store.borrow_mut() = None;
+            let mut guard = self
+                .callgraph_store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = None;
         }
     }
 
-    pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess<'_> {
+    pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
         // Converge to a newer generation another process (or a local cold
         // rebuild) may have published: if our resident store is superseded, drop
         // it so the open path below reopens via the pointer. Cheap pointer read.
         self.revalidate_callgraph_store_generation();
-        if self.callgraph_store.borrow().is_some() {
-            let borrow = self.callgraph_store.borrow_mut();
-            return match RefMut::filter_map(borrow, Option::as_mut).ok() {
-                Some(store) => CallgraphStoreAccess::Ready(store),
-                None => CallgraphStoreAccess::Unavailable,
-            };
+        if let Some(store) = {
+            let guard = self
+                .callgraph_store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_ref().map(Arc::clone)
+        } {
+            return CallgraphStoreAccess::Ready(store);
         }
 
         // A background build is already running; don't start a second one.
@@ -1563,12 +1589,15 @@ impl AppContext {
         if self.is_worktree_bridge() {
             match CallGraphStore::open_readonly(callgraph_dir, project_root) {
                 Ok(Some(store)) => {
-                    *self.callgraph_store.borrow_mut() = Some(store);
-                    let borrow = self.callgraph_store.borrow_mut();
-                    return match RefMut::filter_map(borrow, Option::as_mut).ok() {
-                        Some(store) => CallgraphStoreAccess::Ready(store),
-                        None => CallgraphStoreAccess::Unavailable,
-                    };
+                    let store = Arc::new(store);
+                    {
+                        let mut guard = self
+                            .callgraph_store
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *guard = Some(Arc::clone(&store));
+                    }
+                    return CallgraphStoreAccess::Ready(store);
                 }
                 Ok(None) | Err(_) => return CallgraphStoreAccess::Unavailable,
             }
@@ -1581,12 +1610,15 @@ impl AppContext {
             match CallGraphStore::needs_cold_build(&callgraph_dir, &project_root) {
                 Ok(false) => match CallGraphStore::open(callgraph_dir, project_root) {
                     Ok(store) => {
-                        *self.callgraph_store.borrow_mut() = Some(store);
-                        let borrow = self.callgraph_store.borrow_mut();
-                        return match RefMut::filter_map(borrow, Option::as_mut).ok() {
-                            Some(store) => CallgraphStoreAccess::Ready(store),
-                            None => CallgraphStoreAccess::Unavailable,
-                        };
+                        let store = Arc::new(store);
+                        {
+                            let mut guard = self
+                                .callgraph_store
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            *guard = Some(Arc::clone(&store));
+                        }
+                        return CallgraphStoreAccess::Ready(store);
                     }
                     Err(error) => return CallgraphStoreAccess::Error(error),
                 },
@@ -1628,13 +1660,16 @@ impl AppContext {
                             let _ = store.mark_files_stale(&pending);
                         }
                     }
-                    *self.callgraph_store.borrow_mut() = Some(store);
+                    let store = Arc::new(store);
+                    {
+                        let mut guard = self
+                            .callgraph_store
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *guard = Some(Arc::clone(&store));
+                    }
                     *self.callgraph_store_rx.borrow_mut() = None;
-                    let borrow = self.callgraph_store.borrow_mut();
-                    return match RefMut::filter_map(borrow, Option::as_mut).ok() {
-                        Some(store) => CallgraphStoreAccess::Ready(store),
-                        None => CallgraphStoreAccess::Unavailable,
-                    };
+                    return CallgraphStoreAccess::Ready(store);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
