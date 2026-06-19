@@ -10,6 +10,7 @@ import type { PluginContext } from "../../types.js";
 import { noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
   type PreparedBinary,
@@ -80,11 +81,11 @@ maybeDescribe("e2e semantic search tool", () => {
     const pool = new BridgePool(
       harness.binaryPath,
       { timeoutMs: 20_000 },
-      {
+      configureParamsFromLegacyOverrides({
         semantic_search: options?.experimentalSemanticSearch ?? false,
         storage_dir: join(harness.tempDir, ".storage"),
         harness: "opencode",
-      },
+      }),
     );
     pools.push(pool);
 

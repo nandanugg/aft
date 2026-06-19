@@ -16,6 +16,7 @@ import type { PluginContext } from "../../types.js";
 import { noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
   type PreparedBinary,
@@ -47,14 +48,14 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 20_000 },
-      {
+      configureParamsFromLegacyOverrides({
         project_root: h.tempDir,
         restrict_to_project_root: false,
         bash_permissions: false,
         experimental_bash_background: true,
         storage_dir: h.path(".aft-storage"),
         harness: "opencode",
-      },
+      }),
     );
     const ctx: PluginContext = {
       pool,

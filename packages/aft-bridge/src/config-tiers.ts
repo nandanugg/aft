@@ -42,6 +42,16 @@ export function readConfigTiers(opts: {
   return tiers;
 }
 
+/** Wrap an inline aft.jsonc-shaped config object as a single user-tier ConfigTier
+ *  (the inline analog of readConfigTiers, which reads from disk). For programmatic
+ *  callers / test harnesses that hold a config object rather than a file. */
+export function inlineUserConfigTier(
+  config: Record<string, unknown>,
+  source = "<inline>",
+): ConfigTier[] {
+  return [{ tier: "user", source, doc: JSON.stringify(config) }];
+}
+
 export function formatDroppedKeyWarnings(
   dropped: Array<{ key: string; tier: string; reason: string }>,
 ): string[] {

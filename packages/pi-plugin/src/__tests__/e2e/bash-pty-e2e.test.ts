@@ -6,6 +6,7 @@ import { $ } from "bun";
 import { registerBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
 import {
+  configureParamsFromLegacyOverrides,
   createHarness,
   type Harness,
   type MockExtensionContext,
@@ -44,13 +45,13 @@ maybeDescribe("e2e bash PTY (Pi adapter + bridge + Rust)", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 60_000 },
-      {
+      configureParamsFromLegacyOverrides({
         project_root: h.tempDir,
         restrict_to_project_root: false,
         storage_dir: join(h.tempDir, ".aft-storage"),
         harness: "pi",
         experimental_bash_background: true,
-      },
+      }),
     );
     const ctx: PluginContext = {
       pool,

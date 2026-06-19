@@ -22,6 +22,7 @@ import {
 } from "./format-helpers.js";
 import {
   cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
   type E2EHarness,
   type PreparedBinary,
   prepareBinary,
@@ -98,7 +99,11 @@ async function createToolHarness(
   const pool = new BridgePool(
     h.binaryPath,
     { timeoutMs: 20_000 },
-    { storage_dir: join(h.tempDir, ".storage"), harness: "opencode", ...configOverrides },
+    configureParamsFromLegacyOverrides({
+      storage_dir: join(h.tempDir, ".storage"),
+      harness: "opencode",
+      ...configOverrides,
+    }),
   );
   const sdkCtx = createSdkContext(h.tempDir);
   await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);

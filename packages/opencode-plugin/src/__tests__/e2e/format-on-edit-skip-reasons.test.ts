@@ -16,7 +16,12 @@ import {
   type FormatPreset,
   NO_FORMATTER_PRESET,
 } from "./format-helpers.js";
-import { type E2EHarness, type PreparedBinary, prepareBinary } from "./helpers.js";
+import {
+  configureParamsFromLegacyOverrides,
+  type E2EHarness,
+  type PreparedBinary,
+  prepareBinary,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
@@ -133,12 +138,16 @@ async function executeRustGlobEdit(
   overrides?: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   if (overrides) {
-    const configured = await h.bridge.send("configure", {
-      project_root: h.tempDir,
-      harness: "opencode",
-      validate_on_edit: "syntax",
-      ...overrides,
-    });
+    const configured = await h.bridge.send(
+      "configure",
+      configureParamsFromLegacyOverrides({
+        project_root: h.tempDir,
+        harness: "opencode",
+        configure_warnings_delivery: "log",
+        validate_on_edit: "syntax",
+        ...overrides,
+      }),
+    );
     expect(configured.success).toBe(true);
   }
   return await h.bridge.send("edit_match", {
@@ -210,12 +219,12 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 30_000 },
-      {
+      configureParamsFromLegacyOverrides({
         project_root: h.tempDir,
         storage_dir: h.path(".storage"),
         harness: "opencode",
         ...poolOverrides,
-      },
+      }),
     );
     pools.push(pool);
     const sdkCtx = createSdkContext(h.tempDir);
@@ -237,12 +246,12 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 30_000 },
-      {
+      configureParamsFromLegacyOverrides({
         project_root: h.tempDir,
         storage_dir: h.path(".storage-edit"),
         harness: "opencode",
         ...poolOverrides,
-      },
+      }),
     );
     pools.push(pool);
     const sdkCtx = createSdkContext(h.tempDir);
@@ -291,12 +300,12 @@ maybeDescribe("e2e format_on_edit skip reasons", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 30_000 },
-      {
+      configureParamsFromLegacyOverrides({
         project_root: h.tempDir,
         storage_dir: h.path(".storage-rust"),
         harness: "opencode",
         ...overrides,
-      },
+      }),
     );
     pools.push(pool);
     const bridge = pool.getBridge(h.tempDir);

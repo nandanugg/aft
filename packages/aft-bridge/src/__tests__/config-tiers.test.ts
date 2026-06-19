@@ -4,7 +4,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { formatDroppedKeyWarnings, readConfigTiers } from "../config-tiers.js";
+import {
+  formatDroppedKeyWarnings,
+  inlineUserConfigTier,
+  readConfigTiers,
+} from "../config-tiers.js";
 
 const tempRoots = new Set<string>();
 
@@ -126,6 +130,16 @@ describe("readConfigTiers", () => {
       source: resolve(projectPath),
       doc: projectDoc,
     });
+  });
+});
+
+describe("inlineUserConfigTier", () => {
+  test("wraps an inline config object as a user config tier", () => {
+    const config = { bash: { rewrite: false, compress: false, background: true } };
+
+    expect(inlineUserConfigTier(config, "test-source")).toEqual([
+      { tier: "user", source: "test-source", doc: JSON.stringify(config) },
+    ]);
   });
 });
 

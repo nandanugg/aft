@@ -8,7 +8,13 @@ import { createBashStatusTool, createBashTool } from "../../tools/bash.js";
 import { createBashWriteTool } from "../../tools/bash_write.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk, toolResultText } from "../test-helpers";
-import { cleanupHarnesses, createHarness, type E2EHarness, prepareBinary } from "./helpers.js";
+import {
+  cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
+  createHarness,
+  type E2EHarness,
+  prepareBinary,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
@@ -39,12 +45,12 @@ maybeDescribe("e2e bash PTY (OpenCode adapter + bridge + Rust)", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 20_000 },
-      {
+      configureParamsFromLegacyOverrides({
         restrict_to_project_root: false,
         storage_dir: join(h.tempDir, ".aft-storage"),
         harness: "opencode",
         experimental_bash_background: true,
-      },
+      }),
     );
     const ctx: PluginContext = {
       pool,

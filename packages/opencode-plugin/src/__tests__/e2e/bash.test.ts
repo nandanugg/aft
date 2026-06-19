@@ -10,6 +10,7 @@ import type { PluginContext } from "../../types.js";
 import { mockAsk, noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
   type PreparedBinary,
@@ -70,14 +71,17 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       bridgeOptions: { timeoutMs: 20_000 },
     });
     if (Object.keys(configOverrides).length > 0) {
-      await created.bridge.send("configure", {
-        project_root: created.tempDir,
-        harness: "opencode",
-        restrict_to_project_root: true,
-        bash_permissions: false,
-        storage_dir: join(created.tempDir, ".aft-storage"),
-        ...configOverrides,
-      });
+      await created.bridge.send(
+        "configure",
+        configureParamsFromLegacyOverrides({
+          project_root: created.tempDir,
+          harness: "opencode",
+          restrict_to_project_root: true,
+          bash_permissions: false,
+          storage_dir: join(created.tempDir, ".aft-storage"),
+          ...configOverrides,
+        }),
+      );
     }
     harnesses.push(created);
     return created;
@@ -88,13 +92,13 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const pool = new BridgePool(
       h.binaryPath,
       { timeoutMs: 20_000 },
-      {
+      configureParamsFromLegacyOverrides({
         restrict_to_project_root: true,
         bash_permissions: true,
         storage_dir: join(h.tempDir, ".aft-storage"),
         harness: "opencode",
         ...configOverrides,
-      },
+      }),
     );
     const ctx: PluginContext = {
       pool,
@@ -338,14 +342,17 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
   test("background completions are no longer appended by the bash adapter", async () => {
     const { h, bash } = await pluginHarness({ experimental_bash_background: true });
-    await h.bridge.send("configure", {
-      project_root: h.tempDir,
-      harness: "opencode",
-      restrict_to_project_root: true,
-      bash_permissions: false,
-      storage_dir: join(h.tempDir, ".aft-storage"),
-      experimental_bash_background: true,
-    });
+    await h.bridge.send(
+      "configure",
+      configureParamsFromLegacyOverrides({
+        project_root: h.tempDir,
+        harness: "opencode",
+        restrict_to_project_root: true,
+        bash_permissions: false,
+        storage_dir: join(h.tempDir, ".aft-storage"),
+        experimental_bash_background: true,
+      }),
+    );
     const spawned = await h.bridge.send("bash", {
       command: "echo bg-done | tee bg-marker.txt",
       background: true,

@@ -24,7 +24,12 @@ import {
   RUSTFMT_PRESET,
   tsCollapseSpacesShim,
 } from "./format-helpers.js";
-import { type E2EHarness, type PreparedBinary, prepareBinary } from "./helpers.js";
+import {
+  configureParamsFromLegacyOverrides,
+  type E2EHarness,
+  type PreparedBinary,
+  prepareBinary,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const isCI = process.env.CI === "true";
@@ -159,12 +164,16 @@ maybeDescribe("e2e format_on_edit write tools", () => {
     h: E2EHarness,
     overrides: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    return await h.bridge.send("configure", {
-      project_root: h.tempDir,
-      harness: "opencode",
-      validate_on_edit: "syntax",
-      ...overrides,
-    });
+    return await h.bridge.send(
+      "configure",
+      configureParamsFromLegacyOverrides({
+        project_root: h.tempDir,
+        harness: "opencode",
+        configure_warnings_delivery: "log",
+        validate_on_edit: "syntax",
+        ...overrides,
+      }),
+    );
   }
 
   async function executeHoistedWrite(h: E2EHarness, filePath: string, content: string) {

@@ -16,7 +16,7 @@ import { access, cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/prom
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import { BridgePool, setActiveLogger } from "@cortexkit/aft-bridge";
+import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
@@ -52,6 +52,100 @@ const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin", AFT_BINARY_NAME);
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;
+const GROUP_A_CONFIGURE_KEYS = new Set([
+  "storage_dir",
+  "harness",
+  "project_root",
+  "bash_permissions",
+  "lsp_paths_extra",
+  "lsp_auto_install_binaries",
+  "lsp_inflight_installs",
+  "max_background_bash_tasks",
+  "aft_search_registered",
+  "_ort_dylib_dir",
+  "_bypass_size_limits",
+]);
+
+const LEGACY_CONFIG_KEYS = new Set([
+  "experimental_bash_rewrite",
+  "experimental_bash_compress",
+  "experimental_bash_background",
+  "bash_long_running_reminder_enabled",
+  "bash_long_running_reminder_interval_ms",
+  "experimental_lsp_ty",
+  "lsp_servers",
+  "disabled_lsp",
+]);
+
+function objectDocValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+}
+
+/**
+ * E2E migration shim: keep process-state configure params flat, but wrap legacy
+ * flat aft.jsonc config overrides in an inline user config tier like the plugins do.
+ */
+export function configureParamsFromLegacyOverrides(
+  overrides: Record<string, unknown>,
+): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  const doc: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (GROUP_A_CONFIGURE_KEYS.has(key)) {
+      params[key] = value;
+    } else if (!LEGACY_CONFIG_KEYS.has(key)) {
+      doc[key] = value;
+    }
+  }
+
+  const hasBashLegacy =
+    Object.hasOwn(overrides, "experimental_bash_rewrite") ||
+    Object.hasOwn(overrides, "experimental_bash_compress") ||
+    Object.hasOwn(overrides, "experimental_bash_background") ||
+    Object.hasOwn(overrides, "bash_long_running_reminder_enabled") ||
+    Object.hasOwn(overrides, "bash_long_running_reminder_interval_ms");
+  if (hasBashLegacy) {
+    const bash = objectDocValue(doc.bash);
+    bash.rewrite = Object.hasOwn(overrides, "experimental_bash_rewrite")
+      ? overrides.experimental_bash_rewrite
+      : false;
+    bash.compress = Object.hasOwn(overrides, "experimental_bash_compress")
+      ? overrides.experimental_bash_compress
+      : false;
+    bash.background = Object.hasOwn(overrides, "experimental_bash_background")
+      ? overrides.experimental_bash_background
+      : false;
+    if (Object.hasOwn(overrides, "bash_long_running_reminder_enabled")) {
+      bash.long_running_reminder_enabled = overrides.bash_long_running_reminder_enabled;
+    }
+    if (Object.hasOwn(overrides, "bash_long_running_reminder_interval_ms")) {
+      bash.long_running_reminder_interval_ms = overrides.bash_long_running_reminder_interval_ms;
+    }
+    doc.bash = bash;
+  }
+
+  if (Object.hasOwn(overrides, "experimental_lsp_ty")) {
+    const experimental = objectDocValue(doc.experimental);
+    experimental.lsp_ty = overrides.experimental_lsp_ty;
+    doc.experimental = experimental;
+  }
+
+  if (Object.hasOwn(overrides, "lsp_servers") || Object.hasOwn(overrides, "disabled_lsp")) {
+    const lsp = objectDocValue(doc.lsp);
+    if (Object.hasOwn(overrides, "lsp_servers")) lsp.servers = overrides.lsp_servers;
+    if (Object.hasOwn(overrides, "disabled_lsp")) lsp.disabled = overrides.disabled_lsp;
+    doc.lsp = lsp;
+  }
+
+  if (Object.keys(doc).length > 0) {
+    params.config = inlineUserConfigTier(doc);
+  }
+
+  return params;
+}
 
 // Minimal AgentToolResult shape — pi-agent-core defines
 //   { content: (TextContent | ImageContent)[]; details: T }
@@ -187,7 +281,11 @@ export async function createHarness(
       },
     },
     // Forward the full config to configure so indexing/restrict/etc. match prod.
-    { ...config, storage_dir: join(tempDir, ".aft-storage"), harness: "pi" },
+    configureParamsFromLegacyOverrides({
+      ...config,
+      storage_dir: join(tempDir, ".aft-storage"),
+      harness: "pi",
+    }),
   );
 
   const bridge = pool.getBridge(tempDir);

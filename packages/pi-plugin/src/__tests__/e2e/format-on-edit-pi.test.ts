@@ -4,7 +4,13 @@ import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { createHarness, type Harness, type PreparedBinary, prepareBinary } from "./helpers.js";
+import {
+  configureParamsFromLegacyOverrides,
+  createHarness,
+  type Harness,
+  type PreparedBinary,
+  prepareBinary,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
@@ -138,7 +144,13 @@ async function installPreset(
     ...config,
   };
   if (preset.explicitFormatter) configureParams.formatter = preset.explicitFormatter;
-  const configured = await h.bridge.send("configure", configureParams);
+  const configured = await h.bridge.send(
+    "configure",
+    configureParamsFromLegacyOverrides({
+      configure_warnings_delivery: "log",
+      ...configureParams,
+    }),
+  );
   expect(configured.success).toBe(true);
 }
 

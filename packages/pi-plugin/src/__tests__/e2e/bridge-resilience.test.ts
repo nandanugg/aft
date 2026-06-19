@@ -6,7 +6,13 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
-import { createHarness, type Harness, type PreparedBinary, prepareBinary } from "./helpers.js";
+import {
+  configureParamsFromLegacyOverrides,
+  createHarness,
+  type Harness,
+  type PreparedBinary,
+  prepareBinary,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = initialBinary.binaryPath ? describe : describe.skip;
@@ -180,7 +186,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
     const pool = new BridgePool(
       preparedBinary.binaryPath,
       { timeoutMs: 10_000, maxRestarts: 0 },
-      { search_index: false, harness: "pi" },
+      configureParamsFromLegacyOverrides({ search_index: false, harness: "pi" }),
     );
     extraPools.push(pool);
 

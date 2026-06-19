@@ -48,7 +48,7 @@ export { coerceOptionalInt, coerceStringArray, isEmptyParam } from "./coerce.js"
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
 // --- config tiers ---
 export type { ConfigTier } from "./config-tiers.js";
-export { formatDroppedKeyWarnings, readConfigTiers } from "./config-tiers.js";
+export { formatDroppedKeyWarnings, inlineUserConfigTier, readConfigTiers } from "./config-tiers.js";
 // --- binary resolution ---
 export {
   downloadBinary,

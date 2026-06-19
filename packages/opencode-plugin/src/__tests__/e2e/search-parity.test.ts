@@ -7,6 +7,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
   type PreparedBinary,
@@ -284,11 +285,14 @@ async function configureBridge(
   harness: E2EHarness,
   options: { experimentalSearchIndex: boolean },
 ): Promise<void> {
-  const response = await harness.bridge.send("configure", {
-    project_root: harness.tempDir,
-    harness: "opencode",
-    search_index: options.experimentalSearchIndex,
-  });
+  const response = await harness.bridge.send(
+    "configure",
+    configureParamsFromLegacyOverrides({
+      project_root: harness.tempDir,
+      harness: "opencode",
+      search_index: options.experimentalSearchIndex,
+    }),
+  );
 
   if (response.success !== true) {
     throw new Error(`configure failed: ${String(response.message ?? response.code ?? "unknown")}`);

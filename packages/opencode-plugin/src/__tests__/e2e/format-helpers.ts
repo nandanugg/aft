@@ -14,7 +14,12 @@
 import { existsSync } from "node:fs";
 import { symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { createHarness, type E2EHarness, type PreparedBinary } from "./helpers.js";
+import {
+  configureParamsFromLegacyOverrides,
+  createHarness,
+  type E2EHarness,
+  type PreparedBinary,
+} from "./helpers.js";
 
 /**
  * Names of real formatters/checkers we try to symlink into the harness's
@@ -263,7 +268,10 @@ export async function createFormatHarness(
   if (preset.explicitChecker) {
     configureParams.checker = preset.explicitChecker;
   }
-  const configResp = await harness.bridge.send("configure", configureParams);
+  const configResp = await harness.bridge.send(
+    "configure",
+    configureParamsFromLegacyOverrides(configureParams),
+  );
   if (configResp.success === false) {
     throw new Error(`bridge configure failed: ${(configResp as { message?: string }).message}`);
   }
