@@ -339,7 +339,9 @@ mod tests {
         assert!(response.data["canonical_root"].is_null());
 
         let temp = tempfile::tempdir().unwrap();
-        ctx.config_mut().project_root = Some(temp.path().to_path_buf());
+        ctx.update_config(|config| {
+            config.project_root = Some(temp.path().to_path_buf());
+        });
         ctx.set_canonical_cache_root(std::fs::canonicalize(temp.path()).unwrap());
         ctx.set_cache_role(false, None);
         let response = handle_status(&request(), &ctx);

@@ -217,7 +217,9 @@ fn rewrite_append_uses_original_session_for_backups() {
     let file = dir.path().join("notes.txt");
     fs::write(&file, "before\n").unwrap();
     let ctx = context(dir.path(), true);
-    ctx.config_mut().storage_dir = Some(storage.path().to_path_buf());
+    ctx.update_config(|config| {
+        config.storage_dir = Some(storage.path().to_path_buf());
+    });
     ctx.backup()
         .borrow_mut()
         .set_storage_dir(storage.path().to_path_buf(), 168);

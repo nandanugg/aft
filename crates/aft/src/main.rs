@@ -1068,7 +1068,7 @@ fn delay_search_rebuild_publish_for_debug() {}
 fn spawn_search_corpus_refresh(
     ctx: &AppContext,
     root: std::path::PathBuf,
-    config: aft::config::Config,
+    config: Arc<aft::config::Config>,
 ) {
     if let Some(index) = ctx.search_index().borrow_mut().as_mut() {
         index.ready = false;
@@ -1118,7 +1118,7 @@ fn refresh_project_corpus(ctx: &AppContext, reason: &str, invalidate_ignore_path
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
-    let config = ctx.config().clone();
+    let config = ctx.config();
     let mut status_changed = false;
 
     if invalidate_ignore_paths {

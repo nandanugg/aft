@@ -1,9 +1,9 @@
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use lsp_types::FileChangeType;
@@ -593,15 +593,17 @@ impl Default for App {
 /// and call graph engine. Constructed once at startup and passed by
 /// reference to `dispatch`.
 ///
-/// Stores use `RefCell` for interior mutability — the binary is single-threaded
+/// Most stores use `RefCell` for interior mutability — the binary is single-threaded
 /// (one request at a time on the stdin read loop) so runtime borrow checking
-/// is safe and never contended.
+/// is safe and never contended. `config` is a thread-safe owned snapshot so
+/// future read-side dispatch can hold configuration across other work without
+/// holding a lock guard.
 pub struct AppContext {
     app: Arc<App>,
     provider: Box<dyn LanguageProvider>,
     backup: RefCell<BackupStore>,
     checkpoint: RefCell<CheckpointStore>,
-    config: RefCell<Config>,
+    config: RwLock<Arc<Config>>,
     pub harness: RefCell<Option<Harness>>,
     canonical_cache_root: RefCell<Option<PathBuf>>,
     is_worktree_bridge: RefCell<bool>,
@@ -760,7 +762,7 @@ impl AppContext {
             provider,
             backup: RefCell::new(BackupStore::new()),
             checkpoint: RefCell::new(CheckpointStore::new()),
-            config: RefCell::new(config),
+            config: RwLock::new(Arc::new(config)),
             harness: RefCell::new(None),
             canonical_cache_root: RefCell::new(None),
             is_worktree_bridge: RefCell::new(false),
@@ -1124,7 +1126,9 @@ impl AppContext {
     }
 
     pub fn set_bash_compress_enabled(&self, enabled: bool) {
-        self.config_mut().experimental_bash_compress = enabled;
+        self.update_config(|config| {
+            config.experimental_bash_compress = enabled;
+        });
         self.bash_compress_flag
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1271,14 +1275,29 @@ impl AppContext {
         self.app.db()
     }
 
-    /// Access the configuration (shared borrow).
-    pub fn config(&self) -> Ref<'_, Config> {
-        self.config.borrow()
+    /// Access an owned configuration snapshot.
+    pub fn config(&self) -> Arc<Config> {
+        let guard = match self.config.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Arc::clone(&*guard)
     }
 
-    /// Access the configuration (mutable borrow).
-    pub fn config_mut(&self) -> RefMut<'_, Config> {
-        self.config.borrow_mut()
+    /// Atomically publish a fully-built configuration snapshot.
+    pub fn set_config(&self, config: Config) {
+        let next = Arc::new(config);
+        match self.config.write() {
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
+    }
+
+    /// Clone-mutate-publish the current configuration without returning a guard.
+    pub fn update_config(&self, update: impl FnOnce(&mut Config)) {
+        let mut next = self.config().as_ref().clone();
+        update(&mut next);
+        self.set_config(next);
     }
 
     pub fn set_harness(&self, harness: Harness) {
@@ -1887,7 +1906,7 @@ impl AppContext {
 
     fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {
         self.harness_opt()?;
-        let config = self.config().clone();
+        let config = self.config();
         let project_root = config
             .project_root
             .clone()
@@ -1896,7 +1915,7 @@ impl AppContext {
         Some(InspectSnapshot::new(
             project_root,
             self.inspect_dir(),
-            Arc::new(config),
+            config,
             self.symbol_cache(),
         ))
     }
@@ -2782,7 +2801,9 @@ mod harness_path_tests {
 
     fn ctx_with_storage_and_harness(storage_dir: PathBuf, harness: Harness) -> AppContext {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        ctx.config_mut().storage_dir = Some(storage_dir);
+        ctx.update_config(|config| {
+            config.storage_dir = Some(storage_dir);
+        });
         ctx.set_harness(harness);
         ctx
     }

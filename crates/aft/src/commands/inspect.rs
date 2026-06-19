@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -227,7 +226,7 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
         ));
     }
 
-    let config = ctx.config().clone();
+    let config = ctx.config();
     let project_root = config
         .project_root
         .clone()
@@ -236,7 +235,7 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     Ok(InspectSnapshot::new(
         project_root,
         ctx.inspect_dir(),
-        Arc::new(config),
+        config,
         ctx.symbol_cache(),
     ))
 }

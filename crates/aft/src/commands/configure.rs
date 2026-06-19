@@ -1286,9 +1286,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     debug_assert!(canonical_cache_root.is_absolute());
     let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(&canonical_cache_root);
 
-    let previous_config = ctx.config().clone();
+    let previous_config = ctx.config();
     let previous_project_root = previous_config.project_root.clone();
-    let mut next_config = previous_config.clone();
+    let mut next_config = previous_config.as_ref().clone();
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness);
 
@@ -1469,7 +1469,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Commit phase: no validation returns after this point.
-    *ctx.config_mut() = next_config.clone();
+    ctx.set_config(next_config.clone());
     ctx.set_harness(harness);
     ctx.backup().borrow().set_db_harness(harness);
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
@@ -2598,8 +2598,10 @@ mod tests {
         }
 
         let ctx = test_context();
-        ctx.config_mut().search_index = true;
-        ctx.config_mut().semantic_search = true;
+        ctx.update_config(|config| {
+            config.search_index = true;
+            config.semantic_search = true;
+        });
         let req = configure_request(json!(temp.path()));
         let response = super::handle_configure(&req, &ctx);
 
@@ -2653,7 +2655,9 @@ mod tests {
         }
 
         let ctx = test_context();
-        ctx.config_mut().search_index = true;
+        ctx.update_config(|config| {
+            config.search_index = true;
+        });
         let req = configure_request(json!(subdir));
         let response = super::handle_configure(&req, &ctx);
 

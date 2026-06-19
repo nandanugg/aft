@@ -403,7 +403,9 @@ mod tests {
     fn db_set_state_uses_json_fallback_when_database_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let ctx = test_context();
-        ctx.config_mut().storage_dir = Some(temp.path().to_path_buf());
+        ctx.update_config(|config| {
+            config.storage_dir = Some(temp.path().to_path_buf());
+        });
         ctx.set_harness(Harness::Opencode);
 
         let set_req = state_request(
@@ -426,7 +428,9 @@ mod tests {
     fn db_set_host_state_uses_json_fallback_when_database_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let ctx = test_context();
-        ctx.config_mut().storage_dir = Some(temp.path().to_path_buf());
+        ctx.update_config(|config| {
+            config.storage_dir = Some(temp.path().to_path_buf());
+        });
 
         let set_req = state_request(
             "db_set_host_state",
