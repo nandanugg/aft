@@ -135,7 +135,7 @@ async fn run_module_loop<R, W>(
     dispatch: DispatchFn,
 ) -> Result<(), SubcError>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // ModuleHello: register as a tool provider. control_ops:None = full baseline.
@@ -173,46 +173,62 @@ where
 
     let (writer_tx, writer_rx) = mpsc::channel::<Frame>(256);
     let writer_task = spawn_writer_task(write, writer_rx);
+    // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
+    // the `select!` below: a drain-interval tick (or shutdown) firing while a
+    // frame is mid-transit would drop the partially-consumed bytes and desync the
+    // stream (the next read would parse a body byte as a frame header). A
+    // dedicated reader task owns the socket, reads whole frames sequentially, and
+    // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
+    let (reader_tx, mut reader_rx) = mpsc::channel::<Result<Frame, SubcError>>(256);
+    let reader_task = spawn_reader_task(read, reader_tx);
     let shutdown = Arc::new(Notify::new());
     let drain_pending = Arc::new(AtomicBool::new(false));
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
     let mut actor_root_id: Option<ProjectRootId> = None;
 
-    loop {
+    let loop_result: Result<(), SubcError> = loop {
         tokio::select! {
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
-                break;
+                break Ok(());
             }
-            read_result = read_frame(&mut read) => {
-                let Some(frame) = read_result.map_err(SubcError::FrameIo)? else {
-                    log::info!("subc attach: daemon closed connection");
-                    break;
+            maybe_frame = reader_rx.recv() => {
+                let frame = match maybe_frame {
+                    None => {
+                        log::info!("subc attach: daemon closed connection");
+                        break Ok(());
+                    }
+                    Some(Err(error)) => break Err(error),
+                    Some(Ok(frame)) => frame,
                 };
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
-                        let pong = Frame::build_with_version(
+                        let pong = match Frame::build_with_version(
                             frame.header.ver,
                             FrameType::Pong,
                             frame.header.flags,
                             0,
                             frame.header.corr,
                             Vec::new(),
-                        )
-                        .map_err(SubcError::FrameBuild)?;
-                        send_frame(&writer_tx, pong).await?;
+                        ) {
+                            Ok(pong) => pong,
+                            Err(error) => break Err(SubcError::FrameBuild(error)),
+                        };
+                        if let Err(error) = send_frame(&writer_tx, pong).await {
+                            break Err(error);
+                        }
                     }
                     FrameType::Goodbye if frame.header.channel == 0 => {
                         log::info!("subc attach: received channel-0 Goodbye");
-                        break;
+                        break Ok(());
                     }
                     FrameType::Goodbye => {
                         // Route teardown — N=1 keeps a single actor for the connection.
                         log::debug!("subc attach: route {} torn down", frame.header.channel);
                     }
                     FrameType::Request if frame.header.channel == 0 => {
-                        handle_control_request(
+                        if let Err(error) = handle_control_request(
                             &writer_tx,
                             &frame,
                             &ctx,
@@ -221,10 +237,13 @@ where
                             &shutdown,
                             dispatch,
                         )
-                        .await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
                     }
                     FrameType::Request => {
-                        handle_tool_call(
+                        if let Err(error) = handle_tool_call(
                             &writer_tx,
                             &frame,
                             actor_root_id.clone(),
@@ -232,7 +251,10 @@ where
                             &shutdown,
                             dispatch,
                         )
-                        .await?;
+                        .await
+                        {
+                            break Err(error);
+                        }
                     }
                     // Cancel/Push/etc. are ignored until Phase 3 cancellation.
                     _ => {}
@@ -251,10 +273,14 @@ where
                 }
             }
         }
-    }
+    };
 
+    // The reader task may be parked on `read_frame`; abort it (we are done with
+    // the connection) and flush the writer.
+    reader_task.abort();
     drop(writer_tx);
-    finish_writer_task(writer_task).await
+    let writer_result = finish_writer_task(writer_task).await;
+    loop_result.and(writer_result)
 }
 
 fn spawn_writer_task<W>(
@@ -269,6 +295,37 @@ where
             write_frame(&mut write, &frame).await?;
         }
         Ok(())
+    })
+}
+
+/// Owns the read half and reads whole frames sequentially. `read_frame` is not
+/// cancellation-safe, so it must run here — never inside the main loop's
+/// `select!` — to keep the inbound stream framed. Each frame (or the terminal
+/// error / EOF) is forwarded over `tx`; the loop consumes them via cancel-safe
+/// `recv()`. Exits on EOF (Ok(None)), a read error, or when `tx` is dropped
+/// (the loop ended and aborted us).
+fn spawn_reader_task<R>(mut read: R, tx: mpsc::Sender<Result<Frame, SubcError>>) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut read).await {
+                Ok(Some(frame)) => {
+                    if tx.send(Ok(frame)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    // EOF: let the loop observe channel close as "daemon closed".
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(SubcError::FrameIo(error))).await;
+                    return;
+                }
+            }
+        }
     })
 }
 
