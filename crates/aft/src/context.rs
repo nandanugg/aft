@@ -735,6 +735,9 @@ fn callgraph_build_wait_window() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+#[cfg(test)]
+static CALLGRAPH_COLD_BUILD_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         Self::with_app_and_provider(App::default_shared(), provider, config)
@@ -1665,7 +1668,9 @@ impl AppContext {
         // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
         // window inline for the build to land before returning `Building`; tests
         // set it large so fixture builds resolve to `Ready` synchronously.
-        self.spawn_callgraph_store_cold_build(project_root, callgraph_dir, force_rebuild);
+        if !self.spawn_callgraph_store_cold_build(project_root, callgraph_dir, force_rebuild) {
+            return CallgraphStoreAccess::Building;
+        }
 
         let wait = callgraph_build_wait_window();
         if !wait.is_zero() {
@@ -1713,25 +1718,37 @@ impl AppContext {
         CallgraphStoreAccess::Building
     }
 
-    /// Spawn a background thread that cold-builds the callgraph store and sends
-    /// the finished store over `callgraph_store_rx`. The main loop installs it
-    /// via `drain_callgraph_store_events`. Mirrors the search-index build
-    /// lifecycle (channel + drain).
+    /// Atomically mark a cold build in-flight and spawn the background builder.
+    ///
+    /// The `callgraph_store_rx` lock covers the full check + receiver install +
+    /// thread spawn sequence, so concurrent cold callers cannot both observe an
+    /// empty in-flight slot and double-spawn builders. Returns `false` when
+    /// another caller already has a build in flight.
     fn spawn_callgraph_store_cold_build(
         &self,
         project_root: PathBuf,
         callgraph_dir: PathBuf,
         force_rebuild: bool,
-    ) {
+    ) -> bool {
+        let session_id = crate::log_ctx::current_session();
+        let chunk_size = self.config().callgraph_chunk_size;
+
+        let mut rx_guard = self.callgraph_store_rx.lock();
+        if rx_guard.is_some() {
+            return false;
+        }
+
         if force_rebuild {
             // Consume the force flag now so a follow-up request doesn't queue a
             // second forced build while this one is in flight.
             self.take_callgraph_store_force_rebuild();
         }
         let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
-        *self.callgraph_store_rx.lock() = Some(rx);
-        let session_id = crate::log_ctx::current_session();
-        let chunk_size = self.config().callgraph_chunk_size;
+        *rx_guard = Some(rx);
+
+        #[cfg(test)]
+        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+
         std::thread::spawn(move || {
             crate::log_ctx::with_session(session_id, || {
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
@@ -1764,6 +1781,7 @@ impl AppContext {
                 }
             });
         });
+        true
     }
 
     /// Access the callgraph-store background-build receiver (drained by the
@@ -2593,6 +2611,115 @@ impl AppContext {
             "local_entries": entries,
             "warm_entries": 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod callgraph_store_for_ops_tests {
+    use super::*;
+    use crate::parser::TreeSitterProvider;
+    use std::ffi::OsString;
+    use std::sync::{Barrier, Mutex as StdMutex, MutexGuard, OnceLock};
+    use tempfile::TempDir;
+
+    struct CallgraphWaitWindowEnvGuard {
+        _guard: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for CallgraphWaitWindowEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by the process-local guard held for this
+            // helper's lifetime, and restored before the guard is released.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
+                    None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
+                }
+            }
+        }
+    }
+
+    fn force_async_callgraph_builds() -> CallgraphWaitWindowEnvGuard {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
+        // SAFETY: serialized by LOCK above and restored by the returned guard.
+        unsafe {
+            std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", "0");
+        }
+        CallgraphWaitWindowEnvGuard {
+            _guard: guard,
+            previous,
+        }
+    }
+
+    #[test]
+    fn concurrent_cold_callgraph_store_for_ops_spawns_one_build() {
+        let _env_guard = force_async_callgraph_builds();
+        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
+
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let source_dir = project.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::write(
+            source_dir.join("lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\n",
+        )
+        .expect("source file");
+
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        ));
+
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let ctx = Arc::clone(&ctx);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    matches!(
+                        ctx.callgraph_store_for_ops(),
+                        CallgraphStoreAccess::Building | CallgraphStoreAccess::Ready(_)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        for handle in handles {
+            assert!(
+                handle.join().expect("callgraph caller thread"),
+                "cold callgraph ops should report Building or observe the installed store"
+            );
+        }
+
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "concurrent cold callers must share one background build"
+        );
+
+        let rx = ctx
+            .callgraph_store_rx
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("in-flight receiver installed before spawn");
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("background cold build should complete");
+        *ctx.callgraph_store_rx.lock() = None;
     }
 }
 

@@ -1226,10 +1226,23 @@ fn search_index_ready(ctx: &AppContext) -> bool {
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let mut model_ref = ctx.semantic_embedding_model().lock();
-    let semantic_config = ctx.config().semantic.clone();
 
     if model_ref.is_none() {
-        *model_ref = Some(EmbeddingModel::from_config_for_query(&semantic_config)?);
+        drop(model_ref);
+
+        let semantic_config = ctx.config().semantic.clone();
+        let constructed_model = EmbeddingModel::from_config_for_query(&semantic_config)?;
+
+        model_ref = ctx.semantic_embedding_model().lock();
+        if model_ref.is_none() {
+            *model_ref = Some(constructed_model);
+        } else {
+            drop(model_ref);
+            {
+                let _discarded_model = constructed_model;
+            }
+            model_ref = ctx.semantic_embedding_model().lock();
+        }
     }
 
     let model = model_ref
@@ -1947,6 +1960,50 @@ mod tests {
         });
 
         (format!("http://{}", addr), handle)
+    }
+
+    #[test]
+    fn embed_query_construction_error_leaves_slot_empty_for_retry() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                semantic: SemanticBackendConfig {
+                    backend: SemanticBackend::OpenAiCompatible,
+                    model: "test-embedding".to_string(),
+                    base_url: None,
+                    api_key_env: None,
+                    timeout_ms: 5_000,
+                    max_batch_size: 64,
+                    max_files: 20_000,
+                },
+                ..Config::default()
+            },
+        );
+
+        let err = embed_query("anything", &ctx).expect_err("construction should fail");
+        assert!(
+            err.contains("base_url is required"),
+            "expected missing base_url construction error, got: {err}"
+        );
+        assert!(
+            ctx.semantic_embedding_model().lock().is_none(),
+            "failed model construction must not poison the lazy slot"
+        );
+
+        let (base_url, handle) = start_mock_embedding_server();
+        ctx.update_config(|config| {
+            config.semantic.base_url = Some(base_url);
+        });
+
+        let vector = embed_query("anything", &ctx).expect("retry should construct and embed");
+        assert_eq!(vector, vec![0.1, 0.2, 0.3]);
+        assert!(
+            ctx.semantic_embedding_model().lock().is_some(),
+            "successful retry should install the constructed model"
+        );
+        handle.join().expect("embedding server thread");
     }
 
     #[test]
