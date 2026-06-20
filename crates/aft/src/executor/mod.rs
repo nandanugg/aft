@@ -15,6 +15,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::oneshot;
 
 use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Response};
 
@@ -120,12 +121,6 @@ impl CompletionHandle {
     pub fn into_receiver(self) -> Receiver<Response> {
         self.rx
     }
-
-    fn already_completed(response: Response) -> Self {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let _ = tx.send(response);
-        Self { rx }
-    }
 }
 
 /// Concurrent scheduler-dispatch executor.
@@ -202,27 +197,67 @@ impl Executor {
 
     pub fn submit(&self, root_id: ProjectRootId, lane: Lane, job: ExecutorJob) -> CompletionHandle {
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
-        let mut missing_actor = false;
+        self.submit_with_completion(root_id, lane, job, CompletionSender::Sync(completion_tx));
+        CompletionHandle { rx: completion_rx }
+    }
 
-        {
+    pub fn submit_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        job: ExecutorJob,
+    ) -> oneshot::Receiver<Response> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_with_completion(root_id, lane, job, CompletionSender::Async(completion_tx));
+        completion_rx
+    }
+
+    fn submit_with_completion(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        job: ExecutorJob,
+        completion: CompletionSender,
+    ) {
+        let request_id = executor_request_id();
+        let command = lane_command(lane);
+        let mut job = Some(job);
+        let mut completion = Some(completion);
+
+        let response = {
             let mut state = self.inner.state.lock();
-            if let Some(actor) = state.actors.get_mut(&root_id) {
-                actor.push_job(lane, QueuedJob { job, completion_tx });
-            } else {
-                missing_actor = true;
+            match state.actors.get_mut(&root_id) {
+                Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
+                Some(actor) => {
+                    actor.push_job(
+                        lane,
+                        QueuedJob {
+                            job: job.take().expect("executor job already queued"),
+                            completion: completion
+                                .take()
+                                .expect("executor completion already queued"),
+                            request_id: request_id.clone(),
+                            command,
+                        },
+                    );
+                    None
+                }
+                None => Some(Response::error(
+                    request_id.clone(),
+                    "actor_not_registered",
+                    "executor actor is not registered",
+                )),
             }
-        }
+        };
 
-        if missing_actor {
-            return CompletionHandle::already_completed(Response::error(
-                "executor",
-                "actor_not_registered",
-                "executor actor is not registered",
-            ));
+        if let Some(response) = response {
+            if let Some(completion) = completion {
+                completion.send(response);
+            }
+            return;
         }
 
         self.wake_scheduler();
-        CompletionHandle { rx: completion_rx }
     }
 
     pub fn pool_size(&self) -> usize {
@@ -243,6 +278,16 @@ impl Executor {
 
     pub fn nonrunnable_dispatch_count(&self) -> usize {
         self.inner.nonrunnable_dispatches.load(Ordering::Acquire)
+    }
+
+    pub fn actor_is_fatal(&self, root_id: &ProjectRootId) -> bool {
+        self.inner
+            .state
+            .lock()
+            .actors
+            .get(root_id)
+            .map(|actor| actor.fatal)
+            .unwrap_or(false)
     }
 
     fn wake_scheduler(&self) {
@@ -313,6 +358,7 @@ struct ActorState {
     lsp_status: VecDeque<QueuedJob>,
     heavy_init: VecDeque<QueuedJob>,
     mutating: VecDeque<QueuedJob>,
+    fatal: bool,
 }
 
 impl ActorState {
@@ -330,6 +376,7 @@ impl ActorState {
             lsp_status: VecDeque::new(),
             heavy_init: VecDeque::new(),
             mutating: VecDeque::new(),
+            fatal: false,
         }
     }
 
@@ -356,11 +403,86 @@ impl ActorState {
             Lane::Mutating => &mut self.mutating,
         }
     }
+
+    fn fail_queued_jobs(&mut self) {
+        self.order.clear();
+        fail_queued_job_queue(&mut self.pure_reads);
+        fail_queued_job_queue(&mut self.lsp_status);
+        fail_queued_job_queue(&mut self.heavy_init);
+        fail_queued_job_queue(&mut self.mutating);
+    }
 }
 
 struct QueuedJob {
     job: ExecutorJob,
-    completion_tx: Sender<Response>,
+    completion: CompletionSender,
+    request_id: String,
+    command: String,
+}
+
+fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
+    for queued in queue.drain(..) {
+        queued
+            .completion
+            .send(actor_fatal_response(queued.request_id));
+    }
+}
+
+fn executor_request_id() -> String {
+    "executor".to_string()
+}
+
+fn lane_command(lane: Lane) -> String {
+    format!("executor::{lane:?}")
+}
+
+fn actor_fatal_response(request_id: impl Into<String>) -> Response {
+    Response::error(
+        request_id,
+        "actor_fatal",
+        "executor actor is fatal after a mutating job panic",
+    )
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn panic_response(
+    request_id: impl Into<String>,
+    command: &str,
+    payload: &(dyn std::any::Any + Send),
+) -> Response {
+    let panic_message = panic_payload_message(payload);
+    Response::error(
+        request_id,
+        "internal_error",
+        format!("command '{command}' panicked: {panic_message}"),
+    )
+}
+
+enum CompletionSender {
+    Sync(Sender<Response>),
+    Async(oneshot::Sender<Response>),
+}
+
+impl CompletionSender {
+    fn send(self, response: Response) {
+        match self {
+            Self::Sync(tx) => {
+                let _ = tx.send(response);
+            }
+            Self::Async(tx) => {
+                let _ = tx.send(response);
+            }
+        }
+    }
 }
 
 struct RunJob {
@@ -369,7 +491,9 @@ struct RunJob {
     ctx: Arc<AppContext>,
     epoch: Arc<RwLock<()>>,
     job: ExecutorJob,
-    completion_tx: Sender<Response>,
+    completion: Option<CompletionSender>,
+    request_id: String,
+    command: String,
     heavy_permit: Option<HeavyPermit>,
 }
 
@@ -377,6 +501,7 @@ struct CompletionEvent {
     root_id: ProjectRootId,
     lane: Lane,
     heavy_permit: Option<HeavyPermit>,
+    panicked: bool,
 }
 
 enum SchedulerEvent {
@@ -431,6 +556,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
         root_id,
         lane,
         heavy_permit,
+        panicked,
     } = event;
 
     if let Some(actor) = state.actors.get_mut(&root_id) {
@@ -446,6 +572,11 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
             Lane::Mutating => {
                 actor.writer_pending = false;
             }
+        }
+
+        if panicked && lane == Lane::Mutating {
+            actor.fatal = true;
+            actor.fail_queued_jobs();
         }
     }
 
@@ -478,6 +609,12 @@ fn dispatch_runnable(
                 let Some(actor) = state.actors.get_mut(&root_id) else {
                     continue;
                 };
+
+                if actor.fatal {
+                    actor.fail_queued_jobs();
+                    actor.deficit = 0;
+                    continue;
+                }
 
                 if !actor.has_queued_jobs() {
                     actor.deficit = 0;
@@ -574,19 +711,35 @@ fn try_admit_actor(
         ctx: Arc::clone(&actor.ctx),
         epoch: Arc::clone(&actor.epoch),
         job: queued.job,
-        completion_tx: queued.completion_tx,
+        completion: Some(queued.completion),
+        request_id: queued.request_id,
+        command: queued.command,
         heavy_permit,
     })
 }
 
 fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
     while let Ok(mut run_job) = run_rx.recv() {
-        let response = run_lane_job(&mut run_job);
-        let _ = run_job.completion_tx.send(response);
+        let response =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_lane_job(&mut run_job)));
+        let panicked = response.is_err();
+        let response = match response {
+            Ok(response) => response,
+            Err(payload) => panic_response(
+                run_job.request_id.clone(),
+                &run_job.command,
+                payload.as_ref(),
+            ),
+        };
+
+        if let Some(completion) = run_job.completion.take() {
+            completion.send(response);
+        }
         let completion = CompletionEvent {
             root_id: run_job.root_id,
             lane: run_job.lane,
             heavy_permit: run_job.heavy_permit.take(),
+            panicked,
         };
         let _ = event_tx.send(SchedulerEvent::Completed(completion));
     }

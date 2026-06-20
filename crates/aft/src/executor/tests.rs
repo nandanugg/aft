@@ -301,19 +301,180 @@ fn single_flight() {
         let barrier = Arc::clone(&barrier);
         threads.push(thread::spawn(move || {
             barrier.wait();
-            flight.get_or_build("resource".to_string(), 7, || {
+            flight.get_or_build("resource".to_string(), 7, || -> Result<usize, ()> {
                 build_count.fetch_add(1, Ordering::AcqRel);
                 thread::sleep(Duration::from_millis(50));
-                42
+                Ok(42)
             })
         }));
     }
 
     for thread in threads {
-        let value = thread.join().expect("single-flight racer joins");
+        let value = thread
+            .join()
+            .expect("single-flight racer joins")
+            .expect("single-flight value builds");
         assert_eq!(*value, 42);
     }
     assert_eq!(build_count.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn single_flight_clears_building_after_panic_or_error() {
+    let flight = SingleFlight::<String, usize>::new();
+    let success_count = AtomicUsize::new(0);
+
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<Arc<usize>, ()> =
+            flight.get_or_build("panic-resource".to_string(), 1, || -> Result<usize, ()> {
+                panic!("single-flight builder panic")
+            });
+    }));
+    assert!(panic_result.is_err());
+
+    let value = flight
+        .get_or_build("panic-resource".to_string(), 1, || -> Result<usize, ()> {
+            success_count.fetch_add(1, Ordering::AcqRel);
+            Ok(7)
+        })
+        .expect("panic-cleared key rebuilds");
+    assert_eq!(*value, 7);
+
+    let error = flight.get_or_build(
+        "error-resource".to_string(),
+        1,
+        || -> Result<usize, &'static str> { Err("transient build error") },
+    );
+    assert_eq!(
+        error.expect_err("first build returns error"),
+        "transient build error"
+    );
+
+    let value = flight
+        .get_or_build(
+            "error-resource".to_string(),
+            1,
+            || -> Result<usize, &'static str> {
+                success_count.fetch_add(1, Ordering::AcqRel);
+                Ok(8)
+            },
+        )
+        .expect("error-cleared key rebuilds");
+    assert_eq!(*value, 8);
+    assert_eq!(success_count.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_block_dir, block_root) = test_root("panic-blocker");
+    let (_panic_dir, panic_root) = test_root("panic-mutating");
+    let (_other_dir, other_root) = test_root("panic-other");
+    executor.register_actor(block_root.clone(), test_ctx());
+    executor.register_actor(panic_root.clone(), test_ctx());
+    executor.register_actor(other_root.clone(), test_ctx());
+
+    let (block_started_tx, block_started_rx) = crossbeam_channel::bounded(1);
+    let (release_block_tx, release_block_rx) = crossbeam_channel::bounded(1);
+    let block_handle = executor.submit(
+        block_root,
+        Lane::PureRead,
+        Box::new(move |_| {
+            block_started_tx.send(()).expect("signal blocker start");
+            release_block_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release blocker");
+            ok("blocker")
+        }),
+    );
+    block_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocker starts");
+
+    let panic_handle = executor.submit(
+        panic_root.clone(),
+        Lane::Mutating,
+        Box::new(|_| panic!("mutating panic sentinel")),
+    );
+    let panic_response = panic_handle
+        .recv_timeout(Duration::from_secs(1))
+        .expect("panic completion response");
+    assert!(!panic_response.success);
+    assert_eq!(
+        panic_response
+            .data
+            .get("code")
+            .and_then(|value| value.as_str()),
+        Some("internal_error")
+    );
+    assert!(panic_response
+        .data
+        .get("message")
+        .and_then(|value| value.as_str())
+        .is_some_and(|message| message.contains("mutating panic sentinel")));
+
+    let (other_done_tx, other_done_rx) = crossbeam_channel::bounded(1);
+    let other_handle = executor.submit(
+        other_root,
+        Lane::PureRead,
+        Box::new(move |_| {
+            other_done_tx.send(()).expect("signal other done");
+            ok("other")
+        }),
+    );
+    other_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("another actor runs while blocker still occupies one worker");
+    let other_response = other_handle
+        .recv_timeout(Duration::from_secs(1))
+        .expect("other completion response");
+    assert!(other_response.success);
+
+    let fatal_ran = Arc::new(AtomicUsize::new(0));
+    let fatal_ran_job = Arc::clone(&fatal_ran);
+    let fatal_handle = executor.submit(
+        panic_root.clone(),
+        Lane::PureRead,
+        Box::new(move |_| {
+            fatal_ran_job.store(1, Ordering::Release);
+            ok("should-not-run")
+        }),
+    );
+    let fatal_response = fatal_handle
+        .recv_timeout(Duration::from_secs(1))
+        .expect("fatal actor response");
+    assert!(!fatal_response.success);
+    assert_eq!(
+        fatal_response
+            .data
+            .get("code")
+            .and_then(|value| value.as_str()),
+        Some("actor_fatal")
+    );
+    assert_eq!(fatal_ran.load(Ordering::Acquire), 0);
+    assert!(executor.actor_is_fatal(&panic_root));
+
+    release_block_tx.send(()).expect("release blocker");
+    block_handle
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocker completion response");
+}
+
+#[test]
+fn submit_async_resolves_response() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_dir, root) = test_root("async");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let rx = executor.submit_async(root, Lane::PureRead, Box::new(|_| ok("async")));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build current-thread runtime");
+    let response =
+        runtime.block_on(async { rx.await.expect("async completion sender stays alive") });
+
+    assert!(response.success);
+    assert_eq!(response.id, "async");
 }
 
 #[test]
