@@ -195,9 +195,21 @@ impl Executor {
         self.wake_scheduler();
     }
 
-    pub fn submit(&self, root_id: ProjectRootId, lane: Lane, job: ExecutorJob) -> CompletionHandle {
+    pub fn submit(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+    ) -> CompletionHandle {
         let (completion_tx, completion_rx) = crossbeam_channel::bounded(1);
-        self.submit_with_completion(root_id, lane, job, CompletionSender::Sync(completion_tx));
+        self.submit_with_completion(
+            root_id,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Sync(completion_tx),
+        );
         CompletionHandle { rx: completion_rx }
     }
 
@@ -205,10 +217,17 @@ impl Executor {
         &self,
         root_id: ProjectRootId,
         lane: Lane,
+        request_id: String,
         job: ExecutorJob,
     ) -> oneshot::Receiver<Response> {
         let (completion_tx, completion_rx) = oneshot::channel();
-        self.submit_with_completion(root_id, lane, job, CompletionSender::Async(completion_tx));
+        self.submit_with_completion(
+            root_id,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+        );
         completion_rx
     }
 
@@ -216,10 +235,10 @@ impl Executor {
         &self,
         root_id: ProjectRootId,
         lane: Lane,
+        request_id: String,
         job: ExecutorJob,
         completion: CompletionSender,
     ) {
-        let request_id = executor_request_id();
         let command = lane_command(lane);
         let mut job = Some(job);
         let mut completion = Some(completion);
@@ -426,10 +445,6 @@ fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
             .completion
             .send(actor_fatal_response(queued.request_id));
     }
-}
-
-fn executor_request_id() -> String {
-    "executor".to_string()
 }
 
 fn lane_command(lane: Lane) -> String {
@@ -746,9 +761,16 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
 }
 
 fn run_lane_job(run_job: &mut RunJob) -> Response {
+    let missing_request_id = run_job.request_id.clone();
     let job = std::mem::replace(
         &mut run_job.job,
-        Box::new(|_| Response::error("executor", "job_missing", "executor job already taken")),
+        Box::new(move |_| {
+            Response::error(
+                missing_request_id,
+                "job_missing",
+                "executor job already taken",
+            )
+        }),
     );
 
     match run_job.lane {

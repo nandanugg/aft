@@ -94,11 +94,12 @@ fn main() {
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
     if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
         aft::slog_info!("subc mode, pid {}", std::process::id());
-        // Serial spike: a single AppContext serves the attached routes (N=1).
-        // The multi-root ProjectActor map is P5b; here we prove the wire.
+        // A single AppContext serves the attached routes (N=1); subc tool calls
+        // are routed through the per-actor executor once the first route binds.
         let app = App::default_shared();
-        let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
-        match aft::subc::run_subc_mode(&connection_file, &ctx, dispatch) {
+        let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+        let executor = Arc::new(aft::executor::Executor::new());
+        match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch) {
             Ok(()) => return,
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");

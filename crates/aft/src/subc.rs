@@ -7,22 +7,27 @@
 //! ModuleHello → HelloAck (register as a tool provider), then a channel-0
 //! control loop (Ping/Pong, RouteBind) plus route-channel tool calls.
 //!
-//! Concurrency: this is the P5a SERIAL spike. tokio runs ONLY here, on a
-//! current-thread runtime; the sync command core is reached by calling the
-//! `dispatch` callback INLINE (one call at a time). `AppContext` is `!Send` and
-//! that is fine — a current-thread runtime never moves the future across
-//! threads. The concurrent per-actor executor is P5b; this proves the wire.
+//! Concurrency: subc routes tool calls through the P5b executor. The tokio
+//! edge never dispatches against `AppContext` inline; per-actor executor lanes
+//! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::context::AppContext;
+use crate::executor::{Executor, Lane};
+use crate::path_identity::ProjectRootId;
 use crate::protocol::{RawRequest, Response};
+use crate::runtime_drain;
 
 use subc_protocol::manifest::{
     Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
@@ -35,6 +40,8 @@ use subc_protocol::{
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::task::JoinHandle;
 
 /// Handshake budget. subc binds-before-spawn, so a reachable daemon authenticates
 /// well within this; an unreachable/socket-stale daemon fails loud rather than
@@ -45,7 +52,7 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_CORR: u64 = 1;
 
 /// Sync command dispatch, passed in from `main` (the binary owns the command
-/// table). Called inline for tool calls and the RouteBind-time configure.
+/// table). Invoked only inside executor jobs in subc mode.
 pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
 
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
@@ -54,7 +61,8 @@ pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
 /// fall back to the standalone loop, to avoid split-brain index state.
 pub fn run_subc_mode(
     connection_file_path: &Path,
-    ctx: &AppContext,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -68,8 +76,8 @@ pub fn run_subc_mode(
             "subc attach: authenticated to daemon via {}",
             connection_file_path.display()
         );
-        let (mut read_half, mut write_half) = tokio::io::split(stream);
-        run_module_loop(&mut read_half, &mut write_half, ctx, dispatch).await
+        let (read_half, write_half) = tokio::io::split(stream);
+        run_module_loop(read_half, write_half, ctx, executor, dispatch).await
     })
 }
 
@@ -117,16 +125,18 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
 }
 
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
-/// the connection (EOF) or sends a channel-0 Goodbye.
+/// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
+/// response requests whole-connection teardown.
 async fn run_module_loop<R, W>(
-    read: &mut R,
-    write: &mut W,
-    ctx: &AppContext,
+    mut read: R,
+    mut write: W,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     // ModuleHello: register as a tool provider. control_ops:None = full baseline.
     let hello = ModuleHelloBody {
@@ -142,12 +152,12 @@ where
         serde_json::to_vec(&hello).map_err(SubcError::Json)?,
     )
     .map_err(SubcError::FrameBuild)?;
-    write_frame(write, &hello_frame)
+    write_frame(&mut write, &hello_frame)
         .await
         .map_err(SubcError::FrameIo)?;
 
     // Expect HelloAck (registered) or a channel-0 Error (manifest/version reject).
-    match read_frame(read).await.map_err(SubcError::FrameIo)? {
+    match read_frame(&mut read).await.map_err(SubcError::FrameIo)? {
         None => return Err(SubcError::ClosedBeforeHelloAck),
         Some(frame) => match frame.header.ty {
             FrameType::HelloAck => {
@@ -161,60 +171,137 @@ where
         },
     }
 
-    // Control + route loop.
-    loop {
-        let Some(frame) = read_frame(read).await.map_err(SubcError::FrameIo)? else {
-            log::info!("subc attach: daemon closed connection");
-            return Ok(());
-        };
+    let (writer_tx, writer_rx) = mpsc::channel::<Frame>(256);
+    let writer_task = spawn_writer_task(write, writer_rx);
+    let shutdown = Arc::new(Notify::new());
+    let drain_pending = Arc::new(AtomicBool::new(false));
+    let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut actor_root_id: Option<ProjectRootId> = None;
 
-        match frame.header.ty {
-            FrameType::Ping if frame.header.channel == 0 => {
-                let pong = Frame::build_with_version(
-                    frame.header.ver,
-                    FrameType::Pong,
-                    frame.header.flags,
-                    0,
-                    frame.header.corr,
-                    Vec::new(),
-                )
-                .map_err(SubcError::FrameBuild)?;
-                write_frame(write, &pong)
-                    .await
-                    .map_err(SubcError::FrameIo)?;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                log::warn!("subc attach: fatal executor response requested teardown");
+                break;
             }
-            FrameType::Goodbye if frame.header.channel == 0 => {
-                log::info!("subc attach: received channel-0 Goodbye");
-                return Ok(());
+            read_result = read_frame(&mut read) => {
+                let Some(frame) = read_result.map_err(SubcError::FrameIo)? else {
+                    log::info!("subc attach: daemon closed connection");
+                    break;
+                };
+
+                match frame.header.ty {
+                    FrameType::Ping if frame.header.channel == 0 => {
+                        let pong = Frame::build_with_version(
+                            frame.header.ver,
+                            FrameType::Pong,
+                            frame.header.flags,
+                            0,
+                            frame.header.corr,
+                            Vec::new(),
+                        )
+                        .map_err(SubcError::FrameBuild)?;
+                        send_frame(&writer_tx, pong).await?;
+                    }
+                    FrameType::Goodbye if frame.header.channel == 0 => {
+                        log::info!("subc attach: received channel-0 Goodbye");
+                        break;
+                    }
+                    FrameType::Goodbye => {
+                        // Route teardown — N=1 keeps a single actor for the connection.
+                        log::debug!("subc attach: route {} torn down", frame.header.channel);
+                    }
+                    FrameType::Request if frame.header.channel == 0 => {
+                        handle_control_request(
+                            &writer_tx,
+                            &frame,
+                            &ctx,
+                            &executor,
+                            &mut actor_root_id,
+                            &shutdown,
+                            dispatch,
+                        )
+                        .await?;
+                    }
+                    FrameType::Request => {
+                        handle_tool_call(
+                            &writer_tx,
+                            &frame,
+                            actor_root_id.clone(),
+                            &executor,
+                            &shutdown,
+                            dispatch,
+                        )
+                        .await?;
+                    }
+                    // Cancel/Push/etc. are ignored until Phase 3 cancellation.
+                    _ => {}
+                }
             }
-            FrameType::Goodbye => {
-                // Route teardown — no per-route state to drop in the serial spike.
-                log::debug!("subc attach: route {} torn down", frame.header.channel);
+            _ = drain_interval.tick() => {
+                if let Some(root_id) = actor_root_id.clone() {
+                    maybe_submit_maintenance_drain(
+                        &ctx,
+                        &executor,
+                        root_id,
+                        &writer_tx,
+                        &shutdown,
+                        &drain_pending,
+                    );
+                }
             }
-            FrameType::Request if frame.header.channel == 0 => {
-                handle_control_request(write, &frame, ctx, dispatch).await?;
-            }
-            FrameType::Request => {
-                handle_tool_call(write, &frame, ctx, dispatch).await?;
-            }
-            // Cancel/Push/etc. are ignored in the serial spike (no in-flight set).
-            _ => {}
+        }
+    }
+
+    drop(writer_tx);
+    finish_writer_task(writer_task).await
+}
+
+fn spawn_writer_task<W>(
+    mut write: W,
+    mut rx: mpsc::Receiver<Frame>,
+) -> JoinHandle<Result<(), subc_transport::FrameIoError>>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            write_frame(&mut write, &frame).await?;
+        }
+        Ok(())
+    })
+}
+
+async fn finish_writer_task(
+    mut writer_task: JoinHandle<Result<(), subc_transport::FrameIoError>>,
+) -> Result<(), SubcError> {
+    match tokio::time::timeout(Duration::from_millis(100), &mut writer_task).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(SubcError::FrameIo(error)),
+        Ok(Err(error)) => Err(SubcError::WriterJoin(error)),
+        Err(_) => {
+            writer_task.abort();
+            Ok(())
         }
     }
 }
 
+async fn send_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), SubcError> {
+    tx.send(frame).await.map_err(|_| SubcError::WriterClosed)
+}
+
 /// channel-0 control request — currently only RouteBind. Reconciles the route's
-/// RootConfig via `configure` and replies RouteBindAck (Response lane) or an
-/// ErrorBody (Error lane) on divergence/failure.
-async fn handle_control_request<W>(
-    write: &mut W,
+/// RootConfig through the executor's Mutating lane and replies RouteBindAck
+/// (Response lane) or an ErrorBody (Error lane) on divergence/failure.
+async fn handle_control_request(
+    tx: &mpsc::Sender<Frame>,
     frame: &Frame,
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
+    executor: &Arc<Executor>,
+    actor_root_id: &mut Option<ProjectRootId>,
+    shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
-) -> Result<(), SubcError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), SubcError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(SubcError::Json)?;
     match request {
@@ -224,25 +311,55 @@ where
             identity,
             config,
         } => {
+            let bind_root_id = match ProjectRootId::from_path(&identity.project_root) {
+                Ok(root_id) => root_id,
+                Err(error) => {
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "config_divergence",
+                        &format!("invalid route project root: {error}"),
+                    )
+                    .await;
+                }
+            };
+
+            let submit_root_id = match actor_root_id.as_ref() {
+                None => {
+                    executor.register_actor(bind_root_id.clone(), Arc::clone(ctx));
+                    *actor_root_id = Some(bind_root_id.clone());
+                    bind_root_id
+                }
+                Some(existing) if existing != &bind_root_id => {
+                    log::debug!(
+                        "subc attach: N=1 collapsing root {} onto the single actor {}",
+                        bind_root_id.as_path().display(),
+                        existing.as_path().display()
+                    );
+                    existing.clone()
+                }
+                Some(existing) => existing.clone(),
+            };
+
             // Reconcile RootConfig: build a configure request from the bind
-            // identity + the forwarded config tiers and run it through the sync
-            // core. Success => RouteBindAck; failure => config_divergence Error.
+            // identity + forwarded config tiers and run it through the executor.
+            let request_id = format!("subc-bind-{route_channel}");
             let config_tiers: Vec<Value> = config
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
             let configure_json = json!({
-                "id": format!("subc-bind-{route_channel}"),
+                "id": request_id,
                 "command": "configure",
                 "project_root": identity.project_root,
                 "harness": identity.harness,
                 "config": config_tiers,
             });
-            let reconciled = match serde_json::from_value::<RawRequest>(configure_json) {
-                Ok(req) => dispatch(req, ctx),
+            let configure_req = match serde_json::from_value::<RawRequest>(configure_json) {
+                Ok(req) => req,
                 Err(error) => {
                     return send_route_bind_error(
-                        write,
+                        tx,
                         frame,
                         "config_divergence",
                         &format!("failed to build configure request: {error}"),
@@ -250,17 +367,63 @@ where
                     .await;
                 }
             };
-            let reconciled_ok = serde_json::to_value(&reconciled)
-                .ok()
-                .and_then(|v| v.get("success").and_then(Value::as_bool))
-                .unwrap_or(false);
 
-            if !reconciled_ok {
-                let message = serde_json::to_value(&reconciled)
-                    .ok()
-                    .and_then(|v| v.get("message").and_then(|m| m.as_str().map(String::from)))
-                    .unwrap_or_else(|| "configure failed during route bind".to_string());
-                return send_route_bind_error(write, frame, "config_divergence", &message).await;
+            let configure_request_id = configure_req.id.clone();
+            let configure_rx = executor.submit_async(
+                submit_root_id.clone(),
+                Lane::Mutating,
+                configure_request_id.clone(),
+                Box::new(move |ctx| dispatch(configure_req, ctx)),
+            );
+            let configure_response =
+                await_executor_response(configure_rx, configure_request_id.clone()).await;
+
+            if !configure_response.success {
+                let message =
+                    response_message(&configure_response, "configure failed during route bind");
+                send_route_bind_error(tx, frame, "config_divergence", &message).await?;
+                if response_is_internal_error(&configure_response) {
+                    signal_fatal_teardown(
+                        tx,
+                        Some(route_channel),
+                        frame.header.ver,
+                        frame.header.corr,
+                        shutdown,
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+
+            let drain_request_id = format!("subc-bind-drain-{route_channel}");
+            let drain_response_id = drain_request_id.clone();
+            let drain_rx = executor.submit_async(
+                submit_root_id,
+                Lane::Mutating,
+                drain_request_id.clone(),
+                Box::new(move |ctx| {
+                    runtime_drain::drain_build_completions(ctx);
+                    Response::success(drain_response_id, json!({ "drained": true }))
+                }),
+            );
+            let drain_response = await_executor_response(drain_rx, drain_request_id).await;
+            if !drain_response.success {
+                let message = response_message(
+                    &drain_response,
+                    "build-completion drain failed during route bind",
+                );
+                send_route_bind_error(tx, frame, "config_divergence", &message).await?;
+                if response_is_internal_error(&drain_response) {
+                    signal_fatal_teardown(
+                        tx,
+                        Some(route_channel),
+                        frame.header.ver,
+                        frame.header.corr,
+                        shutdown,
+                    )
+                    .await;
+                }
+                return Ok(());
             }
 
             let ack = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
@@ -274,81 +437,174 @@ where
                 ack,
             )
             .map_err(SubcError::FrameBuild)?;
-            write_frame(write, &response)
-                .await
-                .map_err(SubcError::FrameIo)?;
+            send_frame(tx, response).await?;
             log::info!("subc attach: route {route_channel} bound");
             Ok(())
         }
     }
 }
 
-async fn send_route_bind_error<W>(
-    write: &mut W,
+async fn send_route_bind_error(
+    tx: &mpsc::Sender<Frame>,
     frame: &Frame,
     code: &str,
     message: &str,
-) -> Result<(), SubcError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-    })
-    .map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(
+) -> Result<(), SubcError> {
+    let response = build_error_frame(
         frame.header.ver,
-        FrameType::Error,
-        control_flags(),
         0,
         frame.header.corr,
-        body,
-    )
-    .map_err(SubcError::FrameBuild)?;
-    write_frame(write, &response)
-        .await
-        .map_err(SubcError::FrameIo)?;
+        control_flags(),
+        code,
+        message,
+    )?;
+    send_frame(tx, response).await?;
     log::warn!("subc attach: route bind rejected ({code}): {message}");
     Ok(())
 }
 
-/// Route-channel tool call: `{name, arguments}` → dispatch to the sync command
-/// core → wrap the structured Response in a CallToolResult `{content, isError}`.
-/// v1 mapping: the whole `{success, ...}` Response serialized into ONE text
-/// block; `isError` carries `success == false`.
-async fn handle_tool_call<W>(
-    write: &mut W,
+/// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
+/// the sync command core → wrap the structured Response in a CallToolResult
+/// `{content, isError}`. v1 mapping: the whole `{success, ...}` Response
+/// serialized into ONE text block; `isError` carries `success == false`.
+async fn handle_tool_call(
+    tx: &mpsc::Sender<Frame>,
     frame: &Frame,
-    ctx: &AppContext,
+    actor_root_id: Option<ProjectRootId>,
+    executor: &Arc<Executor>,
+    shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
-) -> Result<(), SubcError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), SubcError> {
+    let Some(root_id) = actor_root_id else {
+        let error = build_error_frame(
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+            frame.header.flags,
+            "route_not_bound",
+            "route is not bound before tool call",
+        )?;
+        return send_frame(tx, error).await;
+    };
+
     let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
 
     // Build a RawRequest: {id, command: name, ...arguments}.
+    let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    let command = call.name;
+    let lane = command_lane(&command);
     let mut map = call.arguments.as_object().cloned().unwrap_or_default();
-    map.insert(
-        "id".to_string(),
-        json!(format!(
-            "subc-{}-{}",
-            frame.header.channel, frame.header.corr
-        )),
-    );
-    map.insert("command".to_string(), json!(call.name));
+    map.insert("id".to_string(), json!(request_id.clone()));
+    map.insert("command".to_string(), json!(command));
 
-    let response = match serde_json::from_value::<RawRequest>(Value::Object(map)) {
-        Ok(req) => dispatch(req, ctx),
-        Err(error) => Response::error(
-            &format!("subc-{}-{}", frame.header.channel, frame.header.corr),
-            "invalid_request",
-            format!("failed to build request from tool call: {error}"),
-        ),
+    let raw_req = match serde_json::from_value::<RawRequest>(Value::Object(map)) {
+        Ok(req) => req,
+        Err(error) => {
+            let response = Response::error(
+                request_id.clone(),
+                "invalid_request",
+                format!("failed to build request from tool call: {error}"),
+            );
+            let response_frame = build_tool_response_frame(
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.corr,
+                frame.header.flags,
+                &response,
+            )?;
+            return send_frame(tx, response_frame).await;
+        }
     };
 
-    let response_value = serde_json::to_value(&response).map_err(SubcError::Json)?;
+    let rx = executor.submit_async(
+        root_id,
+        lane,
+        request_id.clone(),
+        Box::new(move |ctx| dispatch(raw_req, ctx)),
+    );
+    let completion_tx = tx.clone();
+    let completion_shutdown = Arc::clone(shutdown);
+    let route_channel = frame.header.channel;
+    let corr = frame.header.corr;
+    let flags = frame.header.flags;
+    let ver = frame.header.ver;
+    let is_mutating = lane == Lane::Mutating;
+    tokio::spawn(async move {
+        let response = await_executor_response(rx, request_id.clone()).await;
+        let fatal = is_mutating && response_is_internal_error(&response);
+        match build_tool_response_frame(ver, route_channel, corr, flags, &response) {
+            Ok(response_frame) => {
+                let _ = completion_tx.send(response_frame).await;
+            }
+            Err(error) => {
+                log::error!("subc attach: failed to build tool response frame: {error}");
+            }
+        }
+        if fatal {
+            signal_fatal_teardown(
+                &completion_tx,
+                Some(route_channel),
+                ver,
+                corr,
+                &completion_shutdown,
+            )
+            .await;
+        }
+    });
+    Ok(())
+}
+
+fn maybe_submit_maintenance_drain(
+    ctx: &Arc<AppContext>,
+    executor: &Arc<Executor>,
+    root_id: ProjectRootId,
+    tx: &mpsc::Sender<Frame>,
+    shutdown: &Arc<Notify>,
+    drain_pending: &Arc<AtomicBool>,
+) {
+    if !runtime_drain::any_build_in_flight(ctx) {
+        return;
+    }
+    if drain_pending.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let request_id = "subc-maintenance-drain".to_string();
+    let response_id = request_id.clone();
+    let rx = executor.submit_async(
+        root_id,
+        Lane::Mutating,
+        request_id.clone(),
+        Box::new(move |ctx| {
+            runtime_drain::drain_build_completions(ctx);
+            Response::success(response_id, json!({ "drained": true }))
+        }),
+    );
+    let drain_pending = Arc::clone(drain_pending);
+    let tx = tx.clone();
+    let shutdown = Arc::clone(shutdown);
+    tokio::spawn(async move {
+        let response = await_executor_response(rx, request_id).await;
+        drain_pending.store(false, Ordering::Release);
+        if response_is_internal_error(&response) {
+            signal_fatal_teardown(&tx, None, PROTOCOL_VERSION, 0, &shutdown).await;
+        }
+    });
+}
+
+async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: String) -> Response {
+    rx.await
+        .unwrap_or_else(|_| Response::error(request_id, "internal_error", "executor dropped"))
+}
+
+fn build_tool_response_frame(
+    ver: u8,
+    route_channel: u16,
+    corr: u64,
+    flags: Flags,
+    response: &Response,
+) -> Result<Frame, SubcError> {
+    let response_value = serde_json::to_value(response).map_err(SubcError::Json)?;
     let is_error = response_value
         .get("success")
         .and_then(Value::as_bool)
@@ -360,19 +616,141 @@ where
     });
     let body = serde_json::to_vec(&result).map_err(SubcError::Json)?;
 
-    let response_frame = Frame::build_with_version(
-        frame.header.ver,
-        FrameType::Response,
-        frame.header.flags,
-        frame.header.channel,
-        frame.header.corr,
-        body,
+    Frame::build_with_version(ver, FrameType::Response, flags, route_channel, corr, body)
+        .map_err(SubcError::FrameBuild)
+}
+
+fn build_error_frame(
+    ver: u8,
+    channel: u16,
+    corr: u64,
+    flags: Flags,
+    code: &str,
+    message: &str,
+) -> Result<Frame, SubcError> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: code.to_string(),
+        message: message.to_string(),
+    })
+    .map_err(SubcError::Json)?;
+    Frame::build_with_version(ver, FrameType::Error, flags, channel, corr, body)
+        .map_err(SubcError::FrameBuild)
+}
+
+fn build_goodbye_frame(ver: u8, channel: u16, corr: u64) -> Result<Frame, SubcError> {
+    Frame::build_with_version(
+        ver,
+        FrameType::Goodbye,
+        control_flags(),
+        channel,
+        corr,
+        Vec::new(),
     )
-    .map_err(SubcError::FrameBuild)?;
-    write_frame(write, &response_frame)
-        .await
-        .map_err(SubcError::FrameIo)?;
-    Ok(())
+    .map_err(SubcError::FrameBuild)
+}
+
+async fn signal_fatal_teardown(
+    tx: &mpsc::Sender<Frame>,
+    route_channel: Option<u16>,
+    ver: u8,
+    corr: u64,
+    shutdown: &Arc<Notify>,
+) {
+    if let Some(route_channel) = route_channel {
+        if let Ok(frame) = build_goodbye_frame(ver, route_channel, corr) {
+            let _ = tx.send(frame).await;
+        }
+    }
+    if let Ok(frame) = build_goodbye_frame(ver, 0, 0) {
+        let _ = tx.send(frame).await;
+    }
+    shutdown.notify_one();
+}
+
+fn response_message(response: &Response, fallback: &str) -> String {
+    response
+        .data
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn response_is_internal_error(response: &Response) -> bool {
+    !response.success && response.data.get("code").and_then(Value::as_str) == Some("internal_error")
+}
+
+fn command_lane(command: &str) -> Lane {
+    match command {
+        "ping"
+        | "version"
+        | "echo"
+        | "bash_drain_completions"
+        | "bash_regex_match"
+        | "db_get_state"
+        | "db_get_host_state"
+        | "read"
+        | "undo_preview"
+        | "edit_history"
+        | "checkpoint_paths"
+        | "list_checkpoints"
+        | "glob"
+        | "grep"
+        | "git_conflicts"
+        | "ast_search" => Lane::PureRead,
+
+        // Lazy reads mutate parser/terminal/url caches on a miss, but Phase 2b
+        // classifies them onto the reader pool; install races are handled at the
+        // individual cache sites.
+        "bash_status" | "outline" | "zoom" => Lane::PureRead,
+
+        "status"
+        | "inspect"
+        | "lsp_diagnostics"
+        | "lsp_inspect"
+        | "lsp_hover"
+        | "lsp_goto_definition"
+        | "lsp_find_references"
+        | "lsp_prepare_rename" => Lane::SerialLspStatus,
+
+        "semantic_search" | "search" | "callers" | "impact" | "call_tree" | "trace_to"
+        | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => Lane::HeavyInit,
+
+        "bash"
+        | "bash_ack_completions"
+        | "bash_notify"
+        | "bash_unnotify"
+        | "bash_promote"
+        | "bash_kill"
+        | "bash_write"
+        | "db_set_state"
+        | "db_set_host_state"
+        | "undo"
+        | "checkpoint"
+        | "restore_checkpoint"
+        | "write"
+        | "delete_file"
+        | "move_file"
+        | "edit"
+        | "edit_symbol"
+        | "edit_match"
+        | "batch"
+        | "add_import"
+        | "remove_import"
+        | "organize_imports"
+        | "configure"
+        | "move_symbol"
+        | "extract_function"
+        | "inline_symbol"
+        | "ast_replace"
+        | "lsp_rename"
+        | "list_filters"
+        | "trust_filter_project"
+        | "untrust_filter_project"
+        | "snapshot" => Lane::Mutating,
+
+        _ => Lane::Mutating,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +841,8 @@ pub enum SubcError {
     },
     FrameIo(subc_transport::FrameIoError),
     FrameBuild(subc_protocol::FrameBuildError),
+    WriterClosed,
+    WriterJoin(tokio::task::JoinError),
     Json(serde_json::Error),
     ClosedBeforeHelloAck,
     HelloRejected {
@@ -500,6 +880,8 @@ impl fmt::Display for SubcError {
             }
             Self::FrameIo(e) => write!(f, "subc frame I/O error: {e}"),
             Self::FrameBuild(e) => write!(f, "subc frame build error: {e}"),
+            Self::WriterClosed => write!(f, "subc writer task closed"),
+            Self::WriterJoin(e) => write!(f, "subc writer task join error: {e}"),
             Self::Json(e) => write!(f, "subc JSON error: {e}"),
             Self::ClosedBeforeHelloAck => {
                 write!(f, "subc daemon closed the connection before HelloAck")

@@ -735,8 +735,17 @@ fn callgraph_build_wait_window() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-#[cfg(test)]
 static CALLGRAPH_COLD_BUILD_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub fn reset_callgraph_cold_build_spawn_count_for_test() {
+    CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[doc(hidden)]
+pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
+    CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst)
+}
 
 impl AppContext {
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
@@ -1746,7 +1755,6 @@ impl AppContext {
         let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStore>();
         *rx_guard = Some(rx);
 
-        #[cfg(test)]
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
 
         std::thread::spawn(move || {

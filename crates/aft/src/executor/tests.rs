@@ -75,6 +75,7 @@ fn cross_actor_isolation() {
     let a_handle = executor.submit(
         root_a,
         Lane::HeavyInit,
+        "test-request-0".to_string(),
         Box::new(move |_| {
             a_started_tx.send(()).expect("signal heavy start");
             release_a_rx
@@ -92,6 +93,7 @@ fn cross_actor_isolation() {
     let b_handle = executor.submit(
         root_b,
         Lane::PureRead,
+        "test-request-1".to_string(),
         Box::new(move |_| {
             b_done_tx.send(()).expect("signal B read done");
             ok("read-b")
@@ -133,6 +135,7 @@ fn within_actor_read_concurrency() {
         handles.push(executor.submit(
             root.clone(),
             Lane::PureRead,
+            "test-request-2".to_string(),
             Box::new(move |_| {
                 let now = current_reads.fetch_add(1, Ordering::AcqRel) + 1;
                 observe_max(&max_reads, now);
@@ -184,6 +187,7 @@ fn drr_fairness() {
         a_handles.push(executor.submit(
             root_a.clone(),
             Lane::PureRead,
+            "test-request-3".to_string(),
             Box::new(move |_| {
                 a_started_tx.send(index).expect("signal A flood start");
                 release_a_rx
@@ -204,6 +208,7 @@ fn drr_fairness() {
     let b_handle = executor.submit(
         root_b,
         Lane::PureRead,
+        "test-request-4".to_string(),
         Box::new(move |_| {
             b_started_tx.send(()).expect("signal B start");
             ok("b")
@@ -254,6 +259,7 @@ fn heavy_bound() {
         handles.push(executor.submit(
             root,
             Lane::HeavyInit,
+            "test-request-5".to_string(),
             Box::new(move |_| {
                 let now = current_heavy.fetch_add(1, Ordering::AcqRel) + 1;
                 observe_max(&max_heavy, now);
@@ -379,6 +385,7 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
     let block_handle = executor.submit(
         block_root,
         Lane::PureRead,
+        "test-request-6".to_string(),
         Box::new(move |_| {
             block_started_tx.send(()).expect("signal blocker start");
             release_block_rx
@@ -394,12 +401,14 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
     let panic_handle = executor.submit(
         panic_root.clone(),
         Lane::Mutating,
+        "test-request-7".to_string(),
         Box::new(|_| panic!("mutating panic sentinel")),
     );
     let panic_response = panic_handle
         .recv_timeout(Duration::from_secs(1))
         .expect("panic completion response");
     assert!(!panic_response.success);
+    assert_eq!(panic_response.id, "test-request-7");
     assert_eq!(
         panic_response
             .data
@@ -417,6 +426,7 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
     let other_handle = executor.submit(
         other_root,
         Lane::PureRead,
+        "test-request-8".to_string(),
         Box::new(move |_| {
             other_done_tx.send(()).expect("signal other done");
             ok("other")
@@ -435,6 +445,7 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
     let fatal_handle = executor.submit(
         panic_root.clone(),
         Lane::PureRead,
+        "test-request-9".to_string(),
         Box::new(move |_| {
             fatal_ran_job.store(1, Ordering::Release);
             ok("should-not-run")
@@ -444,6 +455,7 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
         .recv_timeout(Duration::from_secs(1))
         .expect("fatal actor response");
     assert!(!fatal_response.success);
+    assert_eq!(fatal_response.id, "test-request-9");
     assert_eq!(
         fatal_response
             .data
@@ -461,12 +473,40 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
 }
 
 #[test]
+fn unregistered_actor_error_uses_submitted_request_id() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_dir, root) = test_root("unregistered");
+
+    let response = executor
+        .submit(
+            root,
+            Lane::PureRead,
+            "missing-actor-request".to_string(),
+            Box::new(|_| ok("should-not-run")),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .expect("unregistered actor completion response");
+
+    assert!(!response.success);
+    assert_eq!(response.id, "missing-actor-request");
+    assert_eq!(
+        response.data.get("code").and_then(|value| value.as_str()),
+        Some("actor_not_registered")
+    );
+}
+
+#[test]
 fn submit_async_resolves_response() {
     let executor = test_executor(2, 1, 1, 2);
     let (_dir, root) = test_root("async");
     executor.register_actor(root.clone(), test_ctx());
 
-    let rx = executor.submit_async(root, Lane::PureRead, Box::new(|_| ok("async")));
+    let rx = executor.submit_async(
+        root,
+        Lane::PureRead,
+        "async-request".to_string(),
+        Box::new(|_| ok("async")),
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build current-thread runtime");
@@ -495,6 +535,7 @@ fn mutator_drains_then_exclusive() {
         read_handles.push(executor.submit(
             root.clone(),
             Lane::PureRead,
+            "test-request-10".to_string(),
             Box::new(move |_| {
                 current_reads.fetch_add(1, Ordering::AcqRel);
                 read_started_tx.send(index).expect("signal read start");
@@ -519,6 +560,7 @@ fn mutator_drains_then_exclusive() {
     let mutator_handle = executor.submit(
         root.clone(),
         Lane::Mutating,
+        "test-request-11".to_string(),
         Box::new(move |_| {
             mutator_started_tx
                 .send(reads_at_mutator.load(Ordering::Acquire))
@@ -534,6 +576,7 @@ fn mutator_drains_then_exclusive() {
     let late_read_handle = executor.submit(
         root,
         Lane::PureRead,
+        "test-request-12".to_string(),
         Box::new(move |_| {
             late_read_started_tx
                 .send(())
@@ -609,6 +652,7 @@ fn no_dispatch_of_nonrunnable() {
         handles.push(executor.submit(
             root,
             lane,
+            "test-request-13".to_string(),
             Box::new(move |_| {
                 thread::sleep(sleep_for);
                 done_tx.send(index).expect("signal randomized job done");

@@ -94,6 +94,7 @@ mod staging_cleanup_test;
 mod state_commands_test;
 mod status_compression_test;
 mod status_disk_scope_test;
+mod subc_bridge_test;
 mod symbol_cache_persist_test;
 mod trace_to_symbol_test;
 mod url_fetch_test;
