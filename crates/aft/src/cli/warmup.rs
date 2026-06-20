@@ -573,6 +573,10 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
     }
 }
 
+// These warmup drain copies are intentionally separate from `runtime_drain`: the
+// warmup CLI is a one-shot with no live status consumer or mid-build edit
+// stream, so it keeps leaner drains without status-emitter signals or
+// pending-path replay. Do not deduplicate them unless that behavior changes.
 /// Install the finished callgraph store once the background cold build sends it
 /// over `callgraph_store_rx`. Mirrors `main::drain_callgraph_store_events` but
 /// without the status-emitter signal (warmup has no sidebar consumer).
