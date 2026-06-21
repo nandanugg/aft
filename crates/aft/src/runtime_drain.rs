@@ -1,7 +1,62 @@
+use crate as aft;
 use crate::context::{AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshRequest};
+use crate::lsp::client::LspEvent;
+use crate::protocol::PushFrame;
 use crate::watcher_filter::watcher_path_is_infra_skip;
 use std::path::Path;
 use std::sync::Arc;
+
+pub fn drain_configure_warning_events(ctx: &AppContext) {
+    for (generation, frame) in ctx.drain_configure_warnings() {
+        if ctx.configure_generation() != generation {
+            aft::slog_info!(
+                "dropping stale configure_warnings for generation {} (current {})",
+                generation,
+                ctx.configure_generation()
+            );
+            continue;
+        }
+
+        if let Some(sender) = ctx.progress_sender_handle() {
+            sender(PushFrame::ConfigureWarnings(frame));
+        }
+    }
+}
+
+pub fn drain_inspect_events(ctx: &AppContext) {
+    let drained = ctx.inspect_manager().drain_completions();
+    // Watcher-driven Tier-2 scans complete via the reuse path, which bypasses
+    // `result_rx`/`drain_completions`. Poll the manager's reuse counter so a
+    // background scan still refreshes the bar (#3) — otherwise the counts and
+    // `~` marker would only update on a manual `aft_inspect`.
+    let reuse_completed = ctx.take_new_reuse_completions();
+    // A completed background Tier-2 scan refreshes the agent status-bar counts
+    // to the freshly-persisted aggregate, and clears the stale marker — so the
+    // bar reflects the new numbers on the next tool result without waiting for
+    // an explicit aft_inspect call.
+    if drained > 0 || reuse_completed {
+        if let Some(project_root) = ctx.config().project_root.clone() {
+            let (dead_code, unused_exports, duplicates) = ctx
+                .inspect_manager()
+                .latest_tier2_counts(ctx.inspect_dir(), project_root);
+            // Don't clear the `~` stale marker until the whole serial Tier-2
+            // cycle has drained — while any category is still in flight the
+            // already-persisted categories may predate the latest edit, so
+            // claiming fresh would be premature (#20). `None` counts preserve
+            // the last-known value rather than fabricating a `0` (#1).
+            let stale = ctx.inspect_manager().tier2_any_in_flight();
+            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, stale);
+            // Push the refreshed snapshot so the sidebar reflects the new Tier-2
+            // counts immediately. `update_status_bar_tier2` only mutates the
+            // in-memory counts (which the agent status bar reads live on each
+            // tool result); the push-driven sidebar would otherwise keep showing
+            // the pre-population snapshot — where `status_bar` was null and the
+            // Code Health section stayed hidden — until some unrelated event
+            // happened to emit a status frame.
+            ctx.status_emitter().signal(ctx.build_status_snapshot());
+        }
+    }
+}
 
 /// Drain all background build-completion receivers in standalone order.
 ///
@@ -380,6 +435,55 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
         }
     }
 
+    if status_changed {
+        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+pub fn drain_lsp_events(ctx: &AppContext) {
+    let drained = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events()
+    };
+    let mut status_changed = drained.diagnostics_changed;
+    for event in drained.events {
+        match event {
+            LspEvent::Notification {
+                server_kind,
+                root,
+                method,
+                params,
+            } => {
+                log::debug!(
+                    "[aft-lsp] notification {:?} {} {} {}",
+                    server_kind,
+                    root.display(),
+                    method,
+                    params.unwrap_or(serde_json::Value::Null)
+                );
+            }
+            LspEvent::ServerRequest {
+                server_kind,
+                root,
+                id,
+                method,
+                params,
+            } => {
+                log::debug!(
+                    "[aft-lsp] request {:?} {} {:?} {} {}",
+                    server_kind,
+                    root.display(),
+                    id,
+                    method,
+                    params.unwrap_or(serde_json::Value::Null)
+                );
+            }
+            LspEvent::ServerExited { server_kind, root } => {
+                aft::slog_info!("exited {:?} {}", server_kind, root.display());
+                status_changed = true;
+            }
+        }
+    }
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }

@@ -13,7 +13,8 @@ use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use aft::path_identity::ProjectRootId;
 use aft::protocol::{
-    BashCompletedFrame, BashLongRunningFrame, PushFrame, RawRequest, Response, StatusChangedFrame,
+    BashCompletedFrame, BashLongRunningFrame, ConfigureWarningsFrame, PushFrame, RawRequest,
+    Response, StatusChangedFrame,
 };
 use aft::subc::run_subc_mode;
 use serde_json::{json, Value};
@@ -454,6 +455,53 @@ fn emit_configure_status_burst_if_requested(req: &RawRequest, ctx: &AppContext) 
     }
 }
 
+fn configure_warning_message(req: &RawRequest) -> Option<String> {
+    let tiers = req.params.get("config")?.as_array()?;
+    for tier in tiers {
+        let Some(doc) = tier.get("doc").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(doc) else {
+            continue;
+        };
+        let Some(spec) = doc.get("subc_test_configure_warning") else {
+            continue;
+        };
+        return Some(
+            spec.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("subc maintenance configure warning")
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
+    let Some(message) = configure_warning_message(req) else {
+        return;
+    };
+    let project_root = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let frame = ConfigureWarningsFrame::new(
+        project_root,
+        1,
+        false,
+        5_000,
+        vec![json!({
+            "code": "subc_test_configure_warning",
+            "message": message,
+        })],
+    );
+    ctx.configure_warnings_sender()
+        .send((ctx.configure_generation(), frame))
+        .expect("queue configure warning");
+}
+
 fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = Arc::clone(BRIDGE_STATE.get().expect("bridge state installed"));
     match req.command.as_str() {
@@ -468,6 +516,7 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 );
             }
             let response = configure_bridge_context(&req, ctx);
+            enqueue_configure_warning_if_requested(&req, ctx);
             emit_configure_status_burst_if_requested(&req, ctx);
             response
         }
@@ -786,8 +835,30 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     )
     .await;
 
-    send_route_bind(&mut stream, 1, 10, &root1).await;
+    send_route_bind_with_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_configure_warning": {
+                "message": "route-1-maintenance-warning",
+            },
+        }),
+    )
+    .await;
     expect_route_bind_ack(&mut stream, 10).await;
+    let configure_warning_pushes = expect_configure_warning_pushes(
+        &mut stream,
+        HashSet::from([1]),
+        &root1,
+        "route-1-maintenance-warning",
+    )
+    .await;
+    assert_eq!(configure_warning_pushes.len(), 1);
 
     // Phase 4d-2a: subc tool calls carry RouteBind session on the RawRequest.
     send_tool_call(&mut stream, 1, 11, "subc_test_echo_session", json!({})).await;
@@ -1483,6 +1554,63 @@ fn push_task_id(body: &Value) -> Option<&str> {
 
 fn push_type(body: &Value) -> Option<&str> {
     body.get("type").and_then(Value::as_str)
+}
+
+fn configure_warning_message_from_push(body: &Value) -> Option<&str> {
+    body.get("warnings")
+        .and_then(Value::as_array)
+        .and_then(|warnings| warnings.first())
+        .and_then(|warning| warning.get("message"))
+        .and_then(Value::as_str)
+}
+
+async fn expect_configure_warning_pushes(
+    stream: &mut tokio::net::TcpStream,
+    expected_channels: HashSet<u16>,
+    expected_root: &std::path::Path,
+    expected_message: &str,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let expected_root = expected_root.to_string_lossy().into_owned();
+    let mut pushes = Vec::new();
+    let mut channels = HashSet::new();
+
+    while channels != expected_channels {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for configure_warnings push"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for configure_warnings push"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for configure_warnings push"));
+        if frame.header.ty != FrameType::Push {
+            panic!(
+                "unexpected non-Push frame while waiting for configure_warnings: {:?}",
+                frame.header.ty
+            );
+        }
+        assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+        let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+        if push_type(&body) == Some("configure_warnings")
+            && body.get("project_root").and_then(Value::as_str) == Some(expected_root.as_str())
+            && configure_warning_message_from_push(&body) == Some(expected_message)
+        {
+            assert!(
+                expected_channels.contains(&frame.header.channel),
+                "configure_warnings push leaked to unexpected channel {}",
+                frame.header.channel
+            );
+            channels.insert(frame.header.channel);
+            pushes.push(body);
+        }
+    }
+
+    assert_eq!(channels, expected_channels);
+    pushes
 }
 
 async fn expect_bash_completed_pushes_for_tool(

@@ -6,7 +6,6 @@ use aft::context::{
 };
 use aft::log_ctx;
 use aft::lsp::child_registry::LspChildRegistry;
-use aft::lsp::client::LspEvent;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::runtime_registry::RuntimeRegistry;
 use aft::watcher_filter::WatcherDispatchEvent;
@@ -260,20 +259,20 @@ fn main() {
 
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
-        drain_configure_warning_events(runtime);
+        aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
         aft::runtime_drain::drain_semantic_index_events(runtime);
         drain_semantic_refresh_events(runtime);
-        drain_inspect_events(runtime);
+        aft::runtime_drain::drain_inspect_events(runtime);
         drain_watcher_events(runtime);
-        drain_lsp_events(runtime);
+        aft::runtime_drain::drain_lsp_events(runtime);
     }
 }
 
 fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
-        drain_configure_warning_events(runtime);
+        aft::runtime_drain::drain_configure_warning_events(runtime);
     }
 }
 
@@ -453,58 +452,6 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_string()
-    }
-}
-
-fn drain_configure_warning_events(ctx: &AppContext) {
-    for (generation, frame) in ctx.drain_configure_warnings() {
-        if ctx.configure_generation() != generation {
-            aft::slog_info!(
-                "dropping stale configure_warnings for generation {} (current {})",
-                generation,
-                ctx.configure_generation()
-            );
-            continue;
-        }
-
-        if let Some(sender) = ctx.progress_sender_handle() {
-            sender(PushFrame::ConfigureWarnings(frame));
-        }
-    }
-}
-
-fn drain_inspect_events(ctx: &AppContext) {
-    let drained = ctx.inspect_manager().drain_completions();
-    // Watcher-driven Tier-2 scans complete via the reuse path, which bypasses
-    // `result_rx`/`drain_completions`. Poll the manager's reuse counter so a
-    // background scan still refreshes the bar (#3) — otherwise the counts and
-    // `~` marker would only update on a manual `aft_inspect`.
-    let reuse_completed = ctx.take_new_reuse_completions();
-    // A completed background Tier-2 scan refreshes the agent status-bar counts
-    // to the freshly-persisted aggregate, and clears the stale marker — so the
-    // bar reflects the new numbers on the next tool result without waiting for
-    // an explicit aft_inspect call.
-    if drained > 0 || reuse_completed {
-        if let Some(project_root) = ctx.config().project_root.clone() {
-            let (dead_code, unused_exports, duplicates) = ctx
-                .inspect_manager()
-                .latest_tier2_counts(ctx.inspect_dir(), project_root);
-            // Don't clear the `~` stale marker until the whole serial Tier-2
-            // cycle has drained — while any category is still in flight the
-            // already-persisted categories may predate the latest edit, so
-            // claiming fresh would be premature (#20). `None` counts preserve
-            // the last-known value rather than fabricating a `0` (#1).
-            let stale = ctx.inspect_manager().tier2_any_in_flight();
-            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, stale);
-            // Push the refreshed snapshot so the sidebar reflects the new Tier-2
-            // counts immediately. `update_status_bar_tier2` only mutates the
-            // in-memory counts (which the agent status bar reads live on each
-            // tool result); the push-driven sidebar would otherwise keep showing
-            // the pre-population snapshot — where `status_bar` was null and the
-            // Code Health section stayed hidden — until some unrelated event
-            // happened to emit a status frame.
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
-        }
     }
 }
 
@@ -1745,55 +1692,6 @@ fn drain_semantic_refresh_events(ctx: &AppContext) {
     }
 }
 
-fn drain_lsp_events(ctx: &AppContext) {
-    let drained = {
-        let mut lsp = ctx.lsp();
-        lsp.drain_events()
-    };
-    let mut status_changed = drained.diagnostics_changed;
-    for event in drained.events {
-        match event {
-            LspEvent::Notification {
-                server_kind,
-                root,
-                method,
-                params,
-            } => {
-                log::debug!(
-                    "[aft-lsp] notification {:?} {} {} {}",
-                    server_kind,
-                    root.display(),
-                    method,
-                    params.unwrap_or(serde_json::Value::Null)
-                );
-            }
-            LspEvent::ServerRequest {
-                server_kind,
-                root,
-                id,
-                method,
-                params,
-            } => {
-                log::debug!(
-                    "[aft-lsp] request {:?} {} {:?} {} {}",
-                    server_kind,
-                    root.display(),
-                    id,
-                    method,
-                    params.unwrap_or(serde_json::Value::Null)
-                );
-            }
-            LspEvent::ServerExited { server_kind, root } => {
-                aft::slog_info!("exited {:?} {}", server_kind, root.display());
-                status_changed = true;
-            }
-        }
-    }
-    if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
-    }
-}
-
 #[cfg(test)]
 mod signal_handler_tests {
     use super::{signal_bg_registries, App, AppContext, Config, RuntimeRegistry};
@@ -1812,10 +1710,9 @@ mod signal_handler_tests {
 #[cfg(test)]
 mod watcher_filter_tests {
     use super::{
-        dispatch_panic_response, drain_configure_warning_events, drain_semantic_refresh_events,
-        drain_watcher_events, record_semantic_refresh_transient_failure,
-        schedule_semantic_refresh_retry, semantic_refresh_circuit_is_open,
-        semantic_refresh_probe_is_scheduled_for_test,
+        dispatch_panic_response, drain_semantic_refresh_events, drain_watcher_events,
+        record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
+        semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
         write_push_frame_or_request_shutdown, BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
         WATCHER_BATCH_INLINE_CAP,
@@ -2307,7 +2204,7 @@ mod watcher_filter_tests {
             ))
             .unwrap();
 
-        drain_configure_warning_events(&ctx);
+        aft::runtime_drain::drain_configure_warning_events(&ctx);
 
         let frame = frame_rx.try_recv().expect("current warning frame");
         match frame {
