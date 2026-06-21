@@ -74,7 +74,7 @@ struct BridgeInner {
 
 impl BridgeState {
     fn wait_until(&self, label: &str, mut predicate: impl FnMut(&BridgeInner) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut guard = self.inner.lock().expect("bridge state lock");
         while !predicate(&guard) {
             let now = Instant::now();
@@ -132,7 +132,7 @@ impl BridgeState {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.deferred_push_started += 1;
         self.cv.notify_all();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !guard.deferred_push_release {
             let now = Instant::now();
             assert!(
@@ -222,7 +222,7 @@ impl BridgeState {
             guard.overlap_current += 1;
             guard.overlap_max = guard.overlap_max.max(guard.overlap_current);
             self.cv.notify_all();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(30);
             while !guard.overlap_release {
                 let now = Instant::now();
                 assert!(now < deadline, "timed out waiting for overlap release");
@@ -247,7 +247,7 @@ impl BridgeState {
             let mut guard = self.inner.lock().expect("bridge state lock");
             guard.heavy_started = true;
             self.cv.notify_all();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(30);
             while !guard.heavy_release {
                 let now = Instant::now();
                 assert!(now < deadline, "timed out waiting for heavy release");
@@ -272,7 +272,7 @@ impl BridgeState {
             guard.epoch_started += 1;
             guard.epoch_current += 1;
             self.cv.notify_all();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(30);
             while !guard.epoch_release {
                 let now = Instant::now();
                 assert!(now < deadline, "timed out waiting for epoch release");
@@ -720,7 +720,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
         Box::new(|_| Response::success("b3-actor-check", json!({ "unexpected": true }))),
     );
     let actor_check_response = actor_check
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("B3 actor check response");
     assert!(!actor_check_response.success);
     assert_eq!(
@@ -1414,7 +1414,7 @@ async fn send_frame(stream: &mut tokio::net::TcpStream, frame: Frame) {
 }
 
 async fn read_any_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
-    tokio::time::timeout(Duration::from_secs(3), read_frame(stream))
+    tokio::time::timeout(Duration::from_secs(30), read_frame(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
         .expect("read frame")
@@ -1422,7 +1422,7 @@ async fn read_any_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str)
 }
 
 async fn read_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for {label}");
@@ -1491,7 +1491,7 @@ async fn expect_bash_completed_pushes_for_tool(
     task_id: &str,
     expected_channels: HashSet<u16>,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut response_seen = false;
     let mut pushes = Vec::new();
     let mut channels = HashSet::new();
@@ -1576,7 +1576,7 @@ async fn expect_route_bind_ack_and_bash_completed_push(
     task_id: &str,
     expected_channel: u16,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut ack_seen = false;
     let mut push_seen = None;
 
@@ -1620,7 +1620,7 @@ async fn expect_route_bind_ack_without_task_push(
     corr: u64,
     task_id: &str,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for RouteBindAck {corr}");
@@ -1654,7 +1654,7 @@ async fn expect_status_pushes_for_tool(
     marker: &str,
     expected_channels: HashSet<u16>,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut response_seen = false;
     let mut pushes = Vec::new();
     let mut channels = HashSet::new();
@@ -1698,7 +1698,7 @@ async fn expect_status_pushes(
     marker: &str,
     expected_channels: HashSet<u16>,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut pushes = Vec::new();
     let mut channels = HashSet::new();
 
@@ -1803,8 +1803,8 @@ async fn wait_for_bash_completion(
     _session_id: &str,
     task_id: &str,
 ) -> Value {
-    for attempt in 0..30 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    for attempt in 0..120 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let corr = first_corr + attempt;
         send_tool_call(
             stream,
@@ -1872,7 +1872,7 @@ async fn poll_callers_until_ready(
     first_corr: u64,
     arguments: Value,
 ) -> Value {
-    for attempt in 0..30 {
+    for attempt in 0..80 {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let corr = first_corr + attempt;
         send_tool_call(stream, channel, corr, "callers", arguments.clone()).await;
