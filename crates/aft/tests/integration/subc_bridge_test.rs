@@ -17,6 +17,7 @@ use aft::protocol::{
     Response, StatusChangedFrame,
 };
 use aft::subc::run_subc_mode;
+use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
@@ -71,6 +72,7 @@ struct BridgeInner {
     deferred_push_started: usize,
     deferred_push_release: bool,
     configure_events: Vec<ConfigureEvent>,
+    watcher_senders: Vec<crossbeam_channel::Sender<WatcherDispatchEvent>>,
 }
 
 impl BridgeState {
@@ -151,6 +153,11 @@ impl BridgeState {
                 "timed out waiting for deferred push release"
             );
         }
+    }
+
+    fn retain_watcher_sender(&self, sender: crossbeam_channel::Sender<WatcherDispatchEvent>) {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.watcher_senders.push(sender);
     }
 
     fn assert_overlap(&self) {
@@ -502,6 +509,51 @@ fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
         .expect("queue configure warning");
 }
 
+fn enqueue_watcher_event_for_test(
+    req: &RawRequest,
+    ctx: &AppContext,
+    state: &BridgeState,
+) -> Response {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return Response::error(
+            &req.id,
+            "missing_project_root",
+            "subc watcher test requires a configured project root",
+        );
+    };
+    let path = root.join("subc_watcher_tick.rs");
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return Response::error(
+                &req.id,
+                "watcher_test_setup_failed",
+                format!("failed to create watcher test dir: {error}"),
+            );
+        }
+    }
+    if let Err(error) = std::fs::write(&path, "pub fn subc_watcher_tick() {}\n") {
+        return Response::error(
+            &req.id,
+            "watcher_test_setup_failed",
+            format!("failed to write watcher test file: {error}"),
+        );
+    }
+
+    // Seed visible Tier-2 counts so the watcher drain has an observable stale-bit
+    // transition to emit as a StatusChanged Push.
+    ctx.update_status_bar_tier2(Some(31), Some(32), Some(33), Some(34), false);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(rx);
+    tx.send(WatcherDispatchEvent::Paths(vec![path.clone()]))
+        .expect("queue watcher event");
+    state.retain_watcher_sender(tx);
+
+    Response::success(
+        &req.id,
+        json!({ "queued": true, "path": path.to_string_lossy() }),
+    )
+}
+
 fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = Arc::clone(BRIDGE_STATE.get().expect("bridge state installed"));
     match req.command.as_str() {
@@ -637,6 +689,7 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
                 json!({ "deferred": emitted, "task_id": task_id, "session_id": session_id }),
             )
         }
+        "subc_test_enqueue_watcher_event" => enqueue_watcher_event_for_test(&req, ctx, &state),
         "enable_callgraph_store_for_test" => {
             ctx.update_config(|config| config.callgraph_store = true);
             Response::success(req.id, json!({ "callgraph_store": true }))
@@ -859,6 +912,22 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     )
     .await;
     assert_eq!(configure_warning_pushes.len(), 1);
+
+    // L1 watcher maintenance: inject a compact watcher event through the same
+    // watcher_rx seam standalone tests use, then let the subc 250ms maintenance
+    // tick drain it on the Mutating lane and emit the stale-status Push.
+    send_tool_call(
+        &mut stream,
+        1,
+        65,
+        "subc_test_enqueue_watcher_event",
+        json!({}),
+    )
+    .await;
+    let watcher_pushes =
+        expect_watcher_stale_status_pushes_for_tool(&mut stream, 65, HashSet::from([1]), &root1)
+            .await;
+    assert_eq!(watcher_pushes.len(), 1);
 
     // Phase 4d-2a: subc tool calls carry RouteBind session on the RawRequest.
     send_tool_call(&mut stream, 1, 11, "subc_test_echo_session", json!({})).await;
@@ -1774,6 +1843,65 @@ async fn expect_route_bind_ack_without_task_push(
             other => panic!("unexpected frame while waiting for RouteBindAck {corr}: {other:?}"),
         }
     }
+}
+
+async fn expect_watcher_stale_status_pushes_for_tool(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    expected_channels: HashSet<u16>,
+    expected_root: &std::path::Path,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let expected_root = expected_root.to_string_lossy().into_owned();
+    let mut response_seen = false;
+    let mut pushes = Vec::new();
+    let mut channels = HashSet::new();
+
+    while !response_seen || channels != expected_channels {
+        let now = Instant::now();
+        assert!(now < deadline, "timed out waiting for watcher stale push");
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for watcher stale push"))
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for watcher stale push"));
+        match frame.header.ty {
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                let snapshot = body.get("snapshot").unwrap_or(&Value::Null);
+                let stale = snapshot
+                    .get("status_bar")
+                    .and_then(|status_bar| status_bar.get("tier2_stale"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                let root_matches = snapshot.get("project_root").and_then(Value::as_str)
+                    == Some(expected_root.as_str());
+                if push_type(&body) == Some("status_changed") && stale && root_matches {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "watcher stale push leaked to unexpected channel {}",
+                        frame.header.channel
+                    );
+                    channels.insert(frame.header.channel);
+                    pushes.push(body);
+                }
+            }
+            FrameType::Response if frame.header.corr == corr => {
+                let response = tool_response_json(&frame);
+                assert!(
+                    response["success"].as_bool().unwrap_or(false),
+                    "watcher injection response should succeed: {response:?}"
+                );
+                response_seen = true;
+            }
+            other => panic!("unexpected frame while waiting for watcher stale push: {other:?}"),
+        }
+    }
+
+    assert_eq!(channels, expected_channels);
+    pushes
 }
 
 async fn expect_status_pushes_for_tool(
