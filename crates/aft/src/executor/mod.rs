@@ -180,18 +180,41 @@ impl Executor {
         }
     }
 
-    pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) {
-        {
+    /// Register an actor if one is not already present.
+    ///
+    /// Existing actors keep their current context and scheduler state; Phase 4
+    /// subc routing reuses them and reconfigures through the Mutating lane
+    /// rather than replacing the per-root [`AppContext`]. Returns `true` when a
+    /// new actor was inserted.
+    pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
+        let inserted = {
             let mut state = self.inner.state.lock();
             if state.actors.contains_key(&root_id) {
-                if let Some(actor) = state.actors.get_mut(&root_id) {
-                    actor.ctx = ctx;
-                }
+                false
             } else {
                 state.actor_order.push(root_id.clone());
                 state.actors.insert(root_id, ActorState::new(ctx));
+                true
             }
-        }
+        };
+        self.wake_scheduler();
+        inserted
+    }
+
+    /// Remove an actor from scheduler state.
+    ///
+    /// This is intentionally minimal: Phase 4a uses it only for a just-created
+    /// RouteBind actor whose configure failed before any route was installed, so
+    /// there is no in-flight work to quiesce. The removed [`AppContext`] is
+    /// dropped after releasing the scheduler lock so watcher/LSP teardown never
+    /// runs under that mutex.
+    pub fn remove_actor(&self, root_id: &ProjectRootId) {
+        let removed = {
+            let mut state = self.inner.state.lock();
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        drop(removed);
         self.wake_scheduler();
     }
 

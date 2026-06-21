@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 use aft::callgraph::CallGraph;
 use aft::config::Config;
 use aft::context::AppContext;
-use aft::executor::{Executor, ExecutorConfig};
+use aft::executor::{Executor, ExecutorConfig, Lane};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
+use aft::path_identity::ProjectRootId;
 use aft::protocol::{RawRequest, Response};
 use aft::subc::run_subc_mode;
 use serde_json::{json, Value};
@@ -31,6 +32,7 @@ struct FakeDaemonInput {
     daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
     root1: std::path::PathBuf,
     root2: std::path::PathBuf,
+    failed_root: std::path::PathBuf,
     callgraph_root: std::path::PathBuf,
     callgraph_file: std::path::PathBuf,
     state: Arc<BridgeState>,
@@ -40,6 +42,14 @@ struct FakeDaemonInput {
 struct BridgeState {
     inner: Mutex<BridgeInner>,
     cv: Condvar,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigureEvent {
+    request_id: String,
+    root: std::path::PathBuf,
+    ctx_addr: usize,
+    epoch_reads_at_start: usize,
 }
 
 #[derive(Default)]
@@ -53,8 +63,7 @@ struct BridgeInner {
     epoch_started: usize,
     epoch_current: usize,
     epoch_release: bool,
-    route2_configure_started: bool,
-    route2_configure_reads_at_start: Option<usize>,
+    configure_events: Vec<ConfigureEvent>,
 }
 
 impl BridgeState {
@@ -89,6 +98,12 @@ impl BridgeState {
         self.cv.notify_all();
     }
 
+    fn begin_epoch_wave(&self) -> usize {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.epoch_release = false;
+        guard.epoch_started
+    }
+
     fn release_epoch_reads(&self) {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.epoch_release = true;
@@ -104,20 +119,57 @@ impl BridgeState {
         );
     }
 
-    fn assert_route2_configure_not_started(&self) {
+    fn wait_for_configure(&self, request_id: &str) -> ConfigureEvent {
+        let label = format!("configure {request_id}");
+        self.wait_until(&label, |inner| {
+            inner
+                .configure_events
+                .iter()
+                .any(|event| event.request_id == request_id)
+        });
+        let guard = self.inner.lock().expect("bridge state lock");
+        guard
+            .configure_events
+            .iter()
+            .find(|event| event.request_id == request_id)
+            .expect("configure event present")
+            .clone()
+    }
+
+    fn assert_configure_not_started(&self, request_id: &str) {
         let guard = self.inner.lock().expect("bridge state lock");
         assert!(
-            !guard.route2_configure_started,
-            "second RouteBind configure started while first-route reads were still in flight"
+            !guard
+                .configure_events
+                .iter()
+                .any(|event| event.request_id == request_id),
+            "{request_id} configure started while same-root reads were still in flight"
         );
     }
 
-    fn assert_route2_configure_saw_no_reads(&self) {
-        let guard = self.inner.lock().expect("bridge state lock");
+    fn assert_configure_root(&self, request_id: &str, root: &std::path::Path) {
+        let event = self.wait_for_configure(request_id);
         assert_eq!(
-            guard.route2_configure_reads_at_start,
-            Some(0),
-            "RouteBind configure must run under the same actor epoch after reads drain"
+            event.root, root,
+            "{request_id} configure should target the requested root"
+        );
+    }
+
+    fn assert_distinct_contexts(&self, first: &str, second: &str) {
+        let first = self.wait_for_configure(first);
+        let second = self.wait_for_configure(second);
+        assert_ne!(
+            first.ctx_addr, second.ctx_addr,
+            "different roots must configure distinct AppContext actors"
+        );
+    }
+
+    fn assert_same_context(&self, first: &str, second: &str) {
+        let first = self.wait_for_configure(first);
+        let second = self.wait_for_configure(second);
+        assert_eq!(
+            first.ctx_addr, second.ctx_addr,
+            "same-root RouteBind must reuse the existing AppContext actor"
         );
     }
 
@@ -198,13 +250,23 @@ impl BridgeState {
         Response::success(id, json!({ "case": "epoch" }))
     }
 
-    fn configure(&self, req: &RawRequest) {
-        if req.id == "subc-bind-2" {
-            let mut guard = self.inner.lock().expect("bridge state lock");
-            guard.route2_configure_started = true;
-            guard.route2_configure_reads_at_start = Some(guard.epoch_current);
-            self.cv.notify_all();
-        }
+    fn configure(&self, req: &RawRequest, ctx: &AppContext) {
+        let root = req
+            .params
+            .get("project_root")
+            .and_then(Value::as_str)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let ctx_addr = ctx as *const AppContext as usize;
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        let epoch_reads_at_start = guard.epoch_current;
+        guard.configure_events.push(ConfigureEvent {
+            request_id: req.id.clone(),
+            root,
+            ctx_addr,
+            epoch_reads_at_start,
+        });
+        self.cv.notify_all();
     }
 }
 
@@ -246,16 +308,34 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
     )
 }
 
+fn ctx_project_root(ctx: &AppContext) -> String {
+    ctx.config()
+        .project_root
+        .as_ref()
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unset>".to_string())
+}
+
 fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = Arc::clone(BRIDGE_STATE.get().expect("bridge state installed"));
     match req.command.as_str() {
         "configure" => {
-            state.configure(&req);
+            state.configure(&req, ctx);
+            if req.id == "subc-bind-5" {
+                return Response::error(
+                    &req.id,
+                    "config_divergence",
+                    "intentional test configure failure",
+                );
+            }
             configure_bridge_context(&req, ctx)
         }
         "read" => match req.params.get("case").and_then(Value::as_str) {
             Some("overlap") => state.overlap_read(req.id),
-            Some("fast") => Response::success(req.id, json!({ "case": "fast" })),
+            Some("fast") => Response::success(
+                req.id,
+                json!({ "case": "fast", "project_root": ctx_project_root(ctx) }),
+            ),
             Some("epoch") => state.epoch_read(req.id),
             other => Response::error(
                 req.id,
@@ -278,12 +358,13 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 }
 
 #[test]
-fn subc_bridge_runs_route_calls_concurrently_and_preserves_epoch() {
+fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     let state = Arc::new(BridgeState::default());
     let _ = BRIDGE_STATE.set(Arc::clone(&state));
 
     let root1 = tempfile::tempdir().expect("root1 tempdir");
     let root2 = tempfile::tempdir().expect("root2 tempdir");
+    let failed_root = tempfile::tempdir().expect("failed root tempdir");
     let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
     let callgraph_src = callgraph_root.path().join("src");
     std::fs::create_dir_all(&callgraph_src).expect("callgraph src dir");
@@ -320,6 +401,7 @@ fn subc_bridge_runs_route_calls_concurrently_and_preserves_epoch() {
     let daemon_state = Arc::clone(&state);
     let root1_path = root1.path().to_path_buf();
     let root2_path = root2.path().to_path_buf();
+    let failed_root_path = failed_root.path().to_path_buf();
     let callgraph_root_path = callgraph_root.path().to_path_buf();
     let callgraph_file_path = callgraph_file.clone();
     let daemon = thread::spawn(move || {
@@ -337,6 +419,7 @@ fn subc_bridge_runs_route_calls_concurrently_and_preserves_epoch() {
                     daemon_id,
                     root1: root1_path,
                     root2: root2_path,
+                    failed_root: failed_root_path,
                     callgraph_root: callgraph_root_path,
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
@@ -362,14 +445,49 @@ fn subc_bridge_runs_route_calls_concurrently_and_preserves_epoch() {
         drr_quantum: 1,
     }));
 
+    let executor_for_check = Arc::clone(&executor);
     run_subc_mode(&conn_path, ctx, executor, bridge_dispatch).expect("subc mode exits cleanly");
     daemon.join().expect("fake daemon joins");
 
     state.assert_overlap();
-    state.assert_route2_configure_saw_no_reads();
+    state.assert_configure_root("subc-bind-1", root1.path());
+    state.assert_configure_root("subc-bind-2", root2.path());
+    state.assert_configure_root("subc-bind-4", root1.path());
+    state.assert_distinct_contexts("subc-bind-1", "subc-bind-2");
+    state.assert_same_context("subc-bind-1", "subc-bind-4");
+    assert!(
+        state.wait_for_configure("subc-bind-2").epoch_reads_at_start >= 2,
+        "different-root configure should run while route 1 reads are in flight"
+    );
+    assert_eq!(
+        state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
+        0,
+        "same-root reconfigure must wait for route 1 reads to drain"
+    );
+
+    let failed_root_id = ProjectRootId::from_path(failed_root.path()).expect("failed root id");
+    let actor_check = executor_for_check.submit(
+        failed_root_id,
+        Lane::PureRead,
+        "b3-actor-check".to_string(),
+        Box::new(|_| Response::success("b3-actor-check", json!({ "unexpected": true }))),
+    );
+    let actor_check_response = actor_check
+        .recv_timeout(Duration::from_secs(1))
+        .expect("B3 actor check response");
+    assert!(!actor_check_response.success);
+    assert_eq!(
+        actor_check_response
+            .data
+            .get("code")
+            .and_then(Value::as_str),
+        Some("actor_not_registered"),
+        "failed new-root bind must remove its just-registered actor"
+    );
 
     drop(root1);
     drop(root2);
+    drop(failed_root);
     drop(callgraph_root);
     drop(storage);
 }
@@ -381,6 +499,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         daemon_id,
         root1,
         root2,
+        failed_root,
         callgraph_root,
         callgraph_file,
         state,
@@ -456,33 +575,78 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     let heavy = read_frame_timeout(&mut stream, "heavy response").await;
     assert_eq!(heavy.header.corr, 200);
 
-    // 4. Epoch safety + Blocker 1: route 2 binds a different root while route 1
-    // reads are in flight. The configure job must collapse onto the single actor
-    // and wait for the first route's reads to drain.
+    // 3. Different roots: route 2 binds while route 1 reads are in flight.
+    // It must get its own actor, so its configure can start and ack before
+    // route 1's read epoch is released.
+    let epoch_base = state.begin_epoch_wave();
     for corr in 300..302 {
         send_tool_call(&mut stream, 1, corr, "read", json!({ "case": "epoch" })).await;
     }
-    state.wait_until("epoch reads started", |inner| inner.epoch_started == 2);
+    state.wait_until("epoch reads started", |inner| {
+        inner.epoch_started == epoch_base + 2
+    });
     send_route_bind(&mut stream, 2, 30, &root2).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    state.assert_route2_configure_not_started();
+    let route2_configure = state.wait_for_configure("subc-bind-2");
+    assert!(
+        route2_configure.epoch_reads_at_start >= 2,
+        "different-root configure should not be blocked by route 1 reads"
+    );
+    expect_route_bind_ack(&mut stream, 30).await;
     state.release_epoch_reads();
     let epoch_corrs = collect_response_corrs(&mut stream, 2).await;
     assert_eq!(epoch_corrs, HashSet::from([300, 301]));
-    expect_route_bind_ack(&mut stream, 30).await;
-    state.assert_route2_configure_saw_no_reads();
 
-    send_tool_call(&mut stream, 2, 400, "read", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 400, "read", json!({ "case": "fast" })).await;
+    let route1_read = read_frame_timeout(&mut stream, "route 1 read response").await;
+    assert_eq!(route1_read.header.channel, 1);
+    assert_eq!(route1_read.header.corr, 400);
+    assert_tool_project_root(&route1_read, &root1);
+    send_tool_call(&mut stream, 2, 401, "read", json!({ "case": "fast" })).await;
     let route2_read = read_frame_timeout(&mut stream, "route 2 read response").await;
     assert_eq!(route2_read.header.channel, 2);
-    assert_eq!(route2_read.header.corr, 400);
+    assert_eq!(route2_read.header.corr, 401);
+    assert_tool_project_root(&route2_read, &root2);
 
-    // 3 + 5. Bind a real source project with callgraph_store disabled so bind-time
-    // configure cannot spawn/install the store. Enable the store under the executor,
-    // then concurrent callers trigger exactly one cold build. A later identical
-    // callers request succeeds only after the maintenance tick drains that build.
-    send_route_bind(&mut stream, 3, 40, &callgraph_root).await;
-    expect_route_bind_ack(&mut stream, 40).await;
+    // 4. Same root: route 4 binds to root 1 while route 1 reads are in flight.
+    // It must reuse the existing actor, so configure cannot start until those
+    // reads leave the shared per-root epoch.
+    let same_root_epoch_base = state.begin_epoch_wave();
+    for corr in 410..412 {
+        send_tool_call(&mut stream, 1, corr, "read", json!({ "case": "epoch" })).await;
+    }
+    state.wait_until("same-root epoch reads started", |inner| {
+        inner.epoch_started == same_root_epoch_base + 2
+    });
+    send_route_bind(&mut stream, 4, 44, &root1).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    state.assert_configure_not_started("subc-bind-4");
+    state.release_epoch_reads();
+    let same_root_corrs = collect_response_corrs(&mut stream, 2).await;
+    assert_eq!(same_root_corrs, HashSet::from([410, 411]));
+    expect_route_bind_ack(&mut stream, 44).await;
+    assert_eq!(
+        state.wait_for_configure("subc-bind-4").epoch_reads_at_start,
+        0,
+        "same-root configure should start only after route 1 reads drain"
+    );
+    send_tool_call(&mut stream, 4, 420, "read", json!({ "case": "fast" })).await;
+    let route4_read = read_frame_timeout(&mut stream, "route 4 read response").await;
+    assert_eq!(route4_read.header.channel, 4);
+    assert_eq!(route4_read.header.corr, 420);
+    assert_tool_project_root(&route4_read, &root1);
+
+    // 5. B3: a new-root configure failure must not install a route and must be
+    // removed from the executor before the connection exits.
+    send_route_bind(&mut stream, 5, 50, &failed_root).await;
+    expect_route_bind_error(&mut stream, 50, "config_divergence").await;
+    send_tool_call(&mut stream, 5, 550, "read", json!({ "case": "fast" })).await;
+    expect_error_frame(&mut stream, 5, 550, "route_not_bound").await;
+
+    // 6. Per-root maintenance: route 3 triggers a callgraph build and the
+    // coalesced maintenance tick drains route 3's actor without collapsing route
+    // 2's independent project_root state.
+    send_route_bind(&mut stream, 3, 60, &callgraph_root).await;
+    expect_route_bind_ack(&mut stream, 60).await;
     send_tool_call(
         &mut stream,
         3,
@@ -528,6 +692,11 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         ready["total_callers"].as_u64().unwrap_or(0) >= 1,
         "ready callers response should contain the built result: {ready:?}"
     );
+    send_tool_call(&mut stream, 2, 700, "read", json!({ "case": "fast" })).await;
+    let route2_after_maintenance =
+        read_frame_timeout(&mut stream, "route 2 read after route 3 maintenance").await;
+    assert_eq!(route2_after_maintenance.header.channel, 2);
+    assert_tool_project_root(&route2_after_maintenance, &root2);
 
     send_frame(
         &mut stream,
@@ -614,6 +783,38 @@ async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
     assert_eq!(frame.header.corr, corr);
     let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).expect("ack body");
     assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+}
+
+async fn expect_route_bind_error(stream: &mut tokio::net::TcpStream, corr: u64, code: &str) {
+    expect_error_frame(stream, 0, corr, code).await;
+}
+
+async fn expect_error_frame(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    code: &str,
+) {
+    let frame = read_frame_timeout(stream, "Error frame").await;
+    assert_eq!(frame.header.ty, FrameType::Error);
+    assert_eq!(frame.header.channel, channel);
+    assert_eq!(frame.header.corr, corr);
+    let body: Value = serde_json::from_slice(&frame.body).expect("error body");
+    assert_eq!(body.get("code").and_then(Value::as_str), Some(code));
+}
+
+fn assert_tool_project_root(frame: &Frame, root: &std::path::Path) {
+    let response = tool_response_json(frame);
+    assert!(
+        response["success"].as_bool().unwrap_or(false),
+        "expected successful tool response: {response:?}"
+    );
+    let expected = root.to_string_lossy().into_owned();
+    assert_eq!(
+        response.get("project_root").and_then(Value::as_str),
+        Some(expected.as_str()),
+        "tool call should target its bound project root"
+    );
 }
 
 async fn collect_response_corrs(stream: &mut tokio::net::TcpStream, count: usize) -> HashSet<u64> {

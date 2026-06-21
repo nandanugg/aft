@@ -11,19 +11,18 @@
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::context::AppContext;
+use crate::config::Config;
+use crate::context::{App, AppContext};
 use crate::executor::{Executor, Lane};
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{RawRequest, Response};
@@ -51,6 +50,31 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 /// Correlation id for the initial ModuleHello (channel 0).
 const HELLO_CORR: u64 = 1;
 
+type RouteChannel = u32;
+
+#[derive(Debug)]
+struct RootMeta {
+    maintenance_pending: bool,
+    last_touched: Instant,
+}
+
+impl RootMeta {
+    fn new(now: Instant) -> Self {
+        Self {
+            maintenance_pending: false,
+            last_touched: now,
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last_touched = Instant::now();
+    }
+}
+
+fn route_key(channel: u16) -> RouteChannel {
+    RouteChannel::from(channel)
+}
+
 /// Sync command dispatch, passed in from `main` (the binary owns the command
 /// table). Invoked only inside executor jobs in subc mode.
 pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
@@ -71,13 +95,15 @@ pub fn run_subc_mode(
         .map_err(SubcError::Runtime)?;
 
     runtime.block_on(async move {
+        let shared_app = ctx.app();
+        drop(ctx);
         let stream = connect_and_authenticate(connection_file_path).await?;
         log::info!(
             "subc attach: authenticated to daemon via {}",
             connection_file_path.display()
         );
         let (read_half, write_half) = tokio::io::split(stream);
-        run_module_loop(read_half, write_half, ctx, executor, dispatch).await
+        run_module_loop(read_half, write_half, shared_app, executor, dispatch).await
     })
 }
 
@@ -130,7 +156,7 @@ async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStre
 async fn run_module_loop<R, W>(
     mut read: R,
     mut write: W,
-    ctx: Arc<AppContext>,
+    shared_app: Arc<App>,
     executor: Arc<Executor>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError>
@@ -182,9 +208,10 @@ where
     let (reader_tx, mut reader_rx) = mpsc::channel::<Result<Frame, SubcError>>(256);
     let reader_task = spawn_reader_task(read, reader_tx);
     let shutdown = Arc::new(Notify::new());
-    let drain_pending = Arc::new(AtomicBool::new(false));
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
-    let mut actor_root_id: Option<ProjectRootId> = None;
+    let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
+    let mut routes: HashMap<RouteChannel, ProjectRootId> = HashMap::new();
+    let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
         tokio::select! {
@@ -224,16 +251,36 @@ where
                         break Ok(());
                     }
                     FrameType::Goodbye => {
-                        // Route teardown — N=1 keeps a single actor for the connection.
-                        log::debug!("subc attach: route {} torn down", frame.header.channel);
+                        let channel = route_key(frame.header.channel);
+                        if let Some(root_id) = routes.remove(&channel) {
+                            if let Some(meta) = live_roots.get_mut(&root_id) {
+                                let idle_for = meta.last_touched.elapsed();
+                                meta.touch();
+                                log::debug!(
+                                    "subc attach: route {} torn down for root {} (last touched {:?} ago)",
+                                    frame.header.channel,
+                                    root_id.as_path().display(),
+                                    idle_for
+                                );
+                            } else {
+                                log::debug!(
+                                    "subc attach: route {} torn down for root {}",
+                                    frame.header.channel,
+                                    root_id.as_path().display()
+                                );
+                            }
+                        } else {
+                            log::debug!("subc attach: unbound route {} torn down", frame.header.channel);
+                        }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
                         if let Err(error) = handle_control_request(
                             &writer_tx,
                             &frame,
-                            &ctx,
+                            &shared_app,
                             &executor,
-                            &mut actor_root_id,
+                            &mut routes,
+                            &mut live_roots,
                             &shutdown,
                             dispatch,
                         )
@@ -246,7 +293,8 @@ where
                         if let Err(error) = handle_tool_call(
                             &writer_tx,
                             &frame,
-                            actor_root_id.clone(),
+                            &routes,
+                            &mut live_roots,
                             &executor,
                             &shutdown,
                             dispatch,
@@ -260,16 +308,28 @@ where
                     _ => {}
                 }
             }
+            Some((root_id, response)) = maintenance_rx.recv() => {
+                if let Some(meta) = live_roots.get_mut(&root_id) {
+                    meta.maintenance_pending = false;
+                }
+                if response_is_internal_error(&response) {
+                    signal_fatal_teardown(&writer_tx, None, PROTOCOL_VERSION, 0, &shutdown).await;
+                }
+            }
             _ = drain_interval.tick() => {
-                if let Some(root_id) = actor_root_id.clone() {
-                    maybe_submit_maintenance_drain(
-                        &ctx,
-                        &executor,
-                        root_id,
-                        &writer_tx,
-                        &shutdown,
-                        &drain_pending,
-                    );
+                let due_roots: Vec<ProjectRootId> = live_roots
+                    .iter_mut()
+                    .filter_map(|(root_id, meta)| {
+                        if meta.maintenance_pending {
+                            None
+                        } else {
+                            meta.maintenance_pending = true;
+                            Some(root_id.clone())
+                        }
+                    })
+                    .collect();
+                for root_id in due_roots {
+                    submit_maintenance_drain(&executor, root_id, &maintenance_tx);
                 }
             }
         }
@@ -353,9 +413,10 @@ async fn send_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), SubcEr
 async fn handle_control_request(
     tx: &mpsc::Sender<Frame>,
     frame: &Frame,
-    ctx: &Arc<AppContext>,
+    shared_app: &Arc<App>,
     executor: &Arc<Executor>,
-    actor_root_id: &mut Option<ProjectRootId>,
+    routes: &mut HashMap<RouteChannel, ProjectRootId>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
@@ -379,23 +440,6 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-            };
-
-            let submit_root_id = match actor_root_id.as_ref() {
-                None => {
-                    executor.register_actor(bind_root_id.clone(), Arc::clone(ctx));
-                    *actor_root_id = Some(bind_root_id.clone());
-                    bind_root_id
-                }
-                Some(existing) if existing != &bind_root_id => {
-                    log::debug!(
-                        "subc attach: N=1 collapsing root {} onto the single actor {}",
-                        bind_root_id.as_path().display(),
-                        existing.as_path().display()
-                    );
-                    existing.clone()
-                }
-                Some(existing) => existing.clone(),
             };
 
             // Reconcile RootConfig: build a configure request from the bind
@@ -425,9 +469,35 @@ async fn handle_control_request(
                 }
             };
 
+            let root_was_live = live_roots.contains_key(&bind_root_id);
+            let inserted_new_actor = if root_was_live {
+                log::debug!(
+                    "subc attach: reusing actor for route {} root {}",
+                    route_channel,
+                    bind_root_id.as_path().display()
+                );
+                false
+            } else {
+                let actor_ctx = Arc::new(AppContext::from_app(
+                    Arc::clone(shared_app),
+                    Config::default(),
+                ));
+                install_bash_compressor(&actor_ctx);
+                let inserted =
+                    executor.register_actor(bind_root_id.clone(), Arc::clone(&actor_ctx));
+                drop(actor_ctx);
+                live_roots.insert(bind_root_id.clone(), RootMeta::new(Instant::now()));
+                log::debug!(
+                    "subc attach: registered actor for route {} root {}",
+                    route_channel,
+                    bind_root_id.as_path().display()
+                );
+                inserted
+            };
+
             let configure_request_id = configure_req.id.clone();
             let configure_rx = executor.submit_async(
-                submit_root_id.clone(),
+                bind_root_id.clone(),
                 Lane::Mutating,
                 configure_request_id.clone(),
                 Box::new(move |ctx| dispatch(configure_req, ctx)),
@@ -436,6 +506,12 @@ async fn handle_control_request(
                 await_executor_response(configure_rx, configure_request_id.clone()).await;
 
             if !configure_response.success {
+                if !root_was_live {
+                    live_roots.remove(&bind_root_id);
+                    if inserted_new_actor {
+                        executor.remove_actor(&bind_root_id);
+                    }
+                }
                 let message =
                     response_message(&configure_response, "configure failed during route bind");
                 send_route_bind_error(tx, frame, "config_divergence", &message).await?;
@@ -452,35 +528,42 @@ async fn handle_control_request(
                 return Ok(());
             }
 
-            let drain_request_id = format!("subc-bind-drain-{route_channel}");
-            let drain_response_id = drain_request_id.clone();
-            let drain_rx = executor.submit_async(
-                submit_root_id,
-                Lane::Mutating,
-                drain_request_id.clone(),
-                Box::new(move |ctx| {
-                    runtime_drain::drain_build_completions(ctx);
-                    Response::success(drain_response_id, json!({ "drained": true }))
-                }),
-            );
-            let drain_response = await_executor_response(drain_rx, drain_request_id).await;
-            if !drain_response.success {
-                let message = response_message(
-                    &drain_response,
-                    "build-completion drain failed during route bind",
+            if !root_was_live {
+                let drain_request_id = format!("subc-bind-drain-{route_channel}");
+                let drain_response_id = drain_request_id.clone();
+                let drain_rx = executor.submit_async(
+                    bind_root_id.clone(),
+                    Lane::Mutating,
+                    drain_request_id.clone(),
+                    Box::new(move |ctx| {
+                        runtime_drain::drain_build_completions(ctx);
+                        Response::success(drain_response_id, json!({ "drained": true }))
+                    }),
                 );
-                send_route_bind_error(tx, frame, "config_divergence", &message).await?;
-                if response_is_internal_error(&drain_response) {
-                    signal_fatal_teardown(
-                        tx,
-                        Some(route_channel),
-                        frame.header.ver,
-                        frame.header.corr,
-                        shutdown,
-                    )
-                    .await;
+                let drain_response = await_executor_response(drain_rx, drain_request_id).await;
+                if !drain_response.success {
+                    let message = response_message(
+                        &drain_response,
+                        "build-completion drain failed during route bind",
+                    );
+                    send_route_bind_error(tx, frame, "config_divergence", &message).await?;
+                    if response_is_internal_error(&drain_response) {
+                        signal_fatal_teardown(
+                            tx,
+                            Some(route_channel),
+                            frame.header.ver,
+                            frame.header.corr,
+                            shutdown,
+                        )
+                        .await;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+            }
+
+            routes.insert(route_key(route_channel), bind_root_id.clone());
+            if let Some(meta) = live_roots.get_mut(&bind_root_id) {
+                meta.touch();
             }
 
             let ack = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
@@ -495,10 +578,37 @@ async fn handle_control_request(
             )
             .map_err(SubcError::FrameBuild)?;
             send_frame(tx, response).await?;
-            log::info!("subc attach: route {route_channel} bound");
+            log::info!(
+                "subc attach: route {} bound to root {}",
+                route_channel,
+                bind_root_id.as_path().display()
+            );
             Ok(())
         }
     }
+}
+
+fn install_bash_compressor(ctx: &AppContext) {
+    // Mirrors main.rs per-actor compressor installation for subc-created actors.
+    let filter_registry_handle = ctx.shared_filter_registry();
+    let compress_flag = ctx.bash_compress_flag();
+    ctx.bash_background().set_compressor_with_exit_code(
+        move |command: &str, output: String, exit_code: Option<i32>| {
+            if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return crate::compress::CompressionResult::new(output);
+            }
+            let registry_guard = match filter_registry_handle.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            crate::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &registry_guard,
+            )
+        },
+    );
 }
 
 async fn send_route_bind_error(
@@ -527,12 +637,13 @@ async fn send_route_bind_error(
 async fn handle_tool_call(
     tx: &mpsc::Sender<Frame>,
     frame: &Frame,
-    actor_root_id: Option<ProjectRootId>,
+    routes: &HashMap<RouteChannel, ProjectRootId>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
-    let Some(root_id) = actor_root_id else {
+    let Some(root_id) = routes.get(&route_key(frame.header.channel)).cloned() else {
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,
@@ -543,6 +654,9 @@ async fn handle_tool_call(
         )?;
         return send_frame(tx, error).await;
     };
+    if let Some(meta) = live_roots.get_mut(&root_id) {
+        meta.touch();
+    }
 
     let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
 
@@ -611,23 +725,17 @@ async fn handle_tool_call(
     Ok(())
 }
 
-fn maybe_submit_maintenance_drain(
-    ctx: &Arc<AppContext>,
+fn submit_maintenance_drain(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
-    tx: &mpsc::Sender<Frame>,
-    shutdown: &Arc<Notify>,
-    drain_pending: &Arc<AtomicBool>,
+    completion_tx: &mpsc::Sender<(ProjectRootId, Response)>,
 ) {
-    if !runtime_drain::any_build_in_flight(ctx) {
-        return;
-    }
-    if drain_pending.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    let request_id = "subc-maintenance-drain".to_string();
+    let request_id = format!(
+        "subc-maintenance-drain-{}",
+        root_id.as_path().to_string_lossy()
+    );
     let response_id = request_id.clone();
+    let completion_root_id = root_id.clone();
     let rx = executor.submit_async(
         root_id,
         Lane::Mutating,
@@ -637,15 +745,10 @@ fn maybe_submit_maintenance_drain(
             Response::success(response_id, json!({ "drained": true }))
         }),
     );
-    let drain_pending = Arc::clone(drain_pending);
-    let tx = tx.clone();
-    let shutdown = Arc::clone(shutdown);
+    let completion_tx = completion_tx.clone();
     tokio::spawn(async move {
         let response = await_executor_response(rx, request_id).await;
-        drain_pending.store(false, Ordering::Release);
-        if response_is_internal_error(&response) {
-            signal_fatal_teardown(&tx, None, PROTOCOL_VERSION, 0, &shutdown).await;
-        }
+        let _ = completion_tx.send((completion_root_id, response)).await;
     });
 }
 
