@@ -1668,12 +1668,11 @@ async fn handle_tool_call(
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let project_root = identity.project_root.as_path();
-    let (command, translated_args) = if subc_bridge_harness_tool_call(&call.name, &call.arguments) {
-        let map = call.arguments.as_object().cloned().unwrap_or_default();
-        (call.name.clone(), map)
-    } else {
+    let (command, translated_args) =
         match crate::subc_translate::subc_translate(&call.name, &call.arguments, project_root) {
             Ok(t) => (t.command, t.args),
+            // A core agent tool that fails translation is a real client error
+            // (e.g. `edit` with no resolvable mode) — surface it, never guess.
             Err(err) if is_subc_agent_core_tool(&call.name) => {
                 let response = Response::error(request_id.clone(), err.code, err.message);
                 let response_frame = build_tool_response_frame(
@@ -1685,12 +1684,13 @@ async fn handle_tool_call(
                 )?;
                 return send_frame(tx, response_frame).await;
             }
+            // Non-core names are already native commands (internal RPCs and the
+            // integration-test synthetic tools) — pass them through verbatim.
             Err(_) => {
                 let map = call.arguments.as_object().cloned().unwrap_or_default();
                 (call.name.clone(), map)
             }
-        }
-    };
+        };
 
     let lane = command_lane(&command);
     let command_for_finalize = command.clone();
@@ -1906,14 +1906,6 @@ fn is_subc_agent_core_tool(name: &str) -> bool {
         name,
         "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
     )
-}
-
-/// Integration-test harness sends agent tool names with non-agent params (e.g. read + `case`).
-fn subc_bridge_harness_tool_call(name: &str, args: &Value) -> bool {
-    let Some(map) = args.as_object() else {
-        return false;
-    };
-    name == "read" && map.contains_key("case")
 }
 
 fn command_lane(command: &str) -> Lane {
