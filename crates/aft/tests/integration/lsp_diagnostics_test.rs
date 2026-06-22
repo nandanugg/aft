@@ -204,7 +204,7 @@ fn executable_crashing_lsp_script(stderr: &str) -> PathBuf {
         }
         source.push_str("exit /b 1\r\n");
         fs::write(&script, source).expect("write crashing lsp cmd script");
-        return script;
+        script
     }
 
     #[cfg(not(windows))]

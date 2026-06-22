@@ -266,6 +266,10 @@ fn make_writable(path: &std::path::Path) {
 #[cfg(windows)]
 fn make_writable(path: &std::path::Path) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
+    // On Windows this clears the read-only file attribute, which is exactly the
+    // intent here; the clippy lint targets the Unix world-writable footgun that
+    // does not apply to this windows-only helper.
+    #[allow(clippy::permissions_set_readonly_false)]
     permissions.set_readonly(false);
     fs::set_permissions(path, permissions).unwrap();
 }
