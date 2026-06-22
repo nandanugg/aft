@@ -18,6 +18,38 @@ pub const STALE_HEARTBEAT_MS: u64 = 15_000;
 pub const LIVE_OWNER_WARN_MS: u64 = 600_000;
 pub const POLL_INTERVAL_MS: u64 = 100;
 
+/// Max consecutive transient OS errors tolerated while creating the lock file
+/// before giving up. On Windows, two processes/threads racing to create (or one
+/// creating while another deletes) the same path can momentarily return
+/// ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32) instead of a clean
+/// "already exists". Those windows close in milliseconds, so a small bounded
+/// retry rides them out while a genuinely persistent permission/IO failure still
+/// surfaces promptly.
+const MAX_TRANSIENT_CREATE_RETRIES: u32 = 50;
+
+/// True for OS errors that mean "another actor is touching this exact lock path
+/// right now", as opposed to a real, persistent failure. On Windows a contended
+/// create/delete on the same file surfaces as ERROR_ACCESS_DENIED (5) or
+/// ERROR_SHARING_VIOLATION (32); `PermissionDenied` covers the former across
+/// platforms. These are retried as contention, never treated as fatal.
+fn is_transient_create_contention(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION = 32. ERROR_ACCESS_DENIED = 5 maps to
+        // PermissionDenied above, but match it explicitly too in case the OS
+        // surfaces it as an Other-kind raw error.
+        if let Some(code) = error.raw_os_error() {
+            if code == 32 || code == 5 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LockConfig {
     heartbeat_interval_ms: u64,
@@ -151,6 +183,7 @@ fn acquire_with_config(
     let hostname = current_hostname();
     let mut warned_live_owner = false;
     let mut warned_stale_live_owner = false;
+    let mut transient_create_failures: u32 = 0;
 
     loop {
         if let Some(deadline) = deadline {
@@ -161,9 +194,24 @@ fn acquire_with_config(
 
         match create_new_lock(path, &hostname, config) {
             Ok(guard) => return Ok(guard),
+            // The lock file already exists — fall through to inspect its owner.
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            // Transient contention (chiefly Windows: a concurrent create/delete
+            // on this exact path surfaces as access-denied/sharing-violation
+            // rather than already-exists). Back off one poll interval and retry,
+            // bounded so a persistent failure still propagates instead of
+            // spinning forever.
+            Err(error) if is_transient_create_contention(&error) => {
+                transient_create_failures += 1;
+                if transient_create_failures > MAX_TRANSIENT_CREATE_RETRIES {
+                    return Err(error.into());
+                }
+                sleep_until_retry(deadline, config.poll_interval_ms)?;
+                continue;
+            }
             Err(error) => return Err(error.into()),
         }
+        transient_create_failures = 0;
 
         let metadata = match read_lock_metadata(path) {
             Ok(metadata) => metadata,
@@ -828,6 +876,31 @@ mod tests {
 
         drop(guard);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn permission_denied_is_treated_as_transient_create_contention() {
+        // Windows surfaces a contended create/delete on the same lock path as
+        // access-denied; acquire must retry these rather than fail the caller.
+        let err = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(is_transient_create_contention(&err));
+    }
+
+    #[test]
+    fn unrelated_io_errors_are_not_treated_as_contention() {
+        // A genuinely fatal error (e.g. the parent dir is missing) must still
+        // propagate, not spin in the transient-retry arm.
+        let err = io::Error::from(io::ErrorKind::NotFound);
+        assert!(!is_transient_create_contention(&err));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sharing_violation_is_treated_as_transient_create_contention() {
+        // ERROR_SHARING_VIOLATION (32) is the other contention code Windows
+        // returns when a concurrent actor holds the path open mid-create.
+        let err = io::Error::from_raw_os_error(32);
+        assert!(is_transient_create_contention(&err));
     }
 
     #[test]
