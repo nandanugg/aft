@@ -55,7 +55,24 @@ const HELLO_CORR: u64 = 1;
 /// detach/re-attach while AFT stays alive; cross-restart replay is phased later.
 const PUSH_BUFFER_MAX_PER_KEY: usize = 256;
 
+/// Bounded guard for control-frame sends. If the daemon stops reading and the
+/// writer queue stays full, tear the subc edge down instead of stalling the
+/// route loop indefinitely.
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Small bounded memory of completed task ids used to suppress stale lossy
+/// long-running reminders that arrive after their reliable completion event.
+const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
+
 type RouteChannel = u32;
+type PushEnvelope = (ProjectRootId, PushFrame);
+type RetryBuffer = HashMap<RouteChannel, VecDeque<(ReplayKey, PushFrame)>>;
+
+#[derive(Clone)]
+struct PushSenders {
+    lossy_tx: mpsc::Sender<PushEnvelope>,
+    reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
+}
 
 #[derive(Debug)]
 struct RootMeta {
@@ -84,6 +101,32 @@ impl ReplayKey {
             harness: identity.harness.clone(),
             session: identity.session.clone(),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CompletedTaskIds {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl CompletedTaskIds {
+    fn remember(&mut self, task_id: &str) {
+        if self.set.contains(task_id) {
+            return;
+        }
+        if self.order.len() >= COMPLETED_TASK_SUPPRESSION_MAX {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        let task_id = task_id.to_string();
+        self.order.push_back(task_id.clone());
+        self.set.insert(task_id);
+    }
+
+    fn contains(&self, task_id: &str) -> bool {
+        self.set.contains(task_id)
     }
 }
 
@@ -193,15 +236,35 @@ fn frame_is_reliable(frame: &PushFrame) -> bool {
     )
 }
 
-fn progress_sender_for_root(
-    push_tx: mpsc::Sender<(ProjectRootId, PushFrame)>,
-    root_id: ProjectRootId,
-) -> ProgressSender {
+fn completed_task_id(frame: &PushFrame) -> Option<&str> {
+    match frame {
+        PushFrame::BashCompleted(completed) => Some(completed.task_id.as_str()),
+        _ => None,
+    }
+}
+
+fn long_running_task_id(frame: &PushFrame) -> Option<&str> {
+    match frame {
+        PushFrame::BashLongRunning(long_running) => Some(long_running.task_id.as_str()),
+        _ => None,
+    }
+}
+
+fn should_drop_lossy_push(completed_tasks: &CompletedTaskIds, frame: &PushFrame) -> bool {
+    long_running_task_id(frame).is_some_and(|task_id| completed_tasks.contains(task_id))
+}
+
+fn progress_sender_for_root(push_senders: PushSenders, root_id: ProjectRootId) -> ProgressSender {
     Arc::new(Box::new(move |frame: PushFrame| {
         // Emitters can run on executor workers, maintenance jobs, watcher drains,
         // semantic refresh workers, or bg-bash watchdog threads. Never block any
-        // of them on subc routing/backpressure; the loop coalesces lossy bursts.
-        let _ = push_tx.try_send((root_id.clone(), frame));
+        // of them on subc routing/backpressure: reliable frames take an
+        // unbounded non-blocking lane; lossy frames stay bounded and coalesced.
+        if frame_is_reliable(&frame) {
+            let _ = push_senders.reliable_tx.send((root_id.clone(), frame));
+        } else {
+            let _ = push_senders.lossy_tx.try_send((root_id.clone(), frame));
+        }
     }))
 }
 
@@ -267,19 +330,30 @@ fn coalesce_push_batch(batch: Vec<(ProjectRootId, PushFrame)>) -> Vec<(ProjectRo
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FanOutResult {
-    /// Channels matching the frame's project/session scope. Buffer decisions use
-    /// this rather than sent_frames so a full writer does not turn a live channel
-    /// into an artificial detach/replay event.
+    /// Channels matching the frame's project/session scope. Reliable Push frames
+    /// that match a channel but hit writer backpressure are held in retry_buffer
+    /// instead of being mistaken for detach replay.
     matched_channels: usize,
-    /// Frames accepted by the writer queue. Full writer queues drop Push frames
-    /// best-effort and never block executor/drain emitters.
+    /// Frames accepted by the writer queue immediately. Lossy frames that are not
+    /// accepted are dropped; reliable frames are retried on transient backpressure.
     sent_frames: usize,
 }
 
-fn try_send_push_body(writer_tx: &mpsc::Sender<Frame>, channel: RouteChannel, body: &[u8]) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushSendOutcome {
+    Sent,
+    Backpressure,
+    PermanentFailure,
+}
+
+fn try_send_push_body(
+    writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    body: &[u8],
+) -> PushSendOutcome {
     let Ok(route_channel) = u16::try_from(channel) else {
         log::warn!("subc attach: invalid route channel {channel} for Push fan-out");
-        return false;
+        return PushSendOutcome::PermanentFailure;
     };
     let push_frame = match Frame::build_with_version(
         PROTOCOL_VERSION,
@@ -292,25 +366,39 @@ fn try_send_push_body(writer_tx: &mpsc::Sender<Frame>, channel: RouteChannel, bo
         Ok(frame) => frame,
         Err(error) => {
             log::warn!("subc attach: failed to build Push frame: {error}");
-            return false;
+            return PushSendOutcome::PermanentFailure;
         }
     };
-    writer_tx.try_send(push_frame).is_ok()
+    match writer_tx.try_send(push_frame) {
+        Ok(()) => PushSendOutcome::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => PushSendOutcome::Backpressure,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            log::warn!("subc attach: writer closed while sending Push frame");
+            PushSendOutcome::PermanentFailure
+        }
+    }
 }
 
 fn try_send_push_frame(
     writer_tx: &mpsc::Sender<Frame>,
     channel: RouteChannel,
     frame: &PushFrame,
-) -> bool {
+) -> PushSendOutcome {
     let body = match serde_json::to_vec(frame) {
         Ok(body) => body,
         Err(error) => {
             log::warn!("subc attach: failed to serialize PushFrame: {error}");
-            return false;
+            return PushSendOutcome::PermanentFailure;
         }
     };
     try_send_push_body(writer_tx, channel, &body)
+}
+
+fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
+    if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
+        queue.pop_front();
+    }
+    queue.push_back(item);
 }
 
 fn buffer_push_frame(
@@ -318,11 +406,31 @@ fn buffer_push_frame(
     key: ReplayKey,
     frame: PushFrame,
 ) {
-    let queue = push_buffer.entry(key).or_default();
-    if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
-        queue.pop_front();
+    bounded_push_back(push_buffer.entry(key).or_default(), frame);
+}
+
+fn buffer_retry_frame(
+    retry_buffer: &mut RetryBuffer,
+    channel: RouteChannel,
+    key: ReplayKey,
+    frame: PushFrame,
+) {
+    bounded_push_back(retry_buffer.entry(channel).or_default(), (key, frame));
+}
+
+fn migrate_retry_buffer_to_push_buffer(
+    retry_buffer: &mut RetryBuffer,
+    channel: RouteChannel,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+) -> usize {
+    let Some(frames) = retry_buffer.remove(&channel) else {
+        return 0;
+    };
+    let migrated = frames.len();
+    for (key, frame) in frames {
+        buffer_push_frame(push_buffer, key, frame);
     }
-    queue.push_back(frame);
+    migrated
 }
 
 fn replay_buffered_push_frames(
@@ -331,29 +439,107 @@ fn replay_buffered_push_frames(
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     key: &ReplayKey,
 ) -> usize {
-    let Some(frames) = push_buffer.remove(key) else {
-        return 0;
-    };
-    let replayed = frames.len();
-    for frame in frames {
-        let _ = try_send_push_frame(writer_tx, channel, &frame);
+    let mut sent = 0;
+    let remove_empty;
+
+    {
+        let Some(queue) = push_buffer.get_mut(key) else {
+            return 0;
+        };
+
+        while let Some(frame) = queue.pop_front() {
+            match try_send_push_frame(writer_tx, channel, &frame) {
+                PushSendOutcome::Sent => sent += 1,
+                PushSendOutcome::Backpressure => {
+                    queue.push_front(frame);
+                    break;
+                }
+                PushSendOutcome::PermanentFailure => {
+                    log::warn!(
+                        "subc attach: dropping buffered reliable Push for root {} harness {} session {} after permanent send failure",
+                        key.root.as_path().display(),
+                        key.harness,
+                        key.session
+                    );
+                }
+            }
+        }
+
+        remove_empty = queue.is_empty();
     }
-    replayed
+
+    if remove_empty {
+        push_buffer.remove(key);
+    }
+
+    sent
 }
 
-fn fan_out_push_frame(
+fn drain_retry_buffer_for_channel(
     writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    retry_buffer: &mut RetryBuffer,
+) -> usize {
+    let mut sent = 0;
+    let remove_empty;
+
+    {
+        let Some(queue) = retry_buffer.get_mut(&channel) else {
+            return 0;
+        };
+
+        while let Some((key, frame)) = queue.pop_front() {
+            match try_send_push_frame(writer_tx, channel, &frame) {
+                PushSendOutcome::Sent => sent += 1,
+                PushSendOutcome::Backpressure => {
+                    queue.push_front((key, frame));
+                    break;
+                }
+                PushSendOutcome::PermanentFailure => {
+                    log::warn!(
+                        "subc attach: dropping retry-buffered reliable Push for route {channel} root {} harness {} session {} after permanent send failure",
+                        key.root.as_path().display(),
+                        key.harness,
+                        key.session
+                    );
+                }
+            }
+        }
+
+        remove_empty = queue.is_empty();
+    }
+
+    if remove_empty {
+        retry_buffer.remove(&channel);
+    }
+
+    sent
+}
+
+fn drain_retry_buffers_for_bound_routes(
+    writer_tx: &mpsc::Sender<Frame>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    retry_buffer: &mut RetryBuffer,
+) -> usize {
+    let channels: Vec<RouteChannel> = routes.keys().copied().collect();
+    channels
+        .into_iter()
+        .map(|channel| drain_retry_buffer_for_channel(writer_tx, channel, retry_buffer))
+        .sum()
+}
+
+fn matching_route_channels(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     root: &ProjectRootId,
     frame: &PushFrame,
-) -> FanOutResult {
+) -> Vec<RouteChannel> {
     let Some(channels) = root_channels.get(root) else {
-        return FanOutResult::default();
+        return Vec::new();
     };
 
     let session = frame_session(frame);
-    let matching_channels: Vec<RouteChannel> = channels
+    channels
         .iter()
         .copied()
         .filter(|channel| match session {
@@ -362,7 +548,42 @@ fn fan_out_push_frame(
                 .is_some_and(|identity| identity.session == session),
             None => true,
         })
-        .collect();
+        .collect()
+}
+
+fn buffer_detached_reliable_push_frame(
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &HashMap<(ProjectRootId, String), String>,
+    root: &ProjectRootId,
+    frame: &PushFrame,
+) {
+    let Some(session) = frame_session(frame) else {
+        log::warn!(
+            "subc attach: dropping reliable project-scoped Push for root {} because no route is bound",
+            root.as_path().display()
+        );
+        return;
+    };
+
+    if let Some(key) = replay_key_for_session(session_identity, root, session) {
+        buffer_push_frame(push_buffer, key, frame.clone());
+    } else {
+        log::warn!(
+            "subc attach: dropping reliable Push for root {} session {} because no retained harness identity is known",
+            root.as_path().display(),
+            session
+        );
+    }
+}
+
+fn fan_out_lossy_push_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root: &ProjectRootId,
+    frame: &PushFrame,
+) -> FanOutResult {
+    let matching_channels = matching_route_channels(routes, root_channels, root, frame);
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
         return FanOutResult::default();
@@ -381,13 +602,121 @@ fn fan_out_push_frame(
 
     let sent_frames = matching_channels
         .into_iter()
-        .filter(|&channel| try_send_push_body(writer_tx, channel, &body))
+        .filter(|&channel| {
+            matches!(
+                try_send_push_body(writer_tx, channel, &body),
+                PushSendOutcome::Sent
+            )
+        })
         .count();
 
     FanOutResult {
         matched_channels,
         sent_frames,
     }
+}
+
+fn fan_out_reliable_push_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &HashMap<(ProjectRootId, String), String>,
+    retry_buffer: &mut RetryBuffer,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    root: &ProjectRootId,
+    frame: &PushFrame,
+) -> FanOutResult {
+    let matching_channels = matching_route_channels(routes, root_channels, root, frame);
+    let matched_channels = matching_channels.len();
+    if matched_channels == 0 {
+        buffer_detached_reliable_push_frame(push_buffer, session_identity, root, frame);
+        return FanOutResult::default();
+    }
+
+    let mut sent_frames = 0;
+    for channel in matching_channels {
+        let Some(identity) = routes.get(&channel) else {
+            log::warn!(
+                "subc attach: dropping reliable Push for stale route channel {channel} with no route identity"
+            );
+            continue;
+        };
+        let key = ReplayKey::from_identity(identity);
+
+        if retry_buffer
+            .get(&channel)
+            .is_some_and(|queue| !queue.is_empty())
+        {
+            buffer_retry_frame(retry_buffer, channel, key, frame.clone());
+            continue;
+        }
+
+        match try_send_push_frame(writer_tx, channel, frame) {
+            PushSendOutcome::Sent => sent_frames += 1,
+            PushSendOutcome::Backpressure => {
+                buffer_retry_frame(retry_buffer, channel, key, frame.clone());
+            }
+            PushSendOutcome::PermanentFailure => {
+                log::warn!(
+                    "subc attach: dropping reliable Push for route {channel} root {} harness {} session {} after permanent send failure",
+                    key.root.as_path().display(),
+                    key.harness,
+                    key.session
+                );
+            }
+        }
+    }
+
+    FanOutResult {
+        matched_channels,
+        sent_frames,
+    }
+}
+
+fn process_reliable_push_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &HashMap<(ProjectRootId, String), String>,
+    retry_buffer: &mut RetryBuffer,
+    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    completed_tasks: &mut CompletedTaskIds,
+    root: ProjectRootId,
+    frame: PushFrame,
+) {
+    if let Some(task_id) = completed_task_id(&frame) {
+        completed_tasks.remember(task_id);
+    }
+    let _ = fan_out_reliable_push_frame(
+        writer_tx,
+        routes,
+        root_channels,
+        session_identity,
+        retry_buffer,
+        push_buffer,
+        &root,
+        &frame,
+    );
+}
+
+fn process_lossy_push_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    completed_tasks: &CompletedTaskIds,
+    root: ProjectRootId,
+    frame: PushFrame,
+) {
+    if should_drop_lossy_push(completed_tasks, &frame) {
+        if let Some(task_id) = long_running_task_id(&frame) {
+            log::debug!(
+                "subc attach: dropping stale BashLongRunning Push for completed task {task_id}"
+            );
+        }
+        return;
+    }
+
+    let _ = fan_out_lossy_push_frame(writer_tx, routes, root_channels, &root, &frame);
 }
 
 /// Sync command dispatch, passed in from `main` (the binary owns the command
@@ -540,11 +869,18 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
-    let (push_tx, mut push_rx) = mpsc::channel::<(ProjectRootId, PushFrame)>(1024);
+    let (lossy_tx, mut lossy_rx) = mpsc::channel::<PushEnvelope>(1024);
+    let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+    let push_senders = PushSenders {
+        lossy_tx,
+        reliable_tx,
+    };
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), String> = HashMap::new();
     let mut push_buffer: HashMap<ReplayKey, VecDeque<PushFrame>> = HashMap::new();
+    let mut retry_buffer: RetryBuffer = HashMap::new();
+    let mut completed_tasks = CompletedTaskIds::default();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
@@ -586,7 +922,18 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
+                        let migrated = migrate_retry_buffer_to_push_buffer(
+                            &mut retry_buffer,
+                            channel,
+                            &mut push_buffer,
+                        );
                         if let Some(identity) = remove_route_channel(&mut routes, &mut root_channels, channel) {
+                            if migrated > 0 {
+                                log::debug!(
+                                    "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from route {} into detach replay",
+                                    frame.header.channel
+                                );
+                            }
                             if let Some(meta) = live_roots.get_mut(&identity.root) {
                                 let idle_for = meta.last_touched.elapsed();
                                 meta.touch();
@@ -608,6 +955,12 @@ where
                                 );
                             }
                         } else {
+                            if migrated > 0 {
+                                log::debug!(
+                                    "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from unbound route {} into detach replay",
+                                    frame.header.channel
+                                );
+                            }
                             log::debug!("subc attach: unbound route {} torn down", frame.header.channel);
                         }
                     }
@@ -622,7 +975,7 @@ where
                             &mut session_identity,
                             &mut push_buffer,
                             &mut live_roots,
-                            &push_tx,
+                            &push_senders,
                             &shutdown,
                             dispatch,
                         )
@@ -650,34 +1003,64 @@ where
                     _ => {}
                 }
             }
-            Some((root_id, frame)) = push_rx.recv() => {
+            Some((root_id, frame)) = reliable_rx.recv() => {
+                // Drain reliable frames in FIFO order. They are intentionally not
+                // coalesced: completion, pattern-match, and warning frames are
+                // must-deliver events.
+                let mut batch = vec![(root_id, frame)];
+                while let Ok(item) = reliable_rx.try_recv() {
+                    batch.push(item);
+                }
+
+                for (root, frame) in batch {
+                    process_reliable_push_frame(
+                        &writer_tx,
+                        &routes,
+                        &root_channels,
+                        &session_identity,
+                        &mut retry_buffer,
+                        &mut push_buffer,
+                        &mut completed_tasks,
+                        root,
+                        frame,
+                    );
+                }
+            }
+            Some((root_id, frame)) = lossy_rx.recv() => {
+                // If both lanes are ready, process any already-queued reliable
+                // completions first so a following stale BashLongRunning frame can
+                // be suppressed even if select! happened to wake on the lossy lane.
+                while let Ok((reliable_root, reliable_frame)) = reliable_rx.try_recv() {
+                    process_reliable_push_frame(
+                        &writer_tx,
+                        &routes,
+                        &root_channels,
+                        &session_identity,
+                        &mut retry_buffer,
+                        &mut push_buffer,
+                        &mut completed_tasks,
+                        reliable_root,
+                        reliable_frame,
+                    );
+                }
+
                 // Drain the currently queued burst in one loop turn so lossy
                 // status/progress classes coalesce before reaching subc's shared
                 // egress queue.
                 let mut batch = vec![(root_id, frame)];
-                while let Ok(item) = push_rx.try_recv() {
+                while let Ok(item) = lossy_rx.try_recv() {
                     batch.push(item);
                 }
 
                 for (root, frame) in coalesce_push_batch(batch) {
-                    let fan_out =
-                        fan_out_push_frame(&writer_tx, &routes, &root_channels, &root, &frame);
-                    if fan_out.matched_channels == 0 && frame_is_reliable(&frame) {
-                        if let Some(session) = frame_session(&frame) {
-                            if let Some(key) =
-                                replay_key_for_session(&session_identity, &root, session)
-                            {
-                                buffer_push_frame(&mut push_buffer, key, frame);
-                            } else {
-                                log::warn!(
-                                    "subc attach: dropping reliable Push for root {} session {} \
-                                     because no retained harness identity is known",
-                                    root.as_path().display(),
-                                    session
-                                );
-                            }
-                        }
-                    }
+                    process_lossy_push_frame(
+                        &writer_tx,
+                        &routes,
+                        &root_channels,
+                        &completed_tasks,
+                        root,
+                        frame,
+                    );
                 }
             }
             Some((root_id, response)) = maintenance_rx.recv() => {
@@ -689,6 +1072,17 @@ where
                 }
             }
             _ = drain_interval.tick() => {
+                let retried = drain_retry_buffers_for_bound_routes(
+                    &writer_tx,
+                    &routes,
+                    &mut retry_buffer,
+                );
+                if retried > 0 {
+                    log::debug!(
+                        "subc attach: retried {retried} reliable Push frame(s) after writer backpressure"
+                    );
+                }
+
                 let due_roots: Vec<ProjectRootId> = live_roots
                     .iter_mut()
                     .filter_map(|(root_id, meta)| {
@@ -776,7 +1170,11 @@ async fn finish_writer_task(
 }
 
 async fn send_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), SubcError> {
-    tx.send(frame).await.map_err(|_| SubcError::WriterClosed)
+    match tokio::time::timeout(CONTROL_SEND_TIMEOUT, tx.send(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(SubcError::WriterClosed),
+        Err(_) => Err(SubcError::WriterBackpressureTimeout),
+    }
 }
 
 /// channel-0 control request — currently only RouteBind. Reconciles the route's
@@ -792,7 +1190,7 @@ async fn handle_control_request(
     session_identity: &mut HashMap<(ProjectRootId, String), String>,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    push_tx: &mpsc::Sender<(ProjectRootId, PushFrame)>,
+    push_senders: &PushSenders,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
@@ -862,7 +1260,7 @@ async fn handle_control_request(
                 ));
                 install_bash_compressor(&actor_ctx);
                 actor_ctx.set_progress_sender(Some(progress_sender_for_root(
-                    push_tx.clone(),
+                    push_senders.clone(),
                     bind_root_id.clone(),
                 )));
                 let inserted =
@@ -1255,11 +1653,17 @@ async fn signal_fatal_teardown(
 ) {
     if let Some(route_channel) = route_channel {
         if let Ok(frame) = build_goodbye_frame(ver, route_channel, corr) {
-            let _ = tx.send(frame).await;
+            if let Err(error) = send_frame(tx, frame).await {
+                log::warn!(
+                    "subc attach: failed to queue fatal route Goodbye for route {route_channel}: {error}"
+                );
+            }
         }
     }
     if let Ok(frame) = build_goodbye_frame(ver, 0, 0) {
-        let _ = tx.send(frame).await;
+        if let Err(error) = send_frame(tx, frame).await {
+            log::warn!("subc attach: failed to queue fatal channel-0 Goodbye: {error}");
+        }
     }
     shutdown.notify_one();
 }
@@ -1535,6 +1939,13 @@ mod tests {
         }
     }
 
+    fn push_frame_task_id(frame: &Frame) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).expect("push body");
+        body.get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
     #[test]
     fn frame_classification_matches_push_delivery_contract() {
         let completion = completion_frame_with_session("done", "session-a");
@@ -1574,16 +1985,26 @@ mod tests {
     fn fan_out_push_frame_routes_session_scoped_and_project_scoped_frames() {
         let (_root_dir, root) = test_root("subc-session-routing-root");
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
+        let identity1 = route_identity(&root, "session-1");
+        let identity2 = route_identity(&root, "session-2");
         let mut routes = HashMap::new();
-        routes.insert(route_key(1), route_identity(&root, "session-1"));
-        routes.insert(route_key(2), route_identity(&root, "session-2"));
+        routes.insert(route_key(1), identity1.clone());
+        routes.insert(route_key(2), identity2.clone());
         let mut root_channels = HashMap::new();
         root_channels.insert(root.clone(), HashSet::from([route_key(1), route_key(2)]));
+        let mut session_identity = HashMap::new();
+        remember_session_identity(&mut session_identity, &identity1);
+        remember_session_identity(&mut session_identity, &identity2);
+        let mut retry_buffer = HashMap::new();
+        let mut push_buffer = HashMap::new();
 
-        let session_result = fan_out_push_frame(
+        let session_result = fan_out_reliable_push_frame(
             &writer_tx,
             &routes,
             &root_channels,
+            &session_identity,
+            &mut retry_buffer,
+            &mut push_buffer,
             &root,
             &completion_frame_with_session("session-only", "session-1"),
         );
@@ -1594,6 +2015,8 @@ mod tests {
                 sent_frames: 1,
             }
         );
+        assert!(retry_buffer.is_empty());
+        assert!(push_buffer.is_empty());
         let session_push = writer_rx.try_recv().expect("session push queued");
         assert_eq!(session_push.header.ty, FrameType::Push);
         assert_eq!(session_push.header.channel, 1);
@@ -1603,7 +2026,7 @@ mod tests {
         );
 
         let project_result =
-            fan_out_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(9));
+            fan_out_lossy_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(9));
         assert_eq!(
             project_result,
             FanOutResult {
@@ -1784,30 +2207,49 @@ mod tests {
     }
 
     #[test]
-    fn progress_sender_drops_when_push_funnel_is_full_without_blocking() {
+    fn progress_sender_keeps_reliable_off_saturated_lossy_funnel_without_blocking() {
         let (_root_dir, root) = test_root("subc-push-full-root");
-        let (push_tx, mut push_rx) = mpsc::channel::<(ProjectRootId, PushFrame)>(1);
-        let sender = progress_sender_for_root(push_tx, root.clone());
+        let (lossy_tx, mut lossy_rx) = mpsc::channel::<PushEnvelope>(1);
+        let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+        let sender = progress_sender_for_root(
+            PushSenders {
+                lossy_tx,
+                reliable_tx,
+            },
+            root.clone(),
+        );
 
         let started = Instant::now();
         sender(status_frame(1));
         sender(status_frame(2));
+        sender(completion_frame("reliable-after-lossy-full"));
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "saturated push sender must return immediately"
         );
 
-        let (received_root, received_frame) = push_rx.try_recv().expect("first frame queued");
+        let (received_root, received_frame) =
+            lossy_rx.try_recv().expect("first lossy frame queued");
         assert_eq!(received_root, root);
         assert_eq!(status_seq(&received_frame), Some(1));
         assert!(
-            push_rx.try_recv().is_err(),
-            "second frame should be dropped"
+            lossy_rx.try_recv().is_err(),
+            "second lossy frame should be dropped"
         );
+
+        let (reliable_root, reliable_frame) = reliable_rx
+            .try_recv()
+            .expect("reliable frame bypasses lossy backpressure");
+        assert_eq!(reliable_root, root);
+        assert_eq!(
+            completion_task(&reliable_frame),
+            Some("reliable-after-lossy-full")
+        );
+        assert!(reliable_rx.try_recv().is_err());
     }
 
     #[test]
-    fn fan_out_push_frame_drops_when_writer_is_full_without_blocking() {
+    fn fan_out_lossy_push_frame_drops_when_writer_is_full_without_blocking() {
         let (_root_dir, root) = test_root("subc-writer-full-root");
         let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
         writer_tx
@@ -1820,7 +2262,7 @@ mod tests {
         let routes = HashMap::new();
         let started = Instant::now();
         let result =
-            fan_out_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(1));
+            fan_out_lossy_push_frame(&writer_tx, &routes, &root_channels, &root, &status_frame(1));
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "saturated writer fan-out must return immediately"
@@ -1840,6 +2282,278 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "push should be dropped on full writer"
+        );
+    }
+
+    #[test]
+    fn reliable_push_backpressure_buffers_and_retries_on_tick() {
+        let (_root_dir, root) = test_root("subc-retry-buffer-root");
+        let identity = route_identity(&root, "session-1");
+        let key = ReplayKey::from_identity(&identity);
+        let mut routes = HashMap::new();
+        routes.insert(route_key(9), identity.clone());
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), HashSet::from([route_key(9)]));
+        let mut session_identity = HashMap::new();
+        remember_session_identity(&mut session_identity, &identity);
+        let mut retry_buffer = HashMap::new();
+        let mut push_buffer = HashMap::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        writer_tx
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .expect("prefill writer queue");
+
+        let result = fan_out_reliable_push_frame(
+            &writer_tx,
+            &routes,
+            &root_channels,
+            &session_identity,
+            &mut retry_buffer,
+            &mut push_buffer,
+            &root,
+            &completion_frame("retry-task"),
+        );
+
+        assert_eq!(
+            result,
+            FanOutResult {
+                matched_channels: 1,
+                sent_frames: 0,
+            }
+        );
+        assert!(push_buffer.is_empty());
+        assert_eq!(retry_buffer.get(&route_key(9)).map(VecDeque::len), Some(1));
+        assert_eq!(&retry_buffer[&route_key(9)][0].0, &key);
+
+        let queued = writer_rx.try_recv().expect("prefilled frame");
+        assert_eq!(queued.header.ty, FrameType::Ping);
+        assert_eq!(
+            drain_retry_buffer_for_channel(&writer_tx, route_key(9), &mut retry_buffer),
+            1
+        );
+        let retried = writer_rx.try_recv().expect("retried reliable push");
+        assert_eq!(retried.header.ty, FrameType::Push);
+        assert_eq!(retried.header.channel, 9);
+        assert_eq!(push_frame_task_id(&retried).as_deref(), Some("retry-task"));
+        assert!(!retry_buffer.contains_key(&route_key(9)));
+    }
+
+    #[test]
+    fn reliable_push_fifo_gates_new_frames_behind_retry_buffer() {
+        let (_root_dir, root) = test_root("subc-retry-fifo-root");
+        let identity = route_identity(&root, "session-1");
+        let mut routes = HashMap::new();
+        routes.insert(route_key(9), identity.clone());
+        let mut root_channels = HashMap::new();
+        root_channels.insert(root.clone(), HashSet::from([route_key(9)]));
+        let mut session_identity = HashMap::new();
+        remember_session_identity(&mut session_identity, &identity);
+        let mut retry_buffer = HashMap::new();
+        let mut push_buffer = HashMap::new();
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(1);
+        writer_tx
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .expect("prefill writer queue");
+
+        let first = completion_frame("fifo-1");
+        let second = completion_frame("fifo-2");
+        let _ = fan_out_reliable_push_frame(
+            &writer_tx,
+            &routes,
+            &root_channels,
+            &session_identity,
+            &mut retry_buffer,
+            &mut push_buffer,
+            &root,
+            &first,
+        );
+        let queued = writer_rx.try_recv().expect("free writer capacity");
+        assert_eq!(queued.header.ty, FrameType::Ping);
+
+        let _ = fan_out_reliable_push_frame(
+            &writer_tx,
+            &routes,
+            &root_channels,
+            &session_identity,
+            &mut retry_buffer,
+            &mut push_buffer,
+            &root,
+            &second,
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "second reliable frame must not bypass pending retry frame"
+        );
+        let queued_tasks: Vec<_> = retry_buffer[&route_key(9)]
+            .iter()
+            .filter_map(|(_, frame)| completion_task(frame))
+            .collect();
+        assert_eq!(queued_tasks, vec!["fifo-1", "fifo-2"]);
+
+        assert_eq!(
+            drain_retry_buffer_for_channel(&writer_tx, route_key(9), &mut retry_buffer),
+            1
+        );
+        let first_sent = writer_rx.try_recv().expect("first reliable push");
+        assert_eq!(push_frame_task_id(&first_sent).as_deref(), Some("fifo-1"));
+        assert_eq!(
+            drain_retry_buffer_for_channel(&writer_tx, route_key(9), &mut retry_buffer),
+            1
+        );
+        let second_sent = writer_rx.try_recv().expect("second reliable push");
+        assert_eq!(push_frame_task_id(&second_sent).as_deref(), Some("fifo-2"));
+        assert!(!retry_buffer.contains_key(&route_key(9)));
+    }
+
+    #[test]
+    fn replay_buffered_push_frames_drains_incrementally_on_backpressure() {
+        let (_root_dir, root) = test_root("subc-incremental-replay-root");
+        let key = ReplayKey {
+            root,
+            harness: "opencode".to_string(),
+            session: "session-1".to_string(),
+        };
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(2);
+        writer_tx
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .expect("prefill writer queue");
+        let mut push_buffer = HashMap::new();
+        for task in ["replay-1", "replay-2", "replay-3"] {
+            buffer_push_frame(&mut push_buffer, key.clone(), completion_frame(task));
+        }
+
+        assert_eq!(
+            replay_buffered_push_frames(&writer_tx, route_key(4), &mut push_buffer, &key),
+            1
+        );
+        assert_eq!(push_buffer.get(&key).map(VecDeque::len), Some(2));
+        let remaining: Vec<_> = push_buffer[&key]
+            .iter()
+            .filter_map(completion_task)
+            .collect();
+        assert_eq!(remaining, vec!["replay-2", "replay-3"]);
+
+        let queued = writer_rx.try_recv().expect("prefilled frame");
+        assert_eq!(queued.header.ty, FrameType::Ping);
+        let first = writer_rx.try_recv().expect("first replayed push");
+        assert_eq!(push_frame_task_id(&first).as_deref(), Some("replay-1"));
+
+        assert_eq!(
+            replay_buffered_push_frames(&writer_tx, route_key(4), &mut push_buffer, &key),
+            2
+        );
+        let second = writer_rx.try_recv().expect("second replayed push");
+        let third = writer_rx.try_recv().expect("third replayed push");
+        assert_eq!(push_frame_task_id(&second).as_deref(), Some("replay-2"));
+        assert_eq!(push_frame_task_id(&third).as_deref(), Some("replay-3"));
+        assert!(!push_buffer.contains_key(&key));
+    }
+
+    #[test]
+    fn goodbye_migrates_retry_buffer_into_detach_replay() {
+        let (_root_dir, root) = test_root("subc-goodbye-migration-root");
+        let key = ReplayKey {
+            root,
+            harness: "opencode".to_string(),
+            session: "session-1".to_string(),
+        };
+        let mut retry_buffer = HashMap::new();
+        buffer_retry_frame(
+            &mut retry_buffer,
+            route_key(5),
+            key.clone(),
+            completion_frame("migrated-task"),
+        );
+        let mut push_buffer = HashMap::new();
+
+        assert_eq!(
+            migrate_retry_buffer_to_push_buffer(&mut retry_buffer, route_key(5), &mut push_buffer),
+            1
+        );
+
+        assert!(!retry_buffer.contains_key(&route_key(5)));
+        assert_eq!(push_buffer.get(&key).map(VecDeque::len), Some(1));
+        assert_eq!(
+            completion_task(&push_buffer[&key][0]),
+            Some("migrated-task")
+        );
+    }
+
+    #[test]
+    fn permanent_push_send_failure_is_dropped_not_retried_forever() {
+        let (_root_dir, root) = test_root("subc-permanent-failure-root");
+        let key = ReplayKey {
+            root,
+            harness: "opencode".to_string(),
+            session: "session-1".to_string(),
+        };
+        let (writer_tx, writer_rx) = mpsc::channel::<Frame>(1);
+        drop(writer_rx);
+
+        let mut push_buffer = HashMap::new();
+        buffer_push_frame(
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("closed-replay"),
+        );
+        assert_eq!(
+            replay_buffered_push_frames(&writer_tx, route_key(4), &mut push_buffer, &key),
+            0
+        );
+        assert!(!push_buffer.contains_key(&key));
+
+        let mut retry_buffer = HashMap::new();
+        buffer_retry_frame(
+            &mut retry_buffer,
+            route_key(4),
+            key,
+            completion_frame("closed-retry"),
+        );
+        assert_eq!(
+            drain_retry_buffer_for_channel(&writer_tx, route_key(4), &mut retry_buffer),
+            0
+        );
+        assert!(!retry_buffer.contains_key(&route_key(4)));
+    }
+
+    #[test]
+    fn completed_task_suppresses_stale_long_running_lossy_push() {
+        let mut completed_tasks = CompletedTaskIds::default();
+        assert!(!should_drop_lossy_push(
+            &completed_tasks,
+            &long_running_frame("stale-task", 100)
+        ));
+
+        completed_tasks.remember("stale-task");
+
+        assert!(should_drop_lossy_push(
+            &completed_tasks,
+            &long_running_frame("stale-task", 200)
+        ));
+        assert!(!should_drop_lossy_push(
+            &completed_tasks,
+            &long_running_frame("other-task", 200)
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_send_times_out_when_writer_queue_remains_full() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<Frame>(1);
+        writer_tx
+            .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 1, Vec::new()).unwrap())
+            .expect("prefill writer queue");
+        let started = Instant::now();
+
+        let result = send_frame(
+            &writer_tx,
+            Frame::build(FrameType::Pong, control_flags(), 0, 2, Vec::new()).unwrap(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SubcError::WriterBackpressureTimeout)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "control send guard should be bounded"
         );
     }
 }
@@ -1869,6 +2583,7 @@ pub enum SubcError {
     FrameIo(subc_transport::FrameIoError),
     FrameBuild(subc_protocol::FrameBuildError),
     WriterClosed,
+    WriterBackpressureTimeout,
     WriterJoin(tokio::task::JoinError),
     Json(serde_json::Error),
     ClosedBeforeHelloAck,
@@ -1908,6 +2623,10 @@ impl fmt::Display for SubcError {
             Self::FrameIo(e) => write!(f, "subc frame I/O error: {e}"),
             Self::FrameBuild(e) => write!(f, "subc frame build error: {e}"),
             Self::WriterClosed => write!(f, "subc writer task closed"),
+            Self::WriterBackpressureTimeout => write!(
+                f,
+                "subc writer task stayed backpressured while sending a control frame"
+            ),
             Self::WriterJoin(e) => write!(f, "subc writer task join error: {e}"),
             Self::Json(e) => write!(f, "subc JSON error: {e}"),
             Self::ClosedBeforeHelloAck => {

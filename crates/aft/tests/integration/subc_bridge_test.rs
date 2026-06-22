@@ -474,6 +474,35 @@ fn emit_configure_status_burst_if_requested(req: &RawRequest, ctx: &AppContext) 
     }
 }
 
+fn configure_bash_completed_task(req: &RawRequest) -> Option<String> {
+    let tiers = req.params.get("config")?.as_array()?;
+    for tier in tiers {
+        let Some(doc) = tier.get("doc").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(doc) else {
+            continue;
+        };
+        let Some(spec) = doc.get("subc_test_configure_bash_completed") else {
+            continue;
+        };
+        return Some(
+            spec.get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("subc-configure-completed")
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn emit_configure_bash_completed_if_requested(req: &RawRequest, ctx: &AppContext) {
+    if let Some(task_id) = configure_bash_completed_task(req) {
+        let session_id = req.session().to_string();
+        emit_push_frame(ctx, bash_completed_push(&task_id, &session_id));
+    }
+}
+
 fn configure_warning_message(req: &RawRequest) -> Option<String> {
     let tiers = req.params.get("config")?.as_array()?;
     for tier in tiers {
@@ -633,6 +662,7 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             let response = configure_bridge_context(&req, ctx);
             enqueue_configure_warning_if_requested(&req, ctx);
             emit_configure_status_burst_if_requested(&req, ctx);
+            emit_configure_bash_completed_if_requested(&req, ctx);
             response
         }
         "read" => match req.params.get("case").and_then(Value::as_str) {
@@ -704,6 +734,31 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             Response::success(
                 req.id,
                 json!({ "emitted": emitted, "task_id": task_id, "session_id": session_id }),
+            )
+        }
+        "subc_test_emit_bash_completed_then_long_running" => {
+            let task_id = req
+                .params
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("subc-test-stale-long-running")
+                .to_string();
+            let session_id = req
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| req.session())
+                .to_string();
+            let completed = emit_push_frame(ctx, bash_completed_push(&task_id, &session_id));
+            let long_running = emit_push_frame(ctx, bash_long_running_push(&task_id, &session_id));
+            Response::success(
+                req.id,
+                json!({
+                    "completed_emitted": completed,
+                    "long_running_emitted": long_running,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                }),
             )
         }
         "subc_test_defer_bash_completed" => {
@@ -1061,6 +1116,44 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     assert_eq!(configure_burst_pushes.len(), 1);
     assert_eq!(push_seq(&configure_burst_pushes[0]), Some(15));
     assert_no_status_push_for_marker(&mut stream, "configure-burst", Duration::from_millis(150))
+        .await;
+
+    // P5b B1: reliable Push frames bypass the bounded lossy funnel. This
+    // configure emits enough lossy status frames to fill lossy_tx while the
+    // RouteBind arm is still awaiting configure, then emits a reliable
+    // BashCompleted. The completion must still arrive.
+    let pressure_task = "reliable-after-lossy-pressure";
+    send_route_bind_with_doc(
+        &mut stream,
+        6,
+        17,
+        &push_burst_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_configure_status_burst": {
+                "marker": "lossy-pressure",
+                "count": 2048,
+            },
+            "subc_test_configure_bash_completed": {
+                "task_id": pressure_task,
+            },
+        }),
+    )
+    .await;
+    let (pressure_statuses, pressure_completions) =
+        expect_route_bind_ack_status_and_bash_completed_pushes(
+            &mut stream,
+            17,
+            "lossy-pressure",
+            pressure_task,
+            HashSet::from([6]),
+        )
+        .await;
+    assert_eq!(pressure_statuses.len(), 1);
+    assert_eq!(pressure_completions.len(), 1);
+    assert_no_status_push_for_marker(&mut stream, "lossy-pressure", Duration::from_millis(150))
         .await;
 
     // L2 response finalizer: a normal route-channel read gets status_bar once
@@ -1468,6 +1561,32 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
     send_route_bind_with_session(&mut stream, 8, 48, &root1, "session-1").await;
     expect_route_bind_ack_without_task_push(&mut stream, 48, lossy_task).await;
     assert_no_bash_push_for_task(&mut stream, lossy_task, Duration::from_millis(150)).await;
+
+    // P5b B1 finding (b): a lossy BashLongRunning emitted after its reliable
+    // BashCompleted is stale and should be suppressed by the subc edge.
+    let stale_long_running_task = "completed-then-stale-long-running";
+    send_tool_call(
+        &mut stream,
+        8,
+        433,
+        "subc_test_emit_bash_completed_then_long_running",
+        json!({ "task_id": stale_long_running_task }),
+    )
+    .await;
+    let stale_completion = expect_bash_completed_pushes_for_tool(
+        &mut stream,
+        433,
+        stale_long_running_task,
+        HashSet::from([8]),
+    )
+    .await;
+    assert_eq!(stale_completion.len(), 1);
+    assert_no_bash_long_running_push_for_task(
+        &mut stream,
+        stale_long_running_task,
+        Duration::from_millis(300),
+    )
+    .await;
 
     // 5. B3: a new-root configure failure must not install a route and must be
     // removed from the executor before the connection exits. Any Push emitted by
@@ -1885,6 +2004,13 @@ async fn expect_bash_completed_pushes_for_tool(
                     );
                     channels.insert(frame.header.channel);
                     pushes.push(body);
+                } else if push_type(&body) == Some("bash_long_running")
+                    && push_task_id(&body) == Some(task_id)
+                {
+                    panic!(
+                        "unexpected long-running push for task {task_id} while waiting for completion on channel {}: {body:?}",
+                        frame.header.channel
+                    );
                 }
             }
             FrameType::Response if frame.header.corr == corr => {
@@ -1901,6 +2027,82 @@ async fn expect_bash_completed_pushes_for_tool(
 
     assert_eq!(channels, expected_channels);
     pushes
+}
+
+async fn expect_route_bind_ack_status_and_bash_completed_pushes(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    marker: &str,
+    task_id: &str,
+    expected_channels: HashSet<u16>,
+) -> (Vec<Value>, Vec<Value>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ack_seen = false;
+    let mut status_pushes = Vec::new();
+    let mut status_channels = HashSet::new();
+    let mut bash_pushes = Vec::new();
+    let mut bash_channels = HashSet::new();
+
+    while !ack_seen || status_channels != expected_channels || bash_channels != expected_channels {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for RouteBindAck {corr}, marker {marker}, and bash push {task_id}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for RouteBindAck {corr}, marker {marker}, and bash push {task_id}"
+                )
+            })
+            .expect("read frame")
+            .unwrap_or_else(|| {
+                panic!(
+                    "EOF waiting for RouteBindAck {corr}, marker {marker}, and bash push {task_id}"
+                )
+            });
+        match frame.header.ty {
+            FrameType::Response if frame.header.corr == corr => {
+                assert_eq!(frame.header.channel, 0);
+                let ack: ModuleControlResponse =
+                    serde_json::from_slice(&frame.body).expect("ack body");
+                assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+                ack_seen = true;
+            }
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_marker(&body) == Some(marker) {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "status push {marker} leaked to unexpected channel {}",
+                        frame.header.channel
+                    );
+                    status_channels.insert(frame.header.channel);
+                    status_pushes.push(body);
+                } else if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body) == Some(task_id)
+                {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "bash push {task_id} leaked to unexpected channel {}",
+                        frame.header.channel
+                    );
+                    bash_channels.insert(frame.header.channel);
+                    bash_pushes.push(body);
+                }
+            }
+            other => panic!(
+                "unexpected frame while waiting for RouteBindAck {corr}, marker {marker}, and bash push {task_id}: {other:?}"
+            ),
+        }
+    }
+
+    assert_eq!(status_channels, expected_channels);
+    assert_eq!(bash_channels, expected_channels);
+    (status_pushes, bash_pushes)
 }
 
 async fn assert_no_bash_push_for_task(
@@ -1931,6 +2133,40 @@ async fn assert_no_bash_push_for_task(
             Ok(Ok(None)) => panic!("EOF while checking absence of bash push {task_id}"),
             Ok(Err(error)) => {
                 panic!("error while checking absence of bash push {task_id}: {error}")
+            }
+        }
+    }
+}
+
+async fn assert_no_bash_long_running_push_for_task(
+    stream: &mut tokio::net::TcpStream,
+    task_id: &str,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Err(_) => return,
+            Ok(Ok(Some(frame))) => {
+                if frame.header.ty == FrameType::Push {
+                    let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                    let stale_long_running = push_type(&body) == Some("bash_long_running")
+                        && push_task_id(&body) == Some(task_id);
+                    assert!(
+                        !stale_long_running,
+                        "unexpected stale long-running push for task {task_id} on channel {}: {body:?}",
+                        frame.header.channel
+                    );
+                }
+            }
+            Ok(Ok(None)) => panic!("EOF while checking absence of stale long-running push"),
+            Ok(Err(error)) => {
+                panic!("error while checking absence of stale long-running push: {error}")
             }
         }
     }
