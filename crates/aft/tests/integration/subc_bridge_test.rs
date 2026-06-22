@@ -1416,6 +1416,12 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         .to_string();
     wait_for_bash_completion(&mut stream, 1, 82, "session-1", &task_id).await;
 
+    // Terminal status precedes in-band completion enqueue, so settle until the
+    // mirror is actually attached before asserting. Drain is non-destructive
+    // (the mirror persists until an explicit ack), so the subsequent reads still
+    // observe it — that persistence is what corr 120/121 verify.
+    settle_until_bg_completion(&mut stream, 1, 8400, &task_id).await;
+
     send_tool_call(&mut stream, 1, 120, "read", json!({ "case": "fast" })).await;
     let first_after_completion = read_frame_timeout(&mut stream, "first completion read").await;
     assert_eq!(first_after_completion.header.corr, 120);
@@ -1643,6 +1649,11 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         .expect("session-4 bash task_id")
         .to_string();
     wait_for_bash_completion(&mut stream, 4, 424, "session-4", &task_id_s4).await;
+
+    // Terminal status precedes in-band completion enqueue (see
+    // settle_until_bg_completion), so settle until the mirror attaches before
+    // asserting it on a specific response corr.
+    settle_until_bg_completion(&mut stream, 4, 4250, &task_id_s4).await;
 
     send_tool_call(&mut stream, 4, 425, "read", json!({ "case": "fast" })).await;
     let s4_after_completion = read_frame_timeout(&mut stream, "session-4 completion read").await;
@@ -2795,6 +2806,50 @@ fn tool_response_json(frame: &Frame) -> Value {
         .as_str()
         .expect("tool result text");
     serde_json::from_str(text).expect("embedded AFT response JSON")
+}
+
+/// Wait until a finished bg task's completion is actually attached in-band to a
+/// tool response, then return.
+///
+/// `wait_for_bash_completion` returns as soon as `bash_status` reports the task
+/// terminal, but a task's status flips terminal (under the task state lock)
+/// slightly BEFORE its completion is enqueued into the drainable queue: the
+/// enqueue runs after the lock releases and does heavy work (terminal render,
+/// token counting, DB write). So the in-band `bg_completions` mirror on the next
+/// tool response is EVENTUAL, not immediate — the reliable `BashCompleted` push
+/// is the immediate delivery path. A consumer that reads the very next response
+/// after observing terminal status can therefore see the mirror appear one
+/// response later (the window widens on slow/loaded runners). `bash_status` is
+/// excluded from finalizer attachment, so deliverability can only be observed
+/// via a non-status tool call. Poll fast reads until the mirror carries this
+/// task, so subsequent assertions observe the settled state; a genuinely
+/// never-delivered completion still fails via the bound.
+async fn settle_until_bg_completion(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    first_corr: u64,
+    task_id: &str,
+) {
+    for attempt in 0..120 {
+        let corr = first_corr + attempt;
+        send_tool_call(stream, channel, corr, "read", json!({ "case": "fast" })).await;
+        let frame = read_frame_timeout(stream, "bg-completion settle read").await;
+        assert_eq!(frame.header.corr, corr);
+        let response = tool_response_json(&frame);
+        let attached = response
+            .get("bg_completions")
+            .and_then(Value::as_array)
+            .is_some_and(|completions| {
+                completions.iter().any(|completion| {
+                    completion.get("task_id").and_then(Value::as_str) == Some(task_id)
+                })
+            });
+        if attached {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("bg completion for {task_id} never became in-band deliverable");
 }
 
 async fn wait_for_bash_completion(
