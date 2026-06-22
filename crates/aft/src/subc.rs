@@ -1665,6 +1665,8 @@ async fn handle_tool_call(
     }
 
     let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
+    let bare_name = call.name.clone();
+    let agent_specified_range = agent_specified_read_range(&call.arguments);
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let project_root = identity.project_root.as_path();
@@ -1680,6 +1682,8 @@ async fn handle_tool_call(
                     frame.header.channel,
                     frame.header.corr,
                     frame.header.flags,
+                    &bare_name,
+                    agent_specified_range,
                     &response,
                 )?;
                 return send_frame(tx, response_frame).await;
@@ -1713,12 +1717,16 @@ async fn handle_tool_call(
                 frame.header.channel,
                 frame.header.corr,
                 frame.header.flags,
+                &bare_name,
+                agent_specified_range,
                 &response,
             )?;
             return send_frame(tx, response_frame).await;
         }
     };
 
+    let bare_name_for_frame = bare_name.clone();
+    let agent_range_for_frame = agent_specified_range;
     let rx = executor.submit_async(
         identity.root,
         lane,
@@ -1751,7 +1759,15 @@ async fn handle_tool_call(
     tokio::spawn(async move {
         let response = await_executor_response(rx, request_id.clone()).await;
         let fatal = is_mutating && response_is_internal_error(&response);
-        match build_tool_response_frame(ver, route_channel, corr, flags, &response) {
+        match build_tool_response_frame(
+            ver,
+            route_channel,
+            corr,
+            flags,
+            &bare_name_for_frame,
+            agent_range_for_frame,
+            &response,
+        ) {
             Ok(response_frame) => {
                 let _ = completion_tx.send(response_frame).await;
             }
@@ -1812,21 +1828,29 @@ async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: St
         .unwrap_or_else(|_| Response::error(request_id, "internal_error", "executor dropped"))
 }
 
+fn agent_specified_read_range(arguments: &Value) -> bool {
+    let Some(obj) = arguments.as_object() else {
+        return false;
+    };
+    obj.contains_key("startLine")
+        || obj.contains_key("endLine")
+        || obj.contains_key("offset")
+        || obj.contains_key("limit")
+}
+
 fn build_tool_response_frame(
     ver: u8,
     route_channel: u16,
     corr: u64,
     flags: Flags,
+    bare_name: &str,
+    agent_specified_range: bool,
     response: &Response,
 ) -> Result<Frame, SubcError> {
-    let response_value = serde_json::to_value(response).map_err(SubcError::Json)?;
-    let is_error = response_value
-        .get("success")
-        .and_then(Value::as_bool)
-        .map(|ok| !ok)
-        .unwrap_or(true);
+    let text = crate::subc_format::format_response(bare_name, response, agent_specified_range);
+    let is_error = !response.success;
     let result = json!({
-        "content": [{ "type": "text", "text": response_value.to_string() }],
+        "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     });
     let body = serde_json::to_vec(&result).map_err(SubcError::Json)?;
