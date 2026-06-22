@@ -80,6 +80,25 @@ struct RootMeta {
     last_touched: Instant,
 }
 
+#[derive(Debug)]
+struct PendingBind {
+    bind_root_id: ProjectRootId,
+    inserted_new_actor: bool,
+    cancelled: bool,
+}
+
+struct RouteBindCompletion {
+    route_channel: u16,
+    identity: RouteIdentity,
+    bind_root_id: ProjectRootId,
+    inserted_new_actor: bool,
+    configure_response: Response,
+    drain_response: Option<Response>,
+    ver: u8,
+    corr: u64,
+    flags: Flags,
+}
+
 #[derive(Debug, Clone)]
 struct RouteIdentity {
     root: ProjectRootId,
@@ -869,6 +888,8 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
+    let (control_completion_tx, mut control_completion_rx) =
+        mpsc::channel::<RouteBindCompletion>(256);
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<PushEnvelope>(1024);
     let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
     let push_senders = PushSenders {
@@ -882,6 +903,7 @@ where
     let mut retry_buffer: RetryBuffer = HashMap::new();
     let mut completed_tasks = CompletedTaskIds::default();
     let mut live_roots: HashMap<ProjectRootId, RootMeta> = HashMap::new();
+    let mut pending_binds: HashMap<RouteChannel, PendingBind> = HashMap::new();
 
     let loop_result: Result<(), SubcError> = loop {
         tokio::select! {
@@ -922,6 +944,13 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
+                        if let Some(pending) = pending_binds.get_mut(&channel) {
+                            pending.cancelled = true;
+                            log::debug!(
+                                "subc attach: cancelled pending RouteBind for route {} on Goodbye",
+                                frame.header.channel
+                            );
+                        }
                         let migrated = migrate_retry_buffer_to_push_buffer(
                             &mut retry_buffer,
                             channel,
@@ -970,13 +999,10 @@ where
                             &frame,
                             &shared_app,
                             &executor,
-                            &mut routes,
-                            &mut root_channels,
-                            &mut session_identity,
-                            &mut push_buffer,
                             &mut live_roots,
+                            &mut pending_binds,
+                            &control_completion_tx,
                             &push_senders,
-                            &shutdown,
                             dispatch,
                         )
                         .await
@@ -989,6 +1015,7 @@ where
                             &writer_tx,
                             &frame,
                             &routes,
+                            &pending_binds,
                             &mut live_roots,
                             &executor,
                             &shutdown,
@@ -1061,6 +1088,24 @@ where
                         root,
                         frame,
                     );
+                }
+            }
+            Some(completion) = control_completion_rx.recv() => {
+                if let Err(error) = handle_route_bind_completion(
+                    &writer_tx,
+                    completion,
+                    &mut routes,
+                    &mut root_channels,
+                    &mut session_identity,
+                    &mut push_buffer,
+                    &mut live_roots,
+                    &mut pending_binds,
+                    &executor,
+                    &shutdown,
+                )
+                .await
+                {
+                    break Err(error);
                 }
             }
             Some((root_id, response)) = maintenance_rx.recv() => {
@@ -1177,21 +1222,170 @@ async fn send_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), SubcEr
     }
 }
 
-/// channel-0 control request — currently only RouteBind. Reconciles the route's
-/// RootConfig through the executor's Mutating lane and replies RouteBindAck
-/// (Response lane) or an ErrorBody (Error lane) on divergence/failure.
-async fn handle_control_request(
-    tx: &mpsc::Sender<Frame>,
-    frame: &Frame,
-    shared_app: &Arc<App>,
+fn rollback_pending_bind_actor(
     executor: &Arc<Executor>,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+    root_id: &ProjectRootId,
+    inserted_new_actor: bool,
+) {
+    if inserted_new_actor && !live_roots.contains_key(root_id) {
+        executor.remove_actor(root_id);
+    }
+}
+
+async fn handle_route_bind_completion(
+    tx: &mpsc::Sender<Frame>,
+    completion: RouteBindCompletion,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), String>,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    push_senders: &PushSenders,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
+) -> Result<(), SubcError> {
+    let route_id = route_key(completion.route_channel);
+    let Some(pending) = pending_binds.remove(&route_id) else {
+        log::warn!(
+            "subc attach: dropping RouteBind completion for non-pending route {}",
+            completion.route_channel
+        );
+        rollback_pending_bind_actor(
+            executor,
+            live_roots,
+            &completion.bind_root_id,
+            completion.inserted_new_actor,
+        );
+        return Ok(());
+    };
+
+    if pending.bind_root_id != completion.bind_root_id {
+        log::warn!(
+            "subc attach: pending RouteBind root mismatch for route {} (pending {} completion {})",
+            completion.route_channel,
+            pending.bind_root_id.as_path().display(),
+            completion.bind_root_id.as_path().display()
+        );
+    }
+
+    let inserted_new_actor = pending.inserted_new_actor || completion.inserted_new_actor;
+    if pending.cancelled {
+        rollback_pending_bind_actor(
+            executor,
+            live_roots,
+            &completion.bind_root_id,
+            inserted_new_actor,
+        );
+        log::debug!(
+            "subc attach: discarded completed RouteBind for cancelled route {} root {}",
+            completion.route_channel,
+            completion.bind_root_id.as_path().display()
+        );
+        return Ok(());
+    }
+
+    let failure = if !completion.configure_response.success {
+        Some((
+            &completion.configure_response,
+            "configure failed during route bind",
+        ))
+    } else if let Some(drain_response) = completion.drain_response.as_ref() {
+        if drain_response.success {
+            None
+        } else {
+            Some((
+                drain_response,
+                "build-completion drain failed during route bind",
+            ))
+        }
+    } else {
+        None
+    };
+
+    if let Some((response, fallback)) = failure {
+        rollback_pending_bind_actor(
+            executor,
+            live_roots,
+            &completion.bind_root_id,
+            inserted_new_actor,
+        );
+        let message = response_message(response, fallback);
+        let fatal = response_is_internal_error(response);
+        send_route_bind_error_parts(
+            tx,
+            completion.ver,
+            completion.corr,
+            completion.flags,
+            "config_divergence",
+            &message,
+        )
+        .await?;
+        if fatal {
+            signal_fatal_teardown(
+                tx,
+                Some(completion.route_channel),
+                completion.ver,
+                completion.corr,
+                shutdown,
+            )
+            .await;
+        }
+        return Ok(());
+    }
+
+    remember_session_identity(session_identity, &completion.identity);
+    let replay_key = ReplayKey::from_identity(&completion.identity);
+    insert_route_channel(routes, root_channels, route_id, completion.identity);
+    live_roots
+        .entry(completion.bind_root_id.clone())
+        .and_modify(RootMeta::touch)
+        .or_insert_with(|| RootMeta::new(Instant::now()));
+
+    let ack =
+        serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(
+        completion.ver,
+        FrameType::Response,
+        control_flags(),
+        0,
+        completion.corr,
+        ack,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_frame(tx, response).await?;
+    let replayed = replay_buffered_push_frames(tx, route_id, push_buffer, &replay_key);
+    if replayed > 0 {
+        log::debug!(
+            "subc attach: replayed {} buffered Push frame(s) to route {} root {} harness {} session {}",
+            replayed,
+            completion.route_channel,
+            replay_key.root.as_path().display(),
+            replay_key.harness,
+            replay_key.session
+        );
+    }
+    log::info!(
+        "subc attach: route {} bound to root {}",
+        completion.route_channel,
+        completion.bind_root_id.as_path().display()
+    );
+    Ok(())
+}
+
+/// channel-0 control request — currently only RouteBind. Reconciles the route's
+/// RootConfig through the executor's Mutating lane and resolves completion on a
+/// loop-owned control-completion channel so slow configure jobs do not block the
+/// transport loop.
+async fn handle_control_request(
+    tx: &mpsc::Sender<Frame>,
+    frame: &Frame,
+    shared_app: &Arc<App>,
+    executor: &Arc<Executor>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
+    push_senders: &PushSenders,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
     let request =
@@ -1203,6 +1397,17 @@ async fn handle_control_request(
             identity,
             config,
         } => {
+            let route_id = route_key(route_channel);
+            if pending_binds.contains_key(&route_id) {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "config_divergence",
+                    "route bind is already pending for channel",
+                )
+                .await;
+            }
+
             let bind_root_id = match ProjectRootId::from_path(&identity.project_root) {
                 Ok(root_id) => root_id,
                 Err(error) => {
@@ -1219,7 +1424,9 @@ async fn handle_control_request(
             // Reconcile RootConfig: build a configure request from the bind
             // identity + forwarded config tiers and run it through the executor.
             let request_id = format!("subc-bind-{route_channel}");
-            let configure_session = identity.session.clone();
+            let bind_project_root = identity.project_root.clone();
+            let bind_harness = identity.harness.clone();
+            let bind_session = identity.session.clone();
             let config_tiers: Vec<Value> = config
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
@@ -1227,9 +1434,9 @@ async fn handle_control_request(
             let configure_json = json!({
                 "id": request_id,
                 "command": "configure",
-                "project_root": identity.project_root,
-                "harness": identity.harness,
-                "session_id": configure_session.clone(),
+                "project_root": bind_project_root,
+                "harness": bind_harness,
+                "session_id": bind_session.clone(),
                 "config": config_tiers,
             });
             let configure_req = match serde_json::from_value::<RawRequest>(configure_json) {
@@ -1245,6 +1452,12 @@ async fn handle_control_request(
                 }
             };
 
+            let route_identity = RouteIdentity {
+                root: bind_root_id.clone(),
+                harness: identity.harness,
+                session: identity.session,
+            };
+            let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             let inserted_new_actor = if root_was_live {
                 log::debug!(
@@ -1266,7 +1479,9 @@ async fn handle_control_request(
                 let inserted =
                     executor.register_actor(bind_root_id.clone(), Arc::clone(&actor_ctx));
                 drop(actor_ctx);
-                live_roots.insert(bind_root_id.clone(), RootMeta::new(Instant::now()));
+                // Do not insert into live_roots until configure succeeds: live_roots
+                // drives maintenance, and a half-configured new actor must not be
+                // maintenance-eligible before its route/session identity exists.
                 log::debug!(
                     "subc attach: registered actor for route {} root {}",
                     route_channel,
@@ -1274,6 +1489,15 @@ async fn handle_control_request(
                 );
                 inserted
             };
+
+            pending_binds.insert(
+                route_id,
+                PendingBind {
+                    bind_root_id: bind_root_id.clone(),
+                    inserted_new_actor,
+                    cancelled: false,
+                },
+            );
 
             let configure_request_id = configure_req.id.clone();
             let configure_rx = executor.submit_async(
@@ -1286,111 +1510,54 @@ async fn handle_control_request(
                     })
                 }),
             );
-            let configure_response =
-                await_executor_response(configure_rx, configure_request_id.clone()).await;
 
-            if !configure_response.success {
-                if !root_was_live {
-                    live_roots.remove(&bind_root_id);
-                    if inserted_new_actor {
-                        executor.remove_actor(&bind_root_id);
-                    }
-                }
-                let message =
-                    response_message(&configure_response, "configure failed during route bind");
-                send_route_bind_error(tx, frame, "config_divergence", &message).await?;
-                if response_is_internal_error(&configure_response) {
-                    signal_fatal_teardown(
-                        tx,
-                        Some(route_channel),
-                        frame.header.ver,
-                        frame.header.corr,
-                        shutdown,
-                    )
-                    .await;
-                }
-                return Ok(());
-            }
-
-            if !root_was_live {
-                let drain_request_id = format!("subc-bind-drain-{route_channel}");
-                let drain_response_id = drain_request_id.clone();
-                let drain_rx = executor.submit_async(
-                    bind_root_id.clone(),
-                    Lane::Mutating,
-                    drain_request_id.clone(),
-                    Box::new(move |ctx| {
-                        runtime_drain::drain_build_completions(ctx);
-                        Response::success(drain_response_id, json!({ "drained": true }))
-                    }),
-                );
-                let drain_response = await_executor_response(drain_rx, drain_request_id).await;
-                if !drain_response.success {
-                    let message = response_message(
-                        &drain_response,
-                        "build-completion drain failed during route bind",
+            let completion_tx = control_completion_tx.clone();
+            let completion_executor = Arc::clone(executor);
+            let completion_identity = route_identity;
+            let completion_root = bind_root_id.clone();
+            let completion_route_channel = route_channel;
+            let completion_ver = frame.header.ver;
+            let completion_corr = frame.header.corr;
+            let completion_flags = frame.header.flags;
+            tokio::spawn(async move {
+                let configure_response =
+                    await_executor_response(configure_rx, configure_request_id.clone()).await;
+                let drain_response = if configure_response.success && !root_was_live {
+                    let drain_request_id = format!("subc-bind-drain-{completion_route_channel}");
+                    let drain_response_id = drain_request_id.clone();
+                    let drain_rx = completion_executor.submit_async(
+                        completion_root.clone(),
+                        Lane::Mutating,
+                        drain_request_id.clone(),
+                        Box::new(move |ctx| {
+                            runtime_drain::drain_build_completions(ctx);
+                            Response::success(drain_response_id, json!({ "drained": true }))
+                        }),
                     );
-                    send_route_bind_error(tx, frame, "config_divergence", &message).await?;
-                    if response_is_internal_error(&drain_response) {
-                        signal_fatal_teardown(
-                            tx,
-                            Some(route_channel),
-                            frame.header.ver,
-                            frame.header.corr,
-                            shutdown,
-                        )
-                        .await;
-                    }
-                    return Ok(());
+                    Some(await_executor_response(drain_rx, drain_request_id).await)
+                } else {
+                    None
+                };
+
+                let completion = RouteBindCompletion {
+                    route_channel: completion_route_channel,
+                    identity: completion_identity,
+                    bind_root_id: completion_root,
+                    inserted_new_actor,
+                    configure_response,
+                    drain_response,
+                    ver: completion_ver,
+                    corr: completion_corr,
+                    flags: completion_flags,
+                };
+                if completion_tx.send(completion).await.is_err() {
+                    log::debug!(
+                        "subc attach: dropped RouteBind completion for route {} after loop exit",
+                        completion_route_channel
+                    );
                 }
-            }
+            });
 
-            let route_identity = RouteIdentity {
-                root: bind_root_id.clone(),
-                harness: identity.harness,
-                session: identity.session,
-            };
-            remember_session_identity(session_identity, &route_identity);
-            let replay_key = ReplayKey::from_identity(&route_identity);
-            insert_route_channel(
-                routes,
-                root_channels,
-                route_key(route_channel),
-                route_identity,
-            );
-            if let Some(meta) = live_roots.get_mut(&bind_root_id) {
-                meta.touch();
-            }
-
-            let ack = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
-                .map_err(SubcError::Json)?;
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                control_flags(),
-                0,
-                frame.header.corr,
-                ack,
-            )
-            .map_err(SubcError::FrameBuild)?;
-            send_frame(tx, response).await?;
-            let replayed =
-                replay_buffered_push_frames(tx, route_key(route_channel), push_buffer, &replay_key);
-            if replayed > 0 {
-                log::debug!(
-                    "subc attach: replayed {} buffered Push frame(s) to route {} root {} harness {} session {}",
-                    replayed,
-                    route_channel,
-                    replay_key.root.as_path().display(),
-                    replay_key.harness,
-                    replay_key.session
-                );
-            }
-            log::info!(
-                "subc attach: route {} bound to root {}",
-                route_channel,
-                bind_root_id.as_path().display()
-            );
             Ok(())
         }
     }
@@ -1425,14 +1592,26 @@ async fn send_route_bind_error(
     code: &str,
     message: &str,
 ) -> Result<(), SubcError> {
-    let response = build_error_frame(
+    send_route_bind_error_parts(
+        tx,
         frame.header.ver,
-        0,
         frame.header.corr,
-        control_flags(),
+        frame.header.flags,
         code,
         message,
-    )?;
+    )
+    .await
+}
+
+async fn send_route_bind_error_parts(
+    tx: &mpsc::Sender<Frame>,
+    ver: u8,
+    corr: u64,
+    flags: Flags,
+    code: &str,
+    message: &str,
+) -> Result<(), SubcError> {
+    let response = build_error_frame(ver, 0, corr, flags, code, message)?;
     send_frame(tx, response).await?;
     log::warn!("subc attach: route bind rejected ({code}): {message}");
     Ok(())
@@ -1446,12 +1625,26 @@ async fn handle_tool_call(
     tx: &mpsc::Sender<Frame>,
     frame: &Frame,
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     shutdown: &Arc<Notify>,
     dispatch: DispatchFn,
 ) -> Result<(), SubcError> {
-    let Some(identity) = routes.get(&route_key(frame.header.channel)).cloned() else {
+    let route_id = route_key(frame.header.channel);
+    if pending_binds.contains_key(&route_id) {
+        let error = build_error_frame(
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.corr,
+            frame.header.flags,
+            "route_not_bound",
+            "route is not bound before tool call",
+        )?;
+        return send_frame(tx, error).await;
+    }
+
+    let Some(identity) = routes.get(&route_id).cloned() else {
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,

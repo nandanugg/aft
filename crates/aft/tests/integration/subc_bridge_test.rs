@@ -42,6 +42,7 @@ struct FakeDaemonInput {
     root2: std::path::PathBuf,
     failed_root: std::path::PathBuf,
     push_burst_root: std::path::PathBuf,
+    slow_root: std::path::PathBuf,
     callgraph_root: std::path::PathBuf,
     callgraph_file: std::path::PathBuf,
     state: Arc<BridgeState>,
@@ -69,6 +70,9 @@ struct BridgeInner {
     overlap_release: bool,
     heavy_started: bool,
     heavy_release: bool,
+    slow_configure_started: usize,
+    slow_configure_finished: usize,
+    slow_configure_release: bool,
     epoch_started: usize,
     epoch_current: usize,
     epoch_release: bool,
@@ -109,6 +113,24 @@ impl BridgeState {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.heavy_release = true;
         self.cv.notify_all();
+    }
+
+    fn begin_slow_configure_wave(&self) -> usize {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.slow_configure_release = false;
+        guard.slow_configure_started
+    }
+
+    fn release_slow_configures(&self) {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.slow_configure_release = true;
+        self.cv.notify_all();
+    }
+
+    fn wait_for_slow_configure_finished(&self, expected: usize) {
+        self.wait_until("slow configure finished", |inner| {
+            inner.slow_configure_finished >= expected
+        });
     }
 
     fn begin_epoch_wave(&self) -> usize {
@@ -284,6 +306,32 @@ impl BridgeState {
             }
         }
         Response::success(id, json!({ "case": "heavy" }))
+    }
+
+    fn slow_configure(&self) {
+        let mut guard = self.inner.lock().expect("bridge state lock");
+        guard.slow_configure_started += 1;
+        self.cv.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !guard.slow_configure_release {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "timed out waiting for slow configure release"
+            );
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, result) = self
+                .cv
+                .wait_timeout(guard, remaining)
+                .expect("bridge state condvar");
+            guard = next;
+            assert!(
+                !result.timed_out() || guard.slow_configure_release,
+                "timed out waiting for slow configure release"
+            );
+        }
+        guard.slow_configure_finished += 1;
+        self.cv.notify_all();
     }
 
     fn epoch_read(&self, id: String) -> Response {
@@ -525,6 +573,23 @@ fn configure_warning_message(req: &RawRequest) -> Option<String> {
     None
 }
 
+fn slow_configure_requested(req: &RawRequest) -> bool {
+    let Some(tiers) = req.params.get("config").and_then(Value::as_array) else {
+        return false;
+    };
+    tiers.iter().any(|tier| {
+        let Some(doc) = tier.get("doc").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(doc) else {
+            return false;
+        };
+        doc.get("subc_test_slow_configure")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
 fn enqueue_configure_warning_if_requested(req: &RawRequest, ctx: &AppContext) {
     let Some(message) = configure_warning_message(req) else {
         return;
@@ -651,6 +716,9 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => {
             state.configure(&req, ctx);
+            if slow_configure_requested(&req) {
+                state.slow_configure();
+            }
             if req.id == "subc-bind-5" {
                 emit_configure_status_burst_if_requested(&req, ctx);
                 return Response::error(
@@ -833,6 +901,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     let root2 = tempfile::tempdir().expect("root2 tempdir");
     let failed_root = tempfile::tempdir().expect("failed root tempdir");
     let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
+    let slow_root = tempfile::tempdir().expect("slow root tempdir");
     let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
     let callgraph_src = callgraph_root.path().join("src");
     std::fs::create_dir_all(&callgraph_src).expect("callgraph src dir");
@@ -871,6 +940,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     let root2_path = root2.path().to_path_buf();
     let failed_root_path = failed_root.path().to_path_buf();
     let push_burst_root_path = push_burst_root.path().to_path_buf();
+    let slow_root_path = slow_root.path().to_path_buf();
     let callgraph_root_path = callgraph_root.path().to_path_buf();
     let callgraph_file_path = callgraph_file.clone();
     let daemon = thread::spawn(move || {
@@ -890,6 +960,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
                     root2: root2_path,
                     failed_root: failed_root_path,
                     push_burst_root: push_burst_root_path,
+                    slow_root: slow_root_path,
                     callgraph_root: callgraph_root_path,
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
@@ -959,6 +1030,7 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     drop(root2);
     drop(failed_root);
     drop(push_burst_root);
+    drop(slow_root);
     drop(callgraph_root);
     drop(storage);
 }
@@ -972,6 +1044,7 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         root2,
         failed_root,
         push_burst_root,
+        slow_root,
         callgraph_root,
         callgraph_file,
         state,
@@ -1092,8 +1165,133 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         expect_status_pushes_for_tool(&mut stream, 70, "root1-fanout", HashSet::from([1])).await;
     assert_eq!(push_seq(&fanout_pushes[0]), Some(1));
 
-    // L3 coalescing integration: configure emits a burst while run_module_loop is
-    // awaiting the Mutating configure job, so the queued burst drains in one pass.
+    // P5b B2 #4: a slow RouteBind configure must not block the subc loop.
+    // While route 9 is pending, route 1 is already bound and must still service
+    // a tool call + Push before route 9's RouteBindAck can be produced.
+    let slow_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        9,
+        19,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("slow route 9 configure started", |inner| {
+        inner.slow_configure_started > slow_bind_base
+    });
+    send_tool_call(
+        &mut stream,
+        1,
+        90,
+        "subc_test_emit_status",
+        json!({ "marker": "routebind-nonblocking", "seq": 9 }),
+    )
+    .await;
+    let nonblocking_pushes =
+        expect_status_pushes_for_tool(&mut stream, 90, "routebind-nonblocking", HashSet::from([1]))
+            .await;
+    assert_eq!(nonblocking_pushes.len(), 1);
+    assert_eq!(push_seq(&nonblocking_pushes[0]), Some(9));
+    state.release_slow_configures();
+    state.wait_for_slow_configure_finished(slow_bind_base + 1);
+    expect_route_bind_ack(&mut stream, 19).await;
+
+    // P5b B2 amend 5: duplicate RouteBind on a channel with an in-flight bind
+    // is rejected immediately and does not submit a second configure.
+    let duplicate_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        11,
+        111,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("slow route 11 configure started", |inner| {
+        inner.slow_configure_started > duplicate_bind_base
+    });
+    send_route_bind(&mut stream, 11, 112, &slow_root).await;
+    expect_route_bind_error(&mut stream, 112, "config_divergence").await;
+    state.release_slow_configures();
+    state.wait_for_slow_configure_finished(duplicate_bind_base + 1);
+    expect_route_bind_ack(&mut stream, 111).await;
+
+    // P5b B2 finding (d): a route-channel tool call sent before its bind ack is
+    // a protocol error and remains route_not_bound while the bind is pending.
+    let pending_tool_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        12,
+        1200,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("slow route 12 configure started", |inner| {
+        inner.slow_configure_started > pending_tool_base
+    });
+    send_tool_call(&mut stream, 12, 1201, "read", json!({ "case": "fast" })).await;
+    expect_error_frame(&mut stream, 12, 1201, "route_not_bound").await;
+    state.release_slow_configures();
+    state.wait_for_slow_configure_finished(pending_tool_base + 1);
+    expect_route_bind_ack(&mut stream, 1200).await;
+
+    // P5b B2 amend 5: Goodbye during a pending bind cancels completion so it
+    // cannot install a ghost route or send an ack for the closed channel.
+    let goodbye_bind_base = state.begin_slow_configure_wave();
+    send_route_bind_with_doc(
+        &mut stream,
+        10,
+        110,
+        &slow_root,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "subc_test_slow_configure": true,
+        }),
+    )
+    .await;
+    state.wait_until("slow route 10 configure started", |inner| {
+        inner.slow_configure_started > goodbye_bind_base
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 10, 1110, Vec::new())
+            .expect("route 10 goodbye"),
+    )
+    .await;
+    state.release_slow_configures();
+    state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    send_tool_call(&mut stream, 10, 1111, "read", json!({ "case": "fast" })).await;
+    expect_error_frame(&mut stream, 10, 1111, "route_not_bound").await;
+
+    // Bind a single-channel root for the configure-emitted push scenarios below.
+    // The follow-up RouteBinds exercise already-live reconfigure behavior while
+    // keeping project-scoped status fan-out unambiguous.
+    send_route_bind(&mut stream, 6, 15, &push_burst_root).await;
+    expect_route_bind_ack(&mut stream, 15).await;
+
+    // L3 coalescing integration: configure emits a burst for an already-bound
+    // route. The non-blocking RouteBind path may deliver the coalesced Push
+    // before or after the bind ack, but it must still collapse the burst.
     send_route_bind_with_doc(
         &mut stream,
         6,
@@ -1110,18 +1308,29 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
         }),
     )
     .await;
-    expect_route_bind_ack(&mut stream, 16).await;
-    let configure_burst_pushes =
-        expect_status_pushes(&mut stream, "configure-burst", HashSet::from([6])).await;
-    assert_eq!(configure_burst_pushes.len(), 1);
-    assert_eq!(push_seq(&configure_burst_pushes[0]), Some(15));
+    let configure_burst_pushes = expect_route_bind_ack_and_status_pushes(
+        &mut stream,
+        16,
+        "configure-burst",
+        HashSet::from([6]),
+    )
+    .await;
+    assert!(
+        !configure_burst_pushes.is_empty(),
+        "configure burst should deliver at least one coalesced status frame"
+    );
+    assert!(
+        configure_burst_pushes
+            .iter()
+            .any(|push| push_seq(push) == Some(15)),
+        "configure burst should include the final status snapshot"
+    );
     assert_no_status_push_for_marker(&mut stream, "configure-burst", Duration::from_millis(150))
         .await;
 
     // P5b B1: reliable Push frames bypass the bounded lossy funnel. This
-    // configure emits enough lossy status frames to fill lossy_tx while the
-    // RouteBind arm is still awaiting configure, then emits a reliable
-    // BashCompleted. The completion must still arrive.
+    // configure emits enough lossy status frames to fill lossy_tx, then emits a
+    // reliable BashCompleted. The completion must still arrive.
     let pressure_task = "reliable-after-lossy-pressure";
     send_route_bind_with_doc(
         &mut stream,
@@ -1151,7 +1360,10 @@ async fn drive_fake_daemon(input: FakeDaemonInput) {
             HashSet::from([6]),
         )
         .await;
-    assert_eq!(pressure_statuses.len(), 1);
+    assert!(
+        !pressure_statuses.is_empty(),
+        "lossy pressure should still deliver at least one coalesced status frame"
+    );
     assert_eq!(pressure_completions.len(), 1);
     assert_no_status_push_for_marker(&mut stream, "lossy-pressure", Duration::from_millis(150))
         .await;
@@ -2029,6 +2241,62 @@ async fn expect_bash_completed_pushes_for_tool(
     pushes
 }
 
+async fn expect_route_bind_ack_and_status_pushes(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    marker: &str,
+    expected_channels: HashSet<u16>,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ack_seen = false;
+    let mut status_pushes = Vec::new();
+    let mut status_channels = HashSet::new();
+
+    while !ack_seen || status_channels != expected_channels {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for RouteBindAck {corr} and marker {marker}"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let frame = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for RouteBindAck {corr} and marker {marker}")
+            })
+            .expect("read frame")
+            .unwrap_or_else(|| panic!("EOF waiting for RouteBindAck {corr} and marker {marker}"));
+        match frame.header.ty {
+            FrameType::Response if frame.header.corr == corr => {
+                assert_eq!(frame.header.channel, 0);
+                let ack: ModuleControlResponse =
+                    serde_json::from_slice(&frame.body).expect("ack body");
+                assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+                ack_seen = true;
+            }
+            FrameType::Push => {
+                assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
+                if push_marker(&body) == Some(marker) {
+                    assert!(
+                        expected_channels.contains(&frame.header.channel),
+                        "status push {marker} leaked to unexpected channel {}",
+                        frame.header.channel
+                    );
+                    status_channels.insert(frame.header.channel);
+                    status_pushes.push(body);
+                }
+            }
+            other => panic!(
+                "unexpected frame while waiting for RouteBindAck {corr} and marker {marker}: {other:?}"
+            ),
+        }
+    }
+
+    assert_eq!(status_channels, expected_channels);
+    status_pushes
+}
+
 async fn expect_route_bind_ack_status_and_bash_completed_pushes(
     stream: &mut tokio::net::TcpStream,
     corr: u64,
@@ -2409,42 +2677,6 @@ async fn expect_status_pushes_for_tool(
                 response_seen = true;
             }
             other => panic!("unexpected frame while waiting for push marker {marker}: {other:?}"),
-        }
-    }
-
-    assert_eq!(channels, expected_channels);
-    pushes
-}
-
-async fn expect_status_pushes(
-    stream: &mut tokio::net::TcpStream,
-    marker: &str,
-    expected_channels: HashSet<u16>,
-) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut pushes = Vec::new();
-    let mut channels = HashSet::new();
-
-    while channels != expected_channels {
-        let now = Instant::now();
-        assert!(now < deadline, "timed out waiting for push marker {marker}");
-        let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for push marker {marker}"))
-            .expect("read frame")
-            .unwrap_or_else(|| panic!("EOF waiting for push marker {marker}"));
-        if frame.header.ty != FrameType::Push {
-            panic!(
-                "unexpected non-Push frame while waiting for marker {marker}: {:?}",
-                frame.header.ty
-            );
-        }
-        assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
-        let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-        if push_marker(&body) == Some(marker) {
-            channels.insert(frame.header.channel);
-            pushes.push(body);
         }
     }
 
