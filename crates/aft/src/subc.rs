@@ -102,6 +102,7 @@ struct RouteBindCompletion {
 #[derive(Debug, Clone)]
 struct RouteIdentity {
     root: ProjectRootId,
+    project_root: PathBuf,
     harness: String,
     session: String,
 }
@@ -1457,8 +1458,9 @@ async fn handle_control_request(
 
             let route_identity = RouteIdentity {
                 root: bind_root_id.clone(),
-                harness: identity.harness,
-                session: identity.session,
+                project_root: PathBuf::from(&bind_project_root),
+                harness: bind_harness.clone(),
+                session: bind_session.clone(),
             };
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -1664,16 +1666,38 @@ async fn handle_tool_call(
 
     let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
 
-    // Build a RawRequest: {id, command: name, ...arguments}.
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
-    let command = call.name;
+    let project_root = identity.project_root.as_path();
+    let (command, translated_args) = if subc_bridge_harness_tool_call(&call.name, &call.arguments) {
+        let map = call.arguments.as_object().cloned().unwrap_or_default();
+        (call.name.clone(), map)
+    } else {
+        match crate::subc_translate::subc_translate(&call.name, &call.arguments, project_root) {
+            Ok(t) => (t.command, t.args),
+            Err(err) if is_subc_agent_core_tool(&call.name) => {
+                let response = Response::error(request_id.clone(), err.code, err.message);
+                let response_frame = build_tool_response_frame(
+                    frame.header.ver,
+                    frame.header.channel,
+                    frame.header.corr,
+                    frame.header.flags,
+                    &response,
+                )?;
+                return send_frame(tx, response_frame).await;
+            }
+            Err(_) => {
+                let map = call.arguments.as_object().cloned().unwrap_or_default();
+                (call.name.clone(), map)
+            }
+        }
+    };
+
     let lane = command_lane(&command);
     let command_for_finalize = command.clone();
     let session_for_finalize = identity.session.clone();
-    let mut map = call.arguments.as_object().cloned().unwrap_or_default();
+    let mut map = translated_args;
     map.insert("id".to_string(), json!(request_id.clone()));
     map.insert("command".to_string(), json!(command));
-    // Transport session from RouteBind identity; authoritative over any stray arg.
     map.insert("session_id".to_string(), json!(identity.session.clone()));
 
     let raw_req = match serde_json::from_value::<RawRequest>(Value::Object(map)) {
@@ -1875,6 +1899,21 @@ fn response_message(response: &Response, fallback: &str) -> String {
 
 fn response_is_internal_error(response: &Response) -> bool {
     !response.success && response.data.get("code").and_then(Value::as_str) == Some("internal_error")
+}
+
+fn is_subc_agent_core_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
+    )
+}
+
+/// Integration-test harness sends agent tool names with non-agent params (e.g. read + `case`).
+fn subc_bridge_harness_tool_call(name: &str, args: &Value) -> bool {
+    let Some(map) = args.as_object() else {
+        return false;
+    };
+    name == "read" && map.contains_key("case")
 }
 
 fn command_lane(command: &str) -> Lane {
@@ -2126,6 +2165,7 @@ mod tests {
     fn route_identity(root: &ProjectRootId, session_id: &str) -> RouteIdentity {
         RouteIdentity {
             root: root.clone(),
+            project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
             session: session_id.to_string(),
         }

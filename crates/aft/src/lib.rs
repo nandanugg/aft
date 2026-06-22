@@ -92,6 +92,7 @@ pub mod runtime_registry;
 pub mod search_index;
 pub mod semantic_index;
 pub mod subc;
+pub mod subc_translate;
 pub mod symbol_cache_disk;
 pub mod symbols;
 pub mod tool_path;

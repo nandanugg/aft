@@ -1,0 +1,528 @@
+//! Agent-facing tool → native command translation (subc edge only).
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Translated {
+    pub command: String,
+    pub args: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslateError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+fn invalid_request(message: impl Into<String>) -> TranslateError {
+    TranslateError {
+        code: "invalid_request",
+        message: message.into(),
+    }
+}
+
+fn resolve_home_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    Some(std::fs::canonicalize(&raw).unwrap_or(raw))
+}
+
+fn expand_tilde(target: &str) -> String {
+    if target == "~" {
+        return resolve_home_dir()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.to_string());
+    }
+    if let Some(rest) = target.strip_prefix("~/") {
+        if let Some(home) = resolve_home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    target.to_string()
+}
+
+pub fn resolve_path_from_project_root(project_root: &Path, target: &str) -> PathBuf {
+    let expanded = expand_tilde(target);
+    let path = Path::new(&expanded);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    }
+}
+
+fn is_empty_param(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+fn coerce_optional_int(value: Option<&Value>, min: i64, max: i64) -> Option<u64> {
+    let value = value?;
+    if value.is_null() || matches!(value, Value::String(s) if s.is_empty()) {
+        return None;
+    }
+    if matches!(value, Value::Array(a) if a.is_empty()) {
+        return None;
+    }
+    let n = match value {
+        Value::Number(num) => num.as_i64()?,
+        Value::String(s) => s.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    if n == 0 && min > 0 {
+        return None;
+    }
+    if n < min || n > max {
+        return None;
+    }
+    Some(n as u64)
+}
+
+fn agent_args_map(args: &Value) -> Map<String, Value> {
+    args.as_object().cloned().unwrap_or_default()
+}
+
+fn insert_resolved_file(map: &mut Map<String, Value>, project_root: &Path, file_path: &str) {
+    let resolved = resolve_path_from_project_root(project_root, file_path);
+    map.insert(
+        "file".to_string(),
+        Value::String(resolved.to_string_lossy().into_owned()),
+    );
+}
+
+pub fn subc_translate(
+    bare_name: &str,
+    agent_args: &Value,
+    project_root: &Path,
+) -> Result<Translated, TranslateError> {
+    match bare_name {
+        "status" => Ok(Translated {
+            command: "status".into(),
+            args: Map::new(),
+        }),
+        "read" => translate_read(agent_args, project_root),
+        "write" => translate_write(agent_args, project_root),
+        "edit" => translate_edit(agent_args, project_root),
+        "grep" => translate_grep(agent_args, project_root),
+        "search" => translate_search(agent_args),
+        "outline" => translate_outline(agent_args, project_root),
+        "inspect" => translate_inspect(agent_args, project_root),
+        other => Err(invalid_request(format!(
+            "subc_translate: unsupported tool {other:?}"
+        ))),
+    }
+}
+
+fn translate_read(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'filePath' is required"))?;
+
+    let mut out = Map::new();
+    insert_resolved_file(&mut out, project_root, file_path);
+
+    let mut start_line = map_in.get("startLine").and_then(Value::as_u64);
+    let mut end_line = map_in.get("endLine").and_then(Value::as_u64);
+
+    if start_line.is_none() {
+        if let Some(offset) = map_in.get("offset").and_then(Value::as_u64) {
+            start_line = Some(offset);
+            if let Some(limit) = map_in.get("limit").and_then(Value::as_u64) {
+                end_line = Some(offset.saturating_add(limit).saturating_sub(1));
+            }
+        }
+    }
+
+    if let Some(sl) = start_line {
+        out.insert("start_line".to_string(), Value::Number(sl.into()));
+    }
+    if let Some(el) = end_line {
+        out.insert("end_line".to_string(), Value::Number(el.into()));
+    }
+    if map_in.get("offset").is_none() {
+        if let Some(limit) = map_in.get("limit").and_then(Value::as_u64) {
+            out.insert("limit".to_string(), Value::Number(limit.into()));
+        }
+    }
+
+    Ok(Translated {
+        command: "read".into(),
+        args: out,
+    })
+}
+
+fn translate_write(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'filePath' is required"))?;
+    let content = map_in
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request("write: missing required param 'content'"))?;
+
+    let mut out = Map::new();
+    insert_resolved_file(&mut out, project_root, file_path);
+    out.insert("content".to_string(), Value::String(content.to_string()));
+    out.insert("create_dirs".to_string(), Value::Bool(true));
+    out.insert("include_diff_content".to_string(), Value::Bool(true));
+
+    Ok(Translated {
+        command: "write".into(),
+        args: out,
+    })
+}
+
+fn translate_edit(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+
+    if map_in.get("startLine").is_some() || map_in.get("endLine").is_some() {
+        return Err(invalid_request(
+            "edit: 'startLine'/'endLine' are not top-level parameters. \
+             For line-range edits, nest them inside the `edits` array. \
+             For find/replace, use 'oldString'/'newString'.",
+        ));
+    }
+
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'filePath' is required"))?;
+
+    let file_str = resolve_path_from_project_root(project_root, file_path)
+        .to_string_lossy()
+        .into_owned();
+
+    if let Some(append) = map_in.get("appendContent").and_then(Value::as_str) {
+        let mut out = Map::new();
+        out.insert("file".to_string(), Value::String(file_str));
+        out.insert("op".to_string(), Value::String("append".into()));
+        out.insert(
+            "append_content".to_string(),
+            Value::String(append.to_string()),
+        );
+        out.insert("create_dirs".to_string(), Value::Bool(true));
+        return Ok(Translated {
+            command: "edit_match".into(),
+            args: out,
+        });
+    }
+
+    if let Some(edits) = map_in.get("edits").and_then(Value::as_array) {
+        let mut out = Map::new();
+        out.insert("file".to_string(), Value::String(file_str));
+        let translated_edits: Vec<Value> = edits
+            .iter()
+            .filter_map(|edit| {
+                let obj = edit.as_object()?;
+                let mut t = Map::new();
+                for (key, value) in obj {
+                    let native_key = match key.as_str() {
+                        "oldString" => "match",
+                        "newString" => "replacement",
+                        "startLine" => "line_start",
+                        "endLine" => "line_end",
+                        other => other,
+                    };
+                    t.insert(native_key.to_string(), value.clone());
+                }
+                Some(Value::Object(t))
+            })
+            .collect();
+        out.insert("edits".to_string(), Value::Array(translated_edits));
+        return Ok(Translated {
+            command: "batch".into(),
+            args: out,
+        });
+    }
+
+    let symbol_is_string = map_in.get("symbol").and_then(Value::as_str).is_some();
+    let old_string_is_string = map_in.get("oldString").and_then(Value::as_str).is_some();
+    let has_content = map_in.get("content").is_some();
+
+    if symbol_is_string && !old_string_is_string && has_content {
+        let mut out = Map::new();
+        out.insert("file".to_string(), Value::String(file_str));
+        out.insert(
+            "symbol".to_string(),
+            map_in.get("symbol").cloned().unwrap_or(Value::Null),
+        );
+        out.insert("operation".to_string(), Value::String("replace".into()));
+        out.insert(
+            "content".to_string(),
+            map_in.get("content").cloned().unwrap_or(Value::Null),
+        );
+        return Ok(Translated {
+            command: "edit_symbol".into(),
+            args: out,
+        });
+    }
+
+    if old_string_is_string {
+        let mut out = Map::new();
+        out.insert("file".to_string(), Value::String(file_str));
+        out.insert(
+            "match".to_string(),
+            Value::String(
+                map_in
+                    .get("oldString")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+        );
+        let replacement = map_in
+            .get("newString")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        out.insert(
+            "replacement".to_string(),
+            Value::String(replacement.to_string()),
+        );
+        if let Some(v) = map_in.get("replaceAll") {
+            out.insert("replace_all".to_string(), v.clone());
+        }
+        if map_in.contains_key("occurrence") {
+            if let Some(v) = map_in.get("occurrence") {
+                out.insert("occurrence".to_string(), v.clone());
+            }
+        }
+        return Ok(Translated {
+            command: "edit_match".into(),
+            args: out,
+        });
+    }
+
+    Err(invalid_request(
+        "edit: no edit mode resolved from arguments.",
+    ))
+}
+
+fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let pattern = map_in
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("grep: missing required param 'pattern'"))?;
+
+    let mut out = Map::new();
+    out.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    if let Some(include) = map_in.get("include") {
+        if !is_empty_param(include) {
+            out.insert("include".to_string(), include.clone());
+        }
+    }
+    if let Some(path_val) = map_in.get("path") {
+        if !is_empty_param(path_val) {
+            if let Some(path_str) = path_val.as_str() {
+                if path_str.contains(',') || path_str.contains('{') {
+                    out.insert("path".to_string(), Value::String(path_str.to_string()));
+                } else {
+                    let resolved = resolve_path_from_project_root(project_root, path_str);
+                    out.insert(
+                        "path".to_string(),
+                        Value::String(resolved.to_string_lossy().into_owned()),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(Translated {
+        command: "grep".into(),
+        args: out,
+    })
+}
+
+fn translate_search(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let query = map_in
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("semantic_search: missing required param 'query'"))?;
+
+    let mut out = Map::new();
+    out.insert("query".to_string(), Value::String(query.to_string()));
+    let top_k = coerce_optional_int(map_in.get("topK"), 1, 100).unwrap_or(10);
+    out.insert("top_k".to_string(), Value::Number(top_k.into()));
+    if let Some(hint) = map_in.get("hint") {
+        if !is_empty_param(hint) {
+            out.insert("hint".to_string(), hint.clone());
+        }
+    }
+
+    Ok(Translated {
+        command: "semantic_search".into(),
+        args: out,
+    })
+}
+
+fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let files_flag = map_in
+        .get("files")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let target = map_in
+        .get("target")
+        .ok_or_else(|| invalid_request("outline: missing required param 'target'"))?;
+
+    if is_empty_param(target) {
+        return Err(invalid_request(
+            "'target' must be a non-empty string or array of strings",
+        ));
+    }
+
+    let mut out = Map::new();
+
+    if let Some(url) = target.as_str() {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            out.insert("file".to_string(), Value::String(url.to_string()));
+            return Ok(Translated {
+                command: "outline".into(),
+                args: out,
+            });
+        }
+    }
+
+    if let Some(arr) = target.as_array() {
+        if arr.is_empty() {
+            return Err(invalid_request(
+                "'target' must be a non-empty string or array of strings",
+            ));
+        }
+        if files_flag {
+            let resolved: Vec<Value> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|entry| {
+                    let p = resolve_path_from_project_root(project_root, entry);
+                    Value::String(p.to_string_lossy().into_owned())
+                })
+                .collect();
+            out.insert("target".to_string(), Value::Array(resolved));
+            out.insert("files".to_string(), Value::Bool(true));
+            return Ok(Translated {
+                command: "outline".into(),
+                args: out,
+            });
+        }
+        let resolved: Vec<Value> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|entry| {
+                let p = resolve_path_from_project_root(project_root, entry);
+                Value::String(p.to_string_lossy().into_owned())
+            })
+            .collect();
+        out.insert("files".to_string(), Value::Array(resolved));
+        return Ok(Translated {
+            command: "outline".into(),
+            args: out,
+        });
+    }
+
+    let target_str = target.as_str().ok_or_else(|| {
+        invalid_request("'target' must be a non-empty string or array of strings")
+    })?;
+
+    let resolved = resolve_path_from_project_root(project_root, target_str);
+    let is_dir = std::fs::metadata(&resolved)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+
+    if files_flag {
+        if is_dir {
+            out.insert(
+                "directory".to_string(),
+                Value::String(resolved.to_string_lossy().into_owned()),
+            );
+        } else {
+            out.insert(
+                "file".to_string(),
+                Value::String(resolved.to_string_lossy().into_owned()),
+            );
+        }
+        out.insert("files".to_string(), Value::Bool(true));
+    } else if is_dir {
+        out.insert(
+            "directory".to_string(),
+            Value::String(resolved.to_string_lossy().into_owned()),
+        );
+    } else {
+        out.insert(
+            "file".to_string(),
+            Value::String(resolved.to_string_lossy().into_owned()),
+        );
+    }
+
+    Ok(Translated {
+        command: "outline".into(),
+        args: out,
+    })
+}
+
+fn translate_inspect(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let mut out = Map::new();
+
+    if let Some(sections) = map_in.get("sections") {
+        if !is_empty_param(sections) {
+            out.insert("sections".to_string(), sections.clone());
+        }
+    }
+
+    if let Some(scope) = map_in.get("scope") {
+        if !is_empty_param(scope) {
+            match scope {
+                Value::String(s) if !s.is_empty() => {
+                    let resolved = resolve_path_from_project_root(project_root, s);
+                    out.insert(
+                        "scope".to_string(),
+                        Value::String(resolved.to_string_lossy().into_owned()),
+                    );
+                }
+                Value::Array(arr) => {
+                    let resolved: Vec<Value> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|entry| {
+                            let p = resolve_path_from_project_root(project_root, entry);
+                            Value::String(p.to_string_lossy().into_owned())
+                        })
+                        .collect();
+                    out.insert("scope".to_string(), Value::Array(resolved));
+                }
+                other => {
+                    out.insert("scope".to_string(), other.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(top_k) = coerce_optional_int(map_in.get("topK"), 1, 100) {
+        out.insert("topK".to_string(), Value::Number(top_k.into()));
+    }
+
+    Ok(Translated {
+        command: "inspect".into(),
+        args: out,
+    })
+}
