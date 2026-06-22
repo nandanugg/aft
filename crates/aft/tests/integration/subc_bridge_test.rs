@@ -2076,9 +2076,18 @@ async fn expect_error_frame(
     code: &str,
 ) {
     let frame = read_frame_timeout(stream, "Error frame").await;
-    assert_eq!(frame.header.ty, FrameType::Error);
-    assert_eq!(frame.header.channel, channel);
-    assert_eq!(frame.header.corr, corr);
+    if frame.header.ty != FrameType::Error
+        || frame.header.channel != channel
+        || frame.header.corr != corr
+    {
+        panic!(
+            "expect_error_frame(channel={channel}, corr={corr}, code={code}): got ty={:?} channel={} corr={} body={}",
+            frame.header.ty,
+            frame.header.channel,
+            frame.header.corr,
+            String::from_utf8_lossy(&frame.body),
+        );
+    }
     let body: Value = serde_json::from_slice(&frame.body).expect("error body");
     assert_eq!(body.get("code").and_then(Value::as_str), Some(code));
 }
