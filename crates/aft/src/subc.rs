@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -1957,6 +1957,20 @@ struct ToolCallRequest {
     arguments: Value,
 }
 
+static SUBC_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("subc_tool_schemas.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_schemas.json: {e}"))
+});
+
+fn tool_schema(name: &str) -> Value {
+    SUBC_TOOL_SCHEMAS.get(name).cloned().unwrap_or_else(|| {
+        log::warn!(
+            "subc build_manifest: missing embedded schema for tool {name:?}; using placeholder"
+        );
+        json!({ "type": "object" })
+    })
+}
+
 /// AFT's subc-mode capability manifest. BARE tool names (the gateway owns the
 /// `aft_` prefix); ModuleManaged concurrency (AFT schedules internally);
 /// FirstParty trust. Minimal-but-conformant tool set for the spike — the full
@@ -1965,7 +1979,7 @@ fn build_manifest() -> ModuleManifest {
     let tool = |name: &str, mutates: bool| Tool {
         name: name.to_string(),
         mutates,
-        schema: json!({ "type": "object" }),
+        schema: tool_schema(name),
     };
     ModuleManifest {
         module_id: "aft".to_string(),
@@ -2750,6 +2764,60 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "control send guard should be bounded"
+        );
+    }
+
+    const CORE_TOOLS: [&str; 8] = [
+        "status", "read", "grep", "search", "outline", "inspect", "edit", "write",
+    ];
+
+    fn is_bare_placeholder_schema(schema: &Value) -> bool {
+        schema == &json!({ "type": "object" })
+    }
+
+    #[test]
+    fn build_manifest_serves_embedded_tool_schemas() {
+        let manifest = build_manifest();
+        let tools = match manifest.provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+            _ => panic!("expected ToolProvider"),
+        };
+        let by_name: HashMap<&str, &Tool> = tools.iter().map(|t| (t.name.as_str(), t)).collect();
+        for name in CORE_TOOLS {
+            let tool = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(
+                !is_bare_placeholder_schema(&tool.schema),
+                "{name} must not use bare placeholder schema"
+            );
+            assert_eq!(
+                tool.schema.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "{name} schema must be an object"
+            );
+        }
+
+        let read = by_name["read"]
+            .schema
+            .get("properties")
+            .and_then(|p| p.as_object());
+        let read_props = read.expect("read schema properties");
+        assert!(
+            read_props.contains_key("filePath"),
+            "read schema must expose filePath"
+        );
+
+        let status = &by_name["status"].schema;
+        assert_eq!(
+            status.get("properties").and_then(|v| v.as_object()),
+            Some(&serde_json::Map::new()),
+            "status schema must have empty properties"
+        );
+        assert_eq!(
+            status.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false),
+            "status schema must forbid additionalProperties"
         );
     }
 }
