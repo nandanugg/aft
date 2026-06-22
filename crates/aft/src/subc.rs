@@ -32,8 +32,9 @@ use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
 use crate::runtime_drain;
 
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ConfigBinding, ConfigSource, IdentityBinding, IdentityScope,
-    ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+    Bindings, Concurrency, ConfigBinding, ConfigSource, ExecutionMode, IdentityBinding,
+    IdentityScope, ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool,
+    TrustTier,
 };
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
@@ -2067,11 +2068,17 @@ fn tool_schema(name: &str) -> Value {
 /// FirstParty trust. Minimal-but-conformant tool set for the spike — the full
 /// bare set is locked before the gateway fronts AFT.
 fn build_manifest() -> ModuleManifest {
-    let tool = |name: &str, mutates: bool| Tool {
+    let tool = |name: &str, execution_mode: ExecutionMode| Tool {
         name: name.to_string(),
-        mutates,
+        execution_mode,
         schema: tool_schema(name),
     };
+    // execution_mode keys on externally-observable side effects, NOT internal
+    // ctx mutation: the readers warm AFT's own index/cache/symbol artifacts
+    // (internal), not the user's workspace, so they are Pure. Only edit/write
+    // produce observable file writes -> Mutating. There is no bash tool in this
+    // core, so Unfenceable is unused here (it stays in the enum for bash/other
+    // modules).
     ModuleManifest {
         module_id: "aft".to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2079,14 +2086,14 @@ fn build_manifest() -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ToolProvider {
             tools: vec![
-                tool("status", false),
-                tool("read", false),
-                tool("grep", false),
-                tool("search", false),
-                tool("outline", false),
-                tool("inspect", false),
-                tool("edit", true),
-                tool("write", true),
+                tool("status", ExecutionMode::Pure),
+                tool("read", ExecutionMode::Pure),
+                tool("grep", ExecutionMode::Pure),
+                tool("search", ExecutionMode::Pure),
+                tool("outline", ExecutionMode::Pure),
+                tool("inspect", ExecutionMode::Pure),
+                tool("edit", ExecutionMode::Mutating),
+                tool("write", ExecutionMode::Mutating),
             ],
             identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
             concurrency: Concurrency::ModuleManaged,
@@ -2911,6 +2918,34 @@ mod tests {
             Some(false),
             "status schema must forbid additionalProperties"
         );
+    }
+
+    #[test]
+    fn build_manifest_classifies_execution_mode_by_observable_effect() {
+        let manifest = build_manifest();
+        let tools = match manifest.provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+            _ => panic!("expected ToolProvider"),
+        };
+        let by_name: HashMap<&str, &Tool> = tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+        // Readers warm AFT's own index/cache/symbol artifacts (internal ctx
+        // mutation), not the user's observable workspace, so they are Pure.
+        for name in ["status", "read", "grep", "search", "outline", "inspect"] {
+            assert_eq!(
+                by_name[name].execution_mode,
+                ExecutionMode::Pure,
+                "{name} produces no observable side effect and must be Pure"
+            );
+        }
+        // Only edit/write produce observable file writes -> Mutating.
+        for name in ["edit", "write"] {
+            assert_eq!(
+                by_name[name].execution_mode,
+                ExecutionMode::Mutating,
+                "{name} writes files and must be Mutating"
+            );
+        }
     }
 }
 
