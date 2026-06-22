@@ -1000,7 +1000,17 @@ fn subc_bridge_routes_multiple_roots_and_reuses_same_root_actor() {
     }));
 
     let executor_for_check = Arc::clone(&executor);
-    run_subc_mode(&conn_path, ctx, executor, bridge_dispatch).expect("subc mode exits cleanly");
+    // Inject a hermetic (nonexistent) user config path so the W5 local read
+    // never touches a real ~/.config/cortexkit/aft.jsonc on the dev/CI machine.
+    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+    run_subc_mode(
+        &conn_path,
+        ctx,
+        executor,
+        bridge_dispatch,
+        Some(user_config_path),
+    )
+    .expect("subc mode exits cleanly");
     daemon.join().expect("fake daemon joins");
 
     state.assert_overlap();

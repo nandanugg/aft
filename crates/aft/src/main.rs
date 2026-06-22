@@ -94,7 +94,13 @@ fn main() {
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         let executor = Arc::new(aft::executor::Executor::new());
-        match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch) {
+        // Resolve AFT's own CortexKit config home once at the boundary; it is
+        // threaded into the per-bind tier composition (W5). Under the gateway
+        // there is no plugin to relay on-disk config, so this is how a gateway
+        // user's aft.jsonc reaches AFT.
+        let user_config_path = aft::subc_config::cortexkit_user_config_path();
+        match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
+        {
             Ok(()) => return,
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");

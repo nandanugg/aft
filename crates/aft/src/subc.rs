@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::context::{App, AppContext, ProgressSender};
 use crate::executor::{Executor, Lane};
+use crate::harness::Harness;
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
@@ -753,6 +755,7 @@ pub fn run_subc_mode(
     ctx: Arc<AppContext>,
     executor: Arc<Executor>,
     dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
 ) -> Result<(), SubcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -775,6 +778,7 @@ pub fn run_subc_mode(
             shared_app,
             executor_for_loop,
             dispatch,
+            user_config_path,
         )
         .await
     });
@@ -839,6 +843,7 @@ async fn run_module_loop<R, W>(
     shared_app: Arc<App>,
     executor: Arc<Executor>,
     dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
 ) -> Result<(), SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1006,6 +1011,7 @@ where
                             &control_completion_tx,
                             &push_senders,
                             dispatch,
+                            user_config_path.as_deref(),
                         )
                         .await
                         {
@@ -1391,6 +1397,7 @@ async fn handle_control_request(
     control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
     push_senders: &PushSenders,
     dispatch: DispatchFn,
+    user_config_path: Option<&Path>,
 ) -> Result<(), SubcError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(SubcError::Json)?;
@@ -1431,7 +1438,36 @@ async fn handle_control_request(
             let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
-            let config_tiers: Vec<Value> = config
+
+            // W5: compose the configure tiers from AFT's own local read of the
+            // CortexKit config home (trusted-local origin) plus the wire-relayed
+            // inline tiers, capped by the fronting harness's trust (an mcp:* front
+            // cannot inject a user tier — it is downgraded to project so the
+            // resolver strips its privileged fields). Under the gateway there is
+            // no plugin to read on-disk config, so this local read is how a
+            // gateway user's `aft.jsonc` reaches AFT at all.
+            let wire_tiers: Vec<crate::config_resolve::ConfigTier> = config
+                .iter()
+                .map(|t| crate::config_resolve::ConfigTier {
+                    tier: t.tier.clone(),
+                    source: t.source.clone(),
+                    doc: t.doc.clone(),
+                })
+                .collect();
+            let parsed_harness = Harness::from_str(&bind_harness).ok();
+            let (composed_tiers, wire_user_downgraded) =
+                crate::subc_config::compose_route_bind_tiers(
+                    user_config_path,
+                    Path::new(&bind_project_root),
+                    wire_tiers,
+                    parsed_harness.as_ref(),
+                );
+            if wire_user_downgraded {
+                log::warn!(
+                    "subc attach: route {route_channel} front {bind_harness:?} relayed a user-tier config over the wire; downgraded to project-tier (privileged fields dropped)"
+                );
+            }
+            let config_tiers: Vec<Value> = composed_tiers
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
