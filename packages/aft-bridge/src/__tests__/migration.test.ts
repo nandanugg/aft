@@ -118,11 +118,12 @@ describe("config file migration", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("single legacy source copies atomically to CortexKit target", () => {
+  test("single legacy source moves to CortexKit target and leaves a marker", () => {
     const source = join(root, "opencode", "aft.jsonc");
     const target = join(root, "cortexkit", "aft.jsonc");
     mkdirSync(join(root, "opencode"), { recursive: true });
-    writeFileSync(source, '{\n  // keep me\n  "semantic_search": true,\n}\n', "utf8");
+    const original = '{\n  // keep me\n  "semantic_search": true,\n}\n';
+    writeFileSync(source, original, "utf8");
 
     const result = migrateAftConfigFile({
       scope: "user",
@@ -132,7 +133,15 @@ describe("config file migration", () => {
 
     expect(result.migrated).toBe(true);
     expect(result.conflict).toBe(false);
-    expect(readFileSync(target, "utf8")).toBe(readFileSync(source, "utf8"));
+    // Live config now lives at the CortexKit target, byte-identical to the original.
+    expect(readFileSync(target, "utf8")).toBe(original);
+    // The old location is moved aside so a later edit there can't silently no-op.
+    expect(existsSync(source)).toBe(false);
+    const marker = `${source}.MOVED_READPLEASE`;
+    expect(existsSync(marker)).toBe(true);
+    const markerContent = readFileSync(marker, "utf8");
+    expect(markerContent).toContain(target); // points to the new location
+    expect(markerContent).toContain('"semantic_search": true'); // preserves original settings
   });
 
   test("existing different target is not overwritten and emits a warning", () => {
@@ -187,11 +196,8 @@ describe("config file migration", () => {
     const target = join(root, "cortexkit", "aft.jsonc");
     mkdirSync(join(root, "opencode"), { recursive: true });
     mkdirSync(join(root, "pi"), { recursive: true });
-    writeFileSync(
-      opencode,
-      '{\n  "formatter": {"typescript": "biome"},\n  "semantic_search": true,\n}\n',
-      "utf8",
-    );
+    const original = '{\n  "formatter": {"typescript": "biome"},\n  "semantic_search": true,\n}\n';
+    writeFileSync(opencode, original, "utf8");
     writeFileSync(pi, '{"semantic_search":true,"formatter":{"typescript":"biome"}}\n', "utf8");
 
     const result = migrateAftConfigFile({
@@ -205,7 +211,36 @@ describe("config file migration", () => {
 
     expect(result.migrated).toBe(true);
     expect(result.conflict).toBe(false);
-    expect(readFileSync(target, "utf8")).toBe(readFileSync(opencode, "utf8"));
+    // first source (opencode) is the one copied to target
+    expect(readFileSync(target, "utf8")).toBe(original);
+    // Both legacy sources are moved aside (every matching trap, not just the copied one).
+    expect(existsSync(opencode)).toBe(false);
+    expect(existsSync(pi)).toBe(false);
+    expect(existsSync(`${opencode}.MOVED_READPLEASE`)).toBe(true);
+    expect(existsSync(`${pi}.MOVED_READPLEASE`)).toBe(true);
+  });
+
+  test("legacy source matching an existing target is moved aside, not left as a trap", () => {
+    const source = join(root, "opencode", "aft.jsonc");
+    const target = join(root, "cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "opencode"), { recursive: true });
+    mkdirSync(join(root, "cortexkit"), { recursive: true });
+    // Target already present (e.g. a prior migration or a fresh CortexKit file)
+    // with semantically-identical content to the legacy source.
+    writeFileSync(source, '{\n  "semantic_search": true,\n}\n', "utf8");
+    writeFileSync(target, '{"semantic_search":true}\n', "utf8");
+
+    const result = migrateAftConfigFile({
+      scope: "user",
+      targetPath: target,
+      legacySources: [{ path: source, label: "OpenCode user" }],
+    });
+
+    // No copy happened (target was already there), but the trap is cleared.
+    expect(result.conflict).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe('{"semantic_search":true}\n');
+    expect(existsSync(source)).toBe(false);
+    expect(existsSync(`${source}.MOVED_READPLEASE`)).toBe(true);
   });
 
   test("concurrent migrations are first-wins and leave valid target content", async () => {

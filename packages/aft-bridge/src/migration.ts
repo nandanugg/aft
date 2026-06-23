@@ -259,6 +259,103 @@ function atomicCopyConfigFile(sourcePath: string, targetPath: string): void {
   }
 }
 
+function atomicWriteConfigFile(targetPath: string, content: string): void {
+  mkdirSync(dirname(targetPath), { recursive: true });
+  const tmpPath = join(
+    dirname(targetPath),
+    `.${basename(targetPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  let fd: number | null = null;
+  try {
+    fd = openSync(tmpPath, "wx", 0o600);
+    writeFileSync(fd, content);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmpPath, targetPath);
+  } catch (err) {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // best-effort close before cleanup
+      }
+    }
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // best-effort temp cleanup
+    }
+    throw err;
+  }
+}
+
+const MOVED_MARKER_SUFFIX = ".MOVED_READPLEASE";
+
+function movedMarkerContent(
+  targetPath: string,
+  originalName: string,
+  originalContent: string,
+): string {
+  const header = [
+    "// AFT configuration moved.",
+    "//",
+    "// AFT now reads its configuration from one shared CortexKit location",
+    "// instead of a per-agent path. The settings that were in this file have",
+    "// been moved to:",
+    "//",
+    `//     ${targetPath}`,
+    "//",
+    "// Edit that file to change AFT settings. This location is no longer read",
+    "// by AFT.",
+    "//",
+    `// To undo, rename this file back to "${originalName}" (and remove the`,
+    "// CortexKit copy above if you want this location to take precedence).",
+    "//",
+    "// Your original settings are preserved below for reference.",
+    "",
+    "",
+  ].join("\n");
+  return `${header}${originalContent}`;
+}
+
+// After the live config is safely at the CortexKit target, rename each legacy
+// source aside to a "<name>.MOVED_READPLEASE" marker so a user editing the old
+// path notices it is no longer read (a copy-in-place leaves a silent stale-edit
+// trap). The marker preserves the original settings and documents how to undo.
+// A failure here is non-fatal: the content is already at the target, so we warn
+// and leave the legacy file in place rather than failing the migration.
+function markLegacySourcesMovedAside(
+  sources: readonly { path: string }[],
+  targetPath: string,
+  logger?: AftConfigFileMigrationOptions["logger"],
+): string[] {
+  const warnings: string[] = [];
+  const info = logger?.info ?? logger?.log;
+  for (const source of sources) {
+    const markerPath = `${source.path}${MOVED_MARKER_SUFFIX}`;
+    try {
+      const original = readFileSync(source.path, "utf-8");
+      atomicWriteConfigFile(
+        markerPath,
+        movedMarkerContent(targetPath, basename(source.path), original),
+      );
+      unlinkSync(source.path);
+      info?.(
+        `Moved legacy AFT config ${source.path} aside to ${markerPath}; AFT now reads ${targetPath}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(
+        `AFT could not move legacy config ${source.path} aside (${msg}); it is now stale and ignored. Delete it manually — AFT reads ${targetPath}.`,
+      );
+      logger?.warn?.(
+        `Could not move legacy AFT config ${source.path} aside (${msg}); AFT reads ${targetPath}`,
+      );
+    }
+  }
+  return warnings;
+}
+
 function visibleConfigMigrationWarning(
   scope: "user" | "project",
   targetPath: string,
@@ -309,6 +406,7 @@ export function migrateAftConfigFile(
         return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
       }
       info?.(`AFT ${opts.scope} config already present at ${opts.targetPath}; legacy copies match`);
+      warnings.push(...markLegacySourcesMovedAside(sources, opts.targetPath, opts.logger));
       return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
     }
 
@@ -330,6 +428,7 @@ export function migrateAftConfigFile(
 
     atomicCopyConfigFile(first.path, opts.targetPath);
     info?.(`Migrated AFT ${opts.scope} config from ${first.path} to ${opts.targetPath}`);
+    warnings.push(...markLegacySourcesMovedAside(sources, opts.targetPath, opts.logger));
     return {
       migrated: true,
       conflict: false,
