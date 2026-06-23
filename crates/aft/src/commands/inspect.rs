@@ -1,15 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::run_diagnostics_category;
-use crate::inspect::{InspectCache, InspectCategory, InspectSnapshot, JobOutcome, JobScope};
+use crate::inspect::{
+    DirectTier2RunOutcome, InspectCache, InspectCategory, InspectSnapshot, JobOutcome, JobScope,
+};
 use crate::protocol::{RawRequest, Response};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
+const DIRECT_TIER2_WAIT_BUDGET: Duration = Duration::from_secs(25);
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     let top_k = match parse_top_k(&req.params) {
@@ -31,10 +35,33 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
 
-    // Callgraph snapshots are only built inside background Tier 2 jobs.
-    // handle_inspect itself is fully read-only for Tier 2 (cache hit only), and
-    // Tier 1 (todos, metrics) does not consume the callgraph snapshot.
     let manager = ctx.inspect_manager();
+    let tier2_deadline = Instant::now() + direct_tier2_wait_budget(&snapshot.project_root);
+    let pending_tier2_paths = ctx.pending_tier2_paths();
+    let mut tier2_receivers = BTreeMap::new();
+    for category in [
+        InspectCategory::DeadCode,
+        InspectCategory::UnusedExports,
+        InspectCategory::Duplicates,
+    ] {
+        let manager = manager.clone();
+        let snapshot = snapshot.clone();
+        let scope = scope.clone();
+        let force_paths = pending_tier2_paths.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(manager.tier2_run_with_reuse_direct(
+                snapshot,
+                category,
+                scope,
+                tier2_deadline,
+                force_paths,
+            ));
+        });
+        tier2_receivers.insert(category, rx);
+    }
+
+    let mut force_paths_completed = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let mut tier2_refresh_needed = false;
     for category in InspectCategory::active() {
@@ -44,24 +71,36 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             // InspectManager's rayon worker path.
             run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
         } else if category.is_tier2() {
-            // Tier 2 (dead_code, unused_exports, duplicates) are NEVER scanned
-            // synchronously here. handle_inspect just returns whatever aggregate
-            // the last Tier 2 run persisted, or Pending if nothing is cached yet.
-            let outcome =
-                manager.tier2_read_cached_readonly(snapshot.clone(), *category, scope.clone());
-            if !ctx.is_worktree_bridge()
-                && matches!(
-                    outcome,
-                    JobOutcome::Stale { .. } | JobOutcome::Pending { .. }
-                )
-            {
+            let direct = tier2_receivers
+                .remove(category)
+                .map(|rx| receive_direct_tier2(rx, tier2_deadline))
+                .unwrap_or_else(|| DirectTier2RunOutcome {
+                    outcome: JobOutcome::Pending { in_flight: true },
+                    force_paths_completed: false,
+                });
+            if direct.force_paths_completed && matches!(direct.outcome, JobOutcome::Fresh { .. }) {
+                force_paths_completed.insert(*category);
+            }
+            if matches!(direct.outcome, JobOutcome::Pending { .. }) {
                 tier2_refresh_needed = true;
             }
-            outcome
+            direct.outcome
         } else {
             manager.submit_category_with_callgraph(snapshot.clone(), *category, scope.clone(), None)
         };
         outcomes.insert(*category, outcome);
+    }
+
+    if !pending_tier2_paths.is_empty()
+        && [
+            InspectCategory::DeadCode,
+            InspectCategory::UnusedExports,
+            InspectCategory::Duplicates,
+        ]
+        .iter()
+        .all(|category| force_paths_completed.contains(category))
+    {
+        ctx.remove_pending_tier2_paths(pending_tier2_paths);
     }
 
     if tier2_refresh_needed {
@@ -238,6 +277,50 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
         config,
         ctx.symbol_cache(),
     ))
+}
+
+fn direct_tier2_wait_budget(project_root: &Path) -> Duration {
+    if !env_project_root_matches("AFT_INSPECT_DIRECT_TIER2_DEADLINE_ROOT", project_root) {
+        return DIRECT_TIER2_WAIT_BUDGET;
+    }
+    std::env::var("AFT_INSPECT_DIRECT_TIER2_DEADLINE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DIRECT_TIER2_WAIT_BUDGET)
+}
+
+fn env_project_root_matches(var: &str, project_root: &Path) -> bool {
+    let Some(raw) = std::env::var_os(var) else {
+        return true;
+    };
+    let expected = PathBuf::from(raw);
+    let expected = std::fs::canonicalize(&expected).unwrap_or(expected);
+    let actual = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    expected == actual
+}
+
+fn receive_direct_tier2(
+    rx: std::sync::mpsc::Receiver<DirectTier2RunOutcome>,
+    deadline: Instant,
+) -> DirectTier2RunOutcome {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return DirectTier2RunOutcome {
+            outcome: JobOutcome::Pending { in_flight: true },
+            force_paths_completed: false,
+        };
+    };
+    if remaining.is_zero() {
+        return DirectTier2RunOutcome {
+            outcome: JobOutcome::Pending { in_flight: true },
+            force_paths_completed: false,
+        };
+    }
+
+    rx.recv_timeout(remaining).unwrap_or(DirectTier2RunOutcome {
+        outcome: JobOutcome::Pending { in_flight: true },
+        force_paths_completed: false,
+    })
 }
 
 fn parse_top_k(params: &Value) -> Result<usize, String> {
@@ -452,6 +535,8 @@ fn build_inspect_payload(
         }
     }
 
+    let complete = pending_categories.is_empty();
+    let incomplete_categories = pending_categories.clone();
     let disabled_categories = InspectCategory::disabled()
         .iter()
         .map(|category| category.as_str())
@@ -475,9 +560,12 @@ fn build_inspect_payload(
     );
 
     let mut payload = serde_json::json!({
+        "complete": complete,
         "summary": Value::Object(summary),
         "text": text,
         "scanner_state": {
+            "complete": complete,
+            "incomplete_categories": incomplete_categories,
             "tier2_last_run": tier2_last_run,
             "tier2_trigger_reason": ctx.tier2_trigger_reason(),
             "stale_categories": stale_categories,

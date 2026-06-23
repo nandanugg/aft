@@ -1317,6 +1317,8 @@ pub fn drain_watcher_events(ctx: &AppContext) {
         return;
     }
 
+    ctx.add_pending_tier2_paths(changed.iter().cloned());
+
     // A real source change makes the last-known Tier-2 counts stale until the
     // next background scan reconciles them — surface that in the status bar
     // immediately (the `~` marker) so the agent never reads them as live.

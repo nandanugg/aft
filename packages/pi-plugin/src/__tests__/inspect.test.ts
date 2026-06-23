@@ -31,7 +31,7 @@ describe("Pi aft_inspect surface", () => {
 });
 
 describe("Pi aft_inspect adapter", () => {
-  test("declares constrained topK schema and Pi-specific async wording", () => {
+  test("declares constrained topK schema and direct-fresh wording", () => {
     const { api, tools } = makeMockApi();
     const { bridge } = makeMockBridge(() => ({ success: true, summary: {} }));
     registerInspectTool(api, makePluginContext(bridge));
@@ -41,10 +41,9 @@ describe("Pi aft_inspect adapter", () => {
     expect(description).toContain("diagnostics");
     expect(description).not.toContain("triggered on session idle");
     expect(description).not.toContain("prewarm");
-    expect(description).toContain("asynchronously on demand");
-    expect(description).toContain("quietly starts a background Tier 2 warmup");
-    expect(description).toContain("at most once every 4 minutes");
-    expect(description).toContain("later call can use cached data");
+    expect(description).toContain("waits for a fresh reuse scan");
+    expect(description).toContain("complete: false");
+    expect(description).toContain("deduped background warmup");
 
     const parameters = inspect.parameters as {
       properties?: Record<string, Record<string, unknown>>;
@@ -126,6 +125,10 @@ describe("Pi aft_inspect adapter", () => {
       scope: ["src", "tests"],
       topK: 9,
       session_id: "pi-session",
+    });
+    expect(calls[0].options).toMatchObject({
+      keepBridgeOnTimeout: true,
+      timeoutMs: 60_000,
     });
   });
 

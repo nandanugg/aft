@@ -535,6 +535,21 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, true)
+    }
+
+    pub fn open_ready_no_rebuild(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<Self>> {
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false)
+    }
+
+    fn open_ready_with_rebuild_policy(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        allow_cold_build: bool,
+    ) -> Result<Option<Self>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
@@ -548,13 +563,19 @@ impl CallGraphStore {
             true,
         )?;
         match root_repair {
-            OpenRootRepair::NeedsRebuild { .. } => {
+            OpenRootRepair::NeedsRebuild { .. } if allow_cold_build => {
                 log_root_repair_rebuild(&root_repair);
                 drop(store);
                 let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
                 let (store, _stats) =
                     Self::cold_build_with_lease(callgraph_dir, project_root, &files)?;
                 Ok(Some(store))
+            }
+            OpenRootRepair::NeedsRebuild { .. } => {
+                crate::slog_info!(
+                    "callgraph store root repair requires rebuild; open-only reader reports unavailable"
+                );
+                Ok(None)
             }
             OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
         }

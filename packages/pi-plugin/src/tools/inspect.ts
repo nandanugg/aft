@@ -378,7 +378,7 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     label: "inspect",
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run asynchronously on demand: when a call sees cold `pending_categories: [...]` or stale `stale_categories: [...]`, Pi quietly starts a background Tier 2 warmup (deduped while in-flight and rate-limited per category to at most once every 4 minutes, matching OpenCode's default idle window). The current call may still return pending results while the cache warms; a later call can use cached data.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Pi may still trigger a deduped background warmup for categories that remain pending.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     parameters: InspectParams,
@@ -393,7 +393,9 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       const sections = normalizeStringOrArray(params.sections);
       const scope = await resolveAndGateScope(extCtx, ctx, normalizeStringOrArray(params.scope));
       const topK = validateOptionalTopK(params.topK);
-      const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx);
+      const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx, {
+        keepBridgeOnTimeout: true,
+      });
       runPendingTier2Categories(bridge, tier2RefreshCategories(response), extCtx);
       const body = response.text as string | undefined;
       if (typeof body === "string") {

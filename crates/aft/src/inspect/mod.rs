@@ -18,5 +18,7 @@ pub use job::{
     InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, InspectTier, JobKey,
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
-pub use manager::{InspectManager, Tier2RunSubmission, Tier2RunSubmissionError};
+pub use manager::{
+    DirectTier2RunOutcome, InspectManager, Tier2RunSubmission, Tier2RunSubmissionError,
+};
 pub use tier2_scheduler::{Tier2RefreshScheduler, Tier2TriggerReason};

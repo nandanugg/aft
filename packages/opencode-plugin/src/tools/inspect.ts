@@ -219,7 +219,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
   const inspectTool: ToolDefinition = {
     description:
       "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) run as background scans triggered on session idle; calls may return cached `stale_categories: [...]` results or `pending_categories: [...]` while a refresh is in progress (waits up to 1s for fresh data before falling back to cached).\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     args: {
@@ -256,7 +256,15 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
       const scope = scoped.scope;
       const topK = args.topK === undefined || args.topK === null ? undefined : args.topK;
 
-      const response = await callBridge(ctx, context, "inspect", { sections, scope, topK });
+      const response = await callBridge(
+        ctx,
+        context,
+        "inspect",
+        { sections, scope, topK },
+        {
+          keepBridgeOnTimeout: true,
+        },
+      );
       if (response.success === false) {
         throw new Error((response.message as string) || "inspect failed");
       }

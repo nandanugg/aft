@@ -18,6 +18,7 @@ export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
   trace_to_symbol: 60_000,
   trace_data: 60_000,
   impact: 60_000,
+  inspect: 60_000,
   grep: 60_000,
   glob: 60_000,
   semantic_search: 60_000,

@@ -13,7 +13,11 @@ import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
-type SendCall = { command: string; params: Record<string, unknown> };
+type SendCall = {
+  command: string;
+  params: Record<string, unknown>;
+  options?: Record<string, unknown>;
+};
 
 type CapturedTimer = {
   callback: () => void;
@@ -63,8 +67,12 @@ function createInspectHarness(
 ) {
   const sendCalls: SendCall[] = [];
   const localBridge = {
-    send: async (command: string, params: Record<string, unknown> = {}) => {
-      sendCalls.push({ command, params });
+    send: async (
+      command: string,
+      params: Record<string, unknown> = {},
+      options?: Record<string, unknown>,
+    ) => {
+      sendCalls.push({ command, params, options });
       return await sendImpl(command, params);
     },
   };
@@ -84,7 +92,8 @@ describe("aft_inspect tool", () => {
 
     expect(inspect.description).toContain("diagnostics");
     expect(inspect.description).toContain("Tier 1 (todos, metrics)");
-    expect(inspect.description).toContain("triggered on session idle");
+    expect(inspect.description).toContain("waits for a fresh reuse scan");
+    expect(inspect.description).toContain("complete: false");
     expect(schemaDescription(inspect.args.scope)).toContain("Tier 1 scopes the scan");
     expect(schemaDescription(inspect.args.scope)).toContain(
       "Tier 2 scans project-wide and applies scope as a result filter",
@@ -108,6 +117,10 @@ describe("aft_inspect tool", () => {
           topK: 7,
           session_id: "inspect-session",
         },
+        options: expect.objectContaining({
+          keepBridgeOnTimeout: true,
+          timeoutMs: 60_000,
+        }),
       },
     ]);
   });

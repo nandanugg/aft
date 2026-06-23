@@ -12,7 +12,7 @@ use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
     FileContribution, InspectCache, InspectCategory, InspectManager, InspectScanSuccess,
-    InspectSnapshot, JobKey,
+    InspectSnapshot, JobKey, JobOutcome,
 };
 use aft::lsp::registry::ServerKind;
 use aft::parser::{SymbolCache, TreeSitterProvider};
@@ -54,6 +54,36 @@ fn write_file(root: &Path, relative_path: &str, contents: &str) -> PathBuf {
 
 fn request(payload: Value) -> RawRequest {
     serde_json::from_value(payload).expect("request parses")
+}
+
+fn env_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(value) = self.previous.take() {
+            unsafe { std::env::set_var(self.key, value) };
+        } else {
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
 }
 
 fn configured_context(root: &Path) -> AppContext {
@@ -255,29 +285,6 @@ fn assert_summary_status(response: &Value, category: &str, status: &str) {
     assert!(
         !summary.contains_key("count"),
         "{category} summary status is not a trusted count: {response:#}"
-    );
-}
-
-/// Stale-WITH-cache contract: the summary surfaces the real last-known count
-/// (matching the status bar's `~D…`) flagged `stale: true`, NOT a bare
-/// `{status:"stale"}` sentinel. Staleness is still signaled via `stale: true`
-/// and `scanner_state.stale_categories` (asserted separately by callers).
-fn assert_summary_stale_with_counts(response: &Value, category: &str) {
-    let summary = response["summary"][category]
-        .as_object()
-        .unwrap_or_else(|| panic!("{category} summary object: {response:#}"));
-    assert_eq!(
-        summary.get("stale").and_then(Value::as_bool),
-        Some(true),
-        "{category} stale-with-cache summary must be flagged stale: {response:#}"
-    );
-    assert!(
-        summary.get("count").and_then(Value::as_u64).is_some(),
-        "{category} stale-with-cache summary must keep its cached count: {response:#}"
-    );
-    assert!(
-        !summary.contains_key("status"),
-        "{category} stale-with-cache summary must not be a bare status sentinel: {response:#}"
     );
 }
 
@@ -514,7 +521,7 @@ fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
 }
 
 #[test]
-fn inspect_command_tier2_returns_pending_status_before_tier2_run() {
+fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -523,10 +530,9 @@ fn inspect_command_tier2_returns_pending_status_before_tier2_run() {
     );
     let ctx = configured_context(&root);
 
-    // No tier2_run call — inspect should return Pending for Tier 2 without
-    // running scanners synchronously (which would block for seconds on big
-    // projects). The summary entry itself must be status-only so agents do not
-    // read an uncomputed category as clean.
+    // No tier2_run call: an explicit inspect now waits for a direct Tier-2
+    // reuse pass and returns the fresh result when the scan finishes before the
+    // direct-inspect deadline.
     let response = inspect(
         &ctx,
         json!({
@@ -538,11 +544,16 @@ fn inspect_command_tier2_returns_pending_status_before_tier2_run() {
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
     for category in ["dead_code", "unused_exports", "duplicates"] {
         assert!(
-            scanner_state_contains(&response, "pending_categories", category),
-            "{category} should be Pending before tier2_run: {response:#}"
+            !scanner_state_contains(&response, "pending_categories", category),
+            "{category} should finish during direct inspect: {response:#}"
         );
-        assert_summary_status(&response, category, "pending");
+        assert!(
+            !scanner_state_contains(&response, "stale_categories", category),
+            "{category} should not be served from a stale aggregate: {response:#}"
+        );
     }
+    assert_summary_count(&response, "unused_exports", 2);
+    assert_summary_count(&response, "duplicates", 0);
 }
 
 #[test]
@@ -893,13 +904,28 @@ fn inspect_command_tier2_warm_cache_hit_is_not_stale() {
 }
 
 #[test]
-fn inspect_command_tier2_changed_file_surfaces_stale_category() {
+fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "src/foo.ts", duplicate_fixture_source());
     write_file(&root, "src/bar.ts", duplicate_fixture_source());
     let ctx = configured_context(&root);
 
-    tier2_run(&ctx, &["duplicates"]);
+    let snapshot = InspectSnapshot::new(
+        root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+    );
+    let initial = ctx.inspect_manager().tier2_run_with_reuse_result(
+        snapshot,
+        InspectCategory::Duplicates,
+        None,
+    );
+    assert!(
+        initial.outcome.is_ok(),
+        "initial duplicates scan: {initial:?}"
+    );
+
     write_file(
         &root,
         "src/foo.ts",
@@ -909,17 +935,240 @@ fn inspect_command_tier2_changed_file_surfaces_stale_category() {
     let response = inspect(
         &ctx,
         json!({
-            "id": "inspect-duplicates-stale-cache",
+            "id": "inspect-duplicates-direct-fresh",
             "command": "inspect",
         }),
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
     assert!(
-        scanner_state_contains(&response, "stale_categories", "duplicates"),
-        "changed duplicate source should mark cached aggregate stale: {response:#}"
+        !scanner_state_contains(&response, "stale_categories", "duplicates"),
+        "direct inspect should not serve the pre-edit aggregate as stale: {response:#}"
     );
-    assert_summary_stale_with_counts(&response, "duplicates");
+    assert!(
+        !scanner_state_contains(&response, "pending_categories", "duplicates"),
+        "warm one-file edit should finish before the direct inspect deadline: {response:#}"
+    );
+    assert_summary_count(&response, "duplicates", 0);
+    let top = response["summary"]["unused_exports"]["top"]
+        .as_array()
+        .expect("unused export preview");
+    assert!(
+        top.iter().any(|item| item["symbol"] == "changed"),
+        "direct inspect should reflect the edited file in Tier-2 output: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_direct_reuse_attaches_to_in_flight_background_category() {
+    let _env_lock = env_serial_lock();
+    let (_temp_dir, root) = fixture_project();
+    let _delay_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_ROOT", &root.to_string_lossy());
+    let _delay = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_MS", "200");
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let ctx = configured_context(&root);
+    let manager = ctx.inspect_manager();
+    let snapshot = InspectSnapshot::new(
+        root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+    );
+
+    manager
+        .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::Duplicates)
+        .expect("queue background duplicate scan");
+    let direct = manager.tier2_run_with_reuse_direct(
+        snapshot,
+        InspectCategory::Duplicates,
+        aft::inspect::JobScope::for_project(root.clone()),
+        Instant::now() + Duration::from_secs(5),
+        Vec::new(),
+    );
+
+    assert!(
+        matches!(direct.outcome, JobOutcome::Fresh { .. }),
+        "direct inspect should attach to and receive the background result: {:?}",
+        direct.outcome
+    );
+    assert_eq!(
+        manager.reuse_completion_count(),
+        1,
+        "direct inspect must not start a competing same-category reuse scan"
+    );
+}
+
+#[test]
+fn inspect_direct_forced_paths_pending_when_followup_misses_deadline() {
+    let _env_lock = env_serial_lock();
+    let (_temp_dir, root) = fixture_project();
+    let _delay_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_ROOT", &root.to_string_lossy());
+    let _delay = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_MS", "10");
+    let _followup_delay_root = EnvVarGuard::set(
+        "AFT_TEST_DIRECT_FORCE_FOLLOWUP_DELAY_ROOT",
+        &root.to_string_lossy(),
+    );
+    let _followup_delay = EnvVarGuard::set("AFT_TEST_DIRECT_FORCE_FOLLOWUP_DELAY_MS", "150");
+    let source = write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let ctx = configured_context(&root);
+    let manager = ctx.inspect_manager();
+    let snapshot = InspectSnapshot::new(
+        root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+    );
+
+    manager
+        .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::Duplicates)
+        .expect("queue background duplicate scan");
+    let direct = manager.tier2_run_with_reuse_direct(
+        snapshot,
+        InspectCategory::Duplicates,
+        aft::inspect::JobScope::for_project(root.clone()),
+        Instant::now() + Duration::from_millis(100),
+        vec![source],
+    );
+
+    assert!(
+        matches!(direct.outcome, JobOutcome::Pending { .. }),
+        "forced paths not incorporated before the deadline must be reported incomplete: {:?}",
+        direct.outcome
+    );
+    assert!(
+        !direct.force_paths_completed,
+        "forced paths were never scanned for this response"
+    );
+}
+
+#[test]
+fn inspect_direct_claimed_reuse_panic_cleans_in_flight_key() {
+    let _env_lock = env_serial_lock();
+    let (_temp_dir, root) = fixture_project();
+    let _panic_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_PANIC_ROOT", &root.to_string_lossy());
+    let _panic_category = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_PANIC_CATEGORY", "duplicates");
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let ctx = configured_context(&root);
+    let manager = ctx.inspect_manager();
+    let snapshot = InspectSnapshot::new(
+        root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+    );
+
+    let direct = manager.tier2_run_with_reuse_direct(
+        snapshot,
+        InspectCategory::Duplicates,
+        aft::inspect::JobScope::for_project(root.clone()),
+        Instant::now() + Duration::from_secs(5),
+        Vec::new(),
+    );
+
+    assert!(
+        matches!(direct.outcome, JobOutcome::Failed { .. }),
+        "panic should be surfaced to waiters as a failed outcome: {:?}",
+        direct.outcome
+    );
+    assert!(
+        !manager.tier2_any_in_flight(),
+        "panic cleanup must remove the single-flight key"
+    );
+}
+
+#[test]
+fn inspect_command_direct_deadline_reports_incomplete_without_zero_counts() {
+    let _env_lock = env_serial_lock();
+    let (_temp_dir, root) = fixture_project();
+    let _deadline_root = EnvVarGuard::set(
+        "AFT_INSPECT_DIRECT_TIER2_DEADLINE_ROOT",
+        &root.to_string_lossy(),
+    );
+    let _delay_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_ROOT", &root.to_string_lossy());
+    let _deadline = EnvVarGuard::set("AFT_INSPECT_DIRECT_TIER2_DEADLINE_MS", "10");
+    let _delay = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_MS", "200");
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "src/bar.ts", duplicate_fixture_source());
+    let ctx = configured_context(&root);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-direct-deadline",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(
+        response["complete"], false,
+        "deadline must be explicit: {response:#}"
+    );
+    assert_eq!(
+        response["scanner_state"]["complete"], false,
+        "scanner_state must mirror incomplete direct inspect: {response:#}"
+    );
+    assert!(
+        scanner_state_contains(&response, "pending_categories", "duplicates"),
+        "slow direct scan should name the still-scanning category: {response:#}"
+    );
+    assert_summary_status(&response, "duplicates", "pending");
+}
+
+#[test]
+fn inspect_command_direct_forced_path_catches_mtime_preserved_same_size_edit() {
+    let (_temp_dir, root) = fixture_project();
+    let source = write_file(&root, "src/export.ts", "export function one() {}\n");
+    let fixed_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(&source, fixed_mtime).expect("set fixed mtime");
+    let ctx = configured_context(&root);
+    let snapshot = InspectSnapshot::new(
+        root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+    );
+    let initial = ctx.inspect_manager().tier2_run_with_reuse_result(
+        snapshot,
+        InspectCategory::UnusedExports,
+        None,
+    );
+    assert!(
+        initial.outcome.is_ok(),
+        "initial unused_exports scan: {initial:?}"
+    );
+
+    fs::write(&source, "export function two() {}\n").expect("same-size mutate");
+    filetime::set_file_mtime(&source, fixed_mtime).expect("restore mtime");
+    ctx.add_pending_tier2_paths([source.clone()]);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-mtime-preserved-direct-fresh",
+            "command": "inspect",
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert!(
+        !scanner_state_contains(&response, "pending_categories", "unused_exports"),
+        "forced direct inspect should complete the invalidated file: {response:#}"
+    );
+    let top = response["summary"]["unused_exports"]["top"]
+        .as_array()
+        .expect("unused exports top");
+    assert!(
+        top.iter().any(|item| item["symbol"] == "two"),
+        "direct inspect must reflect the mtime-preserved content edit: {response:#}"
+    );
+    assert!(
+        !top.iter().any(|item| item["symbol"] == "one"),
+        "direct inspect must not reuse the stat-fresh stale contribution: {response:#}"
+    );
 }
 
 #[test]
@@ -1009,17 +1258,17 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
 
     assert_eq!(after["success"], true, "inspect failed: {after:#}");
     assert!(
-        scanner_state_contains(&after, "stale_categories", "dead_code"),
-        "hash-miss fallback should surface the last-known aggregate as stale: {after:#}"
+        !scanner_state_contains(&after, "stale_categories", "dead_code"),
+        "direct inspect should refresh a hash-miss aggregate instead of serving stale data: {after:#}"
     );
     assert!(
         !scanner_state_contains(&after, "pending_categories", "dead_code"),
-        "hash-miss fallback should not drop to pending when an aggregate exists: {after:#}"
+        "direct hash-miss refresh should complete before the deadline for this fixture: {after:#}"
     );
-    assert_summary_stale_with_counts(&after, "dead_code");
+    assert_summary_count(&after, "dead_code", before_count);
     assert!(
         dead_code_items(&after).contains(&("src/lib.ts".to_string(), "unused".to_string())),
-        "stale hash-miss response should retain previous details: {after:#}"
+        "fresh hash-miss response should retain the expected unused export: {after:#}"
     );
 }
 
@@ -2037,20 +2286,6 @@ fn inspect_command_tier2_last_run_updates_on_hash_match_reuse() {
     write_file(&root, "src/bar.ts", duplicate_fixture_source());
     let ctx = configured_context(&root);
 
-    let cold = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-last-run-cold",
-            "command": "inspect",
-        }),
-    );
-    assert_eq!(cold["success"], true, "inspect failed: {cold:#}");
-    assert!(
-        cold["scanner_state"]["tier2_last_run"].is_null(),
-        "cold Tier 2 state should not have a last run: {cold:#}"
-    );
-
-    tier2_run(&ctx, &["duplicates"]);
     let first = inspect(
         &ctx,
         json!({
@@ -2058,11 +2293,12 @@ fn inspect_command_tier2_last_run_updates_on_hash_match_reuse() {
             "command": "inspect",
         }),
     );
+    assert_eq!(first["success"], true, "inspect failed: {first:#}");
     let first_last_run = first["scanner_state"]["tier2_last_run"]
         .as_i64()
         .expect("first tier2_last_run");
 
-    tier2_run(&ctx, &["duplicates"]);
+    thread::sleep(Duration::from_secs(1));
     let second = inspect(
         &ctx,
         json!({

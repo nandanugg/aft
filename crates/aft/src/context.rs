@@ -602,6 +602,7 @@ pub struct AppContext {
     symbol_cache: SharedSymbolCache,
     inspect_manager: Arc<InspectManager>,
     tier2_refresh_scheduler: parking_lot::Mutex<Tier2RefreshScheduler>,
+    pending_tier2_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     semantic_index: RwLock<Option<SemanticIndex>>,
     semantic_index_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
@@ -773,6 +774,7 @@ impl AppContext {
             symbol_cache,
             inspect_manager: Arc::new(InspectManager::new()),
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
+            pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),
             semantic_index: RwLock::new(None),
             semantic_index_rx: parking_lot::Mutex::new(None),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
@@ -1853,12 +1855,34 @@ impl AppContext {
     pub fn clear_pending_index_updates(&self) {
         self.pending_search_index_paths.lock().clear();
         self.pending_callgraph_store_paths.lock().clear();
+        self.pending_tier2_paths.lock().clear();
         self.pending_semantic_index_paths.lock().clear();
         *self.pending_semantic_corpus_refresh.lock() = false;
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
+    }
+
+    pub fn add_pending_tier2_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.pending_tier2_paths.lock().extend(paths);
+    }
+
+    pub fn pending_tier2_paths(&self) -> Vec<PathBuf> {
+        self.pending_tier2_paths.lock().iter().cloned().collect()
+    }
+
+    pub fn remove_pending_tier2_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut pending = self.pending_tier2_paths.lock();
+        for path in paths {
+            pending.remove(&path);
+        }
     }
 
     /// Returns true when one or more watcher-driven (reuse-path) Tier-2 scans
@@ -2441,6 +2465,8 @@ impl AppContext {
         params: &serde_json::Value,
     ) -> Option<crate::lsp::manager::PostEditWaitOutcome> {
         self.notify_watched_config_files(file_paths);
+        self.add_pending_tier2_paths(file_paths.iter().cloned());
+        let _ = self.mark_status_bar_tier2_stale();
 
         let wants_diagnostics = params
             .get("diagnostics")
@@ -2493,6 +2519,12 @@ impl AppContext {
             .unwrap_or(false);
 
         let custom_markers = self.custom_lsp_root_markers();
+        if let Some(file_paths) = Self::multi_file_write_paths(params) {
+            self.add_pending_tier2_paths(file_paths);
+        } else {
+            self.add_pending_tier2_paths([file_path.to_path_buf()]);
+        }
+        let _ = self.mark_status_bar_tier2_stale();
 
         if !wants_diagnostics {
             if let Some(file_paths) = Self::multi_file_write_paths(params) {

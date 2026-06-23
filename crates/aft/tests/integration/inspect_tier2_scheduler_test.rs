@@ -213,7 +213,7 @@ fn watcher_tick_after_quiet_gap_triggers_tier2_refresh() {
 }
 
 #[test]
-fn inspect_stale_tier2_sets_pull_demand_without_blocking() {
+fn direct_inspect_cold_tier2_computes_without_scheduler_pull() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -226,26 +226,16 @@ fn inspect_stale_tier2_sets_pull_demand_without_blocking() {
 
     let response = inspect(&ctx);
 
-    // Pending scanner state plus pull demand is the non-flaky proof that inspect
-    // returned without running tier2 inline. Wall-clock promptness checks are
-    // noisy on the shared test host.
     assert!(
-        scanner_state_contains(&response, "pending_categories", "dead_code"),
-        "cold tier2 should be pending before the pull-triggered refresh: {response:#}"
+        !scanner_state_contains(&response, "pending_categories", "dead_code"),
+        "direct inspect should wait for the cold Tier-2 result when it finishes before the deadline: {response:#}"
     );
     assert!(
-        ctx.tier2_pull_demand_pending(),
-        "inspect should leave a scheduler pull demand for stale/pending tier2"
+        !ctx.tier2_pull_demand_pending(),
+        "fresh direct inspect should not leave a scheduler pull demand"
     );
     assert_eq!(
         ctx.tick_tier2_refresh_scheduler_at(base + Duration::from_secs(1), 0),
-        Some(Tier2TriggerReason::Pull)
-    );
-
-    let response = wait_for_tier2(&ctx, &["dead_code", "unused_exports", "duplicates"]);
-    assert_eq!(
-        response["scanner_state"]["tier2_trigger_reason"].as_str(),
-        Some("pull"),
-        "inspect should expose the pull trigger reason after the demanded refresh: {response:#}"
+        None
     );
 }
