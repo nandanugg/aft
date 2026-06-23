@@ -2331,7 +2331,12 @@ mod tests {
         let path = dir.path().join("file.txt");
         fs::write(&path, "hello").unwrap();
 
-        let config = Config::default();
+        // format_on_edit defaults to false; opt in so we reach the
+        // language-detection path this test asserts.
+        let config = Config {
+            format_on_edit: true,
+            ..Config::default()
+        };
         let (formatted, reason) = auto_format(&path, &config);
         assert!(!formatted);
         assert_eq!(reason.as_deref(), Some("unsupported_language"));
@@ -2580,6 +2585,7 @@ mod tests {
 
         let config = Config {
             project_root: Some(dir.path().to_path_buf()),
+            format_on_edit: true,
             ..Config::default()
         };
         let (formatted, reason) = auto_format(&path, &config);
