@@ -1225,6 +1225,55 @@ fn parse_config_tiers(
     (!tiers.is_empty()).then_some(tiers)
 }
 
+fn parse_cortexkit_user_config_path(params: &serde_json::Value) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = params.get("cortexkit_user_config_path") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(value) = raw.as_str() else {
+        return Err("configure: cortexkit_user_config_path must be a string".to_string());
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("configure: cortexkit_user_config_path must be an absolute path".to_string());
+    }
+    Ok(Some(path))
+}
+
+fn find_config_tier(
+    tiers: &[crate::config_resolve::ConfigTier],
+    tier_name: &str,
+) -> Option<crate::config_resolve::ConfigTier> {
+    tiers.iter().find(|tier| tier.tier == tier_name).cloned()
+}
+
+fn resolve_config_tiers_for_configure(
+    params: &serde_json::Value,
+    project_root: &Path,
+) -> Result<Vec<crate::config_resolve::ConfigTier>, String> {
+    let wire_tiers = parse_config_tiers(params).unwrap_or_default();
+    let user_config_path = parse_cortexkit_user_config_path(params)?;
+    let file_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
+        user_config_path.as_deref(),
+        project_root,
+    );
+
+    let mut tiers = Vec::new();
+    for tier_name in ["user", "project"] {
+        if let Some(tier) = find_config_tier(&file_tiers, tier_name) {
+            tiers.push(tier);
+        } else if let Some(tier) = find_config_tier(&wire_tiers, tier_name) {
+            tiers.push(tier);
+        }
+    }
+    Ok(tiers)
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -1294,17 +1343,21 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // P1 config relocation: plugins send raw config tiers
     // (`config: [{tier, source, doc}]`), and AFT-core resolves the merge +
-    // trust-boundary itself (crate::config_resolve). Core AftConfig fields are
-    // applied here before process-state fields below; the legacy Group-B flat
-    // params are intentionally not read so they cannot bypass tier trust.
-    // Project-tier trust-boundary drops are surfaced for the warning path.
+    // trust-boundary itself (crate::config_resolve). The CortexKit
+    // config files are authoritative per tier: the user file wins over the wire user tier,
+    // and the project file independently wins over the wire project tier. The
+    // wire tiers remain as a one-release fallback for cached old plugins and for
+    // tiers that have not migrated yet.
     // ALWAYS resolve, even when no tiers are supplied. `resolve_config_onto`
-    // uses reset-onto-default semantics, so an absent/empty `config` must still
+    // uses reset-onto-default semantics, so an absent/empty config must still
     // run it to reset the core-domain config to defaults — otherwise a bind with
     // no tiers would keep the PREVIOUS bind's resolved core config (the
     // cross-bind escalation: a later low-trust bind inheriting an earlier
     // high-trust bind's capability by simply omitting tiers).
-    let tiers = parse_config_tiers(params).unwrap_or_default();
+    let tiers = match resolve_config_tiers_for_configure(params, &root_path) {
+        Ok(tiers) => tiers,
+        Err(error) => return Response::error(&req.id, "invalid_request", error),
+    };
     let config_dropped_keys: Vec<crate::config_resolve::DroppedKey> =
         crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
 
@@ -2325,6 +2378,136 @@ mod tests {
             "source": "/u/aft.jsonc",
             "doc": doc.to_string(),
         })
+    }
+
+    fn project_tier(doc: serde_json::Value) -> serde_json::Value {
+        json!({
+            "tier": "project",
+            "source": "/p/.opencode/aft.jsonc",
+            "doc": doc.to_string(),
+        })
+    }
+
+    fn write_config(path: &std::path::Path, doc: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, doc).unwrap();
+    }
+
+    #[test]
+    fn configure_user_file_wins_project_wire_falls_back_per_tier() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        write_config(&user_path, r#"{ "format_on_edit": false }"#);
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "cortexkit_user_config_path": user_path,
+            "config": [
+                user_tier(json!({ "format_on_edit": true, "url_fetch_allow_private": true })),
+                project_tier(json!({ "callgraph_chunk_size": 3 }))
+            ]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(!ctx.config().format_on_edit);
+        assert!(!ctx.config().url_fetch_allow_private);
+        assert_eq!(ctx.config().callgraph_chunk_size, 3);
+    }
+
+    #[test]
+    fn configure_project_file_wins_user_wire_falls_back_per_tier() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        let project_path = temp.path().join(".cortexkit/aft.jsonc");
+        write_config(&project_path, r#"{ "callgraph_chunk_size": 7 }"#);
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "cortexkit_user_config_path": user_path,
+            "config": [
+                user_tier(json!({ "url_fetch_allow_private": true })),
+                project_tier(json!({ "callgraph_chunk_size": 4 }))
+            ]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(ctx.config().url_fetch_allow_private);
+        assert_eq!(ctx.config().callgraph_chunk_size, 7);
+    }
+
+    #[test]
+    fn configure_both_files_ignore_wire_tiers() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        let project_path = temp.path().join(".cortexkit/aft.jsonc");
+        write_config(
+            &user_path,
+            r#"{ "format_on_edit": false, "url_fetch_allow_private": false }"#,
+        );
+        write_config(&project_path, r#"{ "callgraph_chunk_size": 9 }"#);
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "cortexkit_user_config_path": user_path,
+            "config": [
+                user_tier(json!({ "format_on_edit": true, "url_fetch_allow_private": true })),
+                project_tier(json!({ "callgraph_chunk_size": 2 }))
+            ]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(!ctx.config().format_on_edit);
+        assert!(!ctx.config().url_fetch_allow_private);
+        assert_eq!(ctx.config().callgraph_chunk_size, 9);
+    }
+
+    #[test]
+    fn configure_neither_file_uses_wire_tiers_for_old_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "cortexkit_user_config_path": user_path,
+            "config": [
+                user_tier(json!({ "format_on_edit": false, "url_fetch_allow_private": true })),
+                project_tier(json!({ "callgraph_chunk_size": 11 }))
+            ]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(!ctx.config().format_on_edit);
+        assert!(ctx.config().url_fetch_allow_private);
+        assert_eq!(ctx.config().callgraph_chunk_size, 11);
+    }
+
+    #[test]
+    fn configure_accepts_old_plugin_wire_without_cortexkit_user_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": temp.path(),
+            "harness": "opencode",
+            "config": [
+                user_tier(json!({ "format_on_edit": false })),
+                project_tier(json!({ "callgraph_chunk_size": 13 }))
+            ]
+        }));
+
+        let response = super::handle_configure(&req, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(!ctx.config().format_on_edit);
+        assert_eq!(ctx.config().callgraph_chunk_size, 13);
     }
 
     #[test]

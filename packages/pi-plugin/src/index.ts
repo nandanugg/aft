@@ -2,8 +2,8 @@
  * AFT (Agent File Tools) extension for Pi coding agent.
  *
  * Config is loaded from two levels (project overrides user):
- * - User:    ~/.pi/agent/aft.jsonc (or .json)
- * - Project: <project>/.pi/aft.jsonc (or .json)
+ * - User:    ~/.config/cortexkit/aft.jsonc (XDG_CONFIG_HOME-aware)
+ * - Project: <project>/.cortexkit/aft.jsonc
  *
  * Tools registered:
  *
@@ -57,6 +57,7 @@ import {
   formatConfigParseFailureMessage,
   getConfigLoadErrors,
   loadAftConfig,
+  migrateAftConfigLocations,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
@@ -453,6 +454,31 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   await ensureStorageMigrated({ harness: "pi", binaryPath, logger: bridgeLogger });
+
+  const deliverConfigMigrationWarnings = (messages: readonly string[]) => {
+    for (const message of messages) {
+      const notify = (pi as { ui?: { notify?: (message: string, type?: "warning") => void } }).ui
+        ?.notify;
+      if (typeof notify === "function") {
+        try {
+          notify(message, "warning");
+          continue;
+        } catch (err) {
+          warn(`[config] failed to deliver migration notification: ${err}`);
+        }
+      }
+      try {
+        process.stderr.write(`
+[AFT] ${message}
+`);
+      } catch {
+        // stderr may be unavailable in embedded hosts; warn() still records it.
+      }
+    }
+  };
+  deliverConfigMigrationWarnings(
+    migrateAftConfigLocations(process.cwd(), bridgeLogger).flatMap((result) => result.warnings),
+  );
 
   // Load config (user + project).
   const config = loadAftConfig(process.cwd());

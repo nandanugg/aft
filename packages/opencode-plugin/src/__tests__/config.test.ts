@@ -15,9 +15,9 @@ function createConfigFixture() {
   tempRoots.add(root);
 
   const xdgConfigHome = join(root, "xdg-config");
-  const userConfigDir = join(xdgConfigHome, "opencode");
+  const userConfigDir = join(xdgConfigHome, "cortexkit");
   const projectDirectory = join(root, "project");
-  const projectConfigDir = join(projectDirectory, ".opencode");
+  const projectConfigDir = join(projectDirectory, ".cortexkit");
 
   mkdirSync(userConfigDir, { recursive: true });
   mkdirSync(projectConfigDir, { recursive: true });
@@ -632,10 +632,12 @@ describe("loadAftConfig", () => {
     expect(migrated).not.toContain("experimental_bash_compress");
   });
 
-  test("migrates both jsonc and json candidate files", () => {
+  test("migrates the CortexKit jsonc config file", () => {
     const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
-    writeFileSync(fixture.userJsonPath, JSON.stringify({ experimental_semantic_search: true }));
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ experimental_search_index: true, experimental_semantic_search: true }),
+    );
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
@@ -643,9 +645,9 @@ describe("loadAftConfig", () => {
     });
 
     expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
-    expect(result.stderr).toContain(`Migrated config at ${fixture.userJsonPath}`);
-    expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("search_index");
-    expect(readFileSync(fixture.userJsonPath, "utf-8")).toContain("semantic_search");
+    const migrated = readFileSync(fixture.userConfigPath, "utf-8");
+    expect(migrated).toContain("search_index");
+    expect(migrated).toContain("semantic_search");
   });
 
   test("migrates project and user config independently", () => {

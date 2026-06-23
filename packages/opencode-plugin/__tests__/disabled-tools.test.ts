@@ -14,9 +14,9 @@ function createConfigFixture() {
   tempRoots.add(root);
 
   const xdgConfigHome = join(root, "xdg-config");
-  const userConfigDir = join(xdgConfigHome, "opencode");
+  const userConfigDir = join(xdgConfigHome, "cortexkit");
   const projectDirectory = join(root, "project");
-  const projectConfigDir = join(projectDirectory, ".opencode");
+  const projectConfigDir = join(projectDirectory, ".cortexkit");
 
   mkdirSync(userConfigDir, { recursive: true });
   mkdirSync(projectConfigDir, { recursive: true });

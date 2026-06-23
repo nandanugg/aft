@@ -59,7 +59,7 @@ function findToolInWorkspace(tool: string): string | null {
 export interface FormatPreset {
   /** Files to write into the temp project root before configure(). */
   configFiles: Array<{ path: string; content: string }>;
-  /** Optional explicit `formatter` map for `.opencode/aft.jsonc`. */
+  /** Optional explicit `formatter` map for `.cortexkit/aft.jsonc`. */
   explicitFormatter?: Record<string, string>;
   /** Optional explicit `checker` map. */
   explicitChecker?: Record<string, string>;

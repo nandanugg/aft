@@ -19,9 +19,10 @@ function createConfigFixture() {
   tempRoots.add(root);
 
   const home = join(root, "home");
-  const userConfigDir = join(home, ".pi", "agent");
+  const xdgConfigHome = join(root, "xdg-config");
+  const userConfigDir = join(xdgConfigHome, "cortexkit");
   const projectDirectory = join(root, "project");
-  const projectConfigDir = join(projectDirectory, ".pi");
+  const projectConfigDir = join(projectDirectory, ".cortexkit");
 
   mkdirSync(userConfigDir, { recursive: true });
   mkdirSync(projectConfigDir, { recursive: true });
@@ -29,6 +30,7 @@ function createConfigFixture() {
   return {
     root,
     home,
+    xdgConfigHome,
     projectDirectory,
     userConfigPath: join(userConfigDir, "aft.jsonc"),
     userJsonPath: join(userConfigDir, "aft.json"),
@@ -78,6 +80,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -113,6 +116,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const loaded = JSON.parse(result.stdout);
@@ -138,6 +142,7 @@ describe("loadAftConfig", () => {
         ...process.env,
         AFT_LOG_STDERR: "1",
         HOME: fixture.home,
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
         PROJECT_DIR: fixture.projectDirectory,
       },
       encoding: "utf8",
@@ -156,6 +161,7 @@ describe("loadAftConfig", () => {
         ...process.env,
         AFT_LOG_STDERR: "1",
         HOME: empty.home,
+        XDG_CONFIG_HOME: empty.xdgConfigHome,
         PROJECT_DIR: empty.projectDirectory,
       },
       encoding: "utf8",
@@ -186,6 +192,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
@@ -229,6 +236,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -265,6 +273,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -302,6 +311,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -326,6 +336,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -348,6 +359,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -372,6 +384,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -395,6 +408,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -414,6 +428,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -434,6 +449,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -455,6 +471,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -480,6 +497,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -499,6 +517,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -521,6 +540,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -539,6 +559,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -558,6 +579,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -577,7 +599,10 @@ describe("loadAftConfig", () => {
     );
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ bash: { compress: false } }));
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     // Field-by-field union: user's rewrite=true survives, project's
     // compress=false wins, background not set so it defaults true at
@@ -604,7 +629,10 @@ describe("loadAftConfig", () => {
       JSON.stringify({ experimental: { bash: { compress: false } } }),
     );
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     expect(JSON.parse(result.stdout)).toMatchObject({
       bash: { rewrite: false, compress: false, background: false },
@@ -625,7 +653,10 @@ describe("loadAftConfig", () => {
       }),
     );
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     // Flat keys lift to nested experimental.bash, then graduation lifts the
     // bash block to top-level. lsp_ty stays under experimental.
@@ -647,8 +678,14 @@ describe("loadAftConfig", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
 
-    const first = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
-    const second = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const first = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    const second = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     expect(first.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
     expect(second.stderr).not.toContain(`Migrated config at ${fixture.userConfigPath}`);
@@ -662,7 +699,10 @@ describe("loadAftConfig", () => {
       '{\n  // keep me\n  /* keep this block too */\n  "experimental_bash_rewrite": true,\n}\n',
     );
 
-    runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     const migrated = readFileSync(fixture.userConfigPath, "utf-8");
     expect(migrated).toContain("// keep me");
@@ -673,17 +713,22 @@ describe("loadAftConfig", () => {
     expect(migrated).not.toContain("experimental_bash_rewrite");
   });
 
-  test("migrates both jsonc and json candidate files", () => {
+  test("migrates the CortexKit jsonc config file", () => {
     const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
-    writeFileSync(fixture.userJsonPath, JSON.stringify({ experimental_semantic_search: true }));
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ experimental_search_index: true, experimental_semantic_search: true }),
+    );
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
-    expect(result.stderr).toContain(`Migrated config at ${fixture.userJsonPath}`);
-    expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("search_index");
-    expect(readFileSync(fixture.userJsonPath, "utf-8")).toContain("semantic_search");
+    const migrated = readFileSync(fixture.userConfigPath, "utf-8");
+    expect(migrated).toContain("search_index");
+    expect(migrated).toContain("semantic_search");
   });
 
   test("migrates project and user config independently", () => {
@@ -691,7 +736,10 @@ describe("loadAftConfig", () => {
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ experimental_bash_compress: true }));
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     // experimental_bash_compress lifts to nested experimental.bash.compress,
     // then graduates to top-level bash.compress with materialized siblings.
@@ -710,7 +758,10 @@ describe("loadAftConfig", () => {
       JSON.stringify({ search_index: false, experimental_search_index: true }),
     );
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     expect(JSON.parse(result.stdout)).toEqual({ search_index: false });
     expect(readFileSync(fixture.userConfigPath, "utf-8")).not.toContain(
@@ -724,7 +775,10 @@ describe("loadAftConfig", () => {
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
     chmodSync(fixture.userConfigPath, 0o444);
 
-    const result = runConfigLoader(fixture.projectDirectory, { HOME: fixture.home });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
     expect(JSON.parse(result.stdout)).toEqual({ search_index: true });
     if (result.stderr.includes("Config migration could not write")) {
@@ -787,6 +841,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout);
@@ -822,6 +877,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as {
@@ -844,6 +900,7 @@ describe("loadAftConfig", () => {
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
     const config = JSON.parse(result.stdout) as Record<string, unknown>;

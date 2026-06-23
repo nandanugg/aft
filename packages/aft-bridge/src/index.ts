@@ -64,11 +64,18 @@ export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
 export { stripJsoncSymbols } from "./jsonc.js";
 export type { Logger, LogMeta } from "./logger.js";
-export type { MigrationHarness, MigrationOptions, MigrationStatus } from "./migration.js";
+export type {
+  AftConfigFileMigrationOptions,
+  AftConfigFileMigrationResult,
+  MigrationHarness,
+  MigrationOptions,
+  MigrationStatus,
+} from "./migration.js";
 // --- storage migration ---
 export {
   ensureStorageMigrated,
   getMigrationStatus,
+  migrateAftConfigFile,
   resolveCortexKitStorageRoot,
   resolveLegacyStorageRoot,
 } from "./migration.js";
@@ -88,10 +95,15 @@ export {
   getManualInstallHint,
   isOrtAutoDownloadSupported,
 } from "./onnx-runtime.js";
+export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
 export {
   markAnnouncementSeen,
   repairRootScopedStorageFile,
+  resolveCortexKitConfigPaths,
+  resolveCortexKitProjectConfigPath,
+  resolveCortexKitUserConfigPath,
   resolveHarnessStoragePath,
+  resolveLegacyAftConfigSources,
   shouldShowAnnouncement,
 } from "./paths.js";
 export type { PipeStripResult } from "./pipe-strip.js";

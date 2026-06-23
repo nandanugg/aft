@@ -13,6 +13,6 @@ import type { AftConfig } from "./config.js";
 export interface PluginContext {
   pool: BridgePool;
   config: AftConfig;
-  /** Absolute path to AFT's storage dir (e.g. ~/.pi/agent/aft) */
+  /** Absolute path to AFT's data storage dir (e.g. ~/.local/share/cortexkit/aft). */
   storageDir: string;
 }

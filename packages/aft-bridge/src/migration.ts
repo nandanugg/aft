@@ -1,8 +1,19 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { resolveHarnessStoragePath } from "./paths.js";
+import { basename, dirname, join } from "node:path";
+import { type LegacyAftConfigSource, resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
 
 type SpawnSyncForMigration = typeof spawnSync;
@@ -24,6 +35,25 @@ export interface MigrationOptions {
     log?: (msg: string) => void;
   };
   timeoutMs?: number;
+}
+
+export interface AftConfigFileMigrationOptions {
+  scope: "user" | "project";
+  targetPath: string;
+  legacySources: readonly LegacyAftConfigSource[];
+  logger?: {
+    warn?: (msg: string) => void;
+    info?: (msg: string) => void;
+    log?: (msg: string) => void;
+  };
+}
+
+export interface AftConfigFileMigrationResult {
+  migrated: boolean;
+  conflict: boolean;
+  sourcePath?: string;
+  targetPath: string;
+  warnings: string[];
 }
 
 export interface MigrationStatus {
@@ -69,6 +99,257 @@ export function resolveLegacyStorageRoot(harness: MigrationHarness): string {
 
 export function resolveCortexKitStorageRoot(): string {
   return join(dataHome(), "cortexkit", "aft");
+}
+
+function stripJsoncForParse(input: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    const next = input[i + 1];
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      while (i < input.length && input[i] !== "\n") i++;
+      out += "\n";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i++;
+      i++;
+      out += " ";
+      continue;
+    }
+    out += ch;
+  }
+  let withoutTrailingCommas = "";
+  inString = false;
+  escaped = false;
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i];
+    if (inString) {
+      withoutTrailingCommas += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      withoutTrailingCommas += ch;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < out.length && /\s/.test(out[j])) j++;
+      if (out[j] === "}" || out[j] === "]") continue;
+    }
+    withoutTrailingCommas += ch;
+  }
+  return withoutTrailingCommas;
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortJson((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+function normalizedJsoncSemantics(content: string): string {
+  return JSON.stringify(sortJson(JSON.parse(stripJsoncForParse(content))));
+}
+
+function fileSemanticsMatch(a: string, b: string): boolean {
+  try {
+    return normalizedJsoncSemantics(a) === normalizedJsoncSemantics(b);
+  } catch {
+    return a === b;
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireConfigMigrationLock(lockDir: string): () => void {
+  const deadline = Date.now() + 30_000;
+  while (true) {
+    try {
+      mkdirSync(lockDir, { recursive: false });
+      return () => {
+        try {
+          rmSync(lockDir, { recursive: true, force: true });
+        } catch {
+          // best-effort lock cleanup
+        }
+      };
+    } catch (err) {
+      const code = (err as { code?: unknown })?.code;
+      if (code !== "EEXIST") throw err;
+      try {
+        const ageMs = Date.now() - statSync(lockDir).mtimeMs;
+        if (ageMs > 60_000) {
+          rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // If the lock disappeared between mkdir attempts, retry immediately.
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for config migration lock ${lockDir}`);
+      }
+      sleepSync(25);
+    }
+  }
+}
+
+function atomicCopyConfigFile(sourcePath: string, targetPath: string): void {
+  mkdirSync(dirname(targetPath), { recursive: true });
+  const tmpPath = join(
+    dirname(targetPath),
+    `.${basename(targetPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  let fd: number | null = null;
+  try {
+    fd = openSync(tmpPath, "wx", 0o600);
+    writeFileSync(fd, readFileSync(sourcePath));
+    closeSync(fd);
+    fd = null;
+    renameSync(tmpPath, targetPath);
+  } catch (err) {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // best-effort close before cleanup
+      }
+    }
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // best-effort temp cleanup
+    }
+    throw err;
+  }
+}
+
+function visibleConfigMigrationWarning(
+  scope: "user" | "project",
+  targetPath: string,
+  paths: readonly string[],
+  reason: string,
+): string {
+  const uniquePaths = [...new Set([targetPath, ...paths])];
+  return (
+    `AFT ${scope} config migration refused: ${reason}. ` +
+    `Legacy and CortexKit config paths collapse to one file, but AFT will not overwrite or merge them automatically. ` +
+    `Please consolidate manually into ${targetPath}. Paths: ${uniquePaths.join(" ; ")}`
+  );
+}
+
+export function migrateAftConfigFile(
+  opts: AftConfigFileMigrationOptions,
+): AftConfigFileMigrationResult {
+  const warnings: string[] = [];
+  const existingSources = opts.legacySources.filter((source) => existsSync(source.path));
+  const info = opts.logger?.info ?? opts.logger?.log;
+
+  if (existingSources.length === 0) {
+    return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
+  }
+
+  mkdirSync(dirname(opts.targetPath), { recursive: true });
+  const release = acquireConfigMigrationLock(`${opts.targetPath}.lock`);
+  try {
+    const sources = existingSources.map((source) => ({
+      ...source,
+      content: readFileSync(source.path, "utf-8"),
+    }));
+
+    if (existsSync(opts.targetPath)) {
+      const targetContent = readFileSync(opts.targetPath, "utf-8");
+      const differing = sources.filter(
+        (source) => !fileSemanticsMatch(source.content, targetContent),
+      );
+      if (differing.length > 0) {
+        const message = visibleConfigMigrationWarning(
+          opts.scope,
+          opts.targetPath,
+          differing.map((source) => source.path),
+          "the CortexKit target already exists with different settings",
+        );
+        warnings.push(message);
+        opts.logger?.warn?.(message);
+        return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
+      }
+      info?.(`AFT ${opts.scope} config already present at ${opts.targetPath}; legacy copies match`);
+      return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
+    }
+
+    const first = sources[0];
+    const differing = sources.filter(
+      (source) => !fileSemanticsMatch(source.content, first.content),
+    );
+    if (differing.length > 0) {
+      const message = visibleConfigMigrationWarning(
+        opts.scope,
+        opts.targetPath,
+        sources.map((source) => source.path),
+        "multiple legacy sources have different settings",
+      );
+      warnings.push(message);
+      opts.logger?.warn?.(message);
+      return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
+    }
+
+    atomicCopyConfigFile(first.path, opts.targetPath);
+    info?.(`Migrated AFT ${opts.scope} config from ${first.path} to ${opts.targetPath}`);
+    return {
+      migrated: true,
+      conflict: false,
+      sourcePath: first.path,
+      targetPath: opts.targetPath,
+      warnings,
+    };
+  } catch (err) {
+    const message = visibleConfigMigrationWarning(
+      opts.scope,
+      opts.targetPath,
+      existingSources.map((source) => source.path),
+      `migration failed (${err instanceof Error ? err.message : String(err)})`,
+    );
+    warnings.push(message);
+    opts.logger?.warn?.(message);
+    return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
+  } finally {
+    release();
+  }
 }
 
 function tail(value: string | undefined): string {

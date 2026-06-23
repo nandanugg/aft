@@ -21,6 +21,7 @@ const GROUP_A_PROCESS_KEYS = [
   "max_background_bash_tasks",
   "aft_search_registered",
   "project_root",
+  "cortexkit_user_config_path",
 ] as const;
 
 const GROUP_B_CORE_KEYS = [
@@ -50,20 +51,23 @@ const GROUP_B_CORE_KEYS = [
 
 const tempRoots = new Set<string>();
 const originalHome = process.env.HOME;
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 
 function createFixture() {
   const root = mkdtempSync(join(tmpdir(), "aft-pi-config-tiers-"));
   tempRoots.add(root);
   const home = join(root, "home");
-  const userConfigDir = join(home, ".pi", "agent");
+  const xdgConfigHome = join(root, "xdg-config");
+  const userConfigDir = join(xdgConfigHome, "cortexkit");
   const projectDirectory = join(root, "project");
-  const projectConfigDir = join(projectDirectory, ".pi");
+  const projectConfigDir = join(projectDirectory, ".cortexkit");
   mkdirSync(userConfigDir, { recursive: true });
   mkdirSync(projectConfigDir, { recursive: true });
   return {
     root,
     home,
+    xdgConfigHome,
     projectDirectory,
     userConfigPath: join(userConfigDir, "aft.jsonc"),
     projectConfigPath: join(projectConfigDir, "aft.jsonc"),
@@ -90,12 +94,14 @@ afterEach(() => {
   }
   tempRoots.clear();
   process.env.HOME = originalHome;
+  process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
 });
 
 describe("Pi configure config tiers cutover", () => {
   test("sends raw config tiers plus process-state keys and no resolved core-domain flat params", () => {
     const fixture = createFixture();
     process.env.HOME = fixture.home;
+    process.env.XDG_CONFIG_HOME = fixture.xdgConfigHome;
 
     const userDoc = JSON.stringify(
       {
@@ -151,6 +157,7 @@ describe("Pi configure config tiers cutover", () => {
       env: {
         ...process.env,
         HOME: fixture.home,
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
         PROJECT_DIR: fixture.projectDirectory,
         PROCESS_STATE: JSON.stringify(representativeProcessState(fixture.root)),
       },

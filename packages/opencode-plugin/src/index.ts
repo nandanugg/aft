@@ -26,6 +26,7 @@ import {
   buildConfigTierConfigureParams,
   getConfigLoadErrors,
   loadAftConfig,
+  migrateAftConfigLocations,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
@@ -214,7 +215,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
 
-  // Load config: ~/.config/opencode/aft.jsonc → <project>/.opencode/aft.jsonc
+  const deliverConfigMigrationWarnings = (directory: string, messages: readonly string[]) => {
+    for (const message of messages) {
+      void sendWarning({ client: input.client, directory }, message).catch((err) => {
+        warn(`[config] failed to deliver migration warning: ${err}`);
+      });
+    }
+  };
+  deliverConfigMigrationWarnings(
+    input.directory,
+    migrateAftConfigLocations(input.directory, bridgeLogger).flatMap((result) => result.warnings),
+  );
+
+  // Load config: ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
   const aftConfig = loadAftConfig(input.directory);
   enqueueConfigParseWarnings(input.directory, getConfigLoadErrors());
   const autoUpdateAbort = new AbortController();
@@ -228,7 +241,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   //      tiers for the init-time project so the first bridge configures without
   //      an extra loader call.
   //   2. `projectConfigLoader` (wired below) — PER-BRIDGE raw config tiers,
-  //      loaded from each project's own `.opencode/aft.jsonc` at bridge-spawn
+  //      loaded from each project's own `.cortexkit/aft.jsonc` at bridge-spawn
   //      time. Rust owns merge + trust-boundary stripping for the core domain.
   //
   // The pool merges them with per-project values winning. Without this split,
@@ -406,10 +419,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // Per-project configure overrides — fixes OpenCode Desktop /
     // `opencode serve` mode where one plugin instance serves many projects.
     // Without this, every bridge inherits the project config visible at
-    // plugin init; with it, each project's `.opencode/aft.jsonc` wins for
+    // plugin init; with it, each project's `.cortexkit/aft.jsonc` wins for
     // that project's bridge. See PoolOptions.projectConfigLoader doc.
     projectConfigLoader: (projectRoot) => {
       try {
+        deliverConfigMigrationWarnings(
+          projectRoot,
+          migrateAftConfigLocations(projectRoot, bridgeLogger).flatMap((result) => result.warnings),
+        );
         return buildConfigTierConfigureParams(projectRoot);
       } catch (err) {
         warn(

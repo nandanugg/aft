@@ -1,7 +1,13 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { type ConfigTier, readConfigTiers, stripJsoncSymbols } from "@cortexkit/aft-bridge";
+import {
+  type AftConfigFileMigrationResult,
+  type ConfigTier,
+  migrateAftConfigFile as migrateLegacyAftConfigFile,
+  readConfigTiers,
+  resolveCortexKitConfigPaths,
+  resolveLegacyAftConfigSources,
+  stripJsoncSymbols,
+} from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
 
@@ -907,26 +913,6 @@ export function migrateAftConfigFile(
 // Preserves comments during round-trip in tui-config.ts.
 
 // ---------------------------------------------------------------------------
-// Config file detection (.jsonc preferred over .json)
-// ---------------------------------------------------------------------------
-
-function detectConfigFile(basePath: string): {
-  format: "json" | "jsonc" | "none";
-  path: string;
-} {
-  const jsoncPath = `${basePath}.jsonc`;
-  const jsonPath = `${basePath}.json`;
-
-  if (existsSync(jsoncPath)) {
-    return { format: "jsonc", path: jsoncPath };
-  }
-  if (existsSync(jsonPath)) {
-    return { format: "json", path: jsonPath };
-  }
-  return { format: "none", path: jsonPath };
-}
-
-// ---------------------------------------------------------------------------
 // Partial parse (valid sections survive, invalid sections are skipped)
 // ---------------------------------------------------------------------------
 
@@ -1347,54 +1333,49 @@ export function resolveBridgePoolTransportOptions(config: AftConfig): {
   };
 }
 
-// ---------------------------------------------------------------------------
-// OpenCode config directory detection (same logic as oh-my-opencode)
-// ---------------------------------------------------------------------------
-
-function getOpenCodeConfigDir(): string {
-  const envDir = process.env.OPENCODE_CONFIG_DIR?.trim();
-  if (envDir) {
-    return envDir;
-  }
-
-  // XDG_CONFIG_HOME or homedir()/.config, then /opencode
-  const xdgConfig = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(xdgConfig, "opencode");
-}
-
 export interface ResolvedAftConfigPaths {
   userConfigPath: string;
   projectConfigPath: string;
 }
 
+export function migrateAftConfigLocations(
+  projectDirectory: string,
+  logger: Logger = { log, warn },
+): AftConfigFileMigrationResult[] {
+  const paths = resolveCortexKitConfigPaths(projectDirectory);
+  const legacy = resolveLegacyAftConfigSources(projectDirectory);
+  return [
+    migrateLegacyAftConfigFile({
+      scope: "user",
+      targetPath: paths.userConfigPath,
+      legacySources: legacy.user,
+      logger,
+    }),
+    migrateLegacyAftConfigFile({
+      scope: "project",
+      targetPath: paths.projectConfigPath,
+      legacySources: legacy.project,
+      logger,
+    }),
+  ];
+}
+
 export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
-  // User-level config
-  const configDir = getOpenCodeConfigDir();
-  const userBasePath = join(configDir, "aft");
-  migrateAftConfigFile(`${userBasePath}.jsonc`);
-  migrateAftConfigFile(`${userBasePath}.json`);
-  const userDetected = detectConfigFile(userBasePath);
-  const userConfigPath =
-    userDetected.format !== "none" ? userDetected.path : `${userBasePath}.json`;
-
-  // Project-level config
-  const projectBasePath = join(projectDirectory, ".opencode", "aft");
-  migrateAftConfigFile(`${projectBasePath}.jsonc`);
-  migrateAftConfigFile(`${projectBasePath}.json`);
-  const projectDetected = detectConfigFile(projectBasePath);
-  const projectConfigPath =
-    projectDetected.format !== "none" ? projectDetected.path : `${projectBasePath}.json`;
-
-  return { userConfigPath, projectConfigPath };
+  const paths = resolveCortexKitConfigPaths(projectDirectory);
+  migrateAftConfigFile(paths.userConfigPath);
+  migrateAftConfigFile(paths.projectConfigPath);
+  return paths;
 }
 
 export function buildConfigTierConfigureParams(
   projectDirectory: string,
   processState: Record<string, unknown> = {},
-): Record<string, unknown> & { config: ConfigTier[] } {
+): Record<string, unknown> & { config: ConfigTier[]; cortexkit_user_config_path: string } {
+  const paths = resolveAftConfigPaths(projectDirectory);
   return {
     ...processState,
-    config: readConfigTiers(resolveAftConfigPaths(projectDirectory)),
+    cortexkit_user_config_path: paths.userConfigPath,
+    config: readConfigTiers(paths),
   };
 }
 

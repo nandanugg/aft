@@ -7,6 +7,9 @@ import { join } from "node:path";
 import {
   markAnnouncementSeen,
   repairRootScopedStorageFile,
+  resolveCortexKitConfigPaths,
+  resolveCortexKitProjectConfigPath,
+  resolveCortexKitUserConfigPath,
   resolveHarnessStoragePath,
   shouldShowAnnouncement,
 } from "../paths.js";
@@ -24,6 +27,45 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
   }
   tempRoots.clear();
+});
+
+describe("CortexKit config paths", () => {
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  const originalXdg = process.env.XDG_CONFIG_HOME;
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalUserProfile;
+    process.env.XDG_CONFIG_HOME = originalXdg;
+  });
+
+  test("user config honors absolute XDG_CONFIG_HOME", () => {
+    const root = createStorageRoot();
+    process.env.HOME = join(root, "home");
+    process.env.XDG_CONFIG_HOME = join(root, "xdg");
+
+    expect(resolveCortexKitUserConfigPath()).toBe(join(root, "xdg", "cortexkit", "aft.jsonc"));
+  });
+
+  test("user config falls back to home .config when XDG_CONFIG_HOME is relative", () => {
+    const root = createStorageRoot();
+    process.env.HOME = join(root, "home");
+    process.env.XDG_CONFIG_HOME = "relative-xdg";
+
+    expect(resolveCortexKitUserConfigPath()).toBe(
+      join(root, "home", ".config", "cortexkit", "aft.jsonc"),
+    );
+  });
+
+  test("project config lives under .cortexkit", () => {
+    const root = createStorageRoot();
+
+    expect(resolveCortexKitProjectConfigPath(root)).toBe(join(root, ".cortexkit", "aft.jsonc"));
+    expect(resolveCortexKitConfigPaths(root).projectConfigPath).toBe(
+      join(root, ".cortexkit", "aft.jsonc"),
+    );
+  });
 });
 
 describe("harness storage paths", () => {

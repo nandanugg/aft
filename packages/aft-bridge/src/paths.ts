@@ -1,6 +1,76 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { MigrationHarness } from "./migration.js";
+
+export interface ResolvedAftConfigPaths {
+  userConfigPath: string;
+  projectConfigPath: string;
+}
+
+export interface LegacyAftConfigSource {
+  path: string;
+  label: string;
+}
+
+function homeDir(): string {
+  if (process.platform === "win32") return process.env.USERPROFILE || process.env.HOME || homedir();
+  return process.env.HOME || homedir();
+}
+
+function configHome(): string {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg && isAbsolute(xdg)) return xdg;
+  return join(homeDir(), ".config");
+}
+
+function legacyOpenCodeConfigDir(): string {
+  const envDir = process.env.OPENCODE_CONFIG_DIR?.trim();
+  if (envDir) return resolve(envDir);
+  return join(configHome(), "opencode");
+}
+
+function legacyPiAgentDir(): string {
+  return join(homeDir(), ".pi", "agent");
+}
+
+function legacySources(basePath: string, label: string): LegacyAftConfigSource[] {
+  return [
+    { path: `${basePath}.jsonc`, label: `${label} aft.jsonc` },
+    { path: `${basePath}.json`, label: `${label} aft.json` },
+  ];
+}
+
+export function resolveCortexKitUserConfigPath(): string {
+  return join(configHome(), "cortexkit", "aft.jsonc");
+}
+
+export function resolveCortexKitProjectConfigPath(projectDirectory: string): string {
+  return join(projectDirectory, ".cortexkit", "aft.jsonc");
+}
+
+export function resolveCortexKitConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
+  return {
+    userConfigPath: resolveCortexKitUserConfigPath(),
+    projectConfigPath: resolveCortexKitProjectConfigPath(projectDirectory),
+  };
+}
+
+export function resolveLegacyAftConfigSources(projectDirectory: string): {
+  user: LegacyAftConfigSource[];
+  project: LegacyAftConfigSource[];
+} {
+  return {
+    user: [
+      ...legacySources(join(legacyOpenCodeConfigDir(), "aft"), "OpenCode user"),
+      ...legacySources(join(legacyPiAgentDir(), "aft"), "Pi user"),
+    ],
+    project: [
+      ...legacySources(join(projectDirectory, ".opencode", "aft"), "OpenCode project"),
+      ...legacySources(join(projectDirectory, ".pi", "aft"), "Pi project"),
+    ],
+  };
+}
 
 export function resolveHarnessStoragePath(
   storageRoot: string,

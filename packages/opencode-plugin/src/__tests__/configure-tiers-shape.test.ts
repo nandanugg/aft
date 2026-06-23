@@ -24,6 +24,7 @@ const GROUP_A_PROCESS_KEYS = [
   "max_background_bash_tasks",
   "aft_search_registered",
   "project_root",
+  "cortexkit_user_config_path",
 ] as const;
 
 const GROUP_B_CORE_KEYS = [
@@ -63,9 +64,9 @@ function createFixture() {
   tempRoots.add(root);
   const home = join(root, "home");
   const xdgConfigHome = join(root, "xdg");
-  const userConfigDir = join(xdgConfigHome, "opencode");
+  const userConfigDir = join(xdgConfigHome, "cortexkit");
   const projectDirectory = join(root, "project");
-  const projectConfigDir = join(projectDirectory, ".opencode");
+  const projectConfigDir = join(projectDirectory, ".cortexkit");
   mkdirSync(userConfigDir, { recursive: true });
   mkdirSync(projectConfigDir, { recursive: true });
   return {
