@@ -31,6 +31,18 @@ impl Harness {
     }
 }
 
+/// Max length of the readable (pre-hash) slug portion. The full segment is
+/// `mcp--<readable>--<8 hex>`, so the readable part is capped to keep directory
+/// names bounded while the hash guarantees uniqueness.
+const MCP_SLUG_READABLE_MAX: usize = 40;
+
+/// Build the storage slug for an MCP client. The readable portion is a
+/// sanitized, length-capped rendering of the raw client; a short hash of the
+/// RAW (un-sanitized) client is appended so that distinct clients that sanitize
+/// to the same readable string (e.g. `a/b`, `a:b`, `a b`, casing variants, or
+/// non-ASCII that collapses to `unknown`) still get distinct directories. The
+/// hash is over the raw bytes, so it is collision-resistant where the readable
+/// slug is not.
 fn sanitize_client(client: &str) -> String {
     let lower = client.to_ascii_lowercase();
     let mut out = String::with_capacity(lower.len());
@@ -46,11 +58,25 @@ fn sanitize_client(client: &str) -> String {
         }
     }
     let trimmed = out.trim_matches(|c| c == '-' || c == '.');
-    if trimmed.is_empty() {
+    let mut readable = if trimmed.is_empty() {
         "unknown".to_string()
     } else {
         trimmed.to_string()
+    };
+    if readable.len() > MCP_SLUG_READABLE_MAX {
+        readable.truncate(MCP_SLUG_READABLE_MAX);
+        // Truncation can leave a trailing separator; trim it for tidiness.
+        readable = readable.trim_end_matches(['-', '.']).to_string();
+        if readable.is_empty() {
+            readable = "unknown".to_string();
+        }
     }
+
+    // Short hash of the raw client disambiguates collisions the readable slug
+    // cannot distinguish. blake3 over the raw bytes; first 8 hex chars (32 bits)
+    // is ample for per-machine MCP-client directory uniqueness.
+    let hash = blake3::hash(client.as_bytes()).to_hex();
+    format!("{readable}--{}", &hash.as_str()[..8])
 }
 
 impl Serialize for Harness {
@@ -210,13 +236,57 @@ mod tests {
                 "segment {seg:?} must use mcp-- prefix"
             );
         }
-        assert_eq!(
-            Harness::Mcp {
-                client: "Claude.Code".to_string(),
-            }
-            .storage_segment(),
-            "mcp--claude.code"
+        // Readable portion preserved, hash suffix appended.
+        let claude = Harness::Mcp {
+            client: "Claude.Code".to_string(),
+        }
+        .storage_segment();
+        assert!(
+            claude.starts_with("mcp--claude.code--"),
+            "expected readable slug with hash suffix, got {claude:?}"
         );
-        assert_eq!(sanitize_client(""), "unknown");
+        // Empty client → readable "unknown" plus a (stable) hash of empty bytes.
+        let empty = sanitize_client("");
+        assert!(
+            empty.starts_with("unknown--"),
+            "empty client must render unknown-- plus hash, got {empty:?}"
+        );
+    }
+
+    #[test]
+    fn storage_segment_disambiguates_clients_that_sanitize_to_same_slug() {
+        // a/b, a:b, a b, A-B all collapse to the readable slug "a-b" but are
+        // DISTINCT clients — the raw-bytes hash suffix must keep their storage
+        // directories distinct so two different MCP clients never share state.
+        let seg = |c: &str| {
+            Harness::Mcp {
+                client: c.to_string(),
+            }
+            .storage_segment()
+        };
+        let variants = [seg("a/b"), seg("a:b"), seg("a b"), seg("A-B")];
+        for s in &variants {
+            assert!(
+                s.starts_with("mcp--a-b--"),
+                "expected shared readable slug a-b, got {s:?}"
+            );
+        }
+        let unique: std::collections::HashSet<_> = variants.iter().collect();
+        assert_eq!(
+            unique.len(),
+            variants.len(),
+            "distinct clients must get distinct storage segments: {variants:?}"
+        );
+
+        // Same raw client → same segment (deterministic, stable across calls).
+        assert_eq!(seg("cursor"), seg("cursor"));
+
+        // Very long client: readable portion is capped, segment stays bounded.
+        let long = seg(&"x".repeat(500));
+        assert!(
+            long.len() <= "mcp--".len() + super::MCP_SLUG_READABLE_MAX + "--".len() + 8,
+            "long client segment must be length-bounded, got len {}",
+            long.len()
+        );
     }
 }
