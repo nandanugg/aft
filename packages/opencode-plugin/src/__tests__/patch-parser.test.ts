@@ -221,6 +221,127 @@ describe("applyUpdateChunks error paths", () => {
   });
 });
 
+describe("applyUpdateChunks reflow-tolerant matching", () => {
+  test("matches a one-line hunk against a three-line formatter split", () => {
+    const original =
+      "function demo() {\n  const value = alpha +\n    beta +\n    gamma;\n  return value;\n}\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["  const value = alpha + beta + gamma;"],
+        new_lines: ["  const value = alpha + beta + delta;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/demo.ts", chunks);
+
+    expect(result).toBe(
+      "function demo() {\n  const value = alpha + beta + delta;\n  return value;\n}\n",
+    );
+  });
+
+  test("matches a three-line hunk against a one-line formatter join", () => {
+    const original = "function demo() {\n  const value = alpha + beta + gamma;\n}\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["  const value = alpha +", "    beta +", "    gamma;"],
+        new_lines: ["  const value = alpha +", "    beta +", "    delta;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/demo.ts", chunks);
+
+    expect(result).toBe("function demo() {\n  const value = alpha +\n    beta +\n    delta;\n}\n");
+  });
+
+  test("rejects ambiguous reflow matches instead of choosing a window", () => {
+    const original =
+      "const value = alpha +\n  beta +\n  gamma;\n\nconst value = alpha +\n  beta +\n  gamma;\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["const value = alpha + beta + gamma;"],
+        new_lines: ["const value = alpha + beta + delta;"],
+      },
+    ];
+
+    expect(() => applyUpdateChunks(original, "src/demo.ts", chunks)).toThrow(
+      "Failed to find expected lines in src/demo.ts",
+    );
+  });
+
+  test("does not match a near miss whose non-whitespace content differs", () => {
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["const value = alpha + beta + delta;"],
+        new_lines: ["const value = alpha + beta + epsilon;"],
+      },
+    ];
+
+    expect(() =>
+      applyUpdateChunks("const value = alpha +\n  beta +\n  gamma;\n", "src/demo.ts", chunks),
+    ).toThrow("Failed to find expected lines in src/demo.ts");
+  });
+
+  test("uses a line-contiguous match before considering a reflow candidate", () => {
+    const original =
+      "const value = alpha +\n  beta +\n  gamma;\nconst value = alpha + beta + gamma;\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["const value = alpha + beta + gamma;"],
+        new_lines: ["const value = alpha + beta + delta;"],
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/demo.ts", chunks);
+
+    expect(result).toBe(
+      "const value = alpha +\n  beta +\n  gamma;\nconst value = alpha + beta + delta;\n",
+    );
+  });
+
+  test("keeps the existing whitespace and unicode tiers ahead of reflow", () => {
+    const cases: Array<{
+      name: string;
+      original: string;
+      oldLines: string[];
+      expected: string;
+    }> = [
+      {
+        name: "rstrip",
+        original:
+          "const value = alpha +\n  beta +\n  gamma;\nconst value = alpha + beta + gamma;   \n",
+        oldLines: ["const value = alpha + beta + gamma;"],
+        expected:
+          "const value = alpha +\n  beta +\n  gamma;\nconst value = alpha + beta + delta;\n",
+      },
+      {
+        name: "trim",
+        original:
+          "const value = alpha +\n  beta +\n  gamma;\n  const value = alpha + beta + gamma;\n",
+        oldLines: ["const value = alpha + beta + gamma;"],
+        expected:
+          "const value = alpha +\n  beta +\n  gamma;\nconst value = alpha + beta + delta;\n",
+      },
+      {
+        name: "unicode",
+        original: 'const label =\n  "alpha";\nconst label = “alpha”;\n',
+        oldLines: ['const label = "alpha";'],
+        expected: 'const label =\n  "alpha";\nconst value = alpha + beta + delta;\n',
+      },
+    ];
+
+    for (const { name, original, oldLines, expected } of cases) {
+      const chunks: UpdateFileChunk[] = [
+        {
+          old_lines: oldLines,
+          new_lines: ["const value = alpha + beta + delta;"],
+        },
+      ];
+
+      expect(applyUpdateChunks(original, `src/${name}.ts`, chunks)).toBe(expected);
+    }
+  });
+});
+
 describe("applyUpdateChunks pure-insertion (empty old_lines)", () => {
   // Regression: a pure-insertion chunk (only `+` lines after a `@@` header,
   // so old_lines is empty) WITH a change_context must insert at the context

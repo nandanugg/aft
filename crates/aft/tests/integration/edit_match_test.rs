@@ -256,6 +256,127 @@ fn edit_match_replace_all_rejects_overlapping_fuzzy_matches() {
     assert!(status.success());
 }
 
+#[test]
+fn edit_match_reflow_replaces_formatter_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("split.js");
+    let original =
+        "function demo() {\n  const value = alpha +\n    beta +\n    gamma;\n  return value;\n}\n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "reflow-split",
+        "command": "edit_match",
+        "file": file,
+        "match": "  const value = alpha + beta + gamma;",
+        "replacement": "  const value = alpha + beta + delta;"
+    });
+    let resp = aft.send(&req.to_string());
+
+    assert_eq!(resp["success"], true, "expected edit success: {resp:?}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("split.js")).unwrap(),
+        "function demo() {\n  const value = alpha + beta + delta;\n  return value;\n}\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_reflow_replaces_formatter_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("join.js");
+    let original = "function demo() {\n  const value = alpha + beta + gamma;\n}\n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "reflow-join",
+        "command": "edit_match",
+        "file": file,
+        "match": "  const value = alpha +\n    beta +\n    gamma;",
+        "replacement": "  const value = alpha +\n    beta +\n    delta;"
+    });
+    let resp = aft.send(&req.to_string());
+
+    assert_eq!(resp["success"], true, "expected edit success: {resp:?}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("join.js")).unwrap(),
+        "function demo() {\n  const value = alpha +\n    beta +\n    delta;\n}\n"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_reflow_ambiguous_does_not_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("ambiguous.js");
+    let original =
+        "const value = alpha +\n  beta +\n  gamma;\n\nconst value = alpha +\n  beta +\n  gamma;\n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "reflow-ambiguous",
+        "command": "edit_match",
+        "file": file,
+        "match": "const value = alpha + beta + gamma;",
+        "replacement": "const value = alpha + beta + delta;"
+    });
+    let resp = aft.send(&req.to_string());
+
+    assert_eq!(
+        resp["success"], false,
+        "ambiguous edit should fail: {resp:?}"
+    );
+    assert_eq!(
+        resp["code"], "ambiguous_match",
+        "wrong error code: {resp:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("ambiguous.js")).unwrap(),
+        original
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_reflow_near_miss_does_not_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("near_miss.js");
+    let original = "const value = alpha +\n  beta +\n  gamma;\n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "reflow-near-miss",
+        "command": "edit_match",
+        "file": file,
+        "match": "const value = alpha + beta + delta;",
+        "replacement": "const value = alpha + beta + epsilon;"
+    });
+    let resp = aft.send(&req.to_string());
+
+    assert_eq!(resp["success"], false, "near miss should fail: {resp:?}");
+    assert_eq!(
+        resp["code"], "match_not_found",
+        "wrong error code: {resp:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("near_miss.js")).unwrap(),
+        original
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[cfg(unix)]
 fn make_writable(path: &std::path::Path) {
     let mut permissions = fs::metadata(path).unwrap().permissions();

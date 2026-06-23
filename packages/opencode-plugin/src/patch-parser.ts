@@ -228,6 +228,20 @@ function normalizeIndent(str: string): string {
   return str.replace(/^[\t ]+/, (m) => " ".repeat(m.length));
 }
 
+const REFLOW_NON_WS_TOLERANCE = 8;
+
+function normalizeReflowWhitespace(str: string): string {
+  return str.replace(/\s+/gu, " ").trim();
+}
+
+function stripReflowWhitespace(str: string): string {
+  return str.replace(/\s+/gu, "");
+}
+
+function hasReflowContent(str: string): boolean {
+  return /\S/u.test(str);
+}
+
 type Comparator = (a: string, b: string) => boolean;
 
 function tryMatch(
@@ -285,25 +299,72 @@ function tryMatch(
  *               (BUG-6c: catches "model emitted 2-space indents for a
  *                tab-indented file" or vice versa)
  *   "unicode" — smart quotes, em dashes, ellipsis, NBSP normalization
+ *   "reflow"  — final fallback for formatter line wraps/joins where the
+ *                same non-whitespace content spans a different line count
  */
-type MatchTier = "exact" | "rstrip" | "trim" | "indent" | "unicode";
+type MatchTier = "exact" | "rstrip" | "trim" | "indent" | "unicode" | "reflow";
+
+type SequenceMatch = { found: number; tier: MatchTier; lineCount: number };
+
+function findReflowMatch(
+  lines: string[],
+  pattern: string[],
+  startIndex: number,
+): { found: number; lineCount: number } | null {
+  const needleText = pattern.join("\n");
+  const normalizedNeedle = normalizeReflowWhitespace(needleText);
+  const needleNonWhitespace = stripReflowWhitespace(needleText);
+  if (normalizedNeedle.length === 0 || needleNonWhitespace.length === 0) return null;
+
+  const minNonWhitespace = Math.max(0, needleNonWhitespace.length - REFLOW_NON_WS_TOLERANCE);
+  const maxNonWhitespace = needleNonWhitespace.length + REFLOW_NON_WS_TOLERANCE;
+  const matches: Array<{ found: number; lineCount: number }> = [];
+  const seen = new Set<string>();
+
+  for (let start = Math.max(0, startIndex); start < lines.length; start++) {
+    if (!hasReflowContent(lines[start])) continue;
+
+    let windowNonWhitespaceLen = 0;
+    for (let end = start + 1; end <= lines.length; end++) {
+      const line = lines[end - 1];
+      windowNonWhitespaceLen += stripReflowWhitespace(line).length;
+
+      if (windowNonWhitespaceLen > maxNonWhitespace) break;
+      if (windowNonWhitespaceLen < minNonWhitespace) continue;
+      if (!hasReflowContent(line)) continue;
+
+      const windowText = lines.slice(start, end).join("\n");
+      const windowNonWhitespace = stripReflowWhitespace(windowText);
+      if (windowNonWhitespace !== needleNonWhitespace) continue;
+      if (normalizeReflowWhitespace(windowText) !== normalizedNeedle) continue;
+
+      const key = `${start}:${end}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        matches.push({ found: start, lineCount: end - start });
+      }
+    }
+  }
+
+  return matches.length === 1 ? matches[0] : null;
+}
 
 function seekSequenceTiered(
   lines: string[],
   pattern: string[],
   startIndex: number,
   eof = false,
-): { found: number; tier: MatchTier } | null {
+): SequenceMatch | null {
   if (pattern.length === 0) return null;
 
   const exact = tryMatch(lines, pattern, startIndex, (a, b) => a === b, eof);
-  if (exact !== -1) return { found: exact, tier: "exact" };
+  if (exact !== -1) return { found: exact, tier: "exact", lineCount: pattern.length };
 
   const rstrip = tryMatch(lines, pattern, startIndex, (a, b) => a.trimEnd() === b.trimEnd(), eof);
-  if (rstrip !== -1) return { found: rstrip, tier: "rstrip" };
+  if (rstrip !== -1) return { found: rstrip, tier: "rstrip", lineCount: pattern.length };
 
   const trim = tryMatch(lines, pattern, startIndex, (a, b) => a.trim() === b.trim(), eof);
-  if (trim !== -1) return { found: trim, tier: "trim" };
+  if (trim !== -1) return { found: trim, tier: "trim", lineCount: pattern.length };
 
   // Indent-normalized: collapse leading [\t ]+ to a uniform space run on
   // BOTH sides, then re-trim trailing space (caught by rstrip already, but
@@ -318,7 +379,7 @@ function seekSequenceTiered(
     (a, b) => normalizeIndent(a).trimEnd() === normalizeIndent(b).trimEnd(),
     eof,
   );
-  if (indent !== -1) return { found: indent, tier: "indent" };
+  if (indent !== -1) return { found: indent, tier: "indent", lineCount: pattern.length };
 
   const unicode = tryMatch(
     lines,
@@ -327,7 +388,10 @@ function seekSequenceTiered(
     (a, b) => normalizeUnicode(a.trim()) === normalizeUnicode(b.trim()),
     eof,
   );
-  if (unicode !== -1) return { found: unicode, tier: "unicode" };
+  if (unicode !== -1) return { found: unicode, tier: "unicode", lineCount: pattern.length };
+
+  const reflow = findReflowMatch(lines, pattern, startIndex);
+  if (reflow) return { ...reflow, tier: "reflow" };
 
   return null;
 }
@@ -415,11 +479,11 @@ export function applyUpdateChunks(
 
   for (const chunk of chunks) {
     if (chunk.change_context) {
-      const contextIdx = seekSequence(originalLines, [chunk.change_context], lineIndex);
-      if (contextIdx === -1) {
+      const contextMatch = seekSequenceTiered(originalLines, [chunk.change_context], lineIndex);
+      if (!contextMatch) {
         throw new Error(`Failed to find context '${chunk.change_context}' in ${filePath}`);
       }
-      lineIndex = contextIdx + 1;
+      lineIndex = contextMatch.found + contextMatch.lineCount;
     }
 
     if (chunk.old_lines.length === 0) {
@@ -442,19 +506,19 @@ export function applyUpdateChunks(
 
     let pattern = chunk.old_lines;
     let newSlice = chunk.new_lines;
-    let found = seekSequence(originalLines, pattern, lineIndex, chunk.is_end_of_file);
+    let match = seekSequenceTiered(originalLines, pattern, lineIndex, chunk.is_end_of_file);
 
-    if (found === -1 && pattern.length > 0 && pattern[pattern.length - 1] === "") {
+    if (!match && pattern.length > 0 && pattern[pattern.length - 1] === "") {
       pattern = pattern.slice(0, -1);
       if (newSlice.length > 0 && newSlice[newSlice.length - 1] === "") {
         newSlice = newSlice.slice(0, -1);
       }
-      found = seekSequence(originalLines, pattern, lineIndex, chunk.is_end_of_file);
+      match = seekSequenceTiered(originalLines, pattern, lineIndex, chunk.is_end_of_file);
     }
 
-    if (found !== -1) {
-      replacements.push([found, pattern.length, newSlice]);
-      lineIndex = found + pattern.length;
+    if (match) {
+      replacements.push([match.found, match.lineCount, newSlice]);
+      lineIndex = match.found + match.lineCount;
     } else {
       // Diagnose: did the agent send a hunk whose REWRITE is already in the
       // file? That happens when an agent partially applied the patch in a
@@ -489,7 +553,8 @@ export function applyUpdateChunks(
       // know what kinds of drift the matcher already tolerates and
       // don't waste a turn re-emitting the patch with whitespace
       // tweaks that wouldn't help.
-      const triedTiers = "exact, trimEnd, trim, indent (tab/space), unicode";
+      const triedTiers =
+        "exact, trimEnd, trim, indent (tab/space), unicode, reflow (whitespace-normalized)";
 
       const alreadyAppliedHint = alreadyApplied
         ? "\n\nHint: the replacement content for this hunk already appears in the file. " +
