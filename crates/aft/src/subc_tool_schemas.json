@@ -195,6 +195,10 @@
           "semantic",
           "auto"
         ]
+      },
+      "includeTests": {
+        "description": "Include test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+        "type": "boolean"
       }
     },
     "required": [
