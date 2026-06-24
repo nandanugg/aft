@@ -144,7 +144,7 @@ describe("config file migration", () => {
     expect(markerContent).toContain('"semantic_search": true'); // preserves original settings
   });
 
-  test("existing different target is not overwritten and emits a warning", () => {
+  test("existing target wins permanently; a differing legacy source is preserved as <target>.<harness>_OLD", () => {
     const source = join(root, "pi", "aft.jsonc");
     const target = join(root, "cortexkit", "aft.jsonc");
     mkdirSync(join(root, "pi"), { recursive: true });
@@ -155,39 +155,88 @@ describe("config file migration", () => {
     const result = migrateAftConfigFile({
       scope: "user",
       targetPath: target,
-      legacySources: [{ path: source, label: "Pi user" }],
+      legacySources: [{ path: source, label: "Pi user", harness: "pi" }],
+      operatingHarness: "pi",
     });
 
+    // First-opened wins: the existing target is never overwritten.
     expect(result.migrated).toBe(false);
-    expect(result.conflict).toBe(true);
+    expect(result.conflict).toBe(false);
     expect(readFileSync(target, "utf8")).toBe('{"semantic_search":false}\n');
-    expect(result.warnings.join("\n")).toContain(source);
-    expect(result.warnings.join("\n")).toContain(target);
+    // Pi's differing config is preserved beside the target for manual merge.
+    const oldPath = `${target}.pi_OLD`;
+    expect(existsSync(oldPath)).toBe(true);
+    expect(readFileSync(oldPath, "utf8")).toContain('"semantic_search":true');
+    // The legacy path is cleared so a later edit there can't silently no-op.
+    expect(existsSync(source)).toBe(false);
+    expect(existsSync(`${source}.MOVED_READPLEASE`)).toBe(true);
+    expect(result.warnings.join("\n")).toContain(oldPath);
   });
 
-  test("OpenCode and Pi legacy sources with different semantics refuse without writing", () => {
+  test("differing OpenCode + Pi configs: operating harness wins, other preserved as _OLD (no defaults fallback)", () => {
     const opencode = join(root, "opencode", "aft.jsonc");
     const pi = join(root, "pi", "aft.jsonc");
     const target = join(root, "cortexkit", "aft.jsonc");
     mkdirSync(join(root, "opencode"), { recursive: true });
     mkdirSync(join(root, "pi"), { recursive: true });
-    writeFileSync(opencode, '{"semantic_search":true}\n', "utf8");
-    writeFileSync(pi, '{"semantic_search":false}\n', "utf8");
+    const opencodeContent = '{"semantic_search":true}\n';
+    const piContent = '{"semantic_search":false}\n';
+    writeFileSync(opencode, opencodeContent, "utf8");
+    writeFileSync(pi, piContent, "utf8");
 
     const result = migrateAftConfigFile({
       scope: "user",
       targetPath: target,
       legacySources: [
-        { path: opencode, label: "OpenCode user" },
-        { path: pi, label: "Pi user" },
+        { path: opencode, label: "OpenCode user", harness: "opencode" },
+        { path: pi, label: "Pi user", harness: "pi" },
       ],
+      operatingHarness: "opencode",
     });
 
-    expect(result.migrated).toBe(false);
-    expect(result.conflict).toBe(true);
-    expect(existsSync(target)).toBe(false);
-    expect(result.warnings.join("\n")).toContain(opencode);
-    expect(result.warnings.join("\n")).toContain(pi);
+    // Operating harness (opencode) wins → its config becomes the shared target.
+    // Critically the target IS written (no silent drop to defaults → no index wipe).
+    expect(result.migrated).toBe(true);
+    expect(result.conflict).toBe(false);
+    expect(existsSync(target)).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(opencodeContent);
+    // Pi's differing config is preserved beside the target, not discarded.
+    const piOld = `${target}.pi_OLD`;
+    expect(existsSync(piOld)).toBe(true);
+    expect(readFileSync(piOld, "utf8")).toContain('"semantic_search":false');
+    // Both legacy originals are cleared.
+    expect(existsSync(opencode)).toBe(false);
+    expect(existsSync(pi)).toBe(false);
+    expect(result.warnings.join("\n")).toContain(piOld);
+  });
+
+  test("operating harness selection: Pi wins when it is the operating harness", () => {
+    const opencode = join(root, "opencode", "aft.jsonc");
+    const pi = join(root, "pi", "aft.jsonc");
+    const target = join(root, "cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "opencode"), { recursive: true });
+    mkdirSync(join(root, "pi"), { recursive: true });
+    const opencodeContent = '{"semantic_search":true}\n';
+    const piContent = '{"semantic_search":false}\n';
+    writeFileSync(opencode, opencodeContent, "utf8");
+    writeFileSync(pi, piContent, "utf8");
+
+    const result = migrateAftConfigFile({
+      scope: "user",
+      targetPath: target,
+      // opencode is first by list order; operatingHarness must override that.
+      legacySources: [
+        { path: opencode, label: "OpenCode user", harness: "opencode" },
+        { path: pi, label: "Pi user", harness: "pi" },
+      ],
+      operatingHarness: "pi",
+    });
+
+    expect(result.migrated).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(piContent);
+    const opencodeOld = `${target}.opencode_OLD`;
+    expect(existsSync(opencodeOld)).toBe(true);
+    expect(readFileSync(opencodeOld, "utf8")).toContain('"semantic_search":true');
   });
 
   test("OpenCode and Pi legacy sources with identical semantics copy one", () => {

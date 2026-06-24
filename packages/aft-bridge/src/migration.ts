@@ -41,6 +41,14 @@ export interface AftConfigFileMigrationOptions {
   scope: "user" | "project";
   targetPath: string;
   legacySources: readonly LegacyAftConfigSource[];
+  /**
+   * The harness whose plugin is running this migration. When two harnesses
+   * (OpenCode + Pi) have DIFFERENT legacy configs, this one wins: its config
+   * becomes the shared CortexKit target, and the other's is preserved beside it
+   * as `<target>.<harness>_OLD` for manual merge. Without it, the first source
+   * by list order wins (back-compat for callers that don't pass it).
+   */
+  operatingHarness?: MigrationHarness;
   logger?: {
     warn?: (msg: string) => void;
     info?: (msg: string) => void;
@@ -356,6 +364,67 @@ function markLegacySourcesMovedAside(
   return warnings;
 }
 
+const PRESERVED_OLD_SUFFIX = "_OLD";
+
+function preservedOldContent(
+  losingHarness: MigrationHarness,
+  winningHarness: MigrationHarness | undefined,
+  targetPath: string,
+  originalContent: string,
+): string {
+  const winnerLine = winningHarness
+    ? `// configs differed, so ${winningHarness}'s config won (first harness to run the`
+    : "// configs differed, so the config that was migrated first won and is the";
+  const header = [
+    `// AFT config from ${losingHarness} — preserved, NOT read.`,
+    "//",
+    "// AFT now reads one shared config for all harnesses. Your OpenCode and Pi",
+    winnerLine,
+    winningHarness ? "// migration) and is now the active config at:" : "// active config at:",
+    "//",
+    `//     ${targetPath}`,
+    "//",
+    `// This file holds ${losingHarness}'s previous settings. Merge anything you`,
+    "// want to keep into the active config above, then delete this file. AFT does",
+    "// not read this path.",
+    "",
+    "",
+  ].join("\n");
+  return `${header}${originalContent}`;
+}
+
+// When two harnesses have DIFFERENT legacy configs, the operating harness's
+// config wins (becomes the shared target) and the other's is preserved beside
+// the target as `<target>.<harness>_OLD` so the user can merge it. This replaces
+// the old refuse-and-write-nothing behavior, which dropped the plugin to default
+// config and could wipe a fingerprint-keyed semantic index. `winningHarness` is
+// undefined when the target already existed (we don't know which harness wrote
+// it first), in which case the message describes the existing shared config.
+function preserveDifferingSourceAsOld(
+  source: { path: string; content: string; harness?: MigrationHarness },
+  winningHarness: MigrationHarness | undefined,
+  targetPath: string,
+  logger?: AftConfigFileMigrationOptions["logger"],
+): string {
+  const losingHarness = source.harness ?? "pi";
+  const oldPath = `${targetPath}.${losingHarness}${PRESERVED_OLD_SUFFIX}`;
+  try {
+    atomicWriteConfigFile(
+      oldPath,
+      preservedOldContent(losingHarness, winningHarness, targetPath, source.content),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger?.warn?.(`Could not preserve ${losingHarness} config as ${oldPath} (${msg})`);
+  }
+  const usingDesc = winningHarness ? `${winningHarness}'s config` : "the existing shared config";
+  return (
+    `AFT found different OpenCode and Pi configs during config unification. ` +
+    `Using ${usingDesc} at ${targetPath}; preserved ${losingHarness}'s previous ` +
+    `config at ${oldPath} — merge any settings you want to keep, then delete it.`
+  );
+}
+
 function visibleConfigMigrationWarning(
   scope: "user" | "project",
   targetPath: string,
@@ -389,50 +458,50 @@ export function migrateAftConfigFile(
       content: readFileSync(source.path, "utf-8"),
     }));
 
+    // Target already exists: first-opened wins permanently. We never overwrite
+    // it (whichever harness migrated first owns the shared config). Any legacy
+    // source that DIFFERS from it is preserved beside the target as
+    // `<target>.<harness>_OLD` for manual merge; matching ones are just cleared.
     if (existsSync(opts.targetPath)) {
       const targetContent = readFileSync(opts.targetPath, "utf-8");
-      const differing = sources.filter(
-        (source) => !fileSemanticsMatch(source.content, targetContent),
-      );
-      if (differing.length > 0) {
-        const message = visibleConfigMigrationWarning(
-          opts.scope,
-          opts.targetPath,
-          differing.map((source) => source.path),
-          "the CortexKit target already exists with different settings",
+      for (const source of sources) {
+        if (fileSemanticsMatch(source.content, targetContent)) continue;
+        warnings.push(
+          preserveDifferingSourceAsOld(source, undefined, opts.targetPath, opts.logger),
         );
-        warnings.push(message);
-        opts.logger?.warn?.(message);
-        return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
       }
-      info?.(`AFT ${opts.scope} config already present at ${opts.targetPath}; legacy copies match`);
+      info?.(
+        `AFT ${opts.scope} config already present at ${opts.targetPath}; reconciled ${sources.length} legacy source(s)`,
+      );
       warnings.push(...markLegacySourcesMovedAside(sources, opts.targetPath, opts.logger));
       return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
     }
 
-    const first = sources[0];
-    const differing = sources.filter(
-      (source) => !fileSemanticsMatch(source.content, first.content),
-    );
-    if (differing.length > 0) {
-      const message = visibleConfigMigrationWarning(
-        opts.scope,
-        opts.targetPath,
-        sources.map((source) => source.path),
-        "multiple legacy sources have different settings",
+    // Target does not exist yet. Pick the winner: the operating harness's source
+    // if present, else the first source by list order (back-compat for callers
+    // that don't pass operatingHarness). The winner's config becomes the shared
+    // target; any OTHER source that differs is preserved as `<target>.<harness>_OLD`.
+    const winner =
+      (opts.operatingHarness
+        ? sources.find((source) => source.harness === opts.operatingHarness)
+        : undefined) ?? sources[0];
+
+    atomicCopyConfigFile(winner.path, opts.targetPath);
+    info?.(`Migrated AFT ${opts.scope} config from ${winner.path} to ${opts.targetPath}`);
+
+    for (const source of sources) {
+      if (source.path === winner.path) continue;
+      if (fileSemanticsMatch(source.content, winner.content)) continue;
+      warnings.push(
+        preserveDifferingSourceAsOld(source, winner.harness, opts.targetPath, opts.logger),
       );
-      warnings.push(message);
-      opts.logger?.warn?.(message);
-      return { migrated: false, conflict: true, targetPath: opts.targetPath, warnings };
     }
 
-    atomicCopyConfigFile(first.path, opts.targetPath);
-    info?.(`Migrated AFT ${opts.scope} config from ${first.path} to ${opts.targetPath}`);
     warnings.push(...markLegacySourcesMovedAside(sources, opts.targetPath, opts.logger));
     return {
       migrated: true,
       conflict: false,
-      sourcePath: first.path,
+      sourcePath: winner.path,
       targetPath: opts.targetPath,
       warnings,
     };

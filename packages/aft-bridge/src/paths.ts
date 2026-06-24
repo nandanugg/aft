@@ -11,6 +11,8 @@ export interface ResolvedAftConfigPaths {
 export interface LegacyAftConfigSource {
   path: string;
   label: string;
+  /** Which harness this legacy config belonged to (drives operating-harness-wins). */
+  harness?: MigrationHarness;
 }
 
 function homeDir(): string {
@@ -34,10 +36,14 @@ function legacyPiAgentDir(): string {
   return join(homeDir(), ".pi", "agent");
 }
 
-function legacySources(basePath: string, label: string): LegacyAftConfigSource[] {
+function legacySources(
+  basePath: string,
+  label: string,
+  harness: MigrationHarness,
+): LegacyAftConfigSource[] {
   return [
-    { path: `${basePath}.jsonc`, label: `${label} aft.jsonc` },
-    { path: `${basePath}.json`, label: `${label} aft.json` },
+    { path: `${basePath}.jsonc`, label: `${label} aft.jsonc`, harness },
+    { path: `${basePath}.json`, label: `${label} aft.json`, harness },
   ];
 }
 
@@ -62,12 +68,12 @@ export function resolveLegacyAftConfigSources(projectDirectory: string): {
 } {
   return {
     user: [
-      ...legacySources(join(legacyOpenCodeConfigDir(), "aft"), "OpenCode user"),
-      ...legacySources(join(legacyPiAgentDir(), "aft"), "Pi user"),
+      ...legacySources(join(legacyOpenCodeConfigDir(), "aft"), "OpenCode user", "opencode"),
+      ...legacySources(join(legacyPiAgentDir(), "aft"), "Pi user", "pi"),
     ],
     project: [
-      ...legacySources(join(projectDirectory, ".opencode", "aft"), "OpenCode project"),
-      ...legacySources(join(projectDirectory, ".pi", "aft"), "Pi project"),
+      ...legacySources(join(projectDirectory, ".opencode", "aft"), "OpenCode project", "opencode"),
+      ...legacySources(join(projectDirectory, ".pi", "aft"), "Pi project", "pi"),
     ],
   };
 }

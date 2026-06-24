@@ -1353,12 +1353,14 @@ export function migrateAftConfigLocations(
       scope: "user",
       targetPath: paths.userConfigPath,
       legacySources: legacy.user,
+      operatingHarness: "opencode",
       logger,
     }),
     migrateLegacyAftConfigFile({
       scope: "project",
       targetPath: paths.projectConfigPath,
       legacySources: legacy.project,
+      operatingHarness: "opencode",
       logger,
     }),
   ];
