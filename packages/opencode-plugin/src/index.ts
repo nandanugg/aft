@@ -56,6 +56,11 @@ import {
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { sendIgnoredMessage } from "./shared/ignored-message.js";
 import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
+import {
+  drainNotifications,
+  isTuiConnected,
+  pushNotification,
+} from "./shared/rpc-notifications.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
   getSessionDirectory,
@@ -119,16 +124,44 @@ setActiveLogger(bridgeLogger);
 const STATUS_COMMAND = "aft-status";
 const SENTINEL_PREFIX = "__AFT_STATUS_";
 
-function isTuiMode(): boolean {
-  return process.env.OPENCODE_CLIENT === "cli";
-}
+// Effect HTTP plain-string TypeIds (NOT Symbols), verified against effect 4.x
+// source. Because the guards are `key in obj` checks on string keys, a hand-built
+// object carries them with NO effect import and NO version/realm coupling — it
+// works on the compiled OpenCode binary where effect is unreachable from an
+// external plugin's module resolution.
+const HTTP_SERVER_RESPONSE_TYPE_ID = "~effect/http/HttpServerResponse";
+const HTTP_COOKIES_TYPE_ID = "~effect/http/Cookies";
+const HTTP_BODY_TYPE_ID = "~effect/http/HttpBody";
+const ERROR_REPORTER_IGNORE = "~effect/ErrorReporter/ignore";
 
-// Slash commands are registered by the TUI plugin (tui/index.tsx) via api.command.register()
-// which works in both TUI and Desktop modes. The server plugin only handles execution
-// via command.execute.before hook (for Desktop rendering as ignored message).
-
+/** Prevent OpenCode from forwarding the handled command to the LLM.
+ *
+ *  We throw a normal `Error` whose message preserves the legacy sentinel text
+ *  for hosts that do NOT recognize the Effect HTTP tags. The same Error also
+ *  duck-types an Effect `HttpServerResponse.empty({ status: 204 })`. On
+ *  OpenCode 1.17.x the HTTP error boundary recognizes it via the plain-string
+ *  TypeId (`isHttpServerResponse` = `"~effect/http/HttpServerResponse" in defect`),
+ *  skips the JSON-500 logging path, and writes it as a real 204 — so the handled
+ *  command neither reaches the LLM nor leaks an error into the TUI/log.
+ *
+ *  Field shape is the minimal set `Response.toWeb` dereferences on the empty-body
+ *  path (status / statusText / headers / cookies.cookies / body._tag), traced
+ *  through effect 4.x. No effect import — all string keys + primitives.
+ *
+ *  An official `command.execute.before` handled/cancel/noReply contract remains
+ *  the real fix; this is a duck-typed shim until then. */
 function throwSentinel(command: string): never {
-  throw new Error(`${SENTINEL_PREFIX}${command.toUpperCase().replace(/-/g, "_")}_HANDLED__`);
+  const sentinel = new Error(
+    `${SENTINEL_PREFIX}${command.toUpperCase().replace(/-/g, "_")}_HANDLED__`,
+  ) as Error & Record<string, unknown>;
+  sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID;
+  sentinel[ERROR_REPORTER_IGNORE] = true;
+  sentinel.status = 204;
+  sentinel.statusText = undefined;
+  sentinel.headers = {};
+  sentinel.cookies = { [HTTP_COOKIES_TYPE_ID]: HTTP_COOKIES_TYPE_ID, cookies: {} };
+  sentinel.body = { [HTTP_BODY_TYPE_ID]: HTTP_BODY_TYPE_ID, _tag: "Empty" };
+  throw sentinel;
 }
 
 // IMPORTANT — index.ts must export ONLY the plugin function as default.
@@ -697,6 +730,23 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     }
     return { ...response, served_directory: servedDirectory };
   });
+
+  rpcServer.handle("consume-notifications", async (params) => {
+    const rawLastReceivedId = Number(params.lastReceivedId ?? 0);
+    // Scope drain to the TUI's active session so a notification tagged for a
+    // different session (e.g. a dialog triggered by another client sharing this
+    // process) is never delivered here. sessionId is optional for back-compat:
+    // callers that omit it fall back to the previous unscoped behavior.
+    const sessionId =
+      typeof params.sessionId === "string" && params.sessionId.length > 0
+        ? params.sessionId
+        : undefined;
+    const messages = drainNotifications(
+      Number.isFinite(rawLastReceivedId) ? rawLastReceivedId : 0,
+      sessionId,
+    );
+    return { messages };
+  });
   // Feature announcement — TUI plugin calls this on startup to show a dialog.
   // Uses ANNOUNCEMENT_VERSION (not PLUGIN_VERSION) so patch releases don't re-fire.
 
@@ -1015,8 +1065,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       commandInput: { command: string; sessionID: string },
       _output: unknown,
     ) => {
-      if (isTuiMode() || commandInput.command !== STATUS_COMMAND) {
+      if (commandInput.command !== STATUS_COMMAND) {
         return;
+      }
+
+      if (isTuiConnected(commandInput.sessionID)) {
+        pushNotification(
+          "action",
+          { action: "show-status-dialog", sessionId: commandInput.sessionID },
+          commandInput.sessionID,
+        );
+        throwSentinel(commandInput.command);
       }
 
       // Resolve the session's stored directory before picking a bridge —
@@ -1093,9 +1152,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // surface here was responsible for `S.provider`/`z.config` errors
       // when this hook ran with an unexpected argument.
       if (!config || typeof config !== "object") return;
-      // Register /aft-status for Desktop command palette.
-      // In TUI mode, the TUI plugin also registers it via api.command.register()
-      // which takes priority for dialog rendering.
+      // Register the only /aft-status slash entry. The TUI plugin registers a
+      // palette-only command and receives dialog requests via RPC notifications.
       config.command = {
         ...(config.command ?? {}),
         [STATUS_COMMAND]: {

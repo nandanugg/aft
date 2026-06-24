@@ -26,8 +26,6 @@ import {
 // per-server token on every RPC request; legacy integer port files are still
 // tolerated for already-running older server plugins.
 
-const STATUS_COMMAND = "aft-status";
-
 // RPC clients keyed by directory — one per project
 const rpcClients = new Map<string, AftRpcClient>();
 
@@ -50,6 +48,39 @@ function getSessionId(api: TuiPluginApi): string | null {
     // ignore
   }
   return null;
+}
+
+interface TuiMessage {
+  id: number;
+  type: string;
+  payload: Record<string, unknown>;
+  sessionId?: string;
+}
+
+const lastReceivedNotificationIdBySession = new Map<string, number>();
+
+/** Poll for pending server → TUI notifications via RPC. */
+async function consumeTuiMessages(client: AftRpcClient, sessionId: string): Promise<TuiMessage[]> {
+  try {
+    const result = await client.call<{ messages?: TuiMessage[] }>("consume-notifications", {
+      lastReceivedId: lastReceivedNotificationIdBySession.get(sessionId) ?? 0,
+      sessionId,
+    });
+    return (result.messages ?? []).map((message) => ({
+      id: message.id,
+      type: message.type,
+      payload: message.payload,
+      sessionId: message.sessionId,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function markTuiMessagesReceived(sessionId: string, messages: TuiMessage[]): void {
+  const previous = lastReceivedNotificationIdBySession.get(sessionId) ?? 0;
+  const next = messages.reduce((max, message) => Math.max(max, message.id), previous);
+  if (next > previous) lastReceivedNotificationIdBySession.set(sessionId, next);
 }
 
 // ---------------------------------------------------------------------------
@@ -603,14 +634,12 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
 }
 
 /**
- * Register the `/aft-status` slash command, preferring the v1.14.42+ keymap
- * API and falling back to the legacy `api.command.register` for older hosts.
+ * Register the AFT status palette command, preferring the v1.14.42+ keymap API
+ * and falling back to the legacy `api.command.register` for older hosts.
  *
- * The `keymap.registerLayer` shape uses `name`/`title`/`run`/`namespace`/
- * `slashName` (see `@opencode-ai/plugin/tui` types) and is what the host's
- * own legacy command-shim translates into. Calling it directly skips the
- * deprecation warning and works without depending on the (now-deprecated)
- * `api.command` namespace existing at all.
+ * No slash entry is registered here. The server config hook owns the single
+ * `/aft-status` slash registration, while this palette command keeps Ctrl+P
+ * discovery in the TUI.
  */
 function registerStatusCommand(api: TuiPluginApi): void {
   type ApiAny = {
@@ -634,7 +663,6 @@ function registerStatusCommand(api: TuiPluginApi): void {
           name: "aft.status",
           title: "AFT: Status",
           category: "AFT",
-          slashName: STATUS_COMMAND,
           run() {
             void showStatusDialog(api);
           },
@@ -651,7 +679,6 @@ function registerStatusCommand(api: TuiPluginApi): void {
         title: "AFT: Status",
         value: "aft.status",
         category: "AFT",
-        slash: { name: STATUS_COMMAND },
         onSelect() {
           void showStatusDialog(api);
         },
@@ -660,9 +687,8 @@ function registerStatusCommand(api: TuiPluginApi): void {
     return;
   }
 
-  // Neither API surface is present. The TUI host can still load — we only
-  // lose the slash-command entry point. The sidebar (registered above)
-  // remains available so users can still see AFT status visually.
+  // Neither API surface is present. The TUI host can still load; users can
+  // still see AFT status through the sidebar and server-owned slash command.
 }
 
 async function showStartupNotifications(api: TuiPluginApi): Promise<void> {
@@ -734,8 +760,8 @@ const tui: TuiPlugin = async (api) => {
   try {
     api.slots.register(await createAftSidebarSlot(api, packageVersion));
   } catch {
-    // Older OpenCode TUI hosts may not implement api.slots; fall through
-    // and keep the slash command working.
+    // Older OpenCode TUI hosts may not implement api.slots; fall through and
+    // keep the palette command / server-owned slash command working.
   }
 
   // OpenCode 1.14.42 removed `api.command.register` entirely
@@ -747,6 +773,58 @@ const tui: TuiPlugin = async (api) => {
   // when the keymap surface is missing (older hosts that predate keymap).
   // See https://github.com/cortexkit/aft/issues/33.
   registerStatusCommand(api);
+
+  // Poll for server → TUI dialog requests. The server owns the slash command,
+  // and this poller is how it asks the TUI process to show native UI.
+  let pollInFlight = false;
+  const messagePoller = setInterval(() => {
+    // Scope the drain to the TUI's active session so notifications tagged for a
+    // different session (served by the same RPC process) are not consumed here.
+    // Do not poll on non-session routes: a session-scoped action fetched while
+    // sessionless could otherwise be acked without being shown.
+    if (pollInFlight) return;
+
+    const requestedSessionId = getSessionId(api);
+    if (!requestedSessionId) return;
+
+    const directory = api.state.path.directory ?? "";
+    if (!directory) return;
+
+    pollInFlight = true;
+    const client = getRpcClient(directory);
+    void consumeTuiMessages(client, requestedSessionId)
+      .then(async (messages) => {
+        // If the user switched routes while the RPC was in flight, drop this
+        // batch without advancing the cursor; the next poll for the active
+        // session will fetch the right notifications.
+        if (getSessionId(api) !== requestedSessionId) return;
+
+        const orderedMessages = [...messages].sort((a, b) => a.id - b.id);
+        for (const message of orderedMessages) {
+          if (getSessionId(api) !== requestedSessionId) return;
+          if (message.sessionId && message.sessionId !== requestedSessionId) continue;
+          if (message.type !== "action") continue;
+          if (message.payload?.action !== "show-status-dialog") continue;
+          await showStatusDialog(api);
+        }
+
+        if (getSessionId(api) !== requestedSessionId) return;
+        markTuiMessagesReceived(requestedSessionId, orderedMessages);
+      })
+      .catch(() => {
+        // Intentional: message polling should never crash the TUI.
+      })
+      .finally(() => {
+        pollInFlight = false;
+      });
+  }, 500);
+
+  api.lifecycle?.onDispose?.(() => {
+    clearInterval(messagePoller);
+    lastReceivedNotificationIdBySession.clear();
+    for (const client of rpcClients.values()) client.reset();
+    rpcClients.clear();
+  });
 
   // Show startup notifications — RPC server is already running by the time TUI loads
   void showStartupNotifications(api);
