@@ -63,7 +63,7 @@ use pnpm::PnpmCompressor;
 use prettier::PrettierCompressor;
 use pytest::PytestCompressor;
 use ruff::RuffCompressor;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -413,71 +413,132 @@ fn failure_preserving_result(
         return result;
     }
 
-    if result_looks_successful(&result.text)
-        || raw_failure_signal_absent_from_compressed(stripped_raw_output, &result.text)
+    if dropped_failure_or_error_blocks(&result)
+        || !text_has_failure_signal(&result.text)
+        || result_looks_successful(&result.text)
     {
-        GenericCompressor.compress_with_exit_code(command, stripped_raw_output, exit_code)
-    } else {
+        return GenericCompressor.compress_with_exit_code(command, stripped_raw_output, exit_code);
+    }
+
+    let missing = missing_raw_failure_signal_lines(stripped_raw_output, &result.text);
+    if missing.is_empty() {
         result
+    } else {
+        append_missing_failure_lines(result, &missing)
     }
 }
 
-fn raw_failure_signal_absent_from_compressed(raw_output: &str, compressed_text: &str) -> bool {
-    let mut saw_signal_line = false;
+fn dropped_failure_or_error_blocks(result: &CompressionResult) -> bool {
+    [DropClass::Error, DropClass::Failure]
+        .into_iter()
+        .any(|class| result.dropped_by_class.get(&class).copied().unwrap_or(0) > 0)
+}
+
+fn append_missing_failure_lines(
+    mut result: CompressionResult,
+    missing_failure_lines: &[String],
+) -> CompressionResult {
+    let mut text = result.text.trim_end().to_string();
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str("[raw failure lines preserved by AFT]\n");
+    text.push_str(&missing_failure_lines.join("\n"));
+    result.text = text;
+    result
+}
+
+pub(crate) fn missing_raw_failure_signal_lines(
+    raw_output: &str,
+    compressed_text: &str,
+) -> Vec<String> {
+    let compressed_lines: BTreeSet<String> = compressed_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut missing = Vec::new();
+
     for line in raw_output.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || !line_has_failure_signal(trimmed) {
             continue;
         }
-        saw_signal_line = true;
-        if compressed_text.contains(trimmed) {
-            return false;
+        if compressed_lines.contains(trimmed) || !seen.insert(trimmed.to_string()) {
+            continue;
         }
+        missing.push(trimmed.to_string());
     }
 
-    saw_signal_line && !text_has_failure_signal(compressed_text)
+    missing
 }
 
 fn result_looks_successful(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    !text_has_failure_signal(text)
-        && (lower.contains("clean")
-            || lower.contains(" ok")
-            || lower.contains(":ok")
-            || lower.contains(": ok")
-            || lower.contains("passed")
-            || lower.contains("no errors")
-            || lower.contains("all checks passed")
-            || lower.contains("formatted")
-            || lower.contains("0 fail")
-            || lower.contains("found 0")
-            || lower.contains("up to date")
-            || lower.contains("up-to-date"))
+    lower.contains("clean")
+        || lower.contains(" ok")
+        || lower.contains(":ok")
+        || lower.contains(": ok")
+        || lower.contains("passed")
+        || lower.contains("succeeded")
+        || lower.contains("no errors")
+        || lower.contains("0 errors")
+        || lower.contains("no issues")
+        || lower.contains("no diagnostics")
+        || lower.contains("all checks passed")
+        || lower.contains("formatted")
+        || lower.contains("0 fail")
+        || lower.contains("found 0")
+        || lower.contains("up to date")
+        || lower.contains("up-to-date")
 }
 
-fn text_has_failure_signal(text: &str) -> bool {
+pub(crate) fn text_has_failure_signal(text: &str) -> bool {
     text.lines()
         .any(|line| line_has_failure_signal(line.trim()))
 }
 
 fn line_has_failure_signal(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
     line.contains("error[")
-        || line.contains("error:")
+        || lower.contains("error:")
         || line.contains("Error")
+        || line.contains("ERROR")
+        || lower.contains("internalerror")
+        || lower.contains("traceback")
+        || lower.contains("exception")
+        || lower.contains("no module named")
+        || lower.contains("undefined reference")
+        || lower.contains("linker command failed")
+        || lower.contains("undefined:")
+        || lower.contains("expected declaration")
+        || lower.contains("collect2: error")
+        || lower.contains("ld: error")
+        || lower.contains("fatal error")
         || line.contains("FAILED")
         || line.contains("FAIL")
+        || contains_nonzero_failure_word(line, "fail")
         || contains_nonzero_failure_word(line, "failed")
         || contains_nonzero_failure_word(line, "failure")
         || contains_nonzero_failure_word(line, "failures")
-        || line.contains("panic")
-        || line.contains("cannot find")
-        || line.contains("not found")
-        || line.contains("no such")
+        || lower.contains("panic")
+        || lower.contains("cannot find")
+        || lower.contains("not found")
+        || lower.contains("no such")
 }
 
 fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     for (index, _) in lower.match_indices(word) {
+        let end = index + word.len();
+        let before_is_word = lower[..index].chars().next_back().is_some_and(is_word_char);
+        let after_is_word = lower[end..].chars().next().is_some_and(is_word_char);
+        if before_is_word || after_is_word {
+            continue;
+        }
+
         let prefix = lower[..index].trim_end();
         let digits_start = prefix
             .char_indices()
@@ -494,6 +555,10 @@ fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
         }
     }
     false
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 /// Build the registry of TOML filters from the standard sources for the
@@ -1415,7 +1480,7 @@ mod exit_code_safety_tests {
     }
 
     #[test]
-    fn go_build_nonzero_preserves_missing_module_error_but_zero_keeps_old_summary() {
+    fn go_build_failure_signal_preserved_even_when_exit_zero_masks_failure() {
         let output = "go: go.mod file not found in current directory or any parent directory; see 'go help modules'\n";
 
         let failed =
@@ -1423,9 +1488,10 @@ mod exit_code_safety_tests {
         assert!(!failed.text.contains("go build: ok"));
         assert!(failed.text.contains("go.mod file not found"));
 
-        let successful =
+        let masked =
             compress_with_registry_exit_code("go build ./...", output, Some(0), &empty_registry());
-        assert_eq!(successful.text, "go build: ok");
+        assert!(!masked.text.contains("go build: ok"));
+        assert!(masked.text.contains("go.mod file not found"));
     }
 
     #[test]
@@ -1524,6 +1590,122 @@ replacement = "wget: ok"
             &empty_registry(),
         );
         assert_eq!(legacy.text, "mypy: clean");
+    }
+
+    #[test]
+    fn killed_exit_sentinel_rejects_clean_legacy_summary() {
+        let output = "Success: no issues found in 1 source file
+Error: later chained command failed
+";
+
+        let killed = compress_with_registry_exit_code(
+            "mypy src && node fail.js",
+            output,
+            Some(137),
+            &empty_registry(),
+        );
+        assert_ne!(killed.text, "mypy: clean");
+        assert!(killed.text.contains("Error: later chained command failed"));
+    }
+
+    #[test]
+    fn nonzero_clean_eslint_json_summary_falls_back_to_raw_output() {
+        let output =
+            r#"[{"filePath":"/repo/src/main.ts","messages":[],"errorCount":0,"warningCount":0}]"#;
+
+        let failed = compress_with_registry_exit_code(
+            "eslint -f json .",
+            output,
+            Some(1),
+            &empty_registry(),
+        );
+
+        assert_ne!(failed.text, "eslint: no issues");
+        assert!(failed.text.contains(r#""messages":[]"#));
+    }
+
+    #[test]
+    fn nonzero_appends_distinct_missing_raw_failure_lines() {
+        let raw = "Error: first failure
+progress
+Error: second failure
+";
+        let compressed = CompressionResult::new("Error: first failure");
+
+        let preserved = failure_preserving_result("tool", raw, compressed, Some(1));
+
+        assert!(preserved.text.contains("Error: first failure"));
+        assert!(preserved.text.contains("Error: second failure"));
+        assert!(preserved
+            .text
+            .contains("[raw failure lines preserved by AFT]"));
+    }
+
+    #[test]
+    fn nonzero_cargo_failure_class_cap_falls_back_to_all_failures() {
+        let mut output = String::from(
+            "running 40 tests
+
+failures:
+
+",
+        );
+        for index in 0..40 {
+            output.push_str(&format!(
+                "---- case_{index} stdout ----
+thread 'case_{index}' panicked at src/lib.rs:{index}:1
+
+"
+            ));
+        }
+        output.push_str(
+            "failures:
+",
+        );
+        for index in 0..40 {
+            output.push_str(&format!(
+                "    case_{index}
+"
+            ));
+        }
+        output.push_str(
+            "
+test result: FAILED. 0 passed; 40 failed; 0 ignored; 0 measured; 0 filtered out
+",
+        );
+
+        let failed =
+            compress_with_registry_exit_code("cargo test", &output, Some(101), &empty_registry());
+
+        assert!(failed.text.contains("---- case_0 stdout ----"));
+        assert!(failed.text.contains("---- case_39 stdout ----"));
+        assert!(failed.dropped_by_class.is_empty());
+    }
+
+    #[test]
+    fn toml_shortcircuit_is_skipped_for_unknown_exit_when_failure_signal_exists() {
+        let registry = build_registry(
+            &[(
+                "make",
+                r#"[filter]
+matches = ["make"]
+
+[shortcircuit]
+when = '(?s).*'
+replacement = "make: ok"
+"#,
+            )],
+            None,
+            None,
+        );
+        let output = "build step
+ERROR: compiler crashed
+";
+
+        let failed = compress_with_registry_exit_code("make", output, None, &registry);
+
+        assert_ne!(failed.text, "make: ok");
+        assert!(failed.text.contains("ERROR: compiler crashed"));
     }
 
     #[test]

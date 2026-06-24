@@ -23,13 +23,14 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use super::buffer::{combine_streams, BgBuffer, StreamKind, TokenCountInput};
+use super::buffer::{combine_streams, BgBuffer, DiskTruncation, StreamKind, TokenCountInput};
 use super::output::{
     cap_completion_output, cap_completion_output_with_marker, cap_final_output,
     cap_final_output_with_marker, completion_preview_threshold, json_output_pointer, quote_path,
-    COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES, COMPRESS_INPUT_TAIL_BYTES,
-    FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES, RAW_PASSTHROUGH_HEAD_BYTES,
-    RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES, STRUCTURED_OUTPUT_CAP_BYTES,
+    retained_json_output_pointer, COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES,
+    COMPRESS_INPUT_TAIL_BYTES, FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES,
+    RAW_PASSTHROUGH_HEAD_BYTES, RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES,
+    STRUCTURED_OUTPUT_CAP_BYTES,
 };
 use super::persistence::{
     create_capture_file, delete_task_bundle, read_exit_marker, read_task, session_tasks_dir,
@@ -135,6 +136,7 @@ struct RecoveryContext {
     offset_hint_eligible: bool,
     offset_start_line: Option<usize>,
     byte_truncated: bool,
+    disk_truncated_prefix_bytes: u64,
     output_path: Option<String>,
     stderr_path: Option<String>,
     include_stderr_path: bool,
@@ -142,7 +144,10 @@ struct RecoveryContext {
 
 impl RecoveryContext {
     fn has_visible_drop(&self) -> bool {
-        self.byte_truncated || self.had_inner_drop || !self.dropped_by_class.is_empty()
+        self.byte_truncated
+            || self.disk_truncated_prefix_bytes > 0
+            || self.had_inner_drop
+            || !self.dropped_by_class.is_empty()
     }
 }
 
@@ -313,8 +318,8 @@ impl BgTaskRegistry {
         };
 
         let mut cap_buffer = buffer.clone();
-        cap_buffer.enforce_terminal_cap();
-        let cache = self.render_terminal_output(&metadata, &buffer);
+        let disk_truncation = cap_buffer.enforce_terminal_cap();
+        let cache = self.render_terminal_output(&metadata, &cap_buffer, disk_truncation);
         let mut state = task.state.lock().ok()?;
         if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
             return None;
@@ -330,6 +335,7 @@ impl BgTaskRegistry {
         &self,
         metadata: &PersistedTask,
         buffer: &BgBuffer,
+        disk_truncation: DiskTruncation,
     ) -> TerminalOutputCache {
         if metadata.mode == BgMode::Pty {
             return TerminalOutputCache {
@@ -342,12 +348,14 @@ impl BgTaskRegistry {
             };
         }
 
-        if let Some(structured) = render_structured_output(&metadata.command, buffer) {
+        if let Some(structured) =
+            render_structured_output(&metadata.command, buffer, disk_truncation)
+        {
             return structured;
         }
 
         if !metadata.compressed {
-            return render_raw_passthrough(buffer);
+            return render_raw_passthrough(buffer, disk_truncation);
         }
 
         let raw = buffer.read_combined_head_tail(
@@ -356,7 +364,7 @@ impl BgTaskRegistry {
             COMPRESS_INPUT_TAIL_BYTES,
         );
         let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
-        render_compressed_with_recovery(buffer, compressed, raw.truncated)
+        render_compressed_with_recovery(buffer, compressed, raw.truncated, disk_truncation)
     }
 
     fn snapshot_with_terminal_cache(
@@ -381,8 +389,6 @@ impl BgTaskRegistry {
             (state.metadata.clone(), state.buffer.clone())
         };
 
-        let mut cap_buffer = buffer.clone();
-        cap_buffer.enforce_terminal_cap();
         let cache = self.ensure_terminal_output_cache(task);
         self.enqueue_completion_from_parts(
             &metadata,
@@ -2061,11 +2067,7 @@ impl BgTaskRegistry {
                                 .map_err(|e| format!("failed to write kill marker: {e}"))?;
                         }
 
-                        let exit_code = if terminal_status == BgTaskStatus::TimedOut {
-                            Some(124)
-                        } else {
-                            None
-                        };
+                        let exit_code = terminal_exit_code_for_status(&terminal_status);
                         state
                             .metadata
                             .mark_terminal(terminal_status, exit_code, None);
@@ -2118,11 +2120,7 @@ impl BgTaskRegistry {
                             .map_err(|e| format!("failed to write kill marker: {e}"))?;
                     }
 
-                    let exit_code = if target_status == BgTaskStatus::TimedOut {
-                        Some(124)
-                    } else {
-                        None
-                    };
+                    let exit_code = terminal_exit_code_for_status(&target_status);
                     state.metadata.mark_terminal(target_status, exit_code, None);
                     if self.task_has_watch_control(&task.task_id) {
                         state.metadata.completion_delivered = true;
@@ -2171,11 +2169,7 @@ impl BgTaskRegistry {
                     let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
                         let mut metadata = metadata.clone();
                         let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
-                        let exit_code = if target_status == BgTaskStatus::TimedOut {
-                            Some(124)
-                        } else {
-                            None
-                        };
+                        let exit_code = terminal_exit_code_for_status(&target_status);
                         metadata.mark_terminal(target_status, exit_code, reason);
                         metadata
                     } else {
@@ -2240,8 +2234,9 @@ impl BgTaskRegistry {
         if metadata.mode == BgMode::Pty {
             return None;
         }
-        let buffer = BgBuffer::new(paths.stdout.clone(), paths.stderr.clone());
-        Some(self.render_terminal_output(metadata, &buffer))
+        let mut buffer = BgBuffer::new(paths.stdout.clone(), paths.stderr.clone());
+        let disk_truncation = buffer.enforce_terminal_cap();
+        Some(self.render_terminal_output(metadata, &buffer, disk_truncation))
     }
 
     fn enqueue_completion_from_parts(
@@ -2273,7 +2268,11 @@ impl BgTaskRegistry {
         };
         let render_buffer = buffer.or(owned_buffer.as_ref());
         let owned_render = if terminal_render.is_none() {
-            render_buffer.map(|buffer| self.render_terminal_output(metadata, buffer))
+            render_buffer.map(|buffer| {
+                let mut capped_buffer = buffer.clone();
+                let disk_truncation = capped_buffer.enforce_terminal_cap();
+                self.render_terminal_output(metadata, &capped_buffer, disk_truncation)
+            })
         } else {
             None
         };
@@ -2729,6 +2728,7 @@ fn render_compressed_with_recovery(
     buffer: &BgBuffer,
     mut compressed: CompressionResult,
     input_truncated: bool,
+    disk_truncation: DiskTruncation,
 ) -> TerminalOutputCache {
     // Preserve a single canonical trailing newline. A bare `.trim_end()` strips
     // the legitimate final newline that `echo` and most commands emit, so
@@ -2755,6 +2755,7 @@ fn render_compressed_with_recovery(
         offset_hint_eligible: compressed.offset_hint_eligible,
         offset_start_line: compressed.offset_start_line,
         byte_truncated: input_truncated,
+        disk_truncated_prefix_bytes: disk_truncation.total_prefix_bytes(),
         output_path: output_path.clone(),
         stderr_path: stderr_path.clone(),
         include_stderr_path,
@@ -2872,6 +2873,12 @@ fn recovery_marker(recovery: &RecoveryContext) -> Option<String> {
     }
     if recovery.byte_truncated {
         parts.push("truncated output".to_string());
+    }
+    let disk_truncated_prefix_bytes = recovery.disk_truncated_prefix_bytes;
+    if disk_truncated_prefix_bytes > 0 {
+        parts.push(format!(
+            "truncated {disk_truncated_prefix_bytes} bytes from saved output prefix"
+        ));
     } else if recovery.had_inner_drop && parts.is_empty() {
         parts.push("omitted output".to_string());
     }
@@ -2921,7 +2928,11 @@ fn recovery_hint(recovery: &RecoveryContext) -> String {
         .map(|path| format!("read {}", quote_path(path)))
         .collect::<Vec<_>>()
         .join(" and ");
-    format!("full output: {reads}")
+    if recovery.disk_truncated_prefix_bytes > 0 {
+        format!("retained output: {reads}")
+    } else {
+        format!("full output: {reads}")
+    }
 }
 
 fn strip_plain_truncation_marker_lines(input: &str) -> String {
@@ -2954,11 +2965,16 @@ fn is_recovery_marker(line: &str) -> bool {
     line.starts_with('[')
         && line.ends_with(']')
         && (line.contains("full output: read ")
+            || line.contains("retained output: read ")
             || line.contains("see remaining: tail -n +")
             || line.contains("full output unavailable"))
 }
 
-fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<TerminalOutputCache> {
+fn render_structured_output(
+    command: &str,
+    buffer: &BgBuffer,
+    disk_truncation: DiskTruncation,
+) -> Option<TerminalOutputCache> {
     if !is_gh_structured_command(command) {
         return None;
     }
@@ -2975,8 +2991,17 @@ fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<Terminal
         if !stream_starts_like_json(buffer, StreamKind::Stdout) {
             return None;
         }
+        let output_preview = if disk_truncation.total_prefix_bytes() > 0 {
+            retained_json_output_pointer(
+                stdout_bytes,
+                &output_path,
+                disk_truncation.total_prefix_bytes(),
+            )
+        } else {
+            json_output_pointer(stdout_bytes, &output_path)
+        };
         return Some(TerminalOutputCache {
-            output_preview: json_output_pointer(stdout_bytes, &output_path),
+            output_preview,
             output_truncated: true,
             kind: TerminalOutputKind::Structured,
             output_path: Some(output_path),
@@ -3000,7 +3025,10 @@ fn render_structured_output(command: &str, buffer: &BgBuffer) -> Option<Terminal
     })
 }
 
-fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
+fn render_raw_passthrough(
+    buffer: &BgBuffer,
+    disk_truncation: DiskTruncation,
+) -> TerminalOutputCache {
     let raw = buffer.read_combined_head_tail(
         RAW_PASSTHROUGH_CAP_BYTES,
         RAW_PASSTHROUGH_HEAD_BYTES,
@@ -3008,7 +3036,7 @@ fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
     );
     let output_path = buffer.output_path().map(|path| path.display().to_string());
     let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
-    if !raw.truncated {
+    if !raw.truncated && disk_truncation.total_prefix_bytes() == 0 {
         return TerminalOutputCache {
             output_preview: raw.text,
             output_truncated: false,
@@ -3025,7 +3053,8 @@ fn render_raw_passthrough(buffer: &BgBuffer) -> TerminalOutputCache {
         had_inner_drop: false,
         offset_hint_eligible: false,
         offset_start_line: None,
-        byte_truncated: true,
+        byte_truncated: raw.truncated,
+        disk_truncated_prefix_bytes: disk_truncation.total_prefix_bytes(),
         output_path: output_path.clone(),
         stderr_path: stderr_path.clone(),
         include_stderr_path,
@@ -3603,9 +3632,21 @@ fn terminal_metadata_from_marker(
             };
             metadata.mark_terminal(status, Some(code), reason);
         }
-        ExitMarker::Killed => metadata.mark_terminal(BgTaskStatus::Killed, None, reason),
+        ExitMarker::Killed => metadata.mark_terminal(
+            BgTaskStatus::Killed,
+            terminal_exit_code_for_status(&BgTaskStatus::Killed),
+            reason,
+        ),
     }
     metadata
+}
+
+fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i32> {
+    match status {
+        BgTaskStatus::TimedOut => Some(124),
+        BgTaskStatus::Killed => Some(137),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -4158,6 +4199,49 @@ mod tests {
         assert!(is_recovery_marker(
             "[truncated output; full output unavailable]"
         ));
+        assert!(is_recovery_marker(
+            r#"[truncated 123 bytes from saved output prefix; retained output: read "/tmp/out"]"#
+        ));
+    }
+
+    #[test]
+    fn recovery_marker_reports_disk_prefix_truncation_as_retained_output() {
+        let recovery = RecoveryContext {
+            dropped_by_class: BTreeMap::new(),
+            had_inner_drop: false,
+            offset_hint_eligible: false,
+            offset_start_line: None,
+            byte_truncated: false,
+            disk_truncated_prefix_bytes: 4096,
+            output_path: Some("/tmp/stdout".to_string()),
+            stderr_path: None,
+            include_stderr_path: false,
+        };
+
+        let marker = recovery_marker(&recovery).expect("disk truncation must emit marker");
+
+        assert!(marker.contains("truncated 4096 bytes from saved output prefix"));
+        assert!(marker.contains(r#"retained output: read "/tmp/stdout""#));
+        assert!(!marker.contains("full output: read"));
+    }
+
+    #[test]
+    fn killed_exit_marker_sets_nonzero_sentinel_exit_code() {
+        let metadata = PersistedTask::starting(
+            "task".to_string(),
+            "session".to_string(),
+            "cargo test".to_string(),
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            true,
+            true,
+        );
+
+        let terminal = terminal_metadata_from_marker(metadata, ExitMarker::Killed, None);
+
+        assert_eq!(terminal.status, BgTaskStatus::Killed);
+        assert_eq!(terminal.exit_code, Some(137));
     }
 
     #[test]

@@ -22,7 +22,9 @@ impl Compressor for PnpmCompressor {
         _exit_code: Option<i32>,
     ) -> CompressionResult {
         match pnpm_subcommand(command).as_deref() {
-            Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
+            Some("install" | "i" | "add" | "remove") => {
+                preserve_pnpm_failure(output, compress_package(output)).into()
+            }
             Some("run" | "test" | "build") => GenericCompressor::compress_output(output).into(),
             _ => GenericCompressor::compress_output(output).into(),
         }
@@ -103,6 +105,17 @@ fn pnpm_subcommand(command: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn preserve_pnpm_failure(output: &str, compressed: String) -> String {
+    let stripped_failure = compressed.trim().is_empty()
+        || !super::text_has_failure_signal(&compressed)
+        || !super::missing_raw_failure_signal_lines(output, &compressed).is_empty();
+    if !output.trim().is_empty() && super::text_has_failure_signal(output) && stripped_failure {
+        GenericCompressor::compress_output(output)
+    } else {
+        compressed
+    }
+}
+
 fn compress_package(output: &str) -> String {
     let mut result = Vec::new();
     let mut progress_seen = 0usize;
@@ -143,4 +156,20 @@ fn trim_trailing_lines(input: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pnpm_install_lifecycle_error_does_not_compress_to_empty() {
+        let output = "Progress: resolved 1, reused 0, downloaded 0, added 0\n. postinstall$ node scripts/postinstall.js\n. postinstall: Error: Cannot find module 'sharp'\nELIFECYCLE Command failed with exit code 1\n";
+
+        let compressed = PnpmCompressor.compress("pnpm install", output);
+
+        assert!(!compressed.text.trim().is_empty());
+        assert!(compressed.text.contains("ELIFECYCLE"));
+        assert!(compressed.text.contains("Cannot find module"));
+    }
 }

@@ -17,6 +17,21 @@ pub struct BoundedRead {
     pub total_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskTruncation {
+    pub stdout_prefix_bytes: u64,
+    pub stderr_prefix_bytes: u64,
+    pub combined_prefix_bytes: u64,
+}
+
+impl DiskTruncation {
+    pub fn total_prefix_bytes(self) -> u64 {
+        self.stdout_prefix_bytes
+            .saturating_add(self.stderr_prefix_bytes)
+            .saturating_add(self.combined_prefix_bytes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum BgBuffer {
     Pipes {
@@ -66,37 +81,7 @@ impl BgBuffer {
             Self::Pipes {
                 stdout_path,
                 stderr_path,
-            } => {
-                let stdout = read_file_tail(stdout_path, max_bytes);
-                let stderr = read_file_tail(stderr_path, max_bytes);
-                match (stdout, stderr) {
-                    (Ok((stdout, stdout_truncated)), Ok((stderr, stderr_truncated))) => {
-                        let mut output =
-                            Vec::with_capacity(stdout.len().saturating_add(stderr.len()));
-                        output.extend_from_slice(&stdout);
-                        output.extend_from_slice(&stderr);
-                        let was_over_cap = output.len() > max_bytes;
-                        if was_over_cap {
-                            let keep_from = output.len().saturating_sub(max_bytes);
-                            output.drain(..keep_from);
-                            output = align_start_to_utf8(output);
-                        }
-                        (
-                            String::from_utf8_lossy(&output).into_owned(),
-                            stdout_truncated || stderr_truncated || was_over_cap,
-                        )
-                    }
-                    (Ok((stdout, stdout_truncated)), Err(_)) => (
-                        String::from_utf8_lossy(&stdout).into_owned(),
-                        stdout_truncated,
-                    ),
-                    (Err(_), Ok((stderr, stderr_truncated))) => (
-                        String::from_utf8_lossy(&stderr).into_owned(),
-                        stderr_truncated,
-                    ),
-                    (Err(_), Err(_)) => (String::new(), false),
-                }
-            }
+            } => read_two_file_tails(stdout_path, stderr_path, max_bytes),
             Self::Pty { combined_path } => match read_file_tail(combined_path, max_bytes) {
                 Ok((bytes, truncated)) => (String::from_utf8_lossy(&bytes).into_owned(), truncated),
                 Err(_) => (String::new(), false),
@@ -206,18 +191,21 @@ impl BgBuffer {
         }
     }
 
-    pub fn enforce_terminal_cap(&mut self) {
+    pub fn enforce_terminal_cap(&mut self) -> DiskTruncation {
         match self {
             Self::Pipes {
                 stdout_path,
                 stderr_path,
-            } => {
-                let _ = truncate_front(stdout_path, DISK_LIMIT_BYTES);
-                let _ = truncate_front(stderr_path, DISK_LIMIT_BYTES);
-            }
-            Self::Pty { combined_path } => {
-                let _ = truncate_front(combined_path, DISK_LIMIT_BYTES);
-            }
+            } => DiskTruncation {
+                stdout_prefix_bytes: truncate_front(stdout_path, DISK_LIMIT_BYTES).unwrap_or(0),
+                stderr_prefix_bytes: truncate_front(stderr_path, DISK_LIMIT_BYTES).unwrap_or(0),
+                combined_prefix_bytes: 0,
+            },
+            Self::Pty { combined_path } => DiskTruncation {
+                stdout_prefix_bytes: 0,
+                stderr_prefix_bytes: 0,
+                combined_prefix_bytes: truncate_front(combined_path, DISK_LIMIT_BYTES).unwrap_or(0),
+            },
         }
     }
 
@@ -281,11 +269,19 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
     let metadata = path.metadata()?;
     let total_bytes = metadata.len();
     if total_bytes > max_bytes as u64 {
-        return Ok(BoundedRead {
-            text: String::new(),
-            truncated: true,
-            total_bytes,
-        });
+        if max_bytes == 0 {
+            return Ok(BoundedRead {
+                text: String::new(),
+                truncated: true,
+                total_bytes,
+            });
+        }
+        return read_single_file_head_tail(
+            path,
+            max_bytes,
+            max_bytes / 2,
+            max_bytes - max_bytes / 2,
+        );
     }
     let bytes = fs::read(path)?;
     Ok(BoundedRead {
@@ -352,53 +348,94 @@ fn read_two_file_head_tail(
         };
     }
 
-    let head_len = head_bytes.min(max_bytes) as u64;
-    let tail_len = tail_bytes.min(max_bytes.saturating_sub(head_len as usize)) as u64;
-    let head = read_virtual_range(first, first_len, second, 0, head_len).unwrap_or_default();
-    let tail_start = total_bytes.saturating_sub(tail_len);
-    let tail =
-        read_virtual_range(first, first_len, second, tail_start, tail_len).unwrap_or_default();
+    let head_budget = head_bytes.min(max_bytes);
+    let (first_head, second_head) = split_stream_budget(first_len, second_len, head_budget);
+    let tail_budget = tail_bytes.min(max_bytes.saturating_sub(first_head + second_head));
+    let first_remaining = first_len.saturating_sub(first_head as u64);
+    let second_remaining = second_len.saturating_sub(second_head as u64);
+    let (first_tail, second_tail) =
+        split_stream_budget(first_remaining, second_remaining, tail_budget);
+
+    let first_read =
+        read_single_file_head_tail(first, first_head + first_tail, first_head, first_tail)
+            .unwrap_or_else(|_| BoundedRead {
+                text: String::new(),
+                truncated: false,
+                total_bytes: first_len,
+            });
+    let second_read =
+        read_single_file_head_tail(second, second_head + second_tail, second_head, second_tail)
+            .unwrap_or_else(|_| BoundedRead {
+                text: String::new(),
+                truncated: false,
+                total_bytes: second_len,
+            });
+
     BoundedRead {
-        text: join_head_tail_bytes(head, tail, total_bytes.saturating_sub(head_len + tail_len)),
+        text: combine_streams(&first_read.text, &second_read.text),
         truncated: true,
         total_bytes,
     }
 }
 
-fn read_virtual_range(
-    first: &Path,
-    first_len: u64,
-    second: &Path,
-    start: u64,
-    len: u64,
-) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(len as usize);
-    if len == 0 {
-        return Ok(output);
-    }
-    let end = start.saturating_add(len);
-
-    if start < first_len {
-        let first_read_start = start;
-        let first_read_end = end.min(first_len);
-        output.extend(read_file_range(
-            first,
-            first_read_start,
-            first_read_end.saturating_sub(first_read_start),
-        )?);
+fn read_two_file_tails(first: &Path, second: &Path, max_bytes: usize) -> (String, bool) {
+    let first_len = first.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let second_len = second
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let total_bytes = first_len.saturating_add(second_len);
+    if total_bytes <= max_bytes as u64 {
+        let first_bytes = fs::read(first).unwrap_or_default();
+        let second_bytes = fs::read(second).unwrap_or_default();
+        return (
+            combine_streams(
+                String::from_utf8_lossy(&first_bytes).as_ref(),
+                String::from_utf8_lossy(&second_bytes).as_ref(),
+            ),
+            false,
+        );
     }
 
-    if end > first_len {
-        let second_read_start = start.saturating_sub(first_len);
-        let second_read_end = end.saturating_sub(first_len);
-        output.extend(read_file_range(
-            second,
-            second_read_start,
-            second_read_end.saturating_sub(second_read_start),
-        )?);
-    }
+    let (first_budget, second_budget) = split_stream_budget(first_len, second_len, max_bytes);
+    let (first_bytes, first_truncated) = read_file_tail(first, first_budget)
+        .unwrap_or_else(|_| (Vec::new(), first_len > first_budget as u64));
+    let (second_bytes, second_truncated) = read_file_tail(second, second_budget)
+        .unwrap_or_else(|_| (Vec::new(), second_len > second_budget as u64));
+    (
+        combine_streams(
+            String::from_utf8_lossy(&first_bytes).as_ref(),
+            String::from_utf8_lossy(&second_bytes).as_ref(),
+        ),
+        first_truncated || second_truncated || total_bytes > max_bytes as u64,
+    )
+}
 
-    Ok(output)
+fn split_stream_budget(first_len: u64, second_len: u64, total_budget: usize) -> (usize, usize) {
+    if total_budget == 0 {
+        return (0, 0);
+    }
+    match (first_len > 0, second_len > 0) {
+        (false, false) => (0, 0),
+        (true, false) => (total_budget, 0),
+        (false, true) => (0, total_budget),
+        (true, true) => {
+            let mut first_budget = total_budget / 2;
+            let mut second_budget = total_budget - first_budget;
+            redistribute_unused_budget(first_len, &mut first_budget, &mut second_budget);
+            redistribute_unused_budget(second_len, &mut second_budget, &mut first_budget);
+            (first_budget, second_budget)
+        }
+    }
+}
+
+fn redistribute_unused_budget(len: u64, own_budget: &mut usize, other_budget: &mut usize) {
+    let needed = len.min(usize::MAX as u64) as usize;
+    if needed < *own_budget {
+        let spare = own_budget.saturating_sub(needed);
+        *own_budget = needed;
+        *other_budget = other_budget.saturating_add(spare);
+    }
 }
 
 fn read_file_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
@@ -429,14 +466,14 @@ fn join_head_tail_bytes(head: Vec<u8>, tail: Vec<u8>, truncated_bytes: u64) -> S
     output
 }
 
-fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {
+fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<u64> {
     let len = match path.metadata() {
         Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error),
     };
     if len <= retain_bytes {
-        return Ok(false);
+        return Ok(0);
     }
 
     let mut file = File::open(path)?;
@@ -444,6 +481,7 @@ fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {
     let mut tail = Vec::with_capacity(retain_bytes as usize);
     file.read_to_end(&mut tail)?;
     let tail = align_start_to_utf8(tail);
+    let retained_bytes = tail.len() as u64;
     let tmp = path.with_extension(format!(
         "{}.tmp",
         path.extension()
@@ -452,7 +490,7 @@ fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {
     ));
     fs::write(&tmp, tail)?;
     fs::rename(&tmp, path)?;
-    Ok(true)
+    Ok(len.saturating_sub(retained_bytes))
 }
 
 fn align_start_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -632,5 +670,122 @@ mod tests {
             stdout_pos < stderr_pos,
             "stdout should come before stderr in combined output"
         );
+    }
+
+    #[test]
+    fn read_tail_preserves_each_stream_tail_when_combined_cap_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout");
+        let stderr_path = dir.path().join("stderr");
+        std::fs::write(
+            &stdout_path,
+            format!(
+                "{}
+error: stdout boom
+",
+                "stdout noise
+"
+                .repeat(20)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &stderr_path,
+            format!(
+                "{}
+stderr tail
+",
+                "stderr noise
+"
+                .repeat(200)
+            ),
+        )
+        .unwrap();
+        let buffer = BgBuffer::new(stdout_path, stderr_path);
+
+        let (text, truncated) = buffer.read_tail(160);
+
+        assert!(truncated);
+        assert!(text.contains("error: stdout boom"));
+        assert!(text.contains("stderr tail"));
+    }
+
+    #[test]
+    fn read_combined_head_tail_preserves_each_stream_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout");
+        let stderr_path = dir.path().join("stderr");
+        std::fs::write(
+            &stdout_path,
+            format!(
+                "stdout head
+{}
+ERROR: stdout final
+",
+                "x".repeat(512)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &stderr_path,
+            format!(
+                "stderr head
+{}
+stderr final
+",
+                "y".repeat(2048)
+            ),
+        )
+        .unwrap();
+        let buffer = BgBuffer::new(stdout_path, stderr_path);
+
+        let read = buffer.read_combined_head_tail(256, 64, 192);
+
+        assert!(read.truncated);
+        assert!(read.text.contains("ERROR: stdout final"));
+        assert!(read.text.contains("stderr final"));
+    }
+
+    #[test]
+    fn read_file_bounded_returns_head_and_tail_for_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(
+            &path,
+            format!(
+                "HEAD
+{}
+TAIL",
+                "x".repeat(256)
+            ),
+        )
+        .unwrap();
+
+        let read = read_file_bounded(&path, 64).unwrap();
+
+        assert!(read.truncated);
+        assert!(read.text.contains("HEAD"));
+        assert!(read.text.contains("TAIL"));
+        assert!(read.text.contains("...<truncated "));
+    }
+
+    #[test]
+    fn truncate_front_reports_prefix_bytes_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(
+            &path,
+            b"early root cause
+late tail
+",
+        )
+        .unwrap();
+
+        let removed = truncate_front(&path, 10).unwrap();
+        let retained = std::fs::read_to_string(&path).unwrap();
+
+        assert!(removed > 0);
+        assert!(!retained.contains("early root cause"));
+        assert!(retained.contains("late tail"));
     }
 }

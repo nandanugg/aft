@@ -442,7 +442,11 @@ pub fn apply_filter_with_exit_code(
     let after_strip = kept.join("\n");
 
     // Phase 2: shortcircuit (against the after-strip body)
-    if !matches!(exit_code, Some(code) if code != 0) {
+    let shortcircuit_safe = match exit_code {
+        Some(code) => code == 0,
+        None => !super::text_has_failure_signal(&after_strip),
+    };
+    if shortcircuit_safe {
         if let (Some(when), Some(replacement)) =
             (&filter.shortcircuit_when, &filter.shortcircuit_replacement)
         {

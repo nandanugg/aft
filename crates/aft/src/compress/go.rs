@@ -21,7 +21,7 @@ impl Compressor for GoCompressor {
         exit_code: Option<i32>,
     ) -> CompressionResult {
         match go_subcommand(command).as_deref() {
-            Some("test") => compress_test(output).into(),
+            Some("test") => preserve_go_failure(output, compress_test(output), exit_code).into(),
             Some("build") => preserve_go_failure(output, compress_build(output), exit_code).into(),
             Some("vet") => preserve_go_failure(output, compress_vet(output), exit_code).into(),
             _ => GenericCompressor::compress_output(output).into(),
@@ -35,9 +35,9 @@ impl Compressor for GoCompressor {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        _exit_code: Option<i32>,
+        exit_code: Option<i32>,
     ) -> CompressionResult {
-        compress_test(output).into()
+        preserve_go_failure(output, compress_test(output), exit_code).into()
     }
 }
 
@@ -70,7 +70,17 @@ impl Compressor for GolangciLintCompressor {
 }
 
 fn preserve_go_failure(output: &str, compressed: String, exit_code: Option<i32>) -> String {
-    if exited_nonzero(exit_code) && matches!(compressed.trim(), "go build: ok" | "go vet: clean") {
+    let compressed_trimmed = compressed.trim();
+    let compressed_has_signal = super::text_has_failure_signal(&compressed);
+    let raw_has_signal = super::text_has_failure_signal(output);
+    let missing_failure_lines = super::missing_raw_failure_signal_lines(output, &compressed);
+    let stripped_failure = output.trim().is_empty()
+        || compressed_trimmed.is_empty()
+        || matches!(compressed_trimmed, "go build: ok" | "go vet: clean")
+        || !compressed_has_signal
+        || !missing_failure_lines.is_empty();
+
+    if stripped_failure && (exited_nonzero(exit_code) || raw_has_signal) {
         GenericCompressor::compress_output(output)
     } else {
         compressed
@@ -497,6 +507,46 @@ internal/lib.go:22:12: cannot use x as string"#;
             ),
             "go build: ok"
         );
+    }
+
+    #[test]
+    fn go_build_linker_error_does_not_report_ok_when_exit_is_unknown() {
+        let output = "# example.com/pkg
+/usr/bin/ld: error: undefined reference to `missing_symbol'
+collect2: error: ld returned 1 exit status
+";
+
+        let compressed = go_compress("go build ./...", output);
+
+        assert_ne!(compressed.text, "go build: ok");
+        assert!(compressed.text.contains("undefined reference"));
+        assert!(compressed.text.contains("collect2: error"));
+    }
+
+    #[test]
+    fn go_test_compile_error_preserves_diagnostic_even_with_unknown_exit() {
+        let output = "# example.com/pkg [example.com/pkg.test]
+./main_test.go:8:2: undefined: missingSymbol
+FAIL	example.com/pkg [build failed]
+";
+
+        let compressed = go_compress("go test ./...", output);
+
+        assert!(compressed.text.contains("undefined: missingSymbol"));
+        assert!(compressed.text.contains("FAIL	example.com/pkg"));
+    }
+
+    #[test]
+    fn go_vet_syntax_error_does_not_report_clean_when_exit_is_unknown() {
+        let output = "# example.com/pkg
+vet: ./main.go:9:1: expected declaration, found '}'
+ERROR: vet failed
+";
+
+        let compressed = go_compress("go vet ./...", output);
+
+        assert_ne!(compressed.text, "go vet: clean");
+        assert!(compressed.text.contains("ERROR: vet failed"));
     }
 
     #[test]

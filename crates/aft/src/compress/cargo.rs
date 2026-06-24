@@ -121,6 +121,11 @@ fn is_warning_or_error(line: &str) -> bool {
     trimmed.starts_with("warning:") || trimmed.starts_with("error:")
 }
 
+fn is_error_diagnostic(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("error:") || trimmed.starts_with("error[")
+}
+
 fn is_ignored_progress(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed == "Updating crates.io index" || is_compiling_line(trimmed)
@@ -152,10 +157,12 @@ fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
     if !has_failures {
-        if matches!(exit_code, Some(code) if code != 0)
-            && lines
-                .iter()
-                .any(|line| is_warning_or_error(line) || line.trim_start().starts_with("error["))
+        let has_error_diagnostic = lines.iter().any(|line| is_error_diagnostic(line));
+        let has_warning_or_error = lines
+            .iter()
+            .any(|line| is_warning_or_error(line) || line.trim_start().starts_with("error["));
+        if has_error_diagnostic
+            || (matches!(exit_code, Some(code) if code != 0) && has_warning_or_error)
         {
             return compress_build_like(output);
         }
@@ -272,6 +279,25 @@ mod tests {
         assert!(!result.text.contains("---- case_20 stdout ----"));
         assert!(result.had_inner_drop);
         assert!(!result.offset_hint_eligible);
+    }
+
+    #[test]
+    fn cargo_test_compile_error_preserves_diagnostic_with_unknown_exit() {
+        let output = r#"   Compiling demo v0.1.0 (/tmp/demo)
+error[E0432]: unresolved import `crate::missing`
+ --> src/lib.rs:1:5
+  |
+1 | use crate::missing;
+  |     ^^^^^^^^^^^^^^ no `missing` in the root
+
+error: could not compile `demo` (lib test) due to 1 previous error
+"#;
+
+        let result = compress_test(output, None);
+
+        assert!(result.text.contains("error[E0432]"));
+        assert!(result.text.contains("unresolved import"));
+        assert!(result.text.contains("error: could not compile"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
+use crate::compress::generic::GenericCompressor;
 use crate::compress::{CompressionResult, Compressor};
 
 pub struct PytestCompressor;
@@ -81,7 +82,21 @@ fn compress_pytest(output: &str) -> CompressionResult {
     }
 
     let capped = cap_classified_blocks(blocks);
-    CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
+    let compressed = CompressionResult::with_class_drops(
+        trim_trailing_lines(&capped.text),
+        capped.dropped_by_class,
+    );
+    preserve_pytest_failure(output, compressed)
+}
+
+fn preserve_pytest_failure(output: &str, compressed: CompressionResult) -> CompressionResult {
+    let stripped_failure =
+        compressed.text.trim().is_empty() || !super::text_has_failure_signal(&compressed.text);
+    if !output.trim().is_empty() && super::text_has_failure_signal(output) && stripped_failure {
+        GenericCompressor::compress_output(output).into()
+    } else {
+        compressed
+    }
 }
 
 fn compress_failure_section(
@@ -96,7 +111,7 @@ fn compress_failure_section(
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim();
-        if trimmed.starts_with('=') && trimmed.ends_with('=') {
+        if is_recognized_section_boundary(trimmed) {
             break;
         }
         if is_pytest_case_header(trimmed) && !current.is_empty() {
@@ -112,6 +127,14 @@ fn compress_failure_section(
     }
 
     (blocks, index)
+}
+
+fn is_recognized_section_boundary(trimmed: &str) -> bool {
+    is_section_header(trimmed, "FAILURES")
+        || is_section_header(trimmed, "ERRORS")
+        || is_section_header(trimmed, "warnings summary")
+        || is_section_header(trimmed, "short test summary info")
+        || is_final_summary(trimmed)
 }
 
 fn is_pytest_case_header(trimmed: &str) -> bool {
@@ -216,4 +239,40 @@ fn trim_trailing_lines(input: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pytest_no_module_error_does_not_compress_to_empty() {
+        let output = "/usr/bin/python3: No module named pytest\n";
+
+        let compressed = PytestCompressor.compress("python3 -m pytest", output);
+
+        assert!(compressed.text.contains("No module named pytest"));
+    }
+
+    #[test]
+    fn pytest_internalerror_does_not_compress_to_empty() {
+        let output = "INTERNALERROR> Traceback (most recent call last):\nINTERNALERROR> RuntimeError: plugin exploded\n";
+
+        let compressed = PytestCompressor.compress("pytest", output);
+
+        assert!(compressed.text.contains("INTERNALERROR"));
+        assert!(compressed.text.contains("RuntimeError"));
+    }
+
+    #[test]
+    fn pytest_failure_section_keeps_unrecognized_equals_traceback_lines() {
+        let output = "============================= FAILURES =============================\n____________________________ test_example ____________________________\nTraceback (most recent call last):\n======= custom traceback divider =======\nException: boom\n=========================== short test summary info ===========================\nFAILED tests/test_example.py::test_example - Exception: boom\n";
+
+        let compressed = PytestCompressor.compress("pytest", output);
+
+        assert!(compressed
+            .text
+            .contains("======= custom traceback divider ======="));
+        assert!(compressed.text.contains("Exception: boom"));
+    }
 }

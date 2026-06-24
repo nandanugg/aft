@@ -305,9 +305,30 @@ pub fn json_output_pointer(total_bytes: u64, path: &str) -> String {
     )
 }
 
+pub fn retained_json_output_pointer(
+    total_bytes: u64,
+    path: &str,
+    truncated_prefix_bytes: u64,
+) -> String {
+    let kb = total_bytes.div_ceil(1024);
+    format!(
+        "[JSON output {kb} KB; truncated {truncated_prefix_bytes} bytes from saved output prefix; retained output: read {}]",
+        quote_path(path)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_json_pointer_does_not_claim_full_output() {
+        let pointer = retained_json_output_pointer(2048, "/tmp/stdout", 4096);
+
+        assert!(pointer.contains("truncated 4096 bytes from saved output prefix"));
+        assert!(pointer.contains(r#"retained output: read "/tmp/stdout""#));
+        assert!(!pointer.contains("full output"));
+    }
 
     #[test]
     fn quote_path_preserves_windows_backslashes() {

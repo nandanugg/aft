@@ -20,11 +20,11 @@ impl Compressor for BunCompressor {
         &self,
         command: &str,
         output: &str,
-        _exit_code: Option<i32>,
+        exit_code: Option<i32>,
     ) -> CompressionResult {
         match bun_subcommand(command).as_deref() {
             Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
-            Some("test") => compress_test(output),
+            Some("test") => preserve_bun_failure(output, compress_test(output), exit_code),
             Some("build") => compress_build(output),
             _ => GenericCompressor::compress_output(output).into(),
         }
@@ -49,9 +49,26 @@ impl Compressor for BunCompressor {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        _exit_code: Option<i32>,
+        exit_code: Option<i32>,
     ) -> CompressionResult {
-        compress_test(output)
+        preserve_bun_failure(output, compress_test(output), exit_code)
+    }
+}
+
+fn preserve_bun_failure(
+    output: &str,
+    compressed: CompressionResult,
+    exit_code: Option<i32>,
+) -> CompressionResult {
+    let stripped_failure =
+        compressed.text.trim().is_empty() || !super::text_has_failure_signal(&compressed.text);
+    if !output.trim().is_empty()
+        && stripped_failure
+        && (matches!(exit_code, Some(code) if code != 0) || super::text_has_failure_signal(output))
+    {
+        GenericCompressor::compress_output(output).into()
+    } else {
+        compressed
     }
 }
 
@@ -507,4 +524,20 @@ fn trim_trailing_lines(input: &str) -> String {
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bun_test_compile_error_falls_back_when_exit_is_unknown() {
+        let output = "bun test v1.3.14 (0d9b296a)\n\nerror: Cannot find module './missing' from 'src/app.test.ts'\n\nRan 0 tests across 1 file. [12.00ms]\n";
+
+        let compressed = BunCompressor.compress("bun test", output);
+
+        assert!(compressed.text.contains("Cannot find module"));
+        assert!(compressed.text.contains("Ran 0 tests"));
+        assert_ne!(compressed.text, "bun test\nRan 0 tests across 1 file.");
+    }
 }
