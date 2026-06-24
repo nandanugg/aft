@@ -200,12 +200,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.39.0";
+const ANNOUNCEMENT_VERSION = "0.40.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Accurate Rust dead code: constructors and associated functions reached through receiver-type inference are no longer mis-reported as dead.",
-  "Code Health scans reparse only the file you changed instead of the whole project on every edit — a single-file edit dropped from ~3s of scan work to ~130ms on this repo, byte-identical results.",
-  "R language support in outline, zoom, and the AST tools.",
-  "Edit approval prompts now show the pending diff instead of 'No diff provided', so you can review a change before approving it.",
+  "Groundwork for Subconscious, the CortexKit daemon: configuration now lives in one place under ~/.config/cortexkit/ and <project>/.cortexkit/ (auto-migrated). The daemon integration is dormant — nothing changes in how you run AFT today.",
+  "Bash output never hides a failure: piped commands run exactly as written with their real exit status, cancelled tasks report as failed, and a failing run is never compressed to a clean-looking summary.",
+  "The top aft_search result is now the complete, ready-to-edit symbol (no re-read needed); test files are hidden from results by default.",
+  "format_on_edit is now off by default, and bash commands default to the foreground.",
 ];
 
 /**
