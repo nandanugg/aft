@@ -4,6 +4,7 @@ import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
+  coerceOptionalInt,
   formatBridgeErrorMessage,
   isEmptyParam,
   optionalInt,
@@ -102,7 +103,8 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           file: filePath,
           symbol: args.symbol,
         };
-        if (args.depth !== undefined) params.depth = Number(args.depth);
+        const depth = coerceOptionalInt(args.depth, "depth", 1, Number.MAX_SAFE_INTEGER);
+        if (depth !== undefined) params.depth = depth;
         if (!isEmptyParam(args.expression)) params.expression = args.expression;
         if (!isEmptyParam(args.toSymbol)) params.toSymbol = args.toSymbol;
         if (toFile !== undefined) params.toFile = toFile;

@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt } from "./_shared.js";
+import { callBridge, coerceOptionalInt, isEmptyParam, optionalInt } from "./_shared.js";
 import { askGrepPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -89,7 +89,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
 
       const bridgeParams: Record<string, unknown> = {
         query,
-        top_k: args.topK ?? 10,
+        top_k: coerceOptionalInt(args.topK, "topK", 1, 100) ?? 10,
       };
       if (hint) bridgeParams.hint = hint;
       if (typeof args.includeTests === "boolean") bridgeParams.include_tests = args.includeTests;

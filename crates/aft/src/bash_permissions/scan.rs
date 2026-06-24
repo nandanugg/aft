@@ -103,6 +103,12 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
         let head = tokens[0].as_str();
 
         if head == "cd" {
+            collect_redirection_targets(command, node, &scan_cwd, |target| match target {
+                RedirectTarget::Path(path) => {
+                    push_external_path(&mut asks, &mut seen, &project_root, &path);
+                }
+                RedirectTarget::Dynamic => {}
+            });
             if let Some(arg) = path_args(&parts).next() {
                 if let Some(path) = arg_path(arg, &scan_cwd) {
                     scan_cwd = path;

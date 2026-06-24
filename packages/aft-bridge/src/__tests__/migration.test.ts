@@ -318,6 +318,56 @@ describe("config file migration", () => {
     expect(existsSync(`${source}.MOVED_READPLEASE`)).toBe(true);
   });
 
+  test("pre-existing MOVED_READPLEASE marker is preserved with a suffixed marker", () => {
+    const source = join(root, "opencode", "aft.jsonc");
+    const target = join(root, "cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "opencode"), { recursive: true });
+    const originalMarker = `${source}.MOVED_READPLEASE`;
+    writeFileSync(source, '{"semantic_search":true}\n', "utf8");
+    writeFileSync(originalMarker, "prior migration marker\n", "utf8");
+
+    const warnings: string[] = [];
+    const result = migrateAftConfigFile({
+      scope: "user",
+      targetPath: target,
+      legacySources: [{ path: source, label: "OpenCode user" }],
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+
+    expect(result.migrated).toBe(true);
+    expect(readFileSync(originalMarker, "utf8")).toBe("prior migration marker\n");
+    expect(existsSync(`${originalMarker}.1`)).toBe(true);
+    expect(readFileSync(`${originalMarker}.1`, "utf8")).toContain('"semantic_search":true');
+    expect(warnings.join("\n")).toContain("Preserving existing legacy AFT marker");
+  });
+
+  test("pre-existing _OLD sidecar is preserved with a suffixed sidecar", () => {
+    const source = join(root, "pi", "aft.jsonc");
+    const target = join(root, "cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "pi"), { recursive: true });
+    mkdirSync(join(root, "cortexkit"), { recursive: true });
+    writeFileSync(source, '{"semantic_search":true}\n', "utf8");
+    writeFileSync(target, '{"semantic_search":false}\n', "utf8");
+    const oldPath = `${target}.pi_OLD`;
+    writeFileSync(oldPath, "prior preserved config\n", "utf8");
+
+    const warnings: string[] = [];
+    const result = migrateAftConfigFile({
+      scope: "user",
+      targetPath: target,
+      legacySources: [{ path: source, label: "Pi user", harness: "pi" }],
+      operatingHarness: "pi",
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+
+    expect(result.conflict).toBe(false);
+    expect(readFileSync(oldPath, "utf8")).toBe("prior preserved config\n");
+    expect(existsSync(`${oldPath}.1`)).toBe(true);
+    expect(readFileSync(`${oldPath}.1`, "utf8")).toContain('"semantic_search":true');
+    expect(result.warnings.join("\n")).toContain(`${oldPath}.1`);
+    expect(warnings.join("\n")).toContain("Preserving existing pi config sidecar");
+  });
+
   test("concurrent migrations are first-wins and leave valid target content", async () => {
     const source = join(root, "legacy", "aft.jsonc");
     const target = join(root, "cortexkit", "aft.jsonc");

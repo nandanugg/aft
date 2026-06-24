@@ -263,6 +263,7 @@ function tryMatch(
       }
       if (matches) return fromEnd;
     }
+    return -1;
   }
 
   for (let i = startIndex; i <= lines.length - pattern.length; i++) {
@@ -389,6 +390,8 @@ function seekSequenceTiered(
     eof,
   );
   if (unicode !== -1) return { found: unicode, tier: "unicode", lineCount: pattern.length };
+
+  if (eof) return null;
 
   const reflow = findReflowMatch(lines, pattern, startIndex);
   if (reflow) return { ...reflow, tier: "reflow" };

@@ -24,6 +24,7 @@ import { applyUpdateChunks, type Hunk as PatchHunk, parsePatch } from "../patch-
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
+  coerceOptionalInt,
   optionalInt,
   resolvePathFromProjectRoot,
   resolveProjectRoot,
@@ -554,13 +555,23 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         };
       }
 
+      const rawStartLine = coerceOptionalInt(
+        args.startLine,
+        "startLine",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      const rawEndLine = coerceOptionalInt(args.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+      const rawLimit = coerceOptionalInt(args.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
+      const rawOffset = coerceOptionalInt(args.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
+
       // Normalize offset/limit to startLine/endLine (backward compat with opencode's read)
-      let startLine = args.startLine;
-      let endLine = args.endLine;
-      if (startLine === undefined && args.offset !== undefined) {
-        startLine = args.offset;
-        if (args.limit !== undefined) {
-          endLine = Number(args.offset) + Number(args.limit) - 1;
+      let startLine = rawStartLine;
+      let endLine = rawEndLine;
+      if (startLine === undefined && rawOffset !== undefined) {
+        startLine = rawOffset;
+        if (rawLimit !== undefined) {
+          endLine = rawOffset + rawLimit - 1;
         }
       }
 
@@ -569,7 +580,7 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
       if (startLine !== undefined) params.start_line = startLine;
       if (endLine !== undefined) params.end_line = endLine;
       // Only send limit if we did NOT convert offset to startLine/endLine
-      if (args.limit !== undefined && args.offset === undefined) params.limit = args.limit;
+      if (rawLimit !== undefined && rawOffset === undefined) params.limit = rawLimit;
 
       const data = await callBridge(ctx, context, "read", params);
 
@@ -599,10 +610,10 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 
       // Three-case footer: see formatReadFooter() doc.
       const agentSpecifiedRange =
-        args.startLine !== undefined ||
-        args.endLine !== undefined ||
-        args.offset !== undefined ||
-        args.limit !== undefined;
+        rawStartLine !== undefined ||
+        rawEndLine !== undefined ||
+        rawOffset !== undefined ||
+        rawLimit !== undefined;
       const footer = formatReadFooter(agentSpecifiedRange, data);
       if (footer) output += footer;
 
@@ -860,6 +871,12 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       }
 
       const params: Record<string, unknown> = { file: filePath };
+      const occurrence = coerceOptionalInt(
+        args.occurrence,
+        "occurrence",
+        0,
+        Number.MAX_SAFE_INTEGER,
+      );
 
       // Route to appropriate Rust command
       let command: string;
@@ -901,7 +918,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         params.replacement = args.newString ?? "";
         // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
         if (coerceBoolean(args.replaceAll)) params.replace_all = true;
-        if (args.occurrence !== undefined) params.occurrence = args.occurrence;
+        if (occurrence !== undefined) params.occurrence = occurrence;
       } else {
         // No mode-selecting parameter matched. We deliberately do NOT fall
         // through to a content-only "write" mode here, even when `content` is

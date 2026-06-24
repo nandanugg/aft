@@ -51,6 +51,16 @@ describe("coerceBoolean", () => {
     expect(coerceBoolean({})).toBe(false);
     expect(coerceBoolean([])).toBe(false);
   });
+
+  test("supports default-true booleans with explicit false-like values", () => {
+    expect(coerceBoolean(undefined, true)).toBe(true);
+    expect(coerceBoolean("false", true)).toBe(false);
+    expect(coerceBoolean("0", true)).toBe(false);
+    expect(coerceBoolean(0, true)).toBe(false);
+    expect(coerceBoolean(false, true)).toBe(false);
+    expect(coerceBoolean("true", true)).toBe(true);
+    expect(coerceBoolean("anything else", true)).toBe(true);
+  });
 });
 
 describe("coerceStringArray", () => {

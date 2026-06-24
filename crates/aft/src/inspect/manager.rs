@@ -2549,10 +2549,49 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
     // carry per-item language, so we can't faithfully recompute it — drop it so
     // the scoped summary doesn't render a misleading project-wide breakdown.
     if let Some(object) = payload.as_object_mut() {
+        if object.contains_key("top") {
+            if let Some(top) = recompute_scoped_top_preview(object) {
+                object.insert("top".to_string(), top);
+            } else if let Some(top) = object.get_mut("top").and_then(Value::as_array_mut) {
+                filter_values_for_scope(top, scope);
+            }
+        }
         object.remove("by_language");
     }
 
     payload
+}
+
+fn recompute_scoped_top_preview(
+    object: &serde_json::Map<String, Value>,
+) -> Option<serde_json::Value> {
+    let values = object
+        .get("items")
+        .or_else(|| object.get("groups"))
+        .and_then(Value::as_array)?;
+    Some(Value::Array(
+        values
+            .iter()
+            .take(super::entry_points::TOP_PREVIEW_ITEMS)
+            .map(top_preview_value)
+            .collect(),
+    ))
+}
+
+fn top_preview_value(value: &Value) -> Value {
+    if let Some(files) = value.get("files").and_then(Value::as_array) {
+        let mut object = serde_json::Map::new();
+        object.insert("files".to_string(), Value::Array(files.clone()));
+        if let Some(cost) = value.get("cost").cloned() {
+            object.insert("cost".to_string(), cost);
+        }
+        return Value::Object(object);
+    }
+
+    json!({
+        "file": value.get("file").and_then(Value::as_str).unwrap_or(""),
+        "symbol": value.get("symbol").and_then(Value::as_str).unwrap_or(""),
+    })
 }
 
 fn filter_values_for_scope(values: &mut Vec<serde_json::Value>, scope: &JobScope) -> usize {
@@ -2650,6 +2689,43 @@ mod guard_tests {
             .expect("write fixture");
         }
         dir
+    }
+
+    #[test]
+    fn scoped_filter_recomputes_top_preview_from_scoped_items() {
+        let project_root = PathBuf::from("/project");
+        let scope = JobScope::from_roots(project_root.clone(), vec![project_root.join("src/in")]);
+        let payload = json!({
+            "count": 4,
+            "items": [
+                { "file": "src/out/a.ts", "symbol": "outside" },
+                { "file": "src/in/b.ts", "symbol": "inside_b" },
+                { "file": "src/in/c.ts", "symbol": "inside_c" }
+            ],
+            "top": [
+                { "file": "src/out/a.ts", "symbol": "outside" },
+                { "file": "src/out/z.ts", "symbol": "outside_z" }
+            ],
+            "by_language": { "typescript": 4 }
+        });
+
+        let filtered = filter_payload_for_scope(payload, &scope);
+
+        assert_eq!(filtered["count"], json!(2));
+        assert_eq!(
+            filtered["top"],
+            json!([
+                { "file": "src/in/b.ts", "symbol": "inside_b" },
+                { "file": "src/in/c.ts", "symbol": "inside_c" }
+            ])
+        );
+        assert!(filtered["top"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["file"]
+                .as_str()
+                .is_some_and(|file| file.starts_with("src/in/"))));
     }
 
     #[test]

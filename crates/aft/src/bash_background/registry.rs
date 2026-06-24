@@ -3107,8 +3107,9 @@ fn completion_preview_for_cache(
 }
 
 fn is_gh_structured_command(command: &str) -> bool {
-    let normalized = crate::compress::normalize_command_for_dispatch(command)
-        .unwrap_or_else(|| command.trim_start().to_string());
+    let Some(normalized) = crate::compress::plain_command_for_structured_output(command) else {
+        return false;
+    };
     let tokens = shell_words_for_flags(&normalized);
     let Some(head) = tokens.first() else {
         return false;
@@ -3974,6 +3975,23 @@ mod tests {
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
+
+    #[test]
+    fn gh_structured_detection_rejects_piped_commands() {
+        assert!(is_gh_structured_command(
+            "gh issue list --json number,title"
+        ));
+        assert!(is_gh_structured_command(
+            "cd repo && gh issue list --json number,title"
+        ));
+
+        assert!(!is_gh_structured_command(
+            "gh issue list --json number,title | jq '.[]'"
+        ));
+        assert!(!is_gh_structured_command(
+            "gh issue list --json number,title |"
+        ));
+    }
 
     fn insert_terminal_piped_task(
         registry: &BgTaskRegistry,

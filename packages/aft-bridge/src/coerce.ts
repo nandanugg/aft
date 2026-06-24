@@ -98,8 +98,22 @@ export function coerceTargetParam(value: unknown): string | string[] {
  * false-negative just re-surfaces the original "pass the flag" error (safe); a
  * false-positive on a destructive gate like `recursive` would not be, so the
  * truthy set is kept tight rather than accepting arbitrary truthy values.
+ *
+ * Pass `defaultValue: true` only for contractually default-true options. In
+ * that mode, missing values stay enabled and only explicit false-like values
+ * (`false`, `0`, `"false"`, `"0"`) disable the option.
  */
-export function coerceBoolean(value: unknown): boolean {
+export function coerceBoolean(value: unknown, defaultValue = false): boolean {
+  if (defaultValue) {
+    if (value === undefined) return true;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      return normalized !== "false" && normalized !== "0";
+    }
+    return true;
+  }
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value === 1;
   if (typeof value === "string") {

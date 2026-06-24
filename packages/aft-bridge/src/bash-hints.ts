@@ -93,11 +93,13 @@ export function maybeAppendGrepSearchHint(
 }
 
 function shouldSuppressGrepSearchHint(command: string, projectRoot: string | undefined): boolean {
-  const root = projectRoot?.trim();
-  if (!root) return false;
-
   const statements = splitTopLevelStatements(command);
   if (statements === null) return false;
+
+  if (allSearchPathOperandsAreDynamic(statements)) return true;
+
+  const root = projectRoot?.trim();
+  if (!root) return false;
 
   const resolvedRoot = path.resolve(root);
   // Track the effective cwd across top-level statements so a `cd` into another
@@ -132,12 +134,31 @@ function shouldSuppressGrepSearchHint(command: string, projectRoot: string | und
     // No path operands → grep reads stdin or searches the (in-project) cwd.
     if (operands.length === 0) return false;
     for (const operand of operands) {
+      if (isDynamicPathOperand(operand)) continue;
       if (isPathInsideProject(resolvedRoot, effectiveCwd, operand)) return false;
     }
     // All operands resolve outside the project → this grep is external.
   }
 
   return sawCodeSearchStatement;
+}
+
+function allSearchPathOperandsAreDynamic(statements: string[]): boolean {
+  let sawDynamicOnlySearch = false;
+  for (const statement of statements) {
+    const firstStage = firstPipelineStage(statement);
+    if (firstStage === null) continue;
+    const firstToken = readShellToken(firstStage, skipSpaces(firstStage, 0));
+    if (firstToken === null) continue;
+    const head = firstToken.token;
+    if (head !== "grep" && head !== "rg") continue;
+
+    const operands = collectPathOperands(firstStage, firstToken.end);
+    if (operands.length === 0) return false;
+    if (operands.some((operand) => !isDynamicPathOperand(operand))) return false;
+    sawDynamicOnlySearch = true;
+  }
+  return sawDynamicOnlySearch;
 }
 
 /**
@@ -207,6 +228,10 @@ function looksLikePathOperand(token: string): boolean {
     token.startsWith("./") ||
     token.startsWith("../")
   );
+}
+
+function isDynamicPathOperand(token: string): boolean {
+  return token.startsWith("~") || token.includes("$") || token.includes("`");
 }
 
 function expandTilde(target: string): string {

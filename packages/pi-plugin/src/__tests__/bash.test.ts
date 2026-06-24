@@ -283,6 +283,24 @@ describe("bash tool adapter", () => {
     expect(result.content[0].text).not.toContain("AFT dropped");
   });
 
+  test('forwards string compressed "false" as boolean false', async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({ output: "raw", exit_code: 0 });
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    await tools
+      .get("bash")!
+      .execute("test-call", { command: "printf raw", compressed: "false" }, undefined, undefined, {
+        cwd: "/test",
+      });
+
+    const callArgs = calls[0] as [string, Record<string, unknown>];
+    expect(callArgs[1].compressed).toBe(false);
+  });
+
   test("background bash forwards user kill cap and uses 30s baseline transport budget", async () => {
     // Post-v0.20+ the Rust `bash` call returns `running` immediately, so
     // transport timeout is bounded by spawn + protocol round-trip, not the
@@ -557,6 +575,29 @@ describe("bash tool adapter", () => {
       );
 
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
+  });
+
+  test('async bash_watch forwards string once "false" as boolean false', async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({ watch_id: "watch-sticky" });
+    registerBashTool(api, makeMockContext(bridge));
+
+    await tools
+      .get("bash_watch")!
+      .execute(
+        "call",
+        { task_id: "bash-sticky", pattern: "READY", background: true, once: "false" },
+        undefined,
+        undefined,
+        { cwd: "/test" },
+      );
+
+    const notifyCall = calls.find((call) => (call as [string])[0] === "bash_notify") as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(notifyCall[1].once).toBe(false);
   });
 
   test("BashSpawnHook modifies command before bridge call", async () => {

@@ -380,6 +380,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       const ptyCols = backgroundDisabled
         ? undefined
         : coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
+      const compressed = coerceBoolean(params.compressed, true);
       // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
       const requestedPty = !backgroundDisabled && coerceBoolean(params.pty);
       const effectiveBackground =
@@ -428,7 +429,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           description: params.description,
           background: effectiveBackground,
           notify_on_completion: effectiveBackground,
-          compressed: params.compressed,
+          compressed,
           pty: requestedPty,
           pty_rows: ptyRows,
           pty_cols: ptyCols,
@@ -658,7 +659,7 @@ export function createBashWatchTool(ctx: PluginContext) {
         }
         const notifyParams: Record<string, unknown> = {
           task_id: params.task_id,
-          once: params.once !== false,
+          once: coerceBoolean(params.once, true),
         };
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
@@ -705,7 +706,7 @@ export function createBashWatchTool(ctx: PluginContext) {
           extCtx,
           params.task_id,
           waitFor,
-          params.once !== false,
+          coerceBoolean(params.once, true),
         );
         return textResult(convertedText, { waited: data.waited } as BashWatchDetails);
       }

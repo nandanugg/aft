@@ -299,6 +299,15 @@ function atomicWriteConfigFile(targetPath: string, content: string): void {
 
 const MOVED_MARKER_SUFFIX = ".MOVED_READPLEASE";
 
+function nonClobberingSidecarPath(desiredPath: string): string {
+  if (!existsSync(desiredPath)) return desiredPath;
+  for (let index = 1; index < Number.MAX_SAFE_INTEGER; index++) {
+    const candidate = `${desiredPath}.${index}`;
+    if (!existsSync(candidate)) return candidate;
+  }
+  throw new Error(`could not find available preservation sidecar path for ${desiredPath}`);
+}
+
 function movedMarkerContent(
   targetPath: string,
   originalName: string,
@@ -340,9 +349,15 @@ function markLegacySourcesMovedAside(
   const warnings: string[] = [];
   const info = logger?.info ?? logger?.log;
   for (const source of sources) {
-    const markerPath = `${source.path}${MOVED_MARKER_SUFFIX}`;
+    const desiredMarkerPath = `${source.path}${MOVED_MARKER_SUFFIX}`;
+    const markerPath = nonClobberingSidecarPath(desiredMarkerPath);
     try {
       const original = readFileSync(source.path, "utf-8");
+      if (markerPath !== desiredMarkerPath) {
+        logger?.warn?.(
+          `Preserving existing legacy AFT marker ${desiredMarkerPath}; writing new marker to ${markerPath}`,
+        );
+      }
       atomicWriteConfigFile(
         markerPath,
         movedMarkerContent(targetPath, basename(source.path), original),
@@ -407,8 +422,14 @@ function preserveDifferingSourceAsOld(
   logger?: AftConfigFileMigrationOptions["logger"],
 ): string {
   const losingHarness = source.harness ?? "pi";
-  const oldPath = `${targetPath}.${losingHarness}${PRESERVED_OLD_SUFFIX}`;
+  const desiredOldPath = `${targetPath}.${losingHarness}${PRESERVED_OLD_SUFFIX}`;
+  const oldPath = nonClobberingSidecarPath(desiredOldPath);
   try {
+    if (oldPath !== desiredOldPath) {
+      logger?.warn?.(
+        `Preserving existing ${losingHarness} config sidecar ${desiredOldPath}; writing new preserved config to ${oldPath}`,
+      );
+    }
     atomicWriteConfigFile(
       oldPath,
       preservedOldContent(losingHarness, winningHarness, targetPath, source.content),

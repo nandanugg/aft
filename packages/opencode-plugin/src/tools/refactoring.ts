@@ -2,7 +2,13 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { queryLspHints } from "../lsp.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
+import {
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  resolvePathArg,
+} from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -67,6 +73,19 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
       },
       execute: async (args, context): Promise<string> => {
         const op = args.op as string;
+        const startLine = coerceOptionalInt(
+          args.startLine,
+          "startLine",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        );
+        const endLine = coerceOptionalInt(args.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+        const callSiteLine = coerceOptionalInt(
+          args.callSiteLine,
+          "callSiteLine",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        );
 
         // Use isEmptyParam so empty strings (GPT-family models send "" for omitted
         // required string params) trigger the proper "required" error instead of
@@ -79,11 +98,10 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         }
         if (op === "extract") {
           if (isEmptyParam(args.name)) throw new Error("'name' is required for 'extract' op");
-          if (args.startLine === undefined)
-            throw new Error("'startLine' is required for 'extract' op");
-          if (args.endLine === undefined) throw new Error("'endLine' is required for 'extract' op");
+          if (startLine === undefined) throw new Error("'startLine' is required for 'extract' op");
+          if (endLine === undefined) throw new Error("'endLine' is required for 'extract' op");
         }
-        if (op === "inline" && args.callSiteLine === undefined) {
+        if (op === "inline" && callSiteLine === undefined) {
           throw new Error("'callSiteLine' is required for 'inline' op");
         }
 
@@ -133,12 +151,17 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
             break;
           case "extract":
             params.name = args.name;
-            params.start_line = Number(args.startLine);
-            params.end_line = Number(args.endLine) + 1; // Agent uses inclusive, Rust expects exclusive
+            if (startLine === undefined || endLine === undefined) {
+              throw new Error("'startLine' and 'endLine' are required for 'extract' op");
+            }
+            params.start_line = startLine;
+            // Tool callers provide an inclusive endLine, while the refactoring backend expects
+            // the first line after the selected range.
+            params.end_line = endLine + 1;
             break;
           case "inline":
             params.symbol = args.symbol;
-            params.call_site_line = Number(args.callSiteLine);
+            params.call_site_line = callSiteLine;
             break;
         }
 

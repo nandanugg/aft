@@ -153,6 +153,32 @@ fn bash_permission_scan_collects_redirect_target() {
 }
 
 #[test]
+fn bash_permission_scan_collects_cd_redirect_target() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let response = bash(
+        &mut aft,
+        "cd-redirect",
+        "cd /tmp > /tmp/aft-cd-redirect-out",
+    );
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert!(
+        response["asks"].as_array().unwrap().iter().any(|ask| {
+            ask["kind"] == "external_directory"
+                && ask["patterns"].as_array().unwrap().iter().any(|p| {
+                    p.as_str()
+                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
+                })
+        }),
+        "expected external_directory ask for cd redirect target: {response:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn dynamic_file_args_do_not_emit_external_directory_wildcard() {
     // Issue #135: a dynamic file arg (`rm "$DEST/file"`) is unresolvable. We
     // match native OpenCode (which skips dynamic path args) and emit NO

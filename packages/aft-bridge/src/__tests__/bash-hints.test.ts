@@ -201,6 +201,15 @@ describe("maybeAppendGrepSearchHint", () => {
     ).toBe(output);
   });
 
+  test("does NOT append when grep path operand is dynamic", () => {
+    const output = "match";
+    expect(maybeAppendGrepSearchHint(output, 'grep x "$HOME/foo"', true, projectRoot)).toBe(output);
+    expect(maybeAppendGrepSearchHint(output, 'grep x "$HOME/foo"', true)).toBe(output);
+    expect(maybeAppendGrepSearchHint(output, "grep x '$PROJECT/foo'", true, projectRoot)).toBe(
+      output,
+    );
+  });
+
   test("appends when mixed operands include an in-project path", () => {
     const result = maybeAppendGrepSearchHint(
       "hits",
@@ -213,13 +222,13 @@ describe("maybeAppendGrepSearchHint", () => {
 
   test("preserves always-nudge behavior when projectRoot is empty or undefined", () => {
     const output = "hits";
-    expect(maybeAppendGrepSearchHint(output, "grep x ~/.config/foo", true)).toBe(
+    expect(maybeAppendGrepSearchHint(output, "grep x src/file.ts", true)).toBe(
       `${output}\n\n${AFT_SEARCH_HINT}`,
     );
-    expect(maybeAppendGrepSearchHint(output, "grep x ~/.config/foo", true, "")).toBe(
+    expect(maybeAppendGrepSearchHint(output, "grep x src/file.ts", true, "")).toBe(
       `${output}\n\n${AFT_SEARCH_HINT}`,
     );
-    expect(maybeAppendGrepSearchHint(output, "grep x ~/.config/foo", true, "   ")).toBe(
+    expect(maybeAppendGrepSearchHint(output, "grep x src/file.ts", true, "   ")).toBe(
       `${output}\n\n${AFT_SEARCH_HINT}`,
     );
   });

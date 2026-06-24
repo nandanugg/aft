@@ -321,6 +321,22 @@ describe("OpenCode bash adapter", () => {
     expect(output).not.toContain("AFT dropped");
   });
 
+  test('forwards string compressed "false" as boolean false', async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      output: "raw",
+      exit_code: 0,
+      truncated: false,
+    }));
+
+    await bash.execute(
+      { command: "printf raw", compressed: "false" as unknown as boolean },
+      createMockSdkContext(),
+    );
+
+    expect(calls[0].params.compressed).toBe(false);
+  });
+
   test("transport timeout is bounded by wait-window, not user-supplied task budget", async () => {
     // After the v0.20+ foreground-as-polled-background architecture, the
     // Rust `bash` call returns a `running` status immediately — it does NOT
@@ -759,6 +775,26 @@ describe("bash_status tool", () => {
     );
 
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
+  });
+
+  test('async bash_watch forwards string once "false" as boolean false', async () => {
+    const { calls, watchTool } = makeCtx((cmd) =>
+      cmd === "bash_notify"
+        ? { success: true, watch_id: "watch-sticky" }
+        : { success: true, status: "running" },
+    );
+
+    await watchTool.execute(
+      {
+        taskId: "bash-watch-sticky",
+        pattern: "READY",
+        background: true,
+        once: "false" as unknown as boolean,
+      },
+      createMockSdkContext(),
+    );
+
+    expect(calls.find((call) => call.cmd === "bash_notify")?.params.once).toBe(false);
   });
 
   test("returns running status with anti-polling reminder, no output preview", async () => {

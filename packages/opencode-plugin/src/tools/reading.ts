@@ -8,7 +8,13 @@ import {
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
+import {
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  resolvePathArg,
+} from "./_shared.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -301,6 +307,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         const hasSymbols = !isEmptyParam(args.symbols);
         // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
         const wantCallgraph = coerceBoolean(args.callgraph);
+        const contextLines = coerceOptionalInt(
+          args.contextLines,
+          "contextLines",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        );
 
         // TUI title + scalar metadata for the tool-call header. OpenCode's UI
         // only auto-renders SCALAR args (strings, numbers, booleans) — arrays
@@ -319,7 +331,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             typeof args.symbols === "string" ? args.symbols : JSON.stringify(args.symbols);
         }
         if (hasTargets) zoomDisplay.targets = JSON.stringify(args.targets);
-        if (args.contextLines !== undefined) zoomDisplay.contextLines = args.contextLines;
+        if (contextLines !== undefined) zoomDisplay.contextLines = contextLines;
         if (wantCallgraph) zoomDisplay.callgraph = true;
         const withMeta = (output: string): ToolResult => ({
           output,
@@ -366,7 +378,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
                 file: resolvedTargets[index],
                 symbol: t.symbol,
               };
-              if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+              if (contextLines !== undefined) params.context_lines = contextLines;
               if (wantCallgraph) params.callgraph = true;
               return callBridge(ctx, context, "zoom", params).catch((err) => ({
                 success: false,
@@ -415,7 +427,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           const results = await Promise.all(
             symbolsArray.map((sym) => {
               const params: Record<string, unknown> = { file, symbol: sym };
-              if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+              if (contextLines !== undefined) params.context_lines = contextLines;
               if (wantCallgraph) params.callgraph = true;
               return callBridge(ctx, context, "zoom", params).catch((err) => ({
                 success: false,
@@ -446,7 +458,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
         // No symbols specified: zoom by line-range fallback (or whole file).
         const params: Record<string, unknown> = { file };
-        if (args.contextLines !== undefined) params.context_lines = args.contextLines;
+        if (contextLines !== undefined) params.context_lines = contextLines;
         if (wantCallgraph) params.callgraph = true;
 
         const data = await callBridge(ctx, context, "zoom", params);

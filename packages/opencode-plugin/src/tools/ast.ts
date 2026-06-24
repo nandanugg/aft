@@ -11,7 +11,13 @@ const z = tool.schema;
 import { coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
+import {
+  callBridge,
+  coerceOptionalInt,
+  isEmptyParam,
+  optionalInt,
+  resolvePathArg,
+} from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -127,7 +133,13 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       // project_root instead of round-tripping a useless empty scope.
       if (!isEmptyParam(paths)) params.paths = paths;
       if (!isEmptyParam(args.globs)) params.globs = args.globs;
-      if (args.contextLines !== undefined) params.context = Number(args.contextLines);
+      const contextLines = coerceOptionalInt(
+        args.contextLines,
+        "contextLines",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+      if (contextLines !== undefined) params.context = contextLines;
       const response = await callBridge(ctx, context, "ast_search", params);
 
       // Error response (e.g. invalid pattern)

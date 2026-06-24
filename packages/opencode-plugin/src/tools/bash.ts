@@ -21,7 +21,7 @@ import {
 } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
-import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
+import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
@@ -280,7 +280,10 @@ export function createBashTool(
       // promote it to background), so treat it as unset and let the bridge apply
       // its 30-minute default — this is the #102 fix. When background is
       // disabled there is no promotion window, so `timeout` remains the hard cap.
-      const rawTimeout = args.timeout as number | undefined;
+      const rawTimeout = coerceOptionalInt(args.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
+      const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
+      const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
+      const compressed = coerceBoolean(args.compressed, true);
       const effectiveTimeout =
         effectiveBackground || backgroundDisabled
           ? rawTimeout
@@ -311,10 +314,10 @@ export function createBashTool(
           description,
           background: effectiveBackground,
           notify_on_completion: effectiveBackground,
-          compressed: args.compressed,
+          compressed,
           pty: requestedPty,
-          pty_rows: args.ptyRows,
-          pty_cols: args.ptyCols,
+          pty_rows: ptyRows,
+          pty_cols: ptyCols,
           permissions_requested: true,
         },
         callBashBridge,

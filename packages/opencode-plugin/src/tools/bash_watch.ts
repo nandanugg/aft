@@ -21,7 +21,7 @@ import { disposePtyTerminal, getOrCreatePtyTerminal, readPtyBytes } from "../sha
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
-import { callBashBridge, optionalInt, projectRootFor } from "./_shared.js";
+import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 
 const z = tool.schema;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
@@ -94,7 +94,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         }
         const notifyParams: Record<string, unknown> = {
           task_id: taskId,
-          once: args.once !== false,
+          once: coerceBoolean(args.once, true),
         };
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
@@ -122,7 +122,8 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       const effectiveWaitMs = subagentForcedSync
         ? MAX_BASH_STATUS_WAIT_TIMEOUT_MS
         : Math.min(
-            (args.timeoutMs as number | undefined) ?? DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
+            coerceOptionalInt(args.timeoutMs, "timeoutMs", 1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS) ??
+              DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
             MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
           );
       const data = await waitForBashStatus(
@@ -143,7 +144,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           context,
           taskId,
           waitFor,
-          args.once !== false,
+          coerceBoolean(args.once, true),
         );
         const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
           .metadata;

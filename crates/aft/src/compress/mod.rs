@@ -622,8 +622,8 @@ pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
 /// the same dispatch behaviour as before this helper existed.
 pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
     match resolve_dispatch_target(command) {
-        // Ambiguous/unsafe pipeline: callers that want a head token (e.g. the
-        // gh-structured detector) fall back to the raw command via unwrap_or.
+        // Ambiguous or unsafe pipelines must not be claimed by specific
+        // compressors, so return None to make callers use generic dispatch.
         DispatchTarget::ForceGeneric => None,
         DispatchTarget::Command(resolved) | DispatchTarget::Pipeline(resolved) => {
             if resolved == command.trim_start() {
@@ -632,6 +632,15 @@ pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
                 Some(resolved)
             }
         }
+    }
+}
+
+/// Normalize commands for structured-output detection, where a top-level pipe
+/// must suppress structured handling instead of falling back to the raw command.
+pub(crate) fn plain_command_for_structured_output(command: &str) -> Option<String> {
+    match resolve_dispatch_target(command) {
+        DispatchTarget::Command(resolved) => Some(resolved),
+        DispatchTarget::Pipeline(_) | DispatchTarget::ForceGeneric => None,
     }
 }
 

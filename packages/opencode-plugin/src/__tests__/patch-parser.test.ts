@@ -396,3 +396,35 @@ describe("applyUpdateChunks pure-insertion (empty old_lines)", () => {
     expect(result).toBe("import a;\nimport inserted;\nimport b;\n\nconst x = 1;\n");
   });
 });
+
+describe("applyUpdateChunks EOF-anchored matching", () => {
+  test("applies an EOF hunk only at the final occurrence", () => {
+    const original = "header\nmarker\nold\nmiddle\nmarker\nold\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["marker", "old"],
+        new_lines: ["marker", "new"],
+        is_end_of_file: true,
+      },
+    ];
+
+    const result = applyUpdateChunks(original, "src/eof.ts", chunks);
+
+    expect(result).toBe("header\nmarker\nold\nmiddle\nmarker\nnew\n");
+  });
+
+  test("rejects an EOF hunk instead of forward-scanning to an earlier match", () => {
+    const original = "header\nmarker\nold\nmiddle\nmarker\nchanged\n";
+    const chunks: UpdateFileChunk[] = [
+      {
+        old_lines: ["marker", "old"],
+        new_lines: ["marker", "new"],
+        is_end_of_file: true,
+      },
+    ];
+
+    expect(() => applyUpdateChunks(original, "src/eof.ts", chunks)).toThrow(
+      "Failed to find expected lines in src/eof.ts",
+    );
+  });
+});

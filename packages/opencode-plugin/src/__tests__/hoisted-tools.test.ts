@@ -923,6 +923,29 @@ describe("Hoisted tool execute handlers", () => {
     expect(applyCall?.params.replace_all).toBe(true);
   });
 
+  test('edit coerces string occurrence "0" and keeps the first occurrence selectable', async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+
+    const { calls, tools } = createMockHoistedHarness(async () => ({
+      success: true,
+      replacements: 1,
+    }));
+
+    await tools.edit.execute(
+      {
+        filePath: "repeated.ts",
+        oldString: "oldName",
+        newString: "newName",
+        occurrence: "0" as unknown as number,
+      },
+      sdkCtx,
+    );
+
+    const applyCall = calls.find((c) => c.command === "edit_match" && c.params.preview !== true);
+    expect(applyCall?.params.occurrence).toBe(0);
+  });
+
   /// Diff-payload contract: the plugin requests full before/after from Rust
   /// (include_diff_content) for UI metadata, but the AGENT-facing result must
   /// strip the file content down to counts only. Echoing before/after into the
