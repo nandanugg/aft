@@ -44,6 +44,43 @@ export function coerceStringArray(value: unknown): string[] {
 }
 
 /**
+ * Coerce a polymorphic `string | string[]` tool argument (e.g. aft_outline's
+ * `target`, which is a single path/URL OR an array of paths). Hosts deliver an
+ * array as a JSON-stringified string (`'["a","b"]'`) despite the declared union,
+ * which a naive consumer then treats as ONE literal path — aft_outline tried to
+ * stat a file literally named `["src/a", "src/b"]` and failed.
+ *
+ * Returns:
+ *  - an array if `value` is already an array (non-string/empty entries dropped),
+ *    or a JSON-stringified array of strings;
+ *  - the original string otherwise (single path/URL — single-target semantics
+ *    are preserved, NOT split on spaces/commas).
+ * Non-string, non-array input is returned as-is for the caller to reject.
+ */
+export function coerceTargetParam(value: unknown): string | string[] {
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed.filter(
+            (entry): entry is string => typeof entry === "string" && entry.length > 0,
+          );
+        }
+      } catch {
+        // Not valid JSON; fall through and treat as a single literal path.
+      }
+    }
+    return value;
+  }
+  return value as string;
+}
+
+/**
  * Coerce a tool argument that is contractually a boolean into a real boolean,
  * tolerating the shapes models send in practice.
  *

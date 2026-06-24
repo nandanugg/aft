@@ -6,6 +6,7 @@
 import { stat } from "node:fs/promises";
 import {
   coerceBoolean,
+  coerceTargetParam,
   formatZoomMultiTargetResult,
   formatZoomText,
   unwrapRustZoomBatchEnvelope,
@@ -323,8 +324,11 @@ export function registerReadingTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const target = params.target;
-        // Coerce at the boundary: stringified "true" must enable files mode (coerceBoolean).
+        // Coerce at the boundary: a host may deliver the string|array `target` as
+        // a JSON-stringified array, which would otherwise be treated as one
+        // literal path (coerceTargetParam). And a stringified "true" must enable
+        // files mode (coerceBoolean).
+        const target = coerceTargetParam(params.target);
         const filesMode = coerceBoolean(params.files);
         const isArray = Array.isArray(target) && target.length > 0;
 

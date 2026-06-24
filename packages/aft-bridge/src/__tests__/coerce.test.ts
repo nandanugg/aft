@@ -1,5 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { coerceBoolean, coerceStringArray } from "../coerce.js";
+import { coerceBoolean, coerceStringArray, coerceTargetParam } from "../coerce.js";
+
+describe("coerceTargetParam", () => {
+  test("passes a single path/URL string through unchanged", () => {
+    expect(coerceTargetParam("src/app.ts")).toBe("src/app.ts");
+    expect(coerceTargetParam("https://x/y")).toBe("https://x/y");
+    expect(coerceTargetParam("my file.ts")).toBe("my file.ts");
+  });
+
+  test("parses a JSON-stringified array (the aft_outline bug)", () => {
+    expect(coerceTargetParam('["src/a", "src/b"]')).toEqual(["src/a", "src/b"]);
+    expect(coerceTargetParam('  ["only"]  ')).toEqual(["only"]);
+  });
+
+  test("passes a real array through, dropping empties/non-strings", () => {
+    expect(coerceTargetParam(["a", "b"])).toEqual(["a", "b"]);
+    expect(coerceTargetParam(["a", "", 3, null, "b"] as unknown)).toEqual(["a", "b"]);
+  });
+
+  test("treats a malformed bracketed string as a single literal path", () => {
+    expect(coerceTargetParam("[not json")).toBe("[not json");
+    // A path that merely contains brackets but isn't a JSON array stays a string.
+    expect(coerceTargetParam("weird[name].ts")).toBe("weird[name].ts");
+  });
+});
 
 describe("coerceBoolean", () => {
   test("passes real booleans through", () => {
