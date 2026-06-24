@@ -557,6 +557,65 @@ pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
     })
 }
 
+/// Whether a project-relative path is an actual automated-test file (unit /
+/// integration / spec), as opposed to product code. Used by `aft_search` to hide
+/// test files by default (the `include_tests` param shows them).
+///
+/// This is intentionally SEPARATE from `is_test_support_file`: dead_code and
+/// unused_exports must NOT use it, because a symbol called only from a test file
+/// is still live via that caller. Matching is high-precision to avoid hiding
+/// product code — filename conventions plus the `__tests__` directory segment,
+/// not bare `test`/`spec` directory names which collide with product modules.
+pub(crate) fn is_test_file(relative_path: &str) -> bool {
+    let normalized = relative_path.replace('\\', "/");
+
+    // Directory-segment conventions: `__tests__` (JS/TS) and a `tests` test root
+    // (Rust integration tests, Python). Singular `test`/`spec` are omitted —
+    // they collide with product modules and their files are caught by name below.
+    if normalized
+        .split('/')
+        .any(|segment| matches!(segment, "__tests__" | "__test__" | "tests"))
+    {
+        return true;
+    }
+
+    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let lower = file.to_ascii_lowercase();
+
+    // `*.test.<ext>` / `*.spec.<ext>` — JS/TS/JSX/TSX/Vue/mjs/cjs/…
+    if lower.contains(".test.") || lower.contains(".spec.") {
+        return true;
+    }
+
+    // Per-language filename suffixes (lowercase conventions).
+    if lower.ends_with("_test.rs")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.rb")
+        || lower.ends_with("_test.exs")
+        || lower.ends_with("_spec.rb")
+        || (lower.starts_with("test_") && lower.ends_with(".py"))
+    {
+        return true;
+    }
+
+    // CamelCase test classes — matched case-SENSITIVELY so product files like
+    // `latest.java` (which ends with "test.java" lowercased) don't false-match.
+    const CAMEL_SUFFIXES: &[&str] = &[
+        "Test.java",
+        "Tests.java",
+        "Test.kt",
+        "Tests.kt",
+        "Test.cs",
+        "Tests.cs",
+        "Test.swift",
+        "Tests.swift",
+        "Test.scala",
+        "Spec.scala",
+    ];
+    CAMEL_SUFFIXES.iter().any(|suffix| file.ends_with(suffix))
+}
+
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -575,7 +634,52 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod test_support_tests {
-    use super::is_test_support_file;
+    use super::{is_test_file, is_test_support_file};
+
+    #[test]
+    fn is_test_file_matches_real_test_files() {
+        // JS/TS family: *.test.* / *.spec.*
+        for p in [
+            "src/foo.test.ts",
+            "src/foo.test.tsx",
+            "src/bar.spec.js",
+            "packages/x/component.test.jsx",
+            "app/foo.test.mjs",
+            "src/comp.spec.vue",
+        ] {
+            assert!(is_test_file(p), "{p} should be a test file");
+        }
+        // __tests__ directory and tests roots.
+        assert!(is_test_file("packages/x/__tests__/reading.ts"));
+        assert!(is_test_file("crates/aft/tests/integration/main.rs"));
+        // Per-language filename suffixes.
+        assert!(is_test_file("crates/aft/src/foo_test.rs"));
+        assert!(is_test_file("pkg/handler_test.go"));
+        assert!(is_test_file("app/test_models.py"));
+        assert!(is_test_file("app/models_test.py"));
+        assert!(is_test_file("spec/user_spec.rb"));
+        // CamelCase test classes (case-sensitive).
+        assert!(is_test_file("src/main/UserServiceTest.java"));
+        assert!(is_test_file("src/FooTests.cs"));
+        assert!(is_test_file("Sources/AppTests.swift"));
+        // Windows separators normalize.
+        assert!(is_test_file("packages\\x\\__tests__\\a.ts"));
+    }
+
+    #[test]
+    fn is_test_file_rejects_product_files() {
+        for p in [
+            "crates/aft/src/inspect/job.rs",
+            "packages/x/src/index.ts",
+            "src/contestant.ts",     // "test" substring, not a test file
+            "src/greatest.ts",       // ends with "test" stem, not ".test."
+            "src/latest.java",       // case-sensitive guard: not "Test.java"
+            "src/my_attestation.py", // not test_*/*_test
+            "src/test/helper.ts",    // singular `test` dir must not blanket-match
+        ] {
+            assert!(!is_test_file(p), "{p} must NOT be a test file");
+        }
+    }
 
     #[test]
     fn matches_conventional_support_dirs() {

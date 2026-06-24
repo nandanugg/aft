@@ -74,7 +74,7 @@ const SearchParams = Type.Object({
     Type.Boolean({
       default: false,
       description:
-        "Include test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+        "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
     }),
   ),
 });

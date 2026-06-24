@@ -65,7 +65,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
           .boolean()
           .optional()
           .describe(
-            "Include test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+            "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
           ),
       ),
     },

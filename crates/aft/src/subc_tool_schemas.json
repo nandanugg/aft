@@ -197,7 +197,7 @@
         ]
       },
       "includeTests": {
-        "description": "Include test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+        "description": "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
         "type": "boolean"
       }
     },

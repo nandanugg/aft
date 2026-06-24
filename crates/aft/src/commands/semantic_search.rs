@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::commands::callgraph_store_adapter::callers_result;
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::grep_executor::{self, GrepParams};
-use crate::inspect::job::is_test_support_file;
+use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
@@ -194,8 +194,18 @@ fn path_is_test_support_file(path: &Path, project_root: &Path) -> bool {
     is_test_support_file(relative.to_string_lossy().as_ref())
 }
 
+/// Whether `path` is something `aft_search` hides unless `include_tests` is set:
+/// a test-support file (fixtures/mocks/snapshots) OR an actual test file
+/// (`*.test.ts`, `__tests__/`, `*_test.rs`, …). Search is a code-discovery tool,
+/// so test code is noise by default; `include_tests: true` shows both classes.
+fn path_is_hidden_test_file(path: &Path, project_root: &Path) -> bool {
+    let relative = project_relative_path(path, project_root);
+    let rel = relative.to_string_lossy();
+    is_test_support_file(rel.as_ref()) || is_test_file(rel.as_ref())
+}
+
 fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests: bool) -> bool {
-    include_tests || !path_is_test_support_file(path, project_root)
+    include_tests || !path_is_hidden_test_file(path, project_root)
 }
 
 fn grep_visible_file_count(matches: &[GrepMatch]) -> usize {
@@ -219,7 +229,7 @@ fn filter_grep_result_for_tests(
     let mut visible = result
         .matches
         .into_iter()
-        .filter(|grep_match| !path_is_test_support_file(&grep_match.file, project_root))
+        .filter(|grep_match| !path_is_hidden_test_file(&grep_match.file, project_root))
         .collect::<Vec<_>>();
     let visible_total = visible.len();
     let truncated_by_filter = visible.len() > top_k;
@@ -1158,7 +1168,7 @@ fn collect_degraded_grep_files(project_root: &Path, include_tests: bool) -> (Vec
             continue;
         }
         let path = entry.into_path();
-        if !include_tests && path_is_test_support_file(&path, project_root) {
+        if !include_tests && path_is_hidden_test_file(&path, project_root) {
             continue;
         }
         if files.len() >= DEGRADED_GREP_FILE_LIMIT {
