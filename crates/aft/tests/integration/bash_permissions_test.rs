@@ -130,18 +130,33 @@ fn bash_permission_scan_collects_redirect_target() {
         "expected external_directory ask for redirect target: {response:?}"
     );
 
+    // Issue #135: a DYNAMIC redirect target can't be resolved to a concrete
+    // directory. We match native OpenCode and emit NO external_directory ask
+    // (the old `*` wildcard rendered as "Access external directory ." and, if
+    // "always"-approved, granted blanket external access). The command is still
+    // gated by the bash approval below.
     let dynamic = bash(&mut aft, "dynamic-redirect", "echo hi > $OUTFILE");
     assert_eq!(dynamic["success"], false, "response: {dynamic:?}");
-    assert!(dynamic["asks"].as_array().unwrap().iter().any(|ask| {
-        ask["kind"] == "external_directory"
-            && ask["patterns"].as_array().unwrap().iter().any(|p| p == "*")
-    }));
+    let dyn_asks = dynamic["asks"].as_array().unwrap();
+    assert!(
+        !dyn_asks
+            .iter()
+            .any(|ask| ask["kind"] == "external_directory"),
+        "dynamic redirect must not emit an external_directory ask: {dynamic:?}"
+    );
+    assert!(
+        dyn_asks.iter().any(|ask| ask["kind"] == "bash"),
+        "dynamic redirect must still require bash approval: {dynamic:?}"
+    );
 
     assert!(aft.shutdown().success());
 }
 
 #[test]
-fn dynamic_file_args_require_external_directory_wildcard() {
+fn dynamic_file_args_do_not_emit_external_directory_wildcard() {
+    // Issue #135: a dynamic file arg (`rm "$DEST/file"`) is unresolvable. We
+    // match native OpenCode (which skips dynamic path args) and emit NO
+    // external_directory ask — the bash approval still gates the command.
     let root = TempDir::new().unwrap();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
@@ -149,10 +164,15 @@ fn dynamic_file_args_require_external_directory_wildcard() {
     let response = bash(&mut aft, "dynamic-file-arg", r#"rm "$DEST/file""#);
     assert_eq!(response["success"], false, "response: {response:?}");
     assert_eq!(response["code"], "permission_required");
-    assert!(response["asks"].as_array().unwrap().iter().any(|ask| {
-        ask["kind"] == "external_directory"
-            && ask["patterns"].as_array().unwrap().iter().any(|p| p == "*")
-    }));
+    let asks = response["asks"].as_array().unwrap();
+    assert!(
+        !asks.iter().any(|ask| ask["kind"] == "external_directory"),
+        "dynamic file arg must not emit an external_directory ask: {response:?}"
+    );
+    assert!(
+        asks.iter().any(|ask| ask["kind"] == "bash"),
+        "dynamic file arg must still require bash approval: {response:?}"
+    );
 
     assert!(aft.shutdown().success());
 }

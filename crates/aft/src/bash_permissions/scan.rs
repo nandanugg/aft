@@ -117,8 +117,15 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
                     PathArgTarget::Path(path) => {
                         push_external_path(&mut asks, &mut seen, &project_root, &path);
                     }
-                    PathArgTarget::Dynamic => push_external_wildcard(&mut asks, &mut seen),
-                    PathArgTarget::None => {}
+                    // A dynamic target (e.g. `rm "$DEST/file"`) can't be
+                    // resolved to a concrete directory. Matching native
+                    // OpenCode — which skips dynamic path args entirely — we
+                    // emit NO external_directory ask: the bash command approval
+                    // below already gates the command, and the old wildcard ask
+                    // (`patterns/always: ["*"]`) both rendered as a confusing
+                    // "Access external directory ." and, if "always"-approved,
+                    // granted blanket external-directory access. See issue #135.
+                    PathArgTarget::Dynamic | PathArgTarget::None => {}
                 }
             }
         }
@@ -127,7 +134,11 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
             RedirectTarget::Path(path) => {
                 push_external_path(&mut asks, &mut seen, &project_root, &path);
             }
-            RedirectTarget::Dynamic => push_external_wildcard(&mut asks, &mut seen),
+            // Dynamic redirect target (e.g. `echo hi > "$FOO/bar"`): no
+            // external_directory ask, same rationale as dynamic path args
+            // above — match native OpenCode and rely on the bash approval.
+            // See issue #135.
+            RedirectTarget::Dynamic => {}
         });
 
         // Mirror OpenCode's `packages/opencode/src/tool/bash.ts`: only
@@ -498,18 +509,6 @@ fn push_external_path(
             kind: PermissionKind::ExternalDirectory,
             patterns: vec![pattern.clone()],
             always: vec![pattern],
-        },
-    );
-}
-
-fn push_external_wildcard(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>) {
-    push_ask(
-        asks,
-        seen,
-        PermissionAsk {
-            kind: PermissionKind::ExternalDirectory,
-            patterns: vec!["*".to_string()],
-            always: vec!["*".to_string()],
         },
     );
 }
