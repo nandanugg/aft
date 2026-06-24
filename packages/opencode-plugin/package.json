@@ -32,8 +32,11 @@
   "dependencies": {
     "@clack/prompts": "^1.2.0",
     "@cortexkit/aft-bridge": "0.40.0",
+    "@opentui/core": "^0.4.2",
+    "@opentui/solid": "^0.4.2",
     "@xterm/headless": "^5.5.0",
     "comment-json": "^4.6.2",
+    "solid-js": "1.9.12",
     "undici": "^7.25.0",
     "zod": "^4.1.8"
   },
