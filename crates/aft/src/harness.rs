@@ -32,9 +32,10 @@ impl Harness {
 }
 
 /// Max length of the readable (pre-hash) slug portion. The full segment is
-/// `mcp--<readable>--<8 hex>`, so the readable part is capped to keep directory
+/// `mcp--<readable>--<32 hex>`, so the readable part is capped to keep directory
 /// names bounded while the hash guarantees uniqueness.
 const MCP_SLUG_READABLE_MAX: usize = 40;
+const MCP_SLUG_HASH_HEX_LEN: usize = 32;
 
 /// Build the storage slug for an MCP client. The readable portion is a
 /// sanitized, length-capped rendering of the raw client; a short hash of the
@@ -72,11 +73,10 @@ fn sanitize_client(client: &str) -> String {
         }
     }
 
-    // Short hash of the raw client disambiguates collisions the readable slug
-    // cannot distinguish. blake3 over the raw bytes; first 8 hex chars (32 bits)
-    // is ample for per-machine MCP-client directory uniqueness.
+    // A 128-bit hash suffix prevents hostile same-readable slugs from sharing
+    // storage while keeping directory names short enough for common filesystems.
     let hash = blake3::hash(client.as_bytes()).to_hex();
-    format!("{readable}--{}", &hash.as_str()[..8])
+    format!("{readable}--{}", &hash.as_str()[..MCP_SLUG_HASH_HEX_LEN])
 }
 
 impl Serialize for Harness {
@@ -270,6 +270,16 @@ mod tests {
                 s.starts_with("mcp--a-b--"),
                 "expected shared readable slug a-b, got {s:?}"
             );
+            let (_readable, suffix) = s.rsplit_once("--").expect("hash suffix");
+            assert_eq!(
+                suffix.len(),
+                super::MCP_SLUG_HASH_HEX_LEN,
+                "hash suffix must carry 128 bits of disambiguation: {s:?}"
+            );
+            assert!(
+                suffix.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "hash suffix must be hex: {s:?}"
+            );
         }
         let unique: std::collections::HashSet<_> = variants.iter().collect();
         assert_eq!(
@@ -284,7 +294,11 @@ mod tests {
         // Very long client: readable portion is capped, segment stays bounded.
         let long = seg(&"x".repeat(500));
         assert!(
-            long.len() <= "mcp--".len() + super::MCP_SLUG_READABLE_MAX + "--".len() + 8,
+            long.len()
+                <= "mcp--".len()
+                    + super::MCP_SLUG_READABLE_MAX
+                    + "--".len()
+                    + super::MCP_SLUG_HASH_HEX_LEN,
             "long client segment must be length-bounded, got len {}",
             long.len()
         );

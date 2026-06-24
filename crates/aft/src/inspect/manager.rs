@@ -1913,7 +1913,7 @@ fn scoped_tier2_rollup_job(
     category: InspectCategory,
     scope: &JobScope,
 ) -> InspectJob {
-    InspectJob {
+    let mut job = InspectJob {
         job_id: 0,
         key: JobKey::for_project_category(category),
         category,
@@ -1922,9 +1922,18 @@ fn scoped_tier2_rollup_job(
         inspect_dir: snapshot.inspect_dir.clone(),
         config: Arc::clone(&snapshot.config),
         symbol_cache: Arc::clone(&snapshot.symbol_cache),
-        callgraph_snapshot: (category == InspectCategory::DeadCode)
-            .then(|| Arc::new(CallgraphSnapshot::default())),
+        callgraph_snapshot: None,
+    };
+
+    if category == InspectCategory::DeadCode {
+        // Scoped read-path rollups recompute dead-code liveness from cached
+        // contributions. Use a real ready store snapshot when one exists; if no
+        // snapshot is available, leave it absent so the rollup reports degraded
+        // callgraph_unavailable instead of treating an empty graph as truth.
+        job.callgraph_snapshot = build_tier2_callgraph_snapshot(&job, false);
     }
+
+    job
 }
 
 fn roll_up_dead_code_contributions(
@@ -3089,6 +3098,91 @@ mod dead_code_projection_tests {
 
     static NEXT_MTIME: AtomicI64 = AtomicI64::new(1_900_000_000);
 
+    #[test]
+    fn scoped_dead_code_rollup_uses_ready_callgraph_and_degrades_without_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_projection_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir).expect("store dir");
+        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
+        let files = project_files(&root);
+        store.cold_build(&files).expect("cold build store");
+        let projected = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        drop(store);
+
+        let config = Arc::new(Config {
+            project_root: Some(root.clone()),
+            callgraph_store: true,
+            ..Config::default()
+        });
+        let symbol_cache = Arc::new(RwLock::new(SymbolCache::new()));
+        let scan_job = InspectJob {
+            job_id: 87,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files: files.clone(),
+            project_root: root.clone(),
+            inspect_dir: inspect_dir.clone(),
+            config: Arc::clone(&config),
+            symbol_cache: Arc::clone(&symbol_cache),
+            callgraph_snapshot: Some(Arc::new(projected)),
+        };
+        let success = crate::inspect::scanners::dead_code::run_dead_code_scan(&scan_job)
+            .outcome
+            .expect("dead_code scan succeeds");
+        let cache = InspectCache::open(inspect_dir.clone(), root.clone()).expect("open cache");
+        cache
+            .store_tier2_result(
+                scan_job.key.clone(),
+                &success.scanned_files,
+                &success.contributions,
+                success.aggregate.clone(),
+            )
+            .expect("store tier2 result");
+
+        let snapshot = InspectSnapshot::new(root.clone(), inspect_dir, config, symbol_cache);
+        let scope = JobScope::from_roots(root.clone(), vec![root.join("src/live.ts")]);
+        assert!(
+            !scope.is_project_wide(),
+            "live.ts file scope must be scoped"
+        );
+
+        let ready_payload = scoped_tier2_payload_from_contributions(
+            &snapshot,
+            InspectCategory::DeadCode,
+            &cache,
+            success.aggregate.clone(),
+            &scope,
+        )
+        .expect("ready scoped payload");
+        assert_eq!(
+            ready_payload
+                .get("callgraph_available")
+                .and_then(Value::as_bool),
+            Some(true),
+            "ready store should produce a callgraph-backed scoped rollup: {ready_payload:#}"
+        );
+        assert_live_item(&ready_payload, "src/live.ts", "knownLive");
+
+        std::fs::remove_dir_all(&callgraph_dir).expect("remove ready callgraph store");
+        let unavailable_payload = scoped_tier2_payload_from_contributions(
+            &snapshot,
+            InspectCategory::DeadCode,
+            &cache,
+            success.aggregate,
+            &scope,
+        )
+        .expect("unavailable scoped payload");
+        assert_eq!(
+            unavailable_payload
+                .get("callgraph_available")
+                .and_then(Value::as_bool),
+            Some(false),
+            "missing store must report callgraph_unavailable instead of fabricating an empty graph: {unavailable_payload:#}"
+        );
+        assert_live_item(&unavailable_payload, "src/live.ts", "knownLive");
+    }
     #[derive(Debug, PartialEq, Eq)]
     struct ComparableSnapshot {
         files: BTreeSet<PathBuf>,

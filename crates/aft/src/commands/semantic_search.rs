@@ -1818,8 +1818,8 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
 /// first blank line or non-comment/non-decorator line — i.e. the previous
 /// symbol's code — so it never bleeds a neighbor into the preview. Heuristic by
 /// line prefix to stay language-agnostic: `//` `///` `//!` (Rust/TS/JS/Go/…),
-/// `/*` `*` `*/` (block / JSDoc), `#` (Python/Ruby/Bash comment, Rust `#[attr]`),
-/// `--` (Lua/SQL), `@` (TS/Java/Python decorators).
+/// `/*` `*` `*/` (block / JSDoc), Rust `#[attr]`/`#![...]`, `# ` comments
+/// (Python/Ruby/Bash), `--` (Lua/SQL), and `@` (TS/Java/Python decorators).
 fn doc_comment_start(lines: &[String], start: usize) -> usize {
     let mut s = start;
     while s > 0 {
@@ -1827,7 +1827,7 @@ fn doc_comment_start(lines: &[String], start: usize) -> usize {
         let is_doc_or_attr = prev.starts_with("//")
             || prev.starts_with("/*")
             || prev.starts_with('*')
-            || prev.starts_with('#')
+            || is_hash_doc_or_attr(prev)
             || prev.starts_with("--")
             || prev.starts_with('@');
         if !is_doc_or_attr {
@@ -1836,6 +1836,45 @@ fn doc_comment_start(lines: &[String], start: usize) -> usize {
         s -= 1;
     }
     s
+}
+
+fn is_hash_doc_or_attr(line: &str) -> bool {
+    if line.starts_with("#[") || line.starts_with("#![") {
+        return true;
+    }
+
+    let Some(rest) = line.strip_prefix('#') else {
+        return false;
+    };
+    let Some(first) = rest.chars().next() else {
+        return true;
+    };
+    first.is_whitespace() && !starts_with_c_preprocessor_directive(rest.trim_start())
+}
+
+fn starts_with_c_preprocessor_directive(rest: &str) -> bool {
+    let directive = rest
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    matches!(
+        directive,
+        "define"
+            | "elif"
+            | "else"
+            | "endif"
+            | "error"
+            | "if"
+            | "ifdef"
+            | "ifndef"
+            | "include"
+            | "line"
+            | "pragma"
+            | "region"
+            | "undef"
+            | "using"
+            | "warning"
+    )
 }
 
 fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root: &Path) -> bool {
@@ -2881,6 +2920,48 @@ mod tests {
         assert!(
             !snippet.contains("nextSymbol"),
             "trailing neighbor must NOT bleed in: {snippet}"
+        );
+        assert!(
+            snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
+            "full expansion must carry the no-re-read notice: {snippet}"
+        );
+    }
+
+    #[test]
+    fn rank0_expansion_does_not_include_c_preprocessor_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("target.c");
+        let content = "#include <x.h>
+                       int target(void) {
+                         return 0;
+                       }
+";
+        std::fs::write(&path, content).expect("write");
+        let mut results = vec![HybridResult {
+            file: path,
+            name: "target".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 1,
+            end_line: 3,
+            exported: false,
+            snippet: String::new(),
+            score: HIGH_CONFIDENCE_COSINE_FLOOR,
+            source: "semantic",
+            semantic_score: Some(HIGH_CONFIDENCE_COSINE_FLOOR),
+            lexical_score: None,
+            hybrid_boosted: false,
+        }];
+
+        enrich_snippets_from_source(&mut results, dir.path());
+        let snippet = &results[0].snippet;
+
+        assert!(
+            snippet.contains("int target(void)"),
+            "symbol signature must be present: {snippet}"
+        );
+        assert!(
+            !snippet.contains("#include <x.h>"),
+            "C preprocessor directives must not be treated as symbol docs: {snippet}"
         );
         assert!(
             snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
