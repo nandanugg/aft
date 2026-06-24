@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { type LegacyAftConfigSource, resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
 
@@ -443,7 +443,17 @@ export function migrateAftConfigFile(
   opts: AftConfigFileMigrationOptions,
 ): AftConfigFileMigrationResult {
   const warnings: string[] = [];
-  const existingSources = opts.legacySources.filter((source) => existsSync(source.path));
+  // A legacy source path can resolve to the SAME file as the CortexKit target
+  // (e.g. OPENCODE_CONFIG_DIR pointed at ~/.config/cortexkit, so the legacy
+  // `<opencode-config>/aft.jsonc` IS `~/.config/cortexkit/aft.jsonc`). That file
+  // is the live, already-migrated config — never a legacy source to copy from,
+  // preserve, or (critically) `unlinkSync` aside. Dropping it here prevents the
+  // active config from being deleted, which would fall the plugin back to
+  // defaults and wipe the fingerprint-keyed semantic index (the MC incident).
+  const resolvedTarget = resolve(opts.targetPath);
+  const existingSources = opts.legacySources.filter(
+    (source) => existsSync(source.path) && resolve(source.path) !== resolvedTarget,
+  );
   const info = opts.logger?.info ?? opts.logger?.log;
 
   if (existingSources.length === 0) {

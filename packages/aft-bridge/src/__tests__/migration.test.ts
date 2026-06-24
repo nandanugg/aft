@@ -118,6 +118,32 @@ describe("config file migration", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("a legacy source that resolves to the target is the live config — never deleted", () => {
+    // OPENCODE_CONFIG_DIR can point at ~/.config/cortexkit, making the legacy
+    // `<opencode-config>/aft.jsonc` the SAME file as the CortexKit target. That
+    // file is the already-migrated live config; treating it as a legacy source
+    // would unlinkSync it aside, fall the plugin back to defaults, and wipe the
+    // fingerprint-keyed semantic index. It must be left fully intact.
+    const target = join(root, "cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "cortexkit"), { recursive: true });
+    const live = '{\n  "semantic_search": true,\n}\n';
+    writeFileSync(target, live, "utf8");
+
+    const result = migrateAftConfigFile({
+      scope: "user",
+      targetPath: target,
+      // Same path passed in as a "legacy source" (e.g. via a non-normalized ./).
+      legacySources: [{ path: join(root, "cortexkit", ".", "aft.jsonc"), label: "OpenCode user" }],
+    });
+
+    // No migration happened, nothing was deleted, the live config is untouched.
+    expect(result.migrated).toBe(false);
+    expect(result.conflict).toBe(false);
+    expect(existsSync(target)).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(live);
+    expect(existsSync(`${target}.MOVED_READPLEASE`)).toBe(false);
+  });
+
   test("single legacy source moves to CortexKit target and leaves a marker", () => {
     const source = join(root, "opencode", "aft.jsonc");
     const target = join(root, "cortexkit", "aft.jsonc");
