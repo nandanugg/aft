@@ -3214,7 +3214,9 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "lua"
                 | "pl"
                 | "pm"
-                | "t",
+                | "t"
+                | "r"
+                | "R",
         )
     )
 }
