@@ -200,9 +200,11 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.40.3";
+const ANNOUNCEMENT_VERSION = "0.41.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "read now hands images (PNG, JPEG, GIF, WebP) to the model as visual attachments instead of a binary placeholder, downsized to stay light in context; on OpenCode, PDFs are handed over too.",
+  "Search now works on repositories of any size: the trigram index behind grep and aft_search is disk-backed, so it uses a fixed, small amount of memory (Chromium dropped from ~14 GB to under 800 MB) and the old 20,000-file limit that disabled it on large repos is gone.",
+  "Call-graph navigation (aft_callgraph, symbol move) no longer has a 5,000-file limit — it works on repositories of any size.",
+  "Semantic search (aft_search) now covers Java, Kotlin, Ruby, Swift, Scala, Lua, Perl, and R, in addition to the languages already supported.",
 ];
 
 /**

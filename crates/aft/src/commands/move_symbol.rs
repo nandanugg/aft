@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::commands::callgraph_store_adapter::{building_response, store_error_response};
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit;
 use crate::imports;
@@ -315,25 +314,27 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Prepare new destination content
     let new_dest = append_symbol_to_dest(&dest_content, &dest_symbol_text);
 
-    // --- Discover consumers through the persisted callgraph store ---
+    // --- Discover consumers through the persisted callgraph store (best-effort) ---
+    // move_symbol only supports TS/JS source and destination, and
+    // `collect_ts_js_files` (below) independently brute-walks every TS/JS file as
+    // a candidate consumer for import rewriting. The store query is therefore a
+    // best-effort enrichment that can only surface NON-TS/JS callers, which the
+    // TS/JS import rewriter cannot act on. A still-building, unavailable, or
+    // errored store is never a reason to refuse the move: we proceed with no
+    // extra consumers and let the TS/JS brute-walk do the rewriting. Only a
+    // project with no resolvable root is fatal.
     let (project_root, consumers) = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => {
             let rel_source = source_path
                 .strip_prefix(store.project_root())
                 .unwrap_or(source_path);
-            let source_node = match store.node_for(rel_source, symbol_name) {
-                Ok(node) => node,
-                Err(error) => return store_error_response(&req.id, "move_symbol", error),
-            };
-            let sites =
-                match store.direct_callers_of(Path::new(&source_node.file), &source_node.symbol) {
-                    Ok(sites) => sites,
-                    Err(error) => return store_error_response(&req.id, "move_symbol", error),
-                };
+            let sites = store
+                .node_for(rel_source, symbol_name)
+                .and_then(|node| store.direct_callers_of(Path::new(&node.file), &node.symbol))
+                .unwrap_or_default();
             (store.project_root().to_path_buf(), sites)
         }
-        CallgraphStoreAccess::Building => return building_response(&req.id, "move_symbol"),
-        CallgraphStoreAccess::Unavailable => {
+        _ => {
             let project_root = ctx.canonical_cache_root_opt().or_else(|| {
                 ctx.config()
                     .project_root
@@ -348,9 +349,6 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             };
             (project_root, Vec::new())
-        }
-        CallgraphStoreAccess::Error(error) => {
-            return store_error_response(&req.id, "move_symbol", error)
         }
     };
 
