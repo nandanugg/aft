@@ -1,8 +1,8 @@
-import { resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
 import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
 
 import { dirSize } from "../lib/fs-util.js";
 import { readJsoncFile } from "../lib/jsonc.js";
