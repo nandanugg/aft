@@ -134,6 +134,98 @@ fn outline_directory_skips_symlink_loops() {
 }
 
 #[test]
+fn outline_directory_hides_tests_and_renders_top_level_symbols_only() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "src/service.ts",
+        r#"export class Worker {
+  run(): void {}
+}
+
+export function makeWorker(): Worker {
+  return new Worker();
+}
+"#,
+    );
+    let test_file = write_file(
+        dir.path(),
+        "src/service.test.ts",
+        r#"export function testAlpha(): void {}
+export function testBeta(): void {}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let default_resp = send(
+        &mut aft,
+        json!({"id": "outline-dir-no-tests", "command": "outline", "directory": dir.path()}),
+    );
+    assert_eq!(
+        default_resp["success"], true,
+        "outline should succeed: {default_resp:?}"
+    );
+    let default_text = default_resp["text"].as_str().expect("outline text");
+    assert!(
+        default_text.contains("service.ts"),
+        "non-test file missing: {default_text}"
+    );
+    assert!(
+        default_text.contains("Worker"),
+        "top-level class missing: {default_text}"
+    );
+    assert!(
+        default_text.contains("makeWorker"),
+        "top-level function missing: {default_text}"
+    );
+    assert!(
+        !default_text.contains("service.test.ts"),
+        "test file should be hidden by default: {default_text}"
+    );
+    assert!(
+        !default_text.contains("run"),
+        "directory outline should omit nested methods: {default_text}"
+    );
+
+    let with_tests = send(
+        &mut aft,
+        json!({
+            "id": "outline-dir-with-tests",
+            "command": "outline",
+            "directory": dir.path(),
+            "includeTests": true,
+        }),
+    );
+    assert_eq!(
+        with_tests["success"], true,
+        "outline should succeed: {with_tests:?}"
+    );
+    let with_tests_text = with_tests["text"].as_str().expect("outline text");
+    assert!(
+        with_tests_text.contains("service.test.ts"),
+        "includeTests should include test file: {with_tests_text}"
+    );
+
+    let explicit_test = send(
+        &mut aft,
+        json!({"id": "outline-explicit-test", "command": "outline", "file": test_file}),
+    );
+    assert_eq!(
+        explicit_test["success"], true,
+        "explicit test outline should succeed: {explicit_test:?}"
+    );
+    let explicit_text = explicit_test["text"].as_str().expect("outline text");
+    assert!(
+        explicit_text.contains("testAlpha") && explicit_text.contains("testBeta"),
+        "explicit single test file should still be outlined: {explicit_text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn outline_multi_file_returns_relative_tree_text_without_signatures_for_multiple_languages() {
     let dir = TempDir::new().unwrap();
     let ts = write_file(
@@ -197,12 +289,12 @@ fn outline_multi_file_returns_relative_tree_text_without_signatures_for_multiple
         "Rust symbols should be present: {text}"
     );
     assert!(
-        text.contains("cls") && text.contains("Worker") && text.contains("run"),
-        "Python symbols should be present: {text}"
+        text.contains("cls") && text.contains("Worker") && !text.contains("run"),
+        "multi-file outline should show top-level Python class without nested methods: {text}"
     );
     assert!(
-        text.contains(" h ") && text.contains("Title") && text.contains("Details"),
-        "Markdown headings should be present: {text}"
+        text.contains(" h ") && text.contains("Title") && !text.contains("Details"),
+        "multi-file outline should show top-level Markdown headings only: {text}"
     );
     assert!(
         !text.contains("function greet(name: string): string")

@@ -2155,7 +2155,7 @@ fn blast_radius_annotation_for_result(
         return None;
     }
 
-    let callers = callers_result(store, &result.file, &result.name, 1).ok()?;
+    let callers = callers_result(store, &result.file, &result.name, 1, true).ok()?;
     let mut caller_basenames = Vec::new();
     let mut seen_files = HashSet::new();
     for group in &callers.callers {

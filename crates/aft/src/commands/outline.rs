@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
+use crate::inspect::job::is_test_file;
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
@@ -69,13 +70,31 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let discovery = discover_outline_files(&dir_path);
         let project_root = ctx.config().project_root.clone();
+        let include_tests = include_tests_param(req);
+        let files = if include_tests {
+            discovery.files.clone()
+        } else {
+            discovery
+                .files
+                .iter()
+                .filter(|file| {
+                    let path = Path::new(file);
+                    let relative = project_root
+                        .as_deref()
+                        .and_then(|root| relative_path_from_root(path, root))
+                        .unwrap_or_else(|| path_to_slash(path));
+                    !is_test_file(&relative)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let (file_outlines, skipped_files) =
-            match outline_many_files(&discovery.files, ctx, &req.id, project_root.as_deref()) {
+            match outline_many_files(&files, ctx, &req.id, project_root.as_deref()) {
                 Ok(result) => result,
                 Err(resp) => return resp,
             };
 
-        let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, discovery.files.len());
+        let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, files.len());
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -162,6 +181,14 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         &req.id,
         serde_json::json!({ "text": text, "complete": true }),
     )
+}
+
+fn include_tests_param(req: &RawRequest) -> bool {
+    req.params
+        .get("includeTests")
+        .or_else(|| req.params.get("include_tests"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn resolve_file_or_url(
@@ -955,6 +982,24 @@ fn render_entries(entries: &[OutlineEntry], indent: usize, output: &mut String, 
     }
 }
 
+/// Render only top-level entries. Directory/multi-file outlines are a structure
+/// map; callers can request a specific file when they need methods or fields.
+fn render_top_level_entries(
+    entries: &[OutlineEntry],
+    indent: usize,
+    output: &mut String,
+    with_sig: bool,
+) {
+    let prefix = "  ".repeat(indent);
+    for entry in entries {
+        if with_sig {
+            output.push_str(&format!("{}{}\n", prefix, format_entry_with_sig(entry)));
+        } else {
+            output.push_str(&format!("{}{}\n", prefix, format_entry_compact(entry)));
+        }
+    }
+}
+
 /// Format single-file outline as tree text with signatures.
 fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
     let mut output = format!("{}\n", filename);
@@ -1006,8 +1051,9 @@ fn format_multi_file_tree(
         let file_indent = "  ".repeat(dir_parts.len());
         output.push_str(&format!("{}{}\n", file_indent, file_name));
 
-        // Emit symbols under file
-        render_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
+        // Emit only top-level symbols under each file. Full nested members stay
+        // available via the single-file outline path.
+        render_top_level_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
 
         files_shown += 1;
         prev_parts = parts.iter().map(|s| *s).collect();

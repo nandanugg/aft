@@ -70,6 +70,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     aft_outline: {
       description:
         "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
+        "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n" +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
@@ -87,6 +88,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           .describe(
             "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
           ),
+        includeTests: z
+          .boolean()
+          .optional()
+          .describe(
+            "Directory outline only: include test files. Defaults to false; tests are hidden.",
+          ),
       },
       execute: async (args, context): Promise<string> => {
         // Coerce at the boundary: a host may deliver the string|array `target` as
@@ -95,6 +102,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // files mode (coerceBoolean).
         const target = coerceTargetParam(args.target);
         const filesMode = coerceBoolean(args.files);
+        const hasIncludeTests = !isEmptyParam(args.includeTests);
+        const includeTests = coerceBoolean(args.includeTests);
         const hasUrl =
           typeof target === "string" &&
           (target.startsWith("http://") || target.startsWith("https://"));
@@ -214,7 +223,10 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         if (permissionDenied) return permissionDeniedResponse(permissionDenied);
 
         if (isDirectory) {
-          const response = await callBridge(ctx, context, "outline", { directory: resolvedTarget });
+          const response = await callBridge(ctx, context, "outline", {
+            directory: resolvedTarget,
+            ...(hasIncludeTests ? { includeTests } : {}),
+          });
           if (response.success === false) {
             throw new Error((response.message as string) || "outline failed");
           }

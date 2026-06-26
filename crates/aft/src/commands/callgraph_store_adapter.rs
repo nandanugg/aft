@@ -10,6 +10,7 @@ use crate::callgraph_store::{
 };
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
+use crate::inspect::job::is_test_file;
 use crate::parser::{
     detect_language, extract_symbols_from_tree, grammar_for, FileParser, SharedSymbolCache,
 };
@@ -19,6 +20,18 @@ use crate::symbols::Symbol;
 pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
 
 const TRACE_DATA_RESOLVER_PROVENANCE: &str = "treesitter+resolver";
+const HUB_SUMMARY_THRESHOLD: usize = 20;
+const HUB_SUMMARY_LIMIT: usize = 15;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreHubSummary {
+    pub message: String,
+    pub total: usize,
+    pub hidden_tests: usize,
+    pub shown: usize,
+    pub threshold: usize,
+    pub limit: usize,
+}
 
 #[derive(Debug, Clone, Default)]
 struct EdgeMarker {
@@ -32,6 +45,8 @@ pub struct StoreCallersResult {
     pub file: String,
     pub callers: Vec<StoreCallerGroup>,
     pub total_callers: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub_summary: Option<StoreHubSummary>,
     pub scanned_files: usize,
     pub depth_limited: bool,
     pub truncated: usize,
@@ -80,6 +95,8 @@ pub struct StoreImpactResult {
     pub total_affected: usize,
     pub affected_files: usize,
     pub callers: Vec<StoreImpactCaller>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub_summary: Option<StoreHubSummary>,
     pub depth_limited: bool,
     pub truncated: usize,
 }
@@ -126,6 +143,8 @@ pub struct StoreTraceToResult {
     pub target_file: String,
     pub paths: Vec<StoreTracePath>,
     pub total_paths: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub_summary: Option<StoreHubSummary>,
     pub entry_points_found: usize,
     pub max_depth_reached: bool,
     pub truncated_paths: usize,
@@ -246,11 +265,89 @@ fn edge_resolved_by(site: &StoreCallSite) -> Option<String> {
     site.supplemental_resolution().map(ToString::to_string)
 }
 
+fn test_hidden_summary(
+    kind: &str,
+    total: usize,
+    hidden_tests: usize,
+    shown: usize,
+) -> StoreHubSummary {
+    StoreHubSummary {
+        message: format!(
+            "Next: {total} {kind} ({hidden_tests} in tests, hidden — pass includeTests) — narrow with scope"
+        ),
+        total,
+        hidden_tests,
+        shown,
+        threshold: HUB_SUMMARY_THRESHOLD,
+        limit: HUB_SUMMARY_LIMIT,
+    }
+}
+
+fn included_summary(
+    kind: &str,
+    total: usize,
+    hidden_tests: usize,
+    shown: usize,
+) -> StoreHubSummary {
+    let test_note = if hidden_tests == 0 {
+        String::new()
+    } else {
+        format!(" ({hidden_tests} in tests, included)")
+    };
+    StoreHubSummary {
+        message: format!("Next: {total} {kind}{test_note} — showing {shown}; narrow with scope"),
+        total,
+        hidden_tests,
+        shown,
+        threshold: HUB_SUMMARY_THRESHOLD,
+        limit: HUB_SUMMARY_LIMIT,
+    }
+}
+
+fn callsite_is_from_test(site: &StoreCallSite) -> bool {
+    is_test_file(&site.caller.file)
+}
+
+fn trace_path_starts_in_test(path: &StoreTracePath) -> bool {
+    path.hops.first().is_some_and(|hop| is_test_file(&hop.file))
+}
+
+fn dedup_sites_for_summary(sites: Vec<StoreCallSite>) -> Vec<StoreCallSite> {
+    let mut seen = BTreeSet::new();
+    sites
+        .into_iter()
+        .filter(|site| seen.insert((site.caller.symbol.clone(), site.target_symbol.clone())))
+        .collect()
+}
+
+fn trace_path_shape(path: &StoreTracePath) -> Vec<(String, String)> {
+    path.hops
+        .iter()
+        .map(|hop| (hop.file.clone(), hop.symbol.clone()))
+        .collect()
+}
+
+fn dedup_paths_for_summary(paths: Vec<StoreTracePath>) -> Vec<StoreTracePath> {
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(trace_path_shape(path)))
+        .collect()
+}
+
+fn filter_call_tree_tests(node: &mut StoreCallTreeNode) {
+    node.children.retain(|child| !is_test_file(&child.file));
+    for child in &mut node.children {
+        filter_call_tree_tests(child);
+    }
+}
+
 pub fn callers_result(
     store: &CallGraphStore,
     file: &Path,
     symbol: &str,
     depth: usize,
+    include_tests: bool,
 ) -> StoreAdapterResult<StoreCallersResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
@@ -271,10 +368,43 @@ pub fn callers_result(
         &mut truncated,
     )?;
 
-    let sites = dedup_call_sites(sites);
+    let mut sites = dedup_call_sites(sites);
+    sites.sort_by(|left, right| {
+        left.caller
+            .file
+            .cmp(&right.caller.file)
+            .then(left.line.cmp(&right.line))
+            .then(left.caller.symbol.cmp(&right.caller.symbol))
+    });
     let total_callers = sites.len();
+    let hidden_tests = sites
+        .iter()
+        .filter(|site| callsite_is_from_test(site))
+        .count();
+    let summarize = total_callers > HUB_SUMMARY_THRESHOLD;
+    let visible_sites = sites
+        .into_iter()
+        .filter(|site| include_tests || !callsite_is_from_test(site))
+        .collect::<Vec<_>>();
+    let visible_sites = if summarize {
+        dedup_sites_for_summary(visible_sites)
+            .into_iter()
+            .take(HUB_SUMMARY_LIMIT)
+            .collect::<Vec<_>>()
+    } else {
+        visible_sites
+    };
+    let hub_summary = if summarize {
+        Some(if include_tests {
+            included_summary("callers", total_callers, hidden_tests, visible_sites.len())
+        } else {
+            test_hidden_summary("callers", total_callers, hidden_tests, visible_sites.len())
+        })
+    } else {
+        None
+    };
     let mut groups: BTreeMap<String, Vec<StoreCallerEntry>> = BTreeMap::new();
-    for site in sites {
+    for site in visible_sites {
         groups
             .entry(site.caller.file.clone())
             .or_default()
@@ -294,6 +424,7 @@ pub fn callers_result(
             .map(|(file, callers)| StoreCallerGroup { file, callers })
             .collect(),
         total_callers,
+        hub_summary,
         scanned_files: store.indexed_file_count()?,
         depth_limited,
         truncated,
@@ -305,10 +436,15 @@ pub fn call_tree_result(
     file: &Path,
     symbol: &str,
     depth: usize,
+    include_tests: bool,
 ) -> StoreAdapterResult<StoreCallTreeNode> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let mut visited = HashSet::new();
-    call_tree_inner(store, &target, depth, 0, &mut visited)
+    let mut tree = call_tree_inner(store, &target, depth, 0, &mut visited)?;
+    if !include_tests {
+        filter_call_tree_tests(&mut tree);
+    }
+    Ok(tree)
 }
 
 pub fn impact_result(
@@ -316,6 +452,7 @@ pub fn impact_result(
     file: &Path,
     symbol: &str,
     depth: usize,
+    include_tests: bool,
 ) -> StoreAdapterResult<StoreImpactResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
@@ -336,17 +473,64 @@ pub fn impact_result(
         &mut truncated,
     )?;
 
-    let sites = dedup_call_sites(sites);
+    let mut sites = dedup_call_sites(sites);
+    sites.sort_by(|left, right| {
+        left.caller
+            .file
+            .cmp(&right.caller.file)
+            .then(left.line.cmp(&right.line))
+            .then(left.caller.symbol.cmp(&right.caller.symbol))
+    });
+    let total_affected = sites.len();
+    let hidden_tests = sites
+        .iter()
+        .filter(|site| callsite_is_from_test(site))
+        .count();
+    let summarize = total_affected > HUB_SUMMARY_THRESHOLD;
+    let affected_files = sites
+        .iter()
+        .map(|site| site.caller.file.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let visible_sites = sites
+        .into_iter()
+        .filter(|site| include_tests || !callsite_is_from_test(site))
+        .collect::<Vec<_>>();
+    let visible_sites = if summarize {
+        dedup_sites_for_summary(visible_sites)
+            .into_iter()
+            .take(HUB_SUMMARY_LIMIT)
+            .collect::<Vec<_>>()
+    } else {
+        visible_sites
+    };
+    let hub_summary = if summarize {
+        Some(if include_tests {
+            included_summary(
+                "affected callers",
+                total_affected,
+                hidden_tests,
+                visible_sites.len(),
+            )
+        } else {
+            test_hidden_summary(
+                "affected callers",
+                total_affected,
+                hidden_tests,
+                visible_sites.len(),
+            )
+        })
+    } else {
+        None
+    };
     let target_signature = target.representative.signature.clone();
     let target_parameters = target_signature
         .as_deref()
         .map(|signature| callgraph::extract_parameters(signature, target.representative.lang))
         .unwrap_or_default();
 
-    let mut affected_files = BTreeSet::new();
     let mut callers = Vec::new();
-    for site in sites {
-        affected_files.insert(site.caller.file.clone());
+    for site in visible_sites {
         callers.push(StoreImpactCaller {
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
@@ -378,9 +562,10 @@ pub fn impact_result(
         file: target.representative.file,
         signature: target_signature,
         parameters: target_parameters,
-        total_affected: callers.len(),
-        affected_files: affected_files.len(),
+        total_affected,
+        affected_files,
         callers,
+        hub_summary,
         depth_limited,
         truncated,
     })
@@ -391,6 +576,7 @@ pub fn trace_to_result(
     file: &Path,
     symbol: &str,
     max_depth: usize,
+    include_tests: bool,
 ) -> StoreAdapterResult<StoreTraceToResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_max = if max_depth == 0 { 10 } else { max_depth };
@@ -487,6 +673,34 @@ pub fn trace_to_result(
             .cmp(right_entry)
             .then(left.hops.len().cmp(&right.hops.len()))
     });
+    let total_paths = paths.len();
+    let hidden_tests = paths
+        .iter()
+        .filter(|path| trace_path_starts_in_test(path))
+        .count();
+    let summarize = total_paths > HUB_SUMMARY_THRESHOLD;
+    let visible_paths = paths
+        .into_iter()
+        .filter(|path| include_tests || !trace_path_starts_in_test(path))
+        .collect::<Vec<_>>();
+    let paths = if summarize {
+        dedup_paths_for_summary(visible_paths)
+            .into_iter()
+            .take(HUB_SUMMARY_LIMIT)
+            .collect::<Vec<_>>()
+    } else {
+        visible_paths
+    };
+    let hub_summary = if summarize {
+        Some(if include_tests {
+            included_summary("paths", total_paths, hidden_tests, paths.len())
+        } else {
+            test_hidden_summary("paths", total_paths, hidden_tests, paths.len())
+        })
+    } else {
+        None
+    };
+
     let entry_points_found = paths
         .iter()
         .filter_map(|path| path.hops.first())
@@ -498,7 +712,8 @@ pub fn trace_to_result(
     Ok(StoreTraceToResult {
         target_symbol: target.representative.symbol,
         target_file: target.representative.file,
-        total_paths: paths.len(),
+        total_paths,
+        hub_summary,
         paths,
         entry_points_found,
         max_depth_reached,
@@ -528,6 +743,7 @@ pub fn trace_to_symbol_result(
     to_symbol: &str,
     to_file: Option<&Path>,
     max_depth: usize,
+    include_tests: bool,
 ) -> StoreAdapterResult<StoreTraceToSymbolResult> {
     let origin = resolve_symbol_query(store, file, symbol)?;
     let target_file = to_file.map(|path| relative_file(store, path));
@@ -579,6 +795,9 @@ pub fn trace_to_symbol_result(
         }
 
         for (callee, edge) in callees {
+            if !include_tests && is_test_file(&callee.file) {
+                continue;
+            }
             if !visited.insert((callee.file.clone(), callee.symbol.clone())) {
                 continue;
             }

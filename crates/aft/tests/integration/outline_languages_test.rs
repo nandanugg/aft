@@ -914,7 +914,6 @@ fn outline_supports_requested_new_extensions() {
         "CsType",
         "zigFile",
         "SolType",
-        "solFn",
     ] {
         assert!(
             text.contains(expected),

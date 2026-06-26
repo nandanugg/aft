@@ -129,6 +129,10 @@
       "files": {
         "description": "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
         "type": "boolean"
+      },
+      "includeTests": {
+        "description": "Directory outline only: include test files. Defaults to false; tests are hidden.",
+        "type": "boolean"
       }
     },
     "required": [

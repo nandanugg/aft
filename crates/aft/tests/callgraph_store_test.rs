@@ -129,14 +129,14 @@ fn store_trace_data_self_recursion_does_not_change_callers_or_impact() {
 
     let file = root.join("src/flow.ts");
     let callers = serde_json::to_value(
-        callgraph_store_adapter::callers_result(&store, &file, "f", 2).unwrap(),
+        callgraph_store_adapter::callers_result(&store, &file, "f", 2, true).unwrap(),
     )
     .unwrap();
     assert_eq!(callers["total_callers"], json!(0));
     assert_eq!(callers["callers"], json!([]));
 
     let impact = serde_json::to_value(
-        callgraph_store_adapter::impact_result(&store, &file, "f", 2).unwrap(),
+        callgraph_store_adapter::impact_result(&store, &file, "f", 2, true).unwrap(),
     )
     .unwrap();
     assert_eq!(impact["total_affected"], json!(0));
@@ -1316,22 +1316,22 @@ fn scenario_op_snapshot(store: &CallGraphStore, root: &Path, query: ScenarioQuer
     let to_file = query.to_file.map(|file| root.join(file));
     json!({
         "callers": serde_json::to_value(
-            callgraph_store_adapter::callers_result(store, &target_file, query.target_symbol, 2)
+            callgraph_store_adapter::callers_result(store, &target_file, query.target_symbol, 2, true)
                 .unwrap()
         )
         .unwrap(),
         "call_tree": serde_json::to_value(
-            callgraph_store_adapter::call_tree_result(store, &tree_file, query.tree_symbol, 2)
+            callgraph_store_adapter::call_tree_result(store, &tree_file, query.tree_symbol, 2, true)
                 .unwrap()
         )
         .unwrap(),
         "impact": serde_json::to_value(
-            callgraph_store_adapter::impact_result(store, &target_file, query.target_symbol, 2)
+            callgraph_store_adapter::impact_result(store, &target_file, query.target_symbol, 2, true)
                 .unwrap()
         )
         .unwrap(),
         "trace_to": serde_json::to_value(
-            callgraph_store_adapter::trace_to_result(store, &target_file, query.target_symbol, 4)
+            callgraph_store_adapter::trace_to_result(store, &target_file, query.target_symbol, 4, true)
                 .unwrap()
         )
         .unwrap(),
@@ -1343,6 +1343,7 @@ fn scenario_op_snapshot(store: &CallGraphStore, root: &Path, query: ScenarioQuer
                 query.to_symbol,
                 to_file.as_deref(),
                 4,
+                true,
             )
             .unwrap()
         )

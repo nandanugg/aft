@@ -89,6 +89,15 @@ function depthWarning(
   return theme.fg("warning", `(depth limited${detail})`);
 }
 
+function hubSummaryLine(
+  response: Record<string, unknown>,
+  theme: CallgraphTheme,
+): string | undefined {
+  const summary = asRecord(response.hub_summary);
+  const message = summary ? asString(summary.message) : undefined;
+  return message ? theme.fg("warning", message) : undefined;
+}
+
 function renderTracePath(
   path: Record<string, unknown>,
   index: number,
@@ -159,6 +168,7 @@ export function formatCallgraphSections(
   if (op === "callers") {
     const groups = asRecords(record.callers);
     const warning = depthWarning(record, theme);
+    const hubSummary = hubSummaryLine(record, theme);
     const total = asNumber(record.total_callers) ?? 0;
     const sections = [
       joinNonEmpty([
@@ -167,6 +177,7 @@ export function formatCallgraphSections(
         warning,
       ]),
     ];
+    if (hubSummary) sections.push(hubSummary);
     groups.forEach((group) => {
       sections.push(renderCallersGroupLines(group, theme).join("\n"));
     });
@@ -201,6 +212,7 @@ export function formatCallgraphSections(
   if (op === "trace_to") {
     const paths = asRecords(record.paths);
     const warning = depthWarning(record, theme, "max_depth_reached", "truncated_paths");
+    const hubSummary = hubSummaryLine(record, theme);
     const totalPaths = asNumber(record.total_paths) ?? paths.length;
     const entryPoints = asNumber(record.entry_points_found) ?? 0;
     const sections = [
@@ -210,6 +222,7 @@ export function formatCallgraphSections(
         warning,
       ]),
     ];
+    if (hubSummary) sections.push(hubSummary);
     if (paths.length === 0) sections.push(theme.fg("muted", "No entry paths found."));
     paths.forEach((path, index) => {
       const lines: string[] = [];
@@ -222,6 +235,7 @@ export function formatCallgraphSections(
   if (op === "impact") {
     const callers = asRecords(record.callers);
     const warning = depthWarning(record, theme);
+    const hubSummary = hubSummaryLine(record, theme);
     const totalAffected = asNumber(record.total_affected) ?? callers.length;
     const affectedFiles = asNumber(record.affected_files) ?? 0;
     const sections = [
@@ -231,6 +245,7 @@ export function formatCallgraphSections(
         warning,
       ]),
     ];
+    if (hubSummary) sections.push(hubSummary);
     if (callers.length === 0) sections.push(theme.fg("muted", "No impacted callers found."));
     callers.forEach((caller) => {
       const file = shortenPath(asString(caller.caller_file) ?? "(unknown file)");

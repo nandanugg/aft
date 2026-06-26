@@ -5,6 +5,7 @@ use crate::commands::callgraph_store_adapter::{
     trace_to_symbol_result, unavailable_response,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::inspect::job::is_test_file;
 use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
@@ -91,9 +92,18 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         return store_error_response(&req.id, "trace_to_symbol", error);
     }
 
+    let include_tests = include_tests_param(req);
     let target_candidates = match trace_to_symbol_candidates(&store, to_symbol) {
         Ok(candidates) => candidates,
         Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
+    };
+    let target_candidates = if include_tests {
+        target_candidates
+    } else {
+        target_candidates
+            .into_iter()
+            .filter(|candidate| !is_test_file(&candidate.file))
+            .collect::<Vec<_>>()
     };
 
     if let Some(to_file_path) = to_file_path.as_deref() {
@@ -144,6 +154,7 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         to_symbol,
         to_file_path.as_deref(),
         depth,
+        include_tests,
     ) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
@@ -151,6 +162,14 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         Err(error) => store_error_response(&req.id, "trace_to_symbol", error),
     }
+}
+
+fn include_tests_param(req: &RawRequest) -> bool {
+    req.params
+        .get("includeTests")
+        .or_else(|| req.params.get("include_tests"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn resolve_request_path(project_root: Option<&Path>, file: &str) -> PathBuf {

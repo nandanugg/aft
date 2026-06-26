@@ -79,7 +79,8 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let started = Instant::now();
-    let outcome = callers_result(&store, &file_path, symbol, depth);
+    let include_tests = include_tests_param(req);
+    let outcome = callers_result(&store, &file_path, symbol, depth, include_tests);
     let elapsed_ms = started.elapsed().as_millis();
 
     match outcome {
@@ -104,4 +105,12 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
             store_error_response(&req.id, "callers", error)
         }
     }
+}
+
+fn include_tests_param(req: &RawRequest) -> bool {
+    req.params
+        .get("includeTests")
+        .or_else(|| req.params.get("include_tests"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }

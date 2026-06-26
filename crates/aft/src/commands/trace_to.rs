@@ -76,11 +76,19 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match trace_to_result(&store, &file_path, symbol, depth) {
+    match trace_to_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(result) => {
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }
         Err(error) => store_error_response(&req.id, "trace_to", error),
     }
+}
+
+fn include_tests_param(req: &RawRequest) -> bool {
+    req.params
+        .get("includeTests")
+        .or_else(|| req.params.get("include_tests"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }

@@ -47,6 +47,7 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
         &root.join("src/context.rs"),
         "AppContext::callgraph_store_for_ops",
         1,
+        true,
     ));
     let entries = flattened_callers(&callers);
     assert_eq!(entries.len(), 5, "callers output: {callers:#}");
@@ -62,6 +63,7 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
         &root.join("src/context.rs"),
         "AppContext::callgraph_store_for_ops",
         1,
+        true,
     ));
     let impact_callers = impact["callers"].as_array().unwrap();
     assert_eq!(impact_callers.len(), 5, "impact output: {impact:#}");
@@ -74,6 +76,7 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
         &root.join("src/commands/callers.rs"),
         "handle_callers",
         1,
+        true,
     ));
     let child = tree["children"].as_array().unwrap().first().unwrap();
     assert_eq!(child["name"], "AppContext::callgraph_store_for_ops");
@@ -85,6 +88,7 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
         &root.join("src/context.rs"),
         "AppContext::callgraph_store_for_ops",
         2,
+        true,
     ));
     let target_hop = trace["paths"][0]["hops"]
         .as_array()
@@ -104,6 +108,7 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
         "callgraph_store_for_ops",
         Some(&root.join("src/context.rs")),
         2,
+        true,
     ));
     let target_hop = path["path"]
         .as_array()
@@ -171,6 +176,7 @@ impl Foo {
         &root.join("src/lib.rs"),
         "Foo::method",
         1,
+        true,
     ));
     let entries = flattened_callers(&callers);
     assert_eq!(entries.len(), 1, "self callers output: {callers:#}");
@@ -257,6 +263,7 @@ impl Parser {
         &root.join("src/lib.rs"),
         "Foo::caller",
         1,
+        true,
     ));
     let child = tree["children"].as_array().unwrap().first().unwrap();
     assert_eq!(
@@ -293,6 +300,7 @@ pub fn entry() {
         &root.join("src/lib.rs"),
         "Parser::bespoke_project_action",
         1,
+        true,
     ));
     let entries = flattened_callers(&callers);
     assert_eq!(entries.len(), 1, "distinctive callers output: {callers:#}");
@@ -330,6 +338,7 @@ export function entry(worker: Worker) {
         &root.join("worker.ts"),
         "Worker::run",
         1,
+        true,
     ));
     let entries = flattened_callers(&callers);
     assert_eq!(entries.len(), 1, "TS callers output: {callers:#}");
@@ -394,6 +403,7 @@ export function entry(service: { handle(): void }) {
         &root.join("ambiguous.ts"),
         "entry",
         1,
+        true,
     ));
     let child = tree["children"].as_array().unwrap().first().unwrap();
     assert_eq!(child["name"], "handle", "call_tree output: {tree:#}");
@@ -427,6 +437,7 @@ export function entry(permissionRuleEngine: PermissionRuleEngine) {
         &root.join("engines.ts"),
         "PermissionRuleEngine::evaluate",
         1,
+        true,
     ));
     let entries = flattened_callers(&callers);
     assert_eq!(entries.len(), 1, "scored callers output: {callers:#}");

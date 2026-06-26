@@ -3,7 +3,11 @@
  * Ops: call_tree, callers, trace_to, trace_to_symbol, impact, trace_data.
  */
 
-import { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  formatCallgraphSections,
+  PLAIN_CALLGRAPH_THEME,
+} from "@cortexkit/aft-bridge";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
@@ -61,6 +65,11 @@ function navigateParamsSchema() {
           "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
       }),
     ),
+    includeTests: Type.Optional(
+      Type.Boolean({
+        description: "Include test files in callers/paths. Defaults to false; tests are hidden.",
+      }),
+    ),
   });
 }
 
@@ -110,7 +119,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_callgraph",
     label: "callgraph",
     description:
-      "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params. Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly.",
+      "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source; use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params. Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly.",
     parameters: navigateParamsSchema(),
     async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
       if (isEmptyParam(params.filePath)) {
@@ -149,6 +158,8 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (!isEmptyParam(params.expression)) req.expression = params.expression;
       if (!isEmptyParam(params.toSymbol)) req.toSymbol = params.toSymbol;
       if (toFile !== undefined) req.toFile = toFile;
+      if (!isEmptyParam(params.includeTests))
+        req.include_tests = coerceBoolean(params.includeTests);
       try {
         const response = await callBridge(bridge, params.op, req, extCtx);
         return textResult(

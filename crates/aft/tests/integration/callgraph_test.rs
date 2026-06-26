@@ -4,6 +4,7 @@
 //! using the fixtures in `tests/fixtures/callgraph/`.
 
 use crate::helpers::{fixture_path, AftProcess};
+use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
@@ -19,6 +20,15 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
 
 fn path_text_ends_with(path: &str, suffix: &str) -> bool {
     path.replace('\\', "/").ends_with(suffix)
+}
+
+fn flattened_caller_entries(resp: &Value) -> Vec<&Value> {
+    resp["callers"]
+        .as_array()
+        .expect("callers array")
+        .iter()
+        .flat_map(|group| group["callers"].as_array().expect("caller entries"))
+        .collect()
 }
 
 /// `configure` sets project root and returns success.
@@ -839,7 +849,23 @@ test("calls target", () => {
     assert_eq!(resp["success"], true, "callers should succeed: {:?}", resp);
     assert_eq!(
         resp["total_callers"], 1,
-        "test callback caller should be indexed"
+        "test callback caller should be counted even when hidden"
+    );
+    let callers = resp["callers"].as_array().expect("callers array");
+    assert!(
+        callers.is_empty(),
+        "test caller should be hidden by default while total remains honest: {:?}",
+        callers
+    );
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"3","command":"callers","file":{},"symbol":"testTarget","depth":1,"includeTests":true}}"#,
+        crate::helpers::json_string(&root.join("src/shared/model.ts").display())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "callers with includeTests should succeed: {:?}",
+        resp
     );
     let callers = resp["callers"].as_array().expect("callers array");
     let test_group = callers.iter().find(|group| {
@@ -859,6 +885,248 @@ test("calls target", () => {
         entries.iter().any(|entry| entry["line"] == 5),
         "testTarget call site should be line 5: {:?}",
         entries
+    );
+
+    aft.shutdown();
+}
+
+#[test]
+fn callgraph_hides_tests_by_default_and_summarizes_hubs_honestly() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("src/__tests__")).unwrap();
+    fs::write(
+        root.join("src/target.ts"),
+        r#"export function target(): number {
+  return 1;
+}
+
+export function smallTarget(): number {
+  return 2;
+}
+"#,
+    )
+    .unwrap();
+
+    for idx in 0..20 {
+        fs::write(
+            root.join(format!("src/caller{idx:02}.ts")),
+            format!(
+                r#"import {{ target }} from "./target";
+
+export function caller{idx:02}(): number {{
+  return target();
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+    for idx in 0..5 {
+        fs::write(
+            root.join(format!("src/__tests__/caller{idx:02}.test.ts")),
+            format!(
+                r#"import {{ target, smallTarget }} from "../target";
+
+export function aaaTestCaller{idx:02}(): number {{
+  return target() + smallTarget();
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+    for idx in 0..3 {
+        fs::write(
+            root.join(format!("src/small_caller{idx:02}.ts")),
+            format!(
+                r#"import {{ smallTarget }} from "./target";
+
+export function smallCaller{idx:02}(): number {{
+  return smallTarget();
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+
+    let target_path = root.join("src/target.ts");
+    let callers = aft.send(&format!(
+        r#"{{"id":"callers-hub","command":"callers","file":{},"symbol":"target","depth":1}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(
+        callers["success"], true,
+        "callers should succeed: {callers:?}"
+    );
+    assert_eq!(
+        callers["total_callers"], 25,
+        "summary count should include hidden tests"
+    );
+    let summary = callers["hub_summary"]["message"]
+        .as_str()
+        .expect("hub summary");
+    assert!(
+        summary.contains("Next: 25 callers (5 in tests, hidden — pass includeTests)"),
+        "summary should state hidden tests and honest total: {summary}"
+    );
+    let visible_callers = flattened_caller_entries(&callers);
+    assert_eq!(
+        visible_callers.len(),
+        15,
+        "hub summary should show top 15 callers"
+    );
+    assert!(
+        callers["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|group| !group["file"].as_str().unwrap().contains("__tests__")),
+        "default callers should hide test files: {callers:?}"
+    );
+
+    let callers_with_tests = aft.send(&format!(
+        r#"{{"id":"callers-hub-tests","command":"callers","file":{},"symbol":"target","depth":1,"includeTests":true}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(
+        callers_with_tests["success"], true,
+        "includeTests callers should succeed: {callers_with_tests:?}"
+    );
+    assert!(
+        callers_with_tests["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["file"].as_str().unwrap().contains("__tests__")),
+        "includeTests should show test callers in hub top-k: {callers_with_tests:?}"
+    );
+
+    let impact = aft.send(&format!(
+        r#"{{"id":"impact-hub","command":"impact","file":{},"symbol":"target","depth":1}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(impact["success"], true, "impact should succeed: {impact:?}");
+    assert_eq!(
+        impact["total_affected"], 25,
+        "impact summary count should include hidden tests"
+    );
+    let impact_summary = impact["hub_summary"]["message"]
+        .as_str()
+        .expect("impact summary");
+    assert!(
+        impact_summary
+            .contains("Next: 25 affected callers (5 in tests, hidden — pass includeTests)"),
+        "impact summary should state hidden tests and honest total: {impact_summary}"
+    );
+    let impact_callers = impact["callers"].as_array().expect("impact callers");
+    assert_eq!(
+        impact_callers.len(),
+        15,
+        "impact hub summary should show top 15 callers"
+    );
+    assert!(
+        impact_callers.iter().all(|caller| !caller["caller_file"]
+            .as_str()
+            .unwrap()
+            .contains("__tests__")),
+        "default impact should hide test callers: {impact:?}"
+    );
+
+    let impact_with_tests = aft.send(&format!(
+        r#"{{"id":"impact-hub-tests","command":"impact","file":{},"symbol":"target","depth":1,"includeTests":true}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(
+        impact_with_tests["success"], true,
+        "includeTests impact should succeed: {impact_with_tests:?}"
+    );
+    assert!(
+        impact_with_tests["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|caller| caller["caller_file"]
+                .as_str()
+                .unwrap()
+                .contains("__tests__")),
+        "includeTests should show test impact callers in hub top-k: {impact_with_tests:?}"
+    );
+
+    let trace = aft.send(&format!(
+        r#"{{"id":"trace-hub","command":"trace_to","file":{},"symbol":"target","depth":2}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(trace["success"], true, "trace_to should succeed: {trace:?}");
+    assert_eq!(
+        trace["total_paths"], 26,
+        "trace summary count should include hidden tests and the target self-path"
+    );
+    let trace_summary = trace["hub_summary"]["message"]
+        .as_str()
+        .expect("trace summary");
+    assert!(
+        trace_summary.contains("Next: 26 paths (5 in tests, hidden — pass includeTests)"),
+        "trace summary should state hidden tests and honest total: {trace_summary}"
+    );
+    let paths = trace["paths"].as_array().expect("trace paths");
+    assert_eq!(
+        paths.len(),
+        15,
+        "trace_to hub summary should show top 15 paths"
+    );
+    assert!(
+        paths.iter().all(|path| !path["hops"][0]["file"]
+            .as_str()
+            .unwrap()
+            .contains("__tests__")),
+        "default trace paths should hide test entry points: {trace:?}"
+    );
+
+    let trace_with_tests = aft.send(&format!(
+        r#"{{"id":"trace-hub-tests","command":"trace_to","file":{},"symbol":"target","depth":2,"includeTests":true}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(
+        trace_with_tests["success"], true,
+        "includeTests trace_to should succeed: {trace_with_tests:?}"
+    );
+    assert!(
+        trace_with_tests["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path["hops"][0]["file"]
+                .as_str()
+                .unwrap()
+                .contains("__tests__")),
+        "includeTests should show test trace paths in hub top-k: {trace_with_tests:?}"
+    );
+
+    let small = aft.send(&format!(
+        r#"{{"id":"callers-small","command":"callers","file":{},"symbol":"smallTarget","depth":1}}"#,
+        crate::helpers::json_string(&target_path.display())
+    ));
+    assert_eq!(
+        small["success"], true,
+        "small callers should succeed: {small:?}"
+    );
+    assert_eq!(
+        small["total_callers"], 8,
+        "small total should include hidden tests"
+    );
+    assert!(
+        small.get("hub_summary").is_none(),
+        "small result should not summarize: {small:?}"
+    );
+    assert_eq!(
+        flattened_caller_entries(&small).len(),
+        3,
+        "small result should render the full non-test list after test-gating"
     );
 
     aft.shutdown();

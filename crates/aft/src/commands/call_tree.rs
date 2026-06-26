@@ -76,11 +76,19 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match call_tree_result(&store, &file_path, symbol, depth) {
+    match call_tree_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(tree) => {
             let tree_json = serde_json::to_value(&tree).unwrap_or_default();
             Response::success(&req.id, tree_json)
         }
         Err(error) => store_error_response(&req.id, "call_tree", error),
     }
+}
+
+fn include_tests_param(req: &RawRequest) -> bool {
+    req.params
+        .get("includeTests")
+        .or_else(|| req.params.get("include_tests"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }

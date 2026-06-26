@@ -1,4 +1,4 @@
-import { formatCallgraphSections } from "@cortexkit/aft-bridge";
+import { coerceBoolean, formatCallgraphSections } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -31,6 +31,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
     aft_callgraph: {
       description:
         "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\n" +
+        "Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\n" +
         "Ops:\n" +
         "- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n" +
         "- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n" +
@@ -71,6 +72,10 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           .describe(
             "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
           ),
+        includeTests: z
+          .boolean()
+          .optional()
+          .describe("Include test files in callers/paths. Defaults to false; tests are hidden."),
       },
       execute: async (args, context): Promise<string> => {
         if (isEmptyParam(args.filePath)) {
@@ -108,6 +113,8 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         if (!isEmptyParam(args.expression)) params.expression = args.expression;
         if (!isEmptyParam(args.toSymbol)) params.toSymbol = args.toSymbol;
         if (toFile !== undefined) params.toFile = toFile;
+        if (!isEmptyParam(args.includeTests))
+          params.include_tests = coerceBoolean(args.includeTests);
         const response = await callBridge(ctx, context, args.op as string, params);
         if (response.success === false) {
           const message = formatBridgeErrorMessage(args.op as string, response, params);

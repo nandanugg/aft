@@ -67,6 +67,18 @@ describe("formatCallgraphSections", () => {
     expect(text).not.toContain("line ");
   });
 
+  test("callers renders hub-summary hidden-test guidance", () => {
+    const text = formatCallgraphSections("callers", {
+      total_callers: 49,
+      hub_summary: {
+        message: "Next: 49 callers (41 in tests, hidden — pass includeTests) — narrow with scope",
+      },
+      callers: [],
+    }).join("\n");
+    expect(text).toContain("49 callers");
+    expect(text).toContain("41 in tests, hidden — pass includeTests");
+  });
+
   test("trace_to_symbol renders hops", () => {
     const text = formatCallgraphSections("trace_to_symbol", {
       path: [{ symbol: "main", file: "/repo/a.ts", line: 1 }],

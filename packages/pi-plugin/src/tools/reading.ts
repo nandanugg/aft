@@ -46,6 +46,12 @@ const OutlineParams = Type.Object({
         "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
     }),
   ),
+  includeTests: Type.Optional(
+    Type.Boolean({
+      description:
+        "Directory outline only: include test files. Defaults to false; tests are hidden.",
+    }),
+  ),
 });
 
 const ZoomTarget = Type.Object({
@@ -314,7 +320,7 @@ export function registerReadingTools(
       name: "aft_outline",
       label: "outline",
       description:
-        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
       parameters: OutlineParams,
       async execute(
         _toolCallId: string,
@@ -330,6 +336,8 @@ export function registerReadingTools(
         // files mode (coerceBoolean).
         const target = coerceTargetParam(params.target);
         const filesMode = coerceBoolean(params.files);
+        const hasIncludeTests = !isEmptyParam(params.includeTests);
+        const includeTests = coerceBoolean(params.includeTests);
         const isArray = Array.isArray(target) && target.length > 0;
 
         if (filesMode) {
@@ -416,7 +424,7 @@ export function registerReadingTools(
           const response = await callBridge(
             bridge,
             "outline",
-            { directory: resolvedTarget },
+            { directory: resolvedTarget, ...(hasIncludeTests ? { includeTests } : {}) },
             extCtx,
           );
           return textResult(JSON.stringify(response, null, 2), response);
