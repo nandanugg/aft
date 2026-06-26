@@ -3377,8 +3377,21 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
+#[cfg(unix)]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    // Windows cannot open a directory as a regular File handle without
+    // FILE_FLAG_BACKUP_SEMANTICS — `File::open` on a directory returns
+    // "Access is denied" (os error 5). Directory fsync is also not the
+    // durability mechanism there: `std::fs::rename` maps to MoveFileExW with
+    // MOVEFILE_WRITE_THROUGH, which flushes the rename's metadata change to
+    // disk, and each content/meta file is already `sync_all()`-ed before the
+    // rename. So a separate directory sync is unnecessary on non-Unix.
+    Ok(())
 }
 
 fn prune_unreferenced_backup_files(
