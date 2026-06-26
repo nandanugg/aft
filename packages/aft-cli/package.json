@@ -23,7 +23,7 @@
     "test:unit": "bun test"
   },
   "dependencies": {
-    "@clack/prompts": "^1.2.0",
+    "@clack/prompts": "^1.6.0",
     "@cortexkit/aft-bridge": "0.41.0",
     "comment-json": "^4.6.2"
   },

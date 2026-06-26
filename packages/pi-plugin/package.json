@@ -27,8 +27,8 @@
     "@xterm/headless": "^5.5.0",
     "comment-json": "^5.0.0",
     "diff": "^8.0.4",
-    "typebox": "^1.1.24",
-    "zod": "^4.1.8"
+    "typebox": "1.1.38",
+    "zod": "^4.4.3"
   },
   "optionalDependencies": {
     "@cortexkit/aft-darwin-arm64": "0.41.0",
@@ -39,9 +39,9 @@
     "@cortexkit/aft-win32-x64": "0.41.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@earendil-works/pi-ai": "^0.80.2",
+    "@earendil-works/pi-tui": "^0.80.2",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },
