@@ -1,16 +1,20 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::commands::outline::{
-    build_outline_tree, format_entry_with_sig, symbol_to_entry, OutlineEntry,
+use crate::commands::outline::symbol_to_entry;
+use crate::commands::symbol_render::{
+    build_container_outline, format_qualified_entry, might_have_container_members,
+    qualified_symbol_name, render_container_member_menu, should_return_member_menu,
+    symbol_kind_string,
 };
 use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::lsp_hints;
 use crate::parser::{detect_language, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
-use crate::symbols::{Range, Symbol, SymbolKind};
+use crate::symbols::Range;
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
 
 /// A reference to a called/calling function.
@@ -19,6 +23,31 @@ pub struct CallRef {
     pub name: String,
     /// 1-based line number of the call reference.
     pub line: u32,
+    /// Number of later call sites with the same callee or caller name merged into this entry.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub extra_count: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn dedupe_call_refs_by_name(calls: Vec<CallRef>) -> Vec<CallRef> {
+    let mut index_by_name: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<CallRef> = Vec::new();
+
+    for call in calls {
+        if let Some(index) = index_by_name.get(&call.name).copied() {
+            deduped[index].extra_count = deduped[index]
+                .extra_count
+                .saturating_add(call.extra_count.saturating_add(1));
+        } else {
+            index_by_name.insert(call.name.clone(), deduped.len());
+            deduped.push(call);
+        }
+    }
+
+    deduped
 }
 
 /// Annotations describing file-scoped call relationships.
@@ -45,13 +74,6 @@ struct RawCall {
     line: u32,
     start_byte: usize,
     end_byte: usize,
-}
-
-const LARGE_CONTAINER_MENU_LINE_THRESHOLD: usize = 150;
-
-struct ContainerOutline {
-    entry: OutlineEntry,
-    symbols: Vec<Symbol>,
 }
 
 fn resolve_file_or_url(
@@ -609,13 +631,18 @@ fn zoom_one_symbol(
         let raw_calls = all_file_calls.iter().filter(|call| {
             call.start_byte >= target_byte_start && call.end_byte <= target_byte_end
         });
-        let calls_out: Vec<CallRef> = raw_calls
-            .filter(|call| known_names.contains(&call.name.as_str()) && call.name != target.name)
-            .map(|call| CallRef {
-                name: call.name.clone(),
-                line: call.line,
-            })
-            .collect();
+        let calls_out = dedupe_call_refs_by_name(
+            raw_calls
+                .filter(|call| {
+                    known_names.contains(&call.name.as_str()) && call.name != target.name
+                })
+                .map(|call| CallRef {
+                    name: call.name.clone(),
+                    line: call.line,
+                    extra_count: 0,
+                })
+                .collect(),
+        );
 
         // called_by: bucket the single file-wide call extraction by enclosing symbol range
         let mut called_by: Vec<CallRef> = Vec::new();
@@ -635,14 +662,13 @@ fn zoom_one_symbol(
                     called_by.push(CallRef {
                         name: sym.name.clone(),
                         line: call.line,
+                        extra_count: 0,
                     });
                 }
             }
         }
 
-        // Dedup called_by by (name, line)
-        called_by.sort_by(|a, b| a.name.cmp(&b.name).then(a.line.cmp(&b.line)));
-        called_by.dedup_by(|a, b| a.name == b.name && a.line == b.line);
+        let called_by = dedupe_call_refs_by_name(called_by);
 
         (calls_out, called_by)
     } else {
@@ -679,187 +705,6 @@ fn empty_annotations() -> serde_json::Value {
         "calls_out": [],
         "called_by": [],
     })
-}
-
-fn symbol_kind_string(kind: &SymbolKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| format!("{:?}", kind).to_lowercase())
-}
-
-fn qualified_symbol_name(symbol: &Symbol) -> String {
-    let mut parts = symbol
-        .scope_chain
-        .iter()
-        .filter(|part| !part.is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    parts.push(symbol.name.clone());
-    parts.join(".")
-}
-
-fn range_line_count(range: &Range) -> usize {
-    range
-        .end_line
-        .saturating_sub(range.start_line)
-        .saturating_add(1) as usize
-}
-
-fn range_contains(outer: &Range, inner: &Range) -> bool {
-    (outer.start_line, outer.start_col) <= (inner.start_line, inner.start_col)
-        && (outer.end_line, outer.end_col) >= (inner.end_line, inner.end_col)
-}
-
-fn might_have_container_members(symbol: &Symbol) -> bool {
-    matches!(
-        &symbol.kind,
-        SymbolKind::Class
-            | SymbolKind::Struct
-            | SymbolKind::Interface
-            | SymbolKind::Enum
-            | SymbolKind::Variable
-            | SymbolKind::TypeAlias
-    )
-}
-
-fn is_container_kind(kind: &SymbolKind) -> bool {
-    matches!(
-        kind,
-        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Enum
-    )
-}
-
-fn build_container_outline(
-    ctx: &AppContext,
-    resolved_file_path: &Path,
-    target: &Symbol,
-) -> Result<ContainerOutline, crate::error::AftError> {
-    let symbols = ctx.provider().list_symbols(resolved_file_path)?;
-    let entries = build_outline_tree(&symbols);
-    let entry = find_outline_entry(&entries, target)
-        .cloned()
-        .unwrap_or_else(|| symbol_to_entry(target));
-    Ok(ContainerOutline { entry, symbols })
-}
-
-fn find_outline_entry<'a>(
-    entries: &'a [OutlineEntry],
-    target: &Symbol,
-) -> Option<&'a OutlineEntry> {
-    for entry in entries {
-        if entry.name == target.name && entry.range == target.range {
-            return Some(entry);
-        }
-        if let Some(found) = find_outline_entry(&entry.members, target) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn should_return_member_menu(
-    target: &Symbol,
-    lang: Option<LangId>,
-    outline: Option<&ContainerOutline>,
-) -> bool {
-    let Some(outline) = outline else {
-        return false;
-    };
-    let is_container = is_container_kind(&target.kind) || !outline.entry.members.is_empty();
-    if !is_container {
-        return false;
-    }
-
-    container_rendered_line_count(target, lang, &outline.entry)
-        > LARGE_CONTAINER_MENU_LINE_THRESHOLD
-}
-
-fn container_rendered_line_count(
-    target: &Symbol,
-    lang: Option<LangId>,
-    entry: &OutlineEntry,
-) -> usize {
-    let mut line_count = range_line_count(&target.range);
-
-    // Rust impl blocks are associated with the type in the outline symbol model,
-    // but their method ranges sit outside the struct/enum/trait declaration.
-    // Count those associated method spans so behavior-heavy Rust types get a
-    // drill-down menu without introducing a separate `impl` zoom target.
-    if lang == Some(LangId::Rust) {
-        for member in &entry.members {
-            if !range_contains(&target.range, &member.range) {
-                line_count = line_count.saturating_add(range_line_count(&member.range));
-            }
-        }
-    }
-
-    line_count
-}
-
-fn render_container_member_menu(target: &Symbol, outline: &ContainerOutline) -> String {
-    let kind = symbol_kind_string(&target.kind);
-    let qualified_name = qualified_symbol_name(target);
-    let member_count = outline.entry.members.len();
-    let mut lines = vec![format!(
-        "{kind} {qualified_name} ({member_count} members) — member-signature menu; zoom a member for its body"
-    )];
-
-    lines.push(format_qualified_entry(&outline.entry, Some(target)));
-    if outline.entry.members.is_empty() {
-        lines.push("  (no direct members found)".to_string());
-    } else {
-        for member in &outline.entry.members {
-            let symbol = find_symbol_for_entry(&outline.symbols, member);
-            lines.push(format!("  .{}", format_qualified_entry(member, symbol)));
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn find_symbol_for_entry<'a>(symbols: &'a [Symbol], entry: &OutlineEntry) -> Option<&'a Symbol> {
-    symbols
-        .iter()
-        .find(|symbol| symbol.name == entry.name && symbol.range == entry.range)
-}
-
-fn format_qualified_entry(entry: &OutlineEntry, symbol: Option<&Symbol>) -> String {
-    let Some(symbol) = symbol else {
-        return format_entry_with_sig(entry);
-    };
-    let qualified_name = qualified_symbol_name(symbol);
-    if qualified_name == symbol.name {
-        return format_entry_with_sig(entry);
-    }
-
-    let mut display = entry.clone();
-    display.name = qualified_name.clone();
-    let signature = entry.signature.as_deref().unwrap_or(entry.name.as_str());
-    display.signature = Some(qualified_signature(
-        &symbol.name,
-        &qualified_name,
-        signature,
-    ));
-    format_entry_with_sig(&display)
-}
-
-fn qualified_signature(name: &str, qualified_name: &str, signature: &str) -> String {
-    if signature == name {
-        return qualified_name.to_string();
-    }
-
-    if let Some(rest) = signature.strip_prefix(name) {
-        let boundary = rest
-            .chars()
-            .next()
-            .map_or(true, |ch| !ch.is_alphanumeric() && ch != '_' && ch != '$');
-        if boundary {
-            return format!("{qualified_name}{rest}");
-        }
-    }
-
-    format!("{qualified_name} — {signature}")
 }
 
 fn render_ambiguous_symbol_menu(
@@ -1348,6 +1193,40 @@ function helper(value: number): number {
     }
 
     #[test]
+    fn zoom_leaf_returns_full_body_without_budget_marker() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+        let req = make_zoom_request(
+            "z-leaf-full",
+            path.to_str().unwrap(),
+            "repeatedOutgoing",
+            None,
+        );
+        let resp = handle_zoom(&req, &ctx);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true, "zoom should succeed: {json:?}");
+
+        let symbols = ctx.provider().list_symbols(&path).unwrap();
+        let target = symbols
+            .iter()
+            .find(|symbol| symbol.name == "repeatedOutgoing")
+            .unwrap();
+        let source = std::fs::read_to_string(&path).unwrap();
+        let lines = source.lines().collect::<Vec<_>>();
+        let expected =
+            lines[target.range.start_line as usize..=target.range.end_line as usize].join("\n");
+
+        assert_eq!(json["content"].as_str().unwrap(), expected);
+        assert!(
+            !json["content"]
+                .as_str()
+                .unwrap()
+                .contains("more lines — zoom"),
+            "explicit zoom must not budget-cap leaf bodies"
+        );
+    }
+
+    #[test]
     fn zoom_response_has_calls_out_and_called_by() {
         let ctx = make_ctx();
         let path = fixture_path("calls.ts");
@@ -1382,6 +1261,58 @@ function helper(value: number): number {
             by_names.contains(&"orchestrate"),
             "orchestrate calls compute: {:?}",
             by_names
+        );
+    }
+
+    #[test]
+    fn zoom_callgraph_dedupes_repeated_call_sites_by_name() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+
+        let req = make_zoom_request_cg("z-dedupe-out", path.to_str().unwrap(), "repeatedOutgoing");
+        let resp = handle_zoom(&req, &ctx);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true, "zoom should succeed: {json:?}");
+
+        let calls_out = json["annotations"]["calls_out"]
+            .as_array()
+            .expect("calls_out array");
+        let helper_refs = calls_out
+            .iter()
+            .filter(|call| call["name"] == "helper")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helper_refs.len(),
+            1,
+            "helper should be folded once: {calls_out:?}"
+        );
+        assert_eq!(helper_refs[0]["extra_count"], 1);
+        assert!(
+            calls_out.iter().any(|call| call["name"] == "format"),
+            "distinct callee must not be folded into helper: {calls_out:?}"
+        );
+
+        let req = make_zoom_request_cg("z-dedupe-by", path.to_str().unwrap(), "compute");
+        let resp = handle_zoom(&req, &ctx);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true, "zoom should succeed: {json:?}");
+
+        let called_by = json["annotations"]["called_by"]
+            .as_array()
+            .expect("called_by array");
+        let repeat_refs = called_by
+            .iter()
+            .filter(|call| call["name"] == "repeatCompute")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repeat_refs.len(),
+            1,
+            "repeatCompute should be folded once: {called_by:?}"
+        );
+        assert_eq!(repeat_refs[0]["extra_count"], 1);
+        assert!(
+            called_by.iter().any(|call| call["name"] == "orchestrate"),
+            "distinct caller must not be folded into repeatCompute: {called_by:?}"
         );
     }
 

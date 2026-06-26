@@ -7,6 +7,10 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::commands::callgraph_store_adapter::callers_result;
+use crate::commands::symbol_render::{
+    build_container_outline, might_have_container_members, render_symbol_within_budget,
+    BudgetedSymbolRenderStatus,
+};
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
@@ -17,7 +21,7 @@ use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
 };
 use crate::semantic_index::{is_onnx_runtime_unavailable, EmbeddingModel, SemanticResult};
-use crate::symbols::SymbolKind;
+use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
 const MAX_TOP_K: usize = 100;
@@ -873,7 +877,8 @@ fn handle_semantic_or_hybrid_search(
     // Read display snippets from source on the fly (top 3 only, rank-budgeted)
     // so both the text rendering and the JSON `results` carry fresh, correctly
     // sized previews. Drives the conditional zoom hint.
-    let snippets_incomplete = enrich_snippets_from_source(&mut results, project_root);
+    let snippets_incomplete =
+        enrich_snippets_from_source_with_context(&mut results, project_root, Some(ctx));
 
     search_response(
         req,
@@ -2057,7 +2062,16 @@ fn snippet_line_budget(global_rank: usize) -> usize {
 /// summaries keep the generated summary (not source lines). Returns true when
 /// any snippet was truncated or omitted, so the caller emits the zoom hint only
 /// when it is actionable.
+#[cfg(test)]
 fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path) -> bool {
+    enrich_snippets_from_source_with_context(results, project_root, None)
+}
+
+fn enrich_snippets_from_source_with_context(
+    results: &mut [HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+) -> bool {
     // Cache reads so two top-3 hits in the same file read it once.
     let mut file_lines: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
     let mut incomplete = false;
@@ -2098,22 +2112,20 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
         }
 
         if should_expand_rank0_snippet(rank, result, project_root) {
-            // Render the symbol the way aft_zoom does: its exact body bounds plus
-            // its leading doc comment / attributes / decorators, and nothing after
-            // its end (no trailing neighbor bleed). This spares the agent a
-            // follow-up zoom/read of a file it already saw here, so the cap is
-            // generous; only a runaway giant falls through to the preview budget.
-            let doc_start = doc_comment_start(lines, start);
-            if end.saturating_sub(doc_start) <= RANK0_FULL_SNIPPET_MAX_LINES {
-                // Complete symbol shown — tell the agent it can edit without a
-                // re-read. Only on this full-expansion path, never the capped
-                // preview below. Appended to the snippet (display-only) like the
-                // "+N more lines" trailer, so it renders under the body.
-                result.snippet = format!(
-                    "{}\n{RANK0_FULL_SYMBOL_NOTICE}",
-                    lines[doc_start..end].join("\n")
-                );
-                continue;
+            let rendered = render_rank0_symbol_snippet(result, lines, ctx);
+            match rendered.status {
+                BudgetedSymbolRenderStatus::Complete => {
+                    // Append the full-body notice only for Complete so callers know
+                    // they received the entire symbol source. Skip it for Truncated
+                    // or Menu results.
+                    result.snippet = append_rank0_full_symbol_notice(rendered.content);
+                    continue;
+                }
+                BudgetedSymbolRenderStatus::Truncated | BudgetedSymbolRenderStatus::Menu => {
+                    result.snippet = rendered.content;
+                    incomplete = true;
+                    continue;
+                }
             }
         }
 
@@ -2134,69 +2146,73 @@ fn enrich_snippets_from_source(results: &mut [HybridResult], project_root: &Path
     incomplete
 }
 
-/// Walk `start` (0-based index of the symbol's first body line) backwards over a
-/// contiguous block of leading doc-comment / attribute / decorator lines, so the
-/// rank-0 preview includes the symbol's doc the way aft_zoom does. Stops at the
-/// first blank line or non-comment/non-decorator line — i.e. the previous
-/// symbol's code — so it never bleeds a neighbor into the preview. Heuristic by
-/// line prefix to stay language-agnostic: `//` `///` `//!` (Rust/TS/JS/Go/…),
-/// `/*` `*` `*/` (block / JSDoc), Rust `#[attr]`/`#![...]`, `# ` comments
-/// (Python/Ruby/Bash), `--` (Lua/SQL), and `@` (TS/Java/Python decorators).
-fn doc_comment_start(lines: &[String], start: usize) -> usize {
-    let mut s = start;
-    while s > 0 {
-        let prev = lines[s - 1].trim_start();
-        let is_doc_or_attr = prev.starts_with("//")
-            || prev.starts_with("/*")
-            || prev.starts_with('*')
-            || is_hash_doc_or_attr(prev)
-            || prev.starts_with("--")
-            || prev.starts_with('@');
-        if !is_doc_or_attr {
-            break;
+fn render_rank0_symbol_snippet(
+    result: &HybridResult,
+    lines: &[String],
+    ctx: Option<&AppContext>,
+) -> crate::commands::symbol_render::BudgetedSymbolRender {
+    let target = symbol_for_rank0_render(result, ctx).unwrap_or_else(|| symbol_from_result(result));
+    let outline = ctx.and_then(|ctx| {
+        if might_have_container_members(&target) {
+            build_container_outline(ctx, &result.file, &target).ok()
+        } else {
+            None
         }
-        s -= 1;
-    }
-    s
-}
+    });
 
-fn is_hash_doc_or_attr(line: &str) -> bool {
-    if line.starts_with("#[") || line.starts_with("#![") {
-        return true;
-    }
-
-    let Some(rest) = line.strip_prefix('#') else {
-        return false;
-    };
-    let Some(first) = rest.chars().next() else {
-        return true;
-    };
-    first.is_whitespace() && !starts_with_c_preprocessor_directive(rest.trim_start())
-}
-
-fn starts_with_c_preprocessor_directive(rest: &str) -> bool {
-    let directive = rest
-        .split(|ch: char| !ch.is_ascii_alphabetic())
-        .next()
-        .unwrap_or_default();
-    matches!(
-        directive,
-        "define"
-            | "elif"
-            | "else"
-            | "endif"
-            | "error"
-            | "if"
-            | "ifdef"
-            | "ifndef"
-            | "include"
-            | "line"
-            | "pragma"
-            | "region"
-            | "undef"
-            | "using"
-            | "warning"
+    render_symbol_within_budget(
+        &target,
+        lines,
+        crate::parser::detect_language(&result.file),
+        outline.as_ref(),
+        RANK0_FULL_SNIPPET_MAX_LINES,
     )
+}
+
+fn symbol_for_rank0_render(ctx_result: &HybridResult, ctx: Option<&AppContext>) -> Option<Symbol> {
+    let symbols = ctx?.provider().list_symbols(&ctx_result.file).ok()?;
+    symbols
+        .iter()
+        .find(|symbol| symbol_matches_result(symbol, ctx_result, true))
+        .cloned()
+        .or_else(|| {
+            symbols
+                .into_iter()
+                .find(|symbol| symbol_matches_result(symbol, ctx_result, false))
+        })
+}
+
+fn symbol_matches_result(symbol: &Symbol, result: &HybridResult, exact_range: bool) -> bool {
+    symbol.name == result.name
+        && symbol.kind == result.kind
+        && (!exact_range
+            || (symbol.range.start_line == result.start_line
+                && symbol.range.end_line == result.end_line))
+}
+
+fn symbol_from_result(result: &HybridResult) -> Symbol {
+    Symbol {
+        name: result.name.clone(),
+        kind: result.kind.clone(),
+        range: Range {
+            start_line: result.start_line,
+            start_col: 0,
+            end_line: result.end_line,
+            end_col: 0,
+        },
+        signature: None,
+        scope_chain: Vec::new(),
+        exported: result.exported,
+        parent: None,
+    }
+}
+
+fn append_rank0_full_symbol_notice(content: String) -> String {
+    if content.is_empty() {
+        RANK0_FULL_SYMBOL_NOTICE.to_string()
+    } else {
+        format!("{content}\n{RANK0_FULL_SYMBOL_NOTICE}")
+    }
 }
 
 fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root: &Path) -> bool {
@@ -3681,6 +3697,7 @@ mod tests {
             "full rank-0 symbol should not need a zoom hint"
         );
         assert!(results[0].snippet.contains("line29"));
+        assert!(results[0].snippet.contains(RANK0_FULL_SYMBOL_NOTICE));
         assert!(!results[0].snippet.contains("+10 more lines"));
     }
 
@@ -3719,9 +3736,69 @@ mod tests {
     }
 
     #[test]
-    fn oversized_rank0_full_expansion_falls_back_to_preview() {
-        // Larger than RANK0_FULL_SNIPPET_MAX_LINES (250) so full expansion is
-        // declined and the line-budget preview kicks in.
+    fn rank0_large_container_renders_member_menu_without_full_notice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("large.ts");
+        let mut content = String::from(
+            "class BigContainer {\n  methodOne(): number {\n    const visibleMethodBodyLine = 1;\n",
+        );
+        for i in 0..155 {
+            content.push_str(&format!("    const filler{i} = {i};\n"));
+        }
+        content.push_str(
+            "    return visibleMethodBodyLine;\n  }\n\n  methodTwo(): void {\n    console.log(\"second\");\n  }\n}\n",
+        );
+        std::fs::write(&path, content).expect("write large class");
+        let ctx = test_context(dir.path());
+        let symbols = ctx.provider().list_symbols(&path).expect("list symbols");
+        let target = symbols
+            .iter()
+            .find(|symbol| symbol.name == "BigContainer")
+            .expect("BigContainer symbol");
+        let mut results = vec![HybridResult {
+            file: path,
+            name: "BigContainer".to_string(),
+            kind: SymbolKind::Class,
+            start_line: target.range.start_line,
+            end_line: target.range.end_line,
+            exported: false,
+            snippet: String::new(),
+            score: 0.99,
+            source: "semantic",
+            semantic_score: Some(0.99),
+            lexical_score: None,
+            hybrid_boosted: false,
+            cap_protected: false,
+            lexical_generated_artifact: false,
+        }];
+
+        let incomplete =
+            enrich_snippets_from_source_with_context(&mut results, dir.path(), Some(&ctx));
+        let snippet = &results[0].snippet;
+
+        assert!(incomplete, "member menu is not a complete body");
+        assert!(
+            snippet.contains("member-signature menu; zoom a member for its body"),
+            "large container should render a member menu: {snippet}"
+        );
+        assert!(
+            snippet.contains("BigContainer.methodOne(): number"),
+            "menu should include qualified method signatures: {snippet}"
+        );
+        assert!(
+            !snippet.contains("visibleMethodBodyLine"),
+            "menu must not include the class body: {snippet}"
+        );
+        assert!(
+            !snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
+            "member menu must not claim the full symbol was shown: {snippet}"
+        );
+    }
+
+    #[test]
+    fn oversized_rank0_full_expansion_renders_budgeted_head_slice() {
+        // Use a 300-line symbol so the top result is truncated to a head slice,
+        // setting incomplete=true instead of using the small default preview.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut results = vec![write_symbol_hit(dir.path(), "huge.rs", "huge", 300)];
         results[0].semantic_score = Some(0.99);
@@ -3730,9 +3807,11 @@ mod tests {
         let incomplete = enrich_snippets_from_source(&mut results, dir.path());
 
         assert!(incomplete);
-        assert!(results[0].snippet.contains("line19"));
+        assert!(results[0].snippet.contains("line249"));
         assert!(!results[0].snippet.contains("line299"));
-        assert!(results[0].snippet.contains("+280 more lines"));
+        assert!(results[0]
+            .snippet
+            .contains("… +50 more lines — zoom huge for the full body"));
         assert!(
             !results[0].snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
             "capped fallback is incomplete — must NOT claim no-re-read"

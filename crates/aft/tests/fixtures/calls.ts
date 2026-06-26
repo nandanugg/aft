@@ -39,3 +39,15 @@ function display(value: number): void {
   const text = format(value);
   console.log(text);
 }
+
+function repeatedOutgoing(value: number): string {
+  const first = helper(value);
+  const second = helper(first);
+  return format(second);
+}
+
+function repeatCompute(): number {
+  const first = compute(1, 2);
+  const second = compute(3, 4);
+  return first + second;
+}

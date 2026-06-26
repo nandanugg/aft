@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { isRustZoomBatchEnvelope, unwrapRustZoomBatchEnvelope } from "../zoom-format.js";
+import {
+  formatZoomText,
+  isRustZoomBatchEnvelope,
+  unwrapRustZoomBatchEnvelope,
+} from "../zoom-format.js";
 
 describe("Rust zoom batch envelope", () => {
   test("isRustZoomBatchEnvelope accepts valid batch shape", () => {
@@ -29,5 +33,25 @@ describe("Rust zoom batch envelope", () => {
         content: "body",
       }),
     ).toBe(false);
+  });
+});
+
+describe("formatZoomText call annotations", () => {
+  test("renders folded call-site counts compactly", () => {
+    const text = formatZoomText("src/calls.ts", {
+      name: "caller",
+      kind: "function",
+      range: { start_line: 10, end_line: 12 },
+      content: `function caller() {
+  helper();
+}`,
+      annotations: {
+        calls_out: [{ name: "helper", line: 11, extra_count: 1 }],
+        called_by: [{ name: "orchestrate", line: 20 }],
+      },
+    });
+
+    expect(text).toContain("helper (line 11) +1");
+    expect(text).toContain("orchestrate (line 20)");
   });
 });

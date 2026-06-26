@@ -43,6 +43,7 @@ interface RangeShape {
 interface CallRefShape {
   name: string;
   line: number;
+  extra_count?: number;
 }
 
 interface AnnotationsShape {
@@ -62,6 +63,12 @@ export interface ZoomResponseLike {
   context_before?: string[];
   context_after?: string[];
   annotations?: AnnotationsShape;
+}
+
+function formatExtraCallSites(ref: CallRefShape): string {
+  return Number.isInteger(ref.extra_count) && (ref.extra_count ?? 0) > 0
+    ? ` +${ref.extra_count}`
+    : "";
 }
 
 /**
@@ -123,13 +130,13 @@ export function formatZoomText(targetLabel: string, response: ZoomResponseLike):
   if (callsOut.length > 0) {
     out.push("", "──── calls_out");
     for (const ref of callsOut) {
-      out.push(`  ${ref.name} (line ${ref.line})`);
+      out.push(`  ${ref.name} (line ${ref.line})${formatExtraCallSites(ref)}`);
     }
   }
   if (calledBy.length > 0) {
     out.push("", "──── called_by");
     for (const ref of calledBy) {
-      out.push(`  ${ref.name} (line ${ref.line})`);
+      out.push(`  ${ref.name} (line ${ref.line})${formatExtraCallSites(ref)}`);
     }
   }
 

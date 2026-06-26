@@ -134,6 +134,13 @@ interface ZoomBatchResult {
   text: string;
 }
 
+function zoomExtraCallSites(call: Record<string, unknown>): string {
+  const extraCount = call.extra_count;
+  return typeof extraCount === "number" && Number.isInteger(extraCount) && extraCount > 0
+    ? ` +${extraCount}`
+    : "";
+}
+
 /** Exported for renderer unit tests. */
 export function buildOutlineSections(text: string, theme: Theme): string[] {
   const trimmed = text.trim();
@@ -224,7 +231,7 @@ export function buildZoomSections(
           callsOut
             .map(
               (call) =>
-                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}`,
+                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
             )
             .join("\n"),
         );
@@ -235,7 +242,7 @@ export function buildZoomSections(
           calledBy
             .map(
               (call) =>
-                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}`,
+                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
             )
             .join("\n"),
         );
