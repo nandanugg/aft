@@ -70,6 +70,12 @@ function navigateParamsSchema() {
         description: "Include test files in callers/paths. Defaults to false; tests are hidden.",
       }),
     ),
+    includeUnresolved: Type.Optional(
+      Type.Boolean({
+        description:
+          "Show every unresolved external/stdlib call individually. Defaults to false; unresolved leaf calls are collapsed into one summary per parent.",
+      }),
+    ),
   });
 }
 
@@ -84,7 +90,9 @@ export function buildNavigateSections(
   const themeAdapter = {
     fg: (role: string, s: string) => theme.fg(role as Parameters<Theme["fg"]>[0], s),
   };
-  return formatCallgraphSections(args.op, payload, themeAdapter);
+  return formatCallgraphSections(args.op, payload, themeAdapter, {
+    includeUnresolved: coerceBoolean(args.includeUnresolved),
+  });
 }
 
 /** Exported for renderer unit tests. */
@@ -119,7 +127,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
     name: "aft_callgraph",
     label: "callgraph",
     description:
-      "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source; use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params. Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly.",
+      "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source; use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships. All ops require both `filePath` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toFile`), `trace_data` to follow a value across assignments/params. Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.",
     parameters: navigateParamsSchema(),
     async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
       if (isEmptyParam(params.filePath)) {
@@ -163,7 +171,9 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       try {
         const response = await callBridge(bridge, params.op, req, extCtx);
         return textResult(
-          formatCallgraphSections(params.op, response, PLAIN_CALLGRAPH_THEME).join("\n"),
+          formatCallgraphSections(params.op, response, PLAIN_CALLGRAPH_THEME, {
+            includeUnresolved: coerceBoolean(params.includeUnresolved),
+          }).join("\n"),
           response,
         );
       } catch (error) {

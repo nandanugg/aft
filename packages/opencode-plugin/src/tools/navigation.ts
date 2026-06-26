@@ -40,7 +40,7 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
         "- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n" +
         "- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\n" +
         "All ops require both 'filePath' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\n" +
-        "Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly.\n",
+        "Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.\n",
       // Parameters are Zod-optional because different ops need different subsets.
       // Runtime guards below validate per-op requirements and give clear errors.
       args: {
@@ -76,6 +76,12 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           .boolean()
           .optional()
           .describe("Include test files in callers/paths. Defaults to false; tests are hidden."),
+        includeUnresolved: z
+          .boolean()
+          .optional()
+          .describe(
+            "Show every unresolved external/stdlib call individually. Defaults to false; unresolved leaf calls are collapsed into one summary per parent.",
+          ),
       },
       execute: async (args, context): Promise<string> => {
         if (isEmptyParam(args.filePath)) {
@@ -129,7 +135,9 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
           }
           throw new Error(message);
         }
-        return formatCallgraphSections(args.op as string, response).join("\n");
+        return formatCallgraphSections(args.op as string, response, undefined, {
+          includeUnresolved: coerceBoolean(args.includeUnresolved),
+        }).join("\n");
       },
     },
   };

@@ -21,22 +21,94 @@ describe("formatCallgraphSections", () => {
     expect(text).toContain("2 truncated");
   });
 
-  test("call_tree marks unresolved callees and leaves resolved ones unmarked", () => {
+  test("call_tree collapses unresolved leaf children by default", () => {
     const text = formatCallgraphSections("call_tree", {
       name: "entry",
       file: "/repo/src/a.ts",
       line: 1,
       resolved: true,
       children: [
-        { name: "realCallee", file: "/repo/src/b.ts", line: 10, resolved: true, children: [] },
-        { name: "missing", file: "/repo/src/a.ts", line: 3, resolved: false, children: [] },
+        { name: "len", file: "/repo/src/a.ts", line: 2, resolved: false, children: [] },
+        { name: "Some", file: "/repo/src/a.ts", line: 3, resolved: false, children: [] },
+        { name: "len", file: "/repo/src/a.ts", line: 4, resolved: false, children: [] },
+        { name: "assert", file: "/repo/src/a.ts", line: 5, resolved: false, children: [] },
+        {
+          name: "realCallee",
+          file: "/repo/src/b.ts",
+          line: 10,
+          resolved: true,
+          children: [],
+        },
+        {
+          name: "wrapping_add",
+          file: "/repo/src/a.ts",
+          line: 6,
+          resolved: false,
+          children: [],
+        },
+        { name: "as_ref", file: "/repo/src/a.ts", line: 7, resolved: false, children: [] },
+        { name: "as_ptr", file: "/repo/src/a.ts", line: 8, resolved: false, children: [] },
+        { name: "load", file: "/repo/src/a.ts", line: 9, resolved: false, children: [] },
+        { name: "lock", file: "/repo/src/a.ts", line: 11, resolved: false, children: [] },
+        { name: "Err", file: "/repo/src/a.ts", line: 12, resolved: false, children: [] },
+        { name: "cfg", file: "/repo/src/a.ts", line: 13, resolved: false, children: [] },
+        { name: "panic", file: "/repo/src/a.ts", line: 14, resolved: false, children: [] },
       ],
     }).join("\n");
-    // Unresolved callee: file/line is the callsite, not a definition — must be flagged.
+
+    expect(text).toContain(
+      "↳ + 12 unresolved external calls: len, Some, assert, wrapping_add, as_ref, as_ptr, load, lock, Err, cfg, … (+1 more)",
+    );
+    expect(text.match(/unresolved external calls/g) ?? []).toHaveLength(1);
+    expect(text).toContain("realCallee [/repo/src/b.ts:10]");
+    expect(text).not.toContain("len [/repo/src/a.ts:2] [unresolved]");
+    expect(text).not.toContain("panic [/repo/src/a.ts:14] [unresolved]");
+  });
+
+  test("call_tree includeUnresolved renders every unresolved callee individually", () => {
+    const text = formatCallgraphSections(
+      "call_tree",
+      {
+        name: "entry",
+        file: "/repo/src/a.ts",
+        line: 1,
+        resolved: true,
+        children: [
+          { name: "realCallee", file: "/repo/src/b.ts", line: 10, resolved: true, children: [] },
+          { name: "missing", file: "/repo/src/a.ts", line: 3, resolved: false, children: [] },
+          { name: "len", file: "/repo/src/a.ts", line: 4, resolved: false, children: [] },
+        ],
+      },
+      undefined,
+      { includeUnresolved: true },
+    ).join("\n");
+
     expect(text).toContain("missing [/repo/src/a.ts:3] [unresolved]");
+    expect(text).toContain("len [/repo/src/a.ts:4] [unresolved]");
+    expect(text).not.toContain("unresolved external calls");
     // Resolved callee carries no marker.
     expect(text).toContain("realCallee [/repo/src/b.ts:10]");
     expect(text).not.toContain("realCallee [/repo/src/b.ts:10] [unresolved]");
+  });
+
+  test("call_tree resolved-only output is unchanged by unresolved collapse option", () => {
+    const payload = {
+      name: "entry",
+      file: "/repo/src/a.ts",
+      line: 1,
+      resolved: true,
+      children: [
+        { name: "realCallee", file: "/repo/src/b.ts", line: 10, resolved: true, children: [] },
+      ],
+    };
+    const collapsed = formatCallgraphSections("call_tree", payload).join("\n");
+    const expanded = formatCallgraphSections("call_tree", payload, undefined, {
+      includeUnresolved: true,
+    }).join("\n");
+
+    expect(collapsed).toBe(expanded);
+    expect(collapsed).toContain("realCallee [/repo/src/b.ts:10]");
+    expect(collapsed).not.toContain("unresolved external calls");
   });
 
   test("callers collapses repeated symbols and keeps true total in summary", () => {
@@ -217,7 +289,7 @@ describe("formatCallgraphSections", () => {
     expect(roles).toContain("warning:~");
   });
 
-  test("call_tree keeps [unresolved] independent of name_match marker", () => {
+  test("call_tree preserves name_match markers on resolved edges when siblings collapse", () => {
     const text = formatCallgraphSections("call_tree", {
       name: "entry",
       file: "/repo/a.ts",
@@ -242,7 +314,7 @@ describe("formatCallgraphSections", () => {
       ],
     }).join("\n");
     expect(text).toContain("nameOnly [/repo/b.ts:9] ~");
-    expect(text).toContain("missing [/repo/a.ts:3] [unresolved]");
+    expect(text).toContain("+ 1 unresolved external call: missing");
     expect(text).not.toContain("[unresolved] ~");
   });
 

@@ -93,6 +93,44 @@ describe("aft_callgraph OpenCode adapter", () => {
     });
   });
 
+  test("includeUnresolved is exposed and controls call_tree formatting only", async () => {
+    const payload = {
+      success: true,
+      name: "run",
+      file: "/repo/src/app.ts",
+      line: 1,
+      children: [
+        { name: "len", file: "/repo/src/app.ts", line: 2, resolved: false, children: [] },
+        { name: "Some", file: "/repo/src/app.ts", line: 3, resolved: false, children: [] },
+        { name: "project", file: "/repo/src/project.ts", line: 4, resolved: true, children: [] },
+      ],
+    };
+    const { bridge, calls } = makeMockBridge(() => payload);
+    const tools = navigationTools(makePluginContext(bridge));
+
+    expect(Object.hasOwn(tools.aft_callgraph.args, "includeUnresolved")).toBe(true);
+    expect(tools.aft_callgraph.description).toContain("includeUnresolved=true");
+
+    const collapsed = (await tools.aft_callgraph.execute(
+      { op: "call_tree", filePath: "src/app.ts", symbol: "run" },
+      makeToolContext(),
+    )) as string;
+    const expanded = (await tools.aft_callgraph.execute(
+      { op: "call_tree", filePath: "src/app.ts", symbol: "run", includeUnresolved: true },
+      makeToolContext(),
+    )) as string;
+
+    expect(collapsed).toContain("+ 2 unresolved external calls: len, Some");
+    expect(collapsed).toContain("project [/repo/src/project.ts:4]");
+    expect(collapsed).not.toContain("len [/repo/src/app.ts:2] [unresolved]");
+    expect(expanded).toContain("len [/repo/src/app.ts:2] [unresolved]");
+    expect(expanded).toContain("Some [/repo/src/app.ts:3] [unresolved]");
+    expect(expanded).not.toContain("unresolved external calls");
+    expect(calls).toHaveLength(2);
+    expect(calls[0].params).not.toHaveProperty("includeUnresolved");
+    expect(calls[1].params).not.toHaveProperty("includeUnresolved");
+  });
+
   test("trace_to_symbol ambiguous_target errors include candidates (Rust top-level shape)", async () => {
     // Rust's error_with_data() merges extras into the top-level response,
     // so production traffic has `candidates` next to `code`/`message`, NOT

@@ -8,6 +8,12 @@ export interface CallgraphTheme {
   fg(role: string, text: string): string;
 }
 
+export interface CallgraphFormatOptions {
+  includeUnresolved?: boolean;
+}
+
+const UNRESOLVED_SUMMARY_NAME_LIMIT = 10;
+
 export const PLAIN_CALLGRAPH_THEME: CallgraphTheme = {
   fg: (_role, text) => text,
 };
@@ -54,11 +60,33 @@ function nameMatchEdgeMarker(record: Record<string, unknown>, theme: CallgraphTh
   return asString(record.resolved_by) === "name_match" ? ` ${theme.fg("warning", "~")}` : "";
 }
 
+function isUnresolvedLeaf(node: Record<string, unknown>): boolean {
+  return node.resolved === false && asRecords(node.children).length === 0;
+}
+
+function unresolvedSummaryText(nodes: Record<string, unknown>[]): string {
+  const distinctNames: string[] = [];
+  const seen = new Set<string>();
+  for (const node of nodes) {
+    const name = asString(node.name) ?? "(unknown)";
+    if (seen.has(name)) continue;
+    seen.add(name);
+    distinctNames.push(name);
+  }
+
+  const displayed = distinctNames.slice(0, UNRESOLVED_SUMMARY_NAME_LIMIT);
+  const hidden = distinctNames.length - displayed.length;
+  const names = hidden > 0 ? `${displayed.join(", ")}, … (+${hidden} more)` : displayed.join(", ");
+  const noun = nodes.length === 1 ? "call" : "calls";
+  return `+ ${nodes.length} unresolved external ${noun}: ${names}`;
+}
+
 function renderCallTreeNode(
   node: Record<string, unknown>,
   depth: number,
   lines: string[],
   theme: CallgraphTheme,
+  options: CallgraphFormatOptions,
 ): void {
   const name = asString(node.name) ?? "(unknown)";
   const file = shortenPath(asString(node.file) ?? "(unknown file)");
@@ -71,8 +99,36 @@ function renderCallTreeNode(
   const nameMatch = nameMatchEdgeMarker(node, theme);
   const location = line !== undefined ? `[${file}:${line}]` : `[${file}]`;
   lines.push(treeLine(depth, `${name} ${location}${unresolved}${nameMatch}`));
-  asRecords(node.children).forEach((child) => {
-    renderCallTreeNode(child, depth + 1, lines, theme);
+
+  const children = asRecords(node.children);
+  if (options.includeUnresolved) {
+    children.forEach((child) => {
+      renderCallTreeNode(child, depth + 1, lines, theme, options);
+    });
+    return;
+  }
+
+  const unresolvedLeaves = children.filter(isUnresolvedLeaf);
+  if (unresolvedLeaves.length === 0) {
+    children.forEach((child) => {
+      renderCallTreeNode(child, depth + 1, lines, theme, options);
+    });
+    return;
+  }
+
+  const unresolvedLeafSet = new Set(unresolvedLeaves);
+  let summaryInserted = false;
+  children.forEach((child) => {
+    if (unresolvedLeafSet.has(child)) {
+      if (!summaryInserted) {
+        lines.push(
+          treeLine(depth + 1, theme.fg("warning", unresolvedSummaryText(unresolvedLeaves))),
+        );
+        summaryInserted = true;
+      }
+      return;
+    }
+    renderCallTreeNode(child, depth + 1, lines, theme, options);
   });
 }
 
@@ -153,13 +209,14 @@ export function formatCallgraphSections(
   op: string,
   response: unknown,
   theme: CallgraphTheme = PLAIN_CALLGRAPH_THEME,
+  options: CallgraphFormatOptions = {},
 ): string[] {
   const record = asRecord(response);
   if (!record) return [theme.fg("muted", "No navigation result.")];
 
   if (op === "call_tree") {
     const lines: string[] = [];
-    renderCallTreeNode(record, 0, lines, theme);
+    renderCallTreeNode(record, 0, lines, theme, options);
     const warning = depthWarning(record, theme);
     if (warning) lines.push(warning);
     return lines.length > 0 ? lines : [theme.fg("muted", "No call tree available.")];

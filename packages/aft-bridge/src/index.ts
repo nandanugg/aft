@@ -41,7 +41,7 @@ export {
   tagStderrLine,
 } from "./bridge.js";
 // --- aft_callgraph flat formatter (shared by both plugin hosts) ---
-export type { CallgraphTheme } from "./callgraph-format.js";
+export type { CallgraphFormatOptions, CallgraphTheme } from "./callgraph-format.js";
 export { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "./callgraph-format.js";
 export {
   coerceBoolean,

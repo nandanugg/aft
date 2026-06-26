@@ -127,6 +127,45 @@ describe("navigate renderer", () => {
     expect(traceData).toContain("depth limited");
   });
 
+  test("renderNavigateResult honors includeUnresolved", () => {
+    const payload = {
+      name: "run",
+      file: "/repo/src/a.ts",
+      line: 1,
+      children: [
+        { name: "len", file: "/repo/src/a.ts", line: 2, resolved: false, children: [] },
+        { name: "Some", file: "/repo/src/a.ts", line: 3, resolved: false, children: [] },
+      ],
+    };
+
+    const collapsed = renderToString(
+      renderNavigateResult(
+        makeResult("", payload),
+        { op: "call_tree", filePath: "src/a.ts", symbol: "run" },
+        mockTheme,
+        makeContext({ op: "call_tree", filePath: "src/a.ts", symbol: "run" }),
+      ),
+    );
+    const expanded = renderToString(
+      renderNavigateResult(
+        makeResult("", payload),
+        { op: "call_tree", filePath: "src/a.ts", symbol: "run", includeUnresolved: true },
+        mockTheme,
+        makeContext({
+          op: "call_tree",
+          filePath: "src/a.ts",
+          symbol: "run",
+          includeUnresolved: true,
+        }),
+      ),
+    );
+
+    expect(collapsed).toContain("+ 2 unresolved external calls: len, Some");
+    expect(collapsed).not.toContain("len [/repo/src/a.ts:2] [unresolved]");
+    expect(expanded).toContain("len [/repo/src/a.ts:2] [unresolved]");
+    expect(expanded).not.toContain("unresolved external calls");
+  });
+
   test("renderNavigateResult handles error and empty payloads", () => {
     const error = renderToString(
       renderNavigateResult(

@@ -46,6 +46,53 @@ describe("aft_callgraph adapter", () => {
     });
   });
 
+  test("includeUnresolved is exposed and controls call_tree formatting only", async () => {
+    const { api, tools } = makeMockApi();
+    const payload = {
+      success: true,
+      name: "run",
+      file: "src/app.ts",
+      line: 1,
+      children: [
+        { name: "len", file: "src/app.ts", line: 2, resolved: false, children: [] },
+        { name: "Some", file: "src/app.ts", line: 3, resolved: false, children: [] },
+        { name: "project", file: "src/project.ts", line: 4, resolved: true, children: [] },
+      ],
+    };
+    const { bridge, calls } = makeMockBridge(() => payload);
+    registerNavigateTool(api, makePluginContext(bridge));
+    const tool = tools.get("aft_callgraph")!;
+    const schema = tool.parameters as {
+      properties?: Record<string, { description?: string }>;
+    };
+
+    expect(schema.properties?.includeUnresolved).toBeDefined();
+    expect(schema.properties?.includeUnresolved?.description).toContain("Defaults to false");
+    expect(tool.description).toContain("includeUnresolved=true");
+
+    const collapsed = (await executeTool(tool, {
+      op: "call_tree",
+      filePath: "src/app.ts",
+      symbol: "run",
+    })) as { content: Array<{ type: string; text: string }> };
+    const expanded = (await executeTool(tool, {
+      op: "call_tree",
+      filePath: "src/app.ts",
+      symbol: "run",
+      includeUnresolved: true,
+    })) as { content: Array<{ type: string; text: string }> };
+
+    expect(collapsed.content[0]?.text).toContain("+ 2 unresolved external calls: len, Some");
+    expect(collapsed.content[0]?.text).toContain("project [src/project.ts:4]");
+    expect(collapsed.content[0]?.text).not.toContain("len [src/app.ts:2] [unresolved]");
+    expect(expanded.content[0]?.text).toContain("len [src/app.ts:2] [unresolved]");
+    expect(expanded.content[0]?.text).toContain("Some [src/app.ts:3] [unresolved]");
+    expect(expanded.content[0]?.text).not.toContain("unresolved external calls");
+    expect(calls).toHaveLength(2);
+    expect(calls[0].params).not.toHaveProperty("includeUnresolved");
+    expect(calls[1].params).not.toHaveProperty("includeUnresolved");
+  });
+
   test("trace_data requires expression before bridge dispatch", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge();
