@@ -1422,11 +1422,14 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
 
 fn rerank_semantic_candidates(results: &mut Vec<SemanticResult>, shape: &QueryShape, query: &str) {
     let (tokens, allow_case_fold) = semantic_rerank_tokens(query, shape);
+    let type_concept = query_shape::is_type_concept_identifier_query(query, shape);
+    let apply_definition_priors = shape.kind == QueryKind::NaturalLanguage || type_concept;
+    let kind_prior_strength = semantic_kind_prior_strength(shape, apply_definition_priors);
 
     for result in results.iter_mut() {
         result.rank_score = result.score;
         result.cap_protected = false;
-        result.rank_score *= semantic_kind_multiplier(&result.kind, shape);
+        result.rank_score *= semantic_kind_multiplier(&result.kind, kind_prior_strength);
 
         if !tokens.is_empty()
             && is_definition_kind(&result.kind)
@@ -1441,8 +1444,28 @@ fn rerank_semantic_candidates(results: &mut Vec<SemanticResult>, shape: &QuerySh
         }
     }
 
-    if shape.kind == QueryKind::NaturalLanguage {
+    if apply_definition_priors {
         apply_natural_language_diversity_cap(results);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SemanticKindPriorStrength {
+    NaturalLanguage,
+    Mixed,
+    Inert,
+}
+
+fn semantic_kind_prior_strength(
+    shape: &QueryShape,
+    apply_definition_priors: bool,
+) -> SemanticKindPriorStrength {
+    if apply_definition_priors {
+        SemanticKindPriorStrength::NaturalLanguage
+    } else if shape.kind == QueryKind::Mixed {
+        SemanticKindPriorStrength::Mixed
+    } else {
+        SemanticKindPriorStrength::Inert
     }
 }
 
@@ -1455,9 +1478,9 @@ fn semantic_rerank_tokens(query: &str, shape: &QueryShape) -> (Vec<String>, bool
     }
 }
 
-fn semantic_kind_multiplier(kind: &SymbolKind, shape: &QueryShape) -> f32 {
-    match shape.kind {
-        QueryKind::NaturalLanguage => match kind {
+fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStrength) -> f32 {
+    match strength {
+        SemanticKindPriorStrength::NaturalLanguage => match kind {
             SymbolKind::Function
             | SymbolKind::Class
             | SymbolKind::Method
@@ -1469,7 +1492,7 @@ fn semantic_kind_multiplier(kind: &SymbolKind, shape: &QueryShape) -> f32 {
             SymbolKind::FileSummary => 0.80,
             SymbolKind::Heading => 1.0,
         },
-        QueryKind::Mixed => match kind {
+        SemanticKindPriorStrength::Mixed => match kind {
             SymbolKind::Function
             | SymbolKind::Class
             | SymbolKind::Method
@@ -1480,7 +1503,7 @@ fn semantic_kind_multiplier(kind: &SymbolKind, shape: &QueryShape) -> f32 {
             SymbolKind::FileSummary => 0.90,
             SymbolKind::Variable | SymbolKind::Heading => 1.0,
         },
-        QueryKind::Identifier | QueryKind::Path | QueryKind::ErrorCode | QueryKind::Regex => 1.0,
+        SemanticKindPriorStrength::Inert => 1.0,
     }
 }
 
@@ -2802,6 +2825,197 @@ mod tests {
             .iter()
             .find(|result| result.name == name)
             .expect("candidate present")
+    }
+
+    #[test]
+    fn type_concept_identifier_detector_fires_only_for_titlecase_concepts() {
+        for query in [
+            "Engine implementations",
+            "Engine handlers",
+            "Allocation strategies",
+            "EngineFactory implementations",
+        ] {
+            let shape = query_shape::classify(query);
+            assert_eq!(shape.kind, QueryKind::Identifier, "{query}");
+            assert!(
+                query_shape::is_type_concept_identifier_query(query, &shape),
+                "{query} should get definition priors"
+            );
+        }
+
+        for query in [
+            "engineFactory",
+            "useState hook",
+            "parseConfig option",
+            "Engine",
+        ] {
+            let shape = query_shape::classify(query);
+            assert_eq!(shape.kind, QueryKind::Identifier, "{query}");
+            assert!(
+                !query_shape::is_type_concept_identifier_query(query, &shape),
+                "{query} should keep Identifier priors inert"
+            );
+        }
+
+        for query in ["get user", "parse config"] {
+            let shape = query_shape::classify(query);
+            assert_eq!(shape.kind, QueryKind::NaturalLanguage, "{query}");
+            assert!(!query_shape::is_type_concept_identifier_query(
+                query, &shape
+            ));
+        }
+    }
+
+    #[test]
+    fn type_concept_identifier_kind_prior_raises_definitions() {
+        let shape = rerank_shape(QueryKind::Identifier);
+        let candidates = vec![
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "engineCache",
+                None,
+                SymbolKind::Variable,
+                0.80,
+            ),
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "engineState",
+                None,
+                SymbolKind::Variable,
+                0.79,
+            ),
+            semantic_candidate(
+                "/project/src/renderer.ts",
+                "Renderer",
+                Some("Renderer"),
+                SymbolKind::Class,
+                0.75,
+            ),
+        ];
+
+        let mut type_concept_candidates = candidates.clone();
+        rerank_semantic_candidates(
+            &mut type_concept_candidates,
+            &shape,
+            "Engine implementations",
+        );
+        let type_concept_results = fuse_hybrid_results(
+            type_concept_candidates,
+            Vec::new(),
+            &shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+        assert_eq!(type_concept_results[0].name, "Renderer");
+
+        let mut plain_identifier_candidates = candidates;
+        rerank_semantic_candidates(&mut plain_identifier_candidates, &shape, "engineFactory");
+        assert!(plain_identifier_candidates
+            .iter()
+            .all(|result| (result.rank_score - result.score).abs() < f32::EPSILON));
+        let plain_identifier_results = fuse_hybrid_results(
+            plain_identifier_candidates,
+            Vec::new(),
+            &shape,
+            10,
+            true,
+            Path::new("/project"),
+        );
+        assert_eq!(plain_identifier_results[0].name, "engineCache");
+        assert_eq!(plain_identifier_results[1].name, "engineState");
+        assert_eq!(plain_identifier_results[2].name, "Renderer");
+    }
+
+    #[test]
+    fn type_concept_identifier_diversity_cap_limits_repeated_clusters_only() {
+        let shape = rerank_shape(QueryKind::Identifier);
+        let mut repeated_candidates = vec![
+            semantic_candidate(
+                "/project/src/a.ts",
+                "Engine",
+                Some("Engine"),
+                SymbolKind::Class,
+                0.90,
+            ),
+            semantic_candidate(
+                "/project/src/b.ts",
+                "Engine",
+                Some("Engine"),
+                SymbolKind::Class,
+                0.89,
+            ),
+            semantic_candidate(
+                "/project/src/c.ts",
+                "Engine",
+                Some("Engine"),
+                SymbolKind::Class,
+                0.88,
+            ),
+        ];
+        rerank_semantic_candidates(&mut repeated_candidates, &shape, "Engine implementations");
+        assert_eq!(repeated_candidates.len(), 2);
+        assert!(repeated_candidates
+            .iter()
+            .all(|result| result.name == "Engine"));
+
+        let mut distinct_candidates = vec![
+            semantic_candidate(
+                "/project/src/renderer.ts",
+                "Renderer",
+                Some("Renderer"),
+                SymbolKind::Class,
+                0.80,
+            ),
+            semantic_candidate(
+                "/project/src/parser.ts",
+                "Parser",
+                Some("Parser"),
+                SymbolKind::Class,
+                0.79,
+            ),
+            semantic_candidate(
+                "/project/src/planner.ts",
+                "Planner",
+                Some("Planner"),
+                SymbolKind::Class,
+                0.78,
+            ),
+        ];
+        rerank_semantic_candidates(&mut distinct_candidates, &shape, "Engine implementations");
+        assert_eq!(distinct_candidates.len(), 3);
+        assert!(distinct_candidates
+            .iter()
+            .all(|result| result.rank_score > result.score));
+    }
+
+    #[test]
+    fn type_concept_identifier_exact_name_boost_composes_with_kind_prior() {
+        let shape = rerank_shape(QueryKind::Identifier);
+        let mut candidates = vec![
+            semantic_candidate(
+                "/project/src/engine.ts",
+                "Engine",
+                Some("Engine"),
+                SymbolKind::Class,
+                0.70,
+            ),
+            semantic_candidate(
+                "/project/src/renderer.ts",
+                "Renderer",
+                Some("Renderer"),
+                SymbolKind::Class,
+                0.75,
+            ),
+        ];
+
+        rerank_semantic_candidates(&mut candidates, &shape, "Engine implementations");
+        let named = candidate_rank(&candidates, "Engine");
+        let sibling = candidate_rank(&candidates, "Renderer");
+
+        assert!(named.rank_score > sibling.rank_score);
+        assert!((named.rank_score - (0.70 * 1.08 * 1.20)).abs() < 0.0001);
+        assert!((sibling.rank_score - (0.75 * 1.08)).abs() < 0.0001);
     }
 
     #[test]

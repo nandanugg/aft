@@ -140,6 +140,35 @@ pub fn extract_short_nl_lexical_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn is_type_concept_identifier_query(query: &str, shape: &QueryShape) -> bool {
+    if shape.kind != QueryKind::Identifier {
+        return false;
+    }
+
+    let mut identifier_token_count = 0;
+    let mut has_type_token = false;
+    let mut has_lowercase_concept_word = false;
+
+    for mat in IDENTIFIER_TOKEN_RE.find_iter(query) {
+        let token = mat.as_str();
+        identifier_token_count += 1;
+        has_type_token |= is_type_concept_type_token(token);
+        has_lowercase_concept_word |= is_dictionary_style_lowercase_word(token);
+    }
+
+    identifier_token_count >= 2 && has_type_token && has_lowercase_concept_word
+}
+
+fn is_type_concept_type_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+        && (is_titlecase_word(token)
+            || PASCAL_CASE_RE.is_match(token)
+            || ACRONYM_PASCAL_RE.is_match(token))
+}
+
 /// Code-shaped tokens that are explicit enough to use for semantic name priors
 /// inside natural-language queries. Bare prose words are excluded: a lone
 /// capitalized word like "Engine" is too ambiguous unless quoted, while adjacent
