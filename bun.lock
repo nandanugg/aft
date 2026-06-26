@@ -19,7 +19,7 @@
     },
     "packages/aft-bridge": {
       "name": "@cortexkit/aft-bridge",
-      "version": "0.41.0",
+      "version": "0.42.0",
       "dependencies": {
         "undici": "^7.25.0",
       },
@@ -30,7 +30,7 @@
     },
     "packages/aft-cli": {
       "name": "@cortexkit/aft",
-      "version": "0.41.0",
+      "version": "0.42.0",
       "bin": {
         "aft": "dist/index.js",
       },
@@ -46,10 +46,10 @@
     },
     "packages/opencode-plugin": {
       "name": "@cortexkit/aft-opencode",
-      "version": "0.41.0",
+      "version": "0.42.0",
       "dependencies": {
         "@clack/prompts": "^1.6.0",
-        "@cortexkit/aft-bridge": "0.41.0",
+        "@cortexkit/aft-bridge": "0.42.0",
         "@opentui/core": "^0.4.2",
         "@opentui/solid": "^0.4.2",
         "@xterm/headless": "^5.5.0",
@@ -65,12 +65,12 @@
         "typescript": "^5.8.0",
       },
       "optionalDependencies": {
-        "@cortexkit/aft-darwin-arm64": "0.41.0",
-        "@cortexkit/aft-darwin-x64": "0.41.0",
-        "@cortexkit/aft-linux-arm64": "0.41.0",
-        "@cortexkit/aft-linux-x64": "0.41.0",
-        "@cortexkit/aft-win32-arm64": "0.41.0",
-        "@cortexkit/aft-win32-x64": "0.41.0",
+        "@cortexkit/aft-darwin-arm64": "0.42.0",
+        "@cortexkit/aft-darwin-x64": "0.42.0",
+        "@cortexkit/aft-linux-arm64": "0.42.0",
+        "@cortexkit/aft-linux-x64": "0.42.0",
+        "@cortexkit/aft-win32-arm64": "0.42.0",
+        "@cortexkit/aft-win32-x64": "0.42.0",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=1.17.0",
@@ -78,9 +78,9 @@
     },
     "packages/pi-plugin": {
       "name": "@cortexkit/aft-pi",
-      "version": "0.41.0",
+      "version": "0.42.0",
       "dependencies": {
-        "@cortexkit/aft-bridge": "0.41.0",
+        "@cortexkit/aft-bridge": "0.42.0",
         "@xterm/headless": "^5.5.0",
         "comment-json": "^5.0.0",
         "diff": "^8.0.4",
@@ -95,12 +95,12 @@
         "typescript": "^5.8.0",
       },
       "optionalDependencies": {
-        "@cortexkit/aft-darwin-arm64": "0.41.0",
-        "@cortexkit/aft-darwin-x64": "0.41.0",
-        "@cortexkit/aft-linux-arm64": "0.41.0",
-        "@cortexkit/aft-linux-x64": "0.41.0",
-        "@cortexkit/aft-win32-arm64": "0.41.0",
-        "@cortexkit/aft-win32-x64": "0.41.0",
+        "@cortexkit/aft-darwin-arm64": "0.42.0",
+        "@cortexkit/aft-darwin-x64": "0.42.0",
+        "@cortexkit/aft-linux-arm64": "0.42.0",
+        "@cortexkit/aft-linux-x64": "0.42.0",
+        "@cortexkit/aft-win32-arm64": "0.42.0",
+        "@cortexkit/aft-win32-x64": "0.42.0",
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
@@ -263,23 +263,11 @@
 
     "@cortexkit/aft-bridge": ["@cortexkit/aft-bridge@workspace:packages/aft-bridge"],
 
-    "@cortexkit/aft-darwin-arm64": ["@cortexkit/aft-darwin-arm64@0.41.0", "", { "os": "darwin", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-5thdz6fGvpMBeYaMtx6ac6s2y3z+l3ixHDKhBt7di4Svt58PQ3s/KBUM549WRSy8OcKnEkGOm/OTXbXJDgwVJg=="],
-
-    "@cortexkit/aft-darwin-x64": ["@cortexkit/aft-darwin-x64@0.41.0", "", { "os": "darwin", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-rfFBwaXxTenLSVTKLLwC3AamPglwuRv1NQR8hTp2hn3T7MyQd85lHnsUhZ93yEfBltBUzpQfwvkpccgsDVsjpw=="],
-
-    "@cortexkit/aft-linux-arm64": ["@cortexkit/aft-linux-arm64@0.41.0", "", { "os": "linux", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-YaAVXYLUWpwMp54cOXewCRrONo7r2LOxiFyrcZjSI1yTV0gJ3+tdoWxZYcBRF0ME1TPtuNREiDIxxMwrBjGSBg=="],
-
-    "@cortexkit/aft-linux-x64": ["@cortexkit/aft-linux-x64@0.41.0", "", { "os": "linux", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-abkpLY1eY9lNPMpcwGLL02q7K+xy5bO/Yjq6vpSkcDo58rKA7cWh0eccwjkTGJsHBPANAxpzMIJ3pnemeORiIg=="],
-
     "@cortexkit/aft-opencode": ["@cortexkit/aft-opencode@workspace:packages/opencode-plugin"],
 
     "@cortexkit/aft-pi": ["@cortexkit/aft-pi@workspace:packages/pi-plugin"],
 
     "@cortexkit/aft-pi-rpc-e2e": ["@cortexkit/aft-pi-rpc-e2e@workspace:tests/pi-rpc"],
-
-    "@cortexkit/aft-win32-arm64": ["@cortexkit/aft-win32-arm64@0.41.0", "", { "os": "win32", "cpu": "arm64", "bin": { "aft": "bin/aft.exe" } }, "sha512-gwU672jy0+x/dteFi78DQPCX8pmp0eF9UaPLn0U+z3k4W0SCRerShG2zM/tFb6oH9ANtC4ZNBEA2MUS88wQcbA=="],
-
-    "@cortexkit/aft-win32-x64": ["@cortexkit/aft-win32-x64@0.41.0", "", { "os": "win32", "cpu": "x64", "bin": { "aft": "bin/aft.exe" } }, "sha512-M3Y5xc0kipavstbRknmeCmj82JwOPzKRz6Bxpp35OUFwtHXdhYSgRs26C9UIBsthPAXObyEUjffAi2yLBM8vQg=="],
 
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.80.2", "", { "dependencies": { "@earendil-works/pi-ai": "^0.80.2", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-BF9WPhixIFjT6Kp3Iz3H6ugkU+4AWotM8py96XE5pIK0arJbQKMWbR+dXSWWDEmR5yc/aFQODnuyowOEzMGO7Q=="],
 
