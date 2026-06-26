@@ -709,6 +709,9 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                         entries_total,
                     };
             }
+            SemanticIndexEvent::ColdSeedGateCleared => {
+                ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
+            }
             SemanticIndexEvent::Ready(index) => {
                 *ctx.semantic_index()
                     .write()
@@ -718,6 +721,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     SemanticIndexStatus::ready();
                 keep_receiver = false;
+                ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
             }
             SemanticIndexEvent::Failed(error) => {
                 *ctx.semantic_index()
@@ -728,6 +732,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
+                ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
             }
         }
     }
@@ -849,6 +854,31 @@ mod tests {
         let err = WarmupArgs::parse(args(&["--root", "/tmp/x", "--only", "lsp"])).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("unknown area 'lsp'"));
+    }
+
+    #[test]
+    fn only_semantic_warmup_config_disables_callgraph_and_search() {
+        let areas = WarmupAreas::parse_only("semantic").expect("parse --only semantic");
+        assert_eq!(
+            areas,
+            WarmupAreas {
+                search: false,
+                semantic: true,
+                callgraph: false,
+            }
+        );
+
+        let root = std::path::Path::new("/tmp/aft-warmup-root");
+        let storage = std::path::Path::new("/tmp/aft-warmup-storage");
+        let params = build_warmup_configure_params(root, storage, areas, false);
+        let doc = params["config"][0]["doc"]
+            .as_str()
+            .expect("warmup config doc should be a JSON string");
+        let config_doc: serde_json::Value = serde_json::from_str(doc).expect("config doc parses");
+
+        assert_eq!(config_doc["semantic_search"], serde_json::json!(true));
+        assert_eq!(config_doc["search_index"], serde_json::json!(false));
+        assert_eq!(config_doc["callgraph_store"], serde_json::json!(false));
     }
 
     #[test]

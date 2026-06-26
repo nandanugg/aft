@@ -273,6 +273,11 @@ pub enum SemanticIndexEvent {
         entries_done: Option<usize>,
         entries_total: Option<usize>,
     },
+    /// Emitted when the semantic worker avoids or pauses full project corpus
+    /// collection before reaching terminal Ready/Failed, such as after loading a
+    /// cached index or while waiting to retry an embedding backend with no vectors
+    /// retained. Work that was waiting for the full index can proceed.
+    ColdSeedGateCleared,
     Ready(SemanticIndex),
     Failed(String),
 }
@@ -603,6 +608,14 @@ pub struct AppContext {
     semantic_index: RwLock<Option<SemanticIndex>>,
     semantic_index_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
+    /// True while this context has a cold semantic seed scheduled or actively
+    /// collecting/embedding/persisting the full project corpus. The semantic
+    /// worker clears it as soon as it proves the cached/incremental path is in use.
+    semantic_cold_seed_active: Arc<AtomicBool>,
+    /// Monotonic generation that prevents a superseded semantic worker from
+    /// reopening the cold-seed gate after a later configure has reset it.
+    semantic_cold_seed_generation: Arc<AtomicU64>,
+    semantic_callgraph_warm_deferred: AtomicBool,
     pending_semantic_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     pending_semantic_corpus_refresh: parking_lot::Mutex<bool>,
     semantic_refresh_tx:
@@ -774,6 +787,9 @@ impl AppContext {
             semantic_index: RwLock::new(None),
             semantic_index_rx: parking_lot::Mutex::new(None),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
+            semantic_cold_seed_active: Arc::new(AtomicBool::new(false)),
+            semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
+            semantic_callgraph_warm_deferred: AtomicBool::new(false),
             pending_semantic_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             pending_semantic_corpus_refresh: parking_lot::Mutex::new(false),
             semantic_refresh_tx: parking_lot::Mutex::new(None),
@@ -1653,6 +1669,11 @@ impl AppContext {
             }
         }
 
+        if self.semantic_cold_seed_active() {
+            self.defer_callgraph_store_warm_for_semantic_cold_seed();
+            return CallgraphStoreAccess::Building;
+        }
+
         // Cold build required: run it off the request thread and return
         // `Building` so the agent retries (the watcher keeps the store fresh
         // once it lands). By default this never blocks the request thread.
@@ -1921,10 +1942,14 @@ impl AppContext {
         let manager = self.inspect_manager();
         let can_write = !self.is_worktree_bridge();
         let in_flight = manager.tier2_any_in_flight();
-        let decision =
-            self.tier2_refresh_scheduler
-                .lock()
-                .tick(now, changed_path_count, can_write, in_flight);
+        let semantic_cold_seed_active = self.semantic_cold_seed_active();
+        let decision = self.tier2_refresh_scheduler.lock().tick_with_semantic_gate(
+            now,
+            changed_path_count,
+            can_write,
+            in_flight,
+            semantic_cold_seed_active,
+        );
 
         if let Some(reason) = decision {
             self.start_tier2_refresh(reason, manager);
@@ -2040,6 +2065,115 @@ impl AppContext {
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
         &self.semantic_index_status
+    }
+
+    /// Reset this context's cold semantic seed gate for a newly accepted
+    /// configure and return the generation token for the worker being spawned.
+    pub fn reset_semantic_cold_seed_gate_for_configure(&self) -> u64 {
+        self.semantic_cold_seed_active
+            .store(false, Ordering::SeqCst);
+        self.semantic_callgraph_warm_deferred
+            .store(false, Ordering::SeqCst);
+        self.semantic_cold_seed_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub fn semantic_cold_seed_active_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.semantic_cold_seed_active)
+    }
+
+    pub fn semantic_cold_seed_generation_flag(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.semantic_cold_seed_generation)
+    }
+
+    pub fn semantic_cold_seed_active(&self) -> bool {
+        self.semantic_cold_seed_active.load(Ordering::SeqCst)
+    }
+
+    pub fn schedule_semantic_cold_seed_gate_for_configure(&self) {
+        self.semantic_cold_seed_active.store(true, Ordering::SeqCst);
+    }
+
+    pub fn defer_callgraph_store_warm_for_semantic_cold_seed(&self) {
+        self.semantic_callgraph_warm_deferred
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn semantic_callgraph_warm_deferred(&self) -> bool {
+        self.semantic_callgraph_warm_deferred.load(Ordering::SeqCst)
+    }
+
+    /// Clear the cold-seed gate and resume work that was intentionally held back
+    /// while the full semantic corpus was accumulating. This entry point is used
+    /// by the code that drains events from the semantic worker.
+    pub fn clear_semantic_cold_seed_gate_and_resume_deferred_work(&self) {
+        self.resume_semantic_cold_seed_deferred_work(false);
+    }
+
+    /// Resume work after the semantic worker has already cleared the atomic gate
+    /// itself, such as on cached-index load or before a retry backoff sleep.
+    pub fn resume_deferred_work_after_semantic_cold_seed_gate_cleared(&self) {
+        self.resume_semantic_cold_seed_deferred_work(true);
+    }
+
+    fn resume_semantic_cold_seed_deferred_work(&self, force: bool) {
+        let was_active = self.semantic_cold_seed_active.swap(false, Ordering::SeqCst);
+        let had_deferred_callgraph = self.semantic_callgraph_warm_deferred();
+
+        if force || was_active || had_deferred_callgraph {
+            let _ = self.request_tier2_refresh_pull();
+        }
+
+        if self
+            .semantic_callgraph_warm_deferred
+            .swap(false, Ordering::SeqCst)
+        {
+            if !self.config().callgraph_store
+                || self
+                    .degraded_reasons
+                    .lock()
+                    .iter()
+                    .any(|reason| reason == "home_root")
+            {
+                return;
+            }
+
+            match self.callgraph_store_for_ops() {
+                CallgraphStoreAccess::Ready(_) => {
+                    crate::slog_debug!(
+                        "deferred callgraph store warm completed after semantic cold seed gate cleared"
+                    );
+                }
+                CallgraphStoreAccess::Building => {
+                    crate::slog_info!(
+                        "deferred callgraph store warm scheduled after semantic cold seed gate cleared"
+                    );
+                }
+                CallgraphStoreAccess::Unavailable => {
+                    crate::slog_info!(
+                        "deferred callgraph store warm unavailable after semantic cold seed gate cleared"
+                    );
+                }
+                CallgraphStoreAccess::Error(error) => {
+                    crate::slog_warn!(
+                        "deferred callgraph store warm failed after semantic cold seed gate cleared: {}",
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_semantic_cold_seed_active_for_test(&self, active: bool) {
+        self.semantic_cold_seed_active
+            .store(active, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn semantic_callgraph_warm_deferred_for_test(&self) -> bool {
+        self.semantic_callgraph_warm_deferred()
     }
 
     pub fn install_semantic_refresh_worker(
@@ -2676,6 +2810,249 @@ mod callgraph_store_for_ops_tests {
             _guard: guard,
             previous,
         }
+    }
+
+    fn cold_build_context() -> Arc<AppContext> {
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let source_dir = project.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::write(
+            source_dir.join("lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\n",
+        )
+        .expect("source file");
+
+        Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.keep()),
+                storage_dir: Some(storage.keep()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        ))
+    }
+
+    fn empty_semantic_index_for_ctx(ctx: &AppContext) -> SemanticIndex {
+        let project_root = ctx
+            .config()
+            .project_root
+            .clone()
+            .expect("test context has a project root");
+        let files: Vec<PathBuf> = Vec::new();
+        let mut embed = |_texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> { Ok(Vec::new()) };
+        SemanticIndex::build(&project_root, &files, &mut embed, 1)
+            .expect("empty semantic index should build")
+    }
+
+    #[test]
+    fn semantic_ready_event_resumes_deferred_callgraph_and_tier2() {
+        let _env_guard = force_async_callgraph_builds();
+        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
+        let ctx = cold_build_context();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        ctx.schedule_semantic_cold_seed_gate_for_configure();
+
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert_eq!(CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        tx.send(SemanticIndexEvent::Ready(empty_semantic_index_for_ctx(
+            &ctx,
+        )))
+        .expect("send ready event");
+
+        crate::runtime_drain::drain_semantic_index_events(&ctx);
+
+        assert!(
+            !ctx.semantic_cold_seed_active(),
+            "semantic Ready must clear the scheduled cold gate"
+        );
+        assert!(
+            ctx.tier2_pull_demand_pending(),
+            "semantic Ready must resume deferred Tier-2 work"
+        );
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "semantic Ready must resume the deferred callgraph warm"
+        );
+        let rx = ctx
+            .callgraph_store_rx
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("ready resume should install an in-flight callgraph receiver");
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("background cold build should complete");
+        *ctx.callgraph_store_rx.lock() = None;
+    }
+
+    #[test]
+    fn semantic_gate_cleared_event_resumes_deferred_callgraph_and_tier2() {
+        let _env_guard = force_async_callgraph_builds();
+        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
+        let ctx = cold_build_context();
+        ctx.schedule_semantic_cold_seed_gate_for_configure();
+
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert_eq!(CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
+
+        assert!(
+            !ctx.semantic_cold_seed_active(),
+            "cached-load or retry-wait clear must reopen the semantic cold gate"
+        );
+        assert!(
+            ctx.tier2_pull_demand_pending(),
+            "cached-load or retry-wait clear must resume deferred Tier-2 work"
+        );
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "cached-load or retry-wait clear must resume deferred callgraph warm"
+        );
+        let rx = ctx
+            .callgraph_store_rx
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("gate-clear resume should install an in-flight callgraph receiver");
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("background cold build should complete");
+        *ctx.callgraph_store_rx.lock() = None;
+    }
+
+    #[test]
+    fn semantic_cold_seed_gate_defers_callgraph_cold_spawn_until_resume() {
+        let _env_guard = force_async_callgraph_builds();
+        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
+        let ctx = cold_build_context();
+
+        ctx.set_semantic_cold_seed_active_for_test(true);
+        assert!(
+            matches!(
+                ctx.callgraph_store_for_ops(),
+                CallgraphStoreAccess::Building
+            ),
+            "callgraph ops should degrade as building while the semantic cold gate is active"
+        );
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            0,
+            "semantic cold gate must not spawn a competing callgraph cold build"
+        );
+        assert!(ctx.semantic_callgraph_warm_deferred_for_test());
+
+        ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "clearing the semantic cold gate should resume the deferred callgraph warm"
+        );
+
+        let rx = ctx
+            .callgraph_store_rx
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("deferred warm should install an in-flight receiver");
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("background cold build should complete");
+        *ctx.callgraph_store_rx.lock() = None;
+    }
+
+    #[test]
+    fn semantic_cold_seed_gate_clear_requests_tier2_pull() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.schedule_semantic_cold_seed_gate_for_configure();
+
+        ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
+
+        assert!(
+            !ctx.semantic_cold_seed_active(),
+            "retry-wait or cached-load events must reopen the semantic cold gate"
+        );
+        assert!(
+            ctx.tier2_pull_demand_pending(),
+            "clearing the semantic cold gate should kick a Tier-2 pull refresh"
+        );
+    }
+
+    #[test]
+    fn semantic_failed_event_clears_scheduled_gate_and_requests_tier2_pull() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        ctx.schedule_semantic_cold_seed_gate_for_configure();
+        tx.send(SemanticIndexEvent::Failed(
+            "embedding backend failed".to_string(),
+        ))
+        .expect("send failed event");
+
+        crate::runtime_drain::drain_semantic_index_events(&ctx);
+
+        assert!(
+            !ctx.semantic_cold_seed_active(),
+            "semantic Failed must clear the scheduled cold gate"
+        );
+        assert!(
+            ctx.tier2_pull_demand_pending(),
+            "semantic Failed must resume deferred Tier-2 work"
+        );
+    }
+
+    #[test]
+    fn semantic_disconnect_clears_scheduled_gate_and_requests_tier2_pull() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        ctx.schedule_semantic_cold_seed_gate_for_configure();
+        drop(tx);
+
+        crate::runtime_drain::drain_semantic_index_events(&ctx);
+
+        assert!(
+            !ctx.semantic_cold_seed_active(),
+            "semantic worker disconnect must clear the scheduled cold gate"
+        );
+        assert!(
+            ctx.tier2_pull_demand_pending(),
+            "semantic worker disconnect must resume deferred Tier-2 work"
+        );
+    }
+
+    #[test]
+    fn semantic_cold_seed_gate_is_per_context_for_tier2_scheduler() {
+        let ctx_a = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx_b = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let base = Instant::now();
+        ctx_a.reset_tier2_refresh_scheduler_at(base);
+        ctx_b.reset_tier2_refresh_scheduler_at(base);
+        ctx_a.set_semantic_cold_seed_active_for_test(true);
+
+        assert_eq!(
+            ctx_a.tick_tier2_refresh_scheduler_at(
+                base + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY,
+                0,
+            ),
+            None,
+            "root A should defer Tier-2 while its semantic cold seed is active"
+        );
+        assert_eq!(
+            ctx_b.tick_tier2_refresh_scheduler_at(
+                base + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY,
+                0,
+            ),
+            Some(Tier2TriggerReason::ConfigureWarm),
+            "root B must not inherit root A's semantic cold gate"
+        );
     }
 
     #[test]

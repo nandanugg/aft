@@ -82,11 +82,26 @@ impl Tier2RefreshScheduler {
         can_write: bool,
         in_flight: bool,
     ) -> Option<Tier2TriggerReason> {
+        self.tick_with_semantic_gate(now, changed_path_count, can_write, in_flight, false)
+    }
+
+    pub fn tick_with_semantic_gate(
+        &mut self,
+        now: Instant,
+        changed_path_count: usize,
+        can_write: bool,
+        in_flight: bool,
+        semantic_cold_seed_active: bool,
+    ) -> Option<Tier2TriggerReason> {
         if changed_path_count > 0 {
             self.record_changes(now, changed_path_count);
         }
 
         if !can_write || in_flight || !self.min_interval_elapsed(now) {
+            return None;
+        }
+
+        if semantic_cold_seed_active {
             return None;
         }
 
@@ -300,6 +315,51 @@ mod tests {
         assert_eq!(
             scheduler.tick(warm + TIER2_REFRESH_STORM_DEBOUNCE, 0, true, false),
             Some(Tier2TriggerReason::Debounce)
+        );
+    }
+
+    #[test]
+    fn semantic_cold_seed_gate_defers_without_consuming_pending_work() {
+        let (mut scheduler, base) = configured_scheduler();
+        let warm = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+
+        assert_eq!(
+            scheduler.tick_with_semantic_gate(warm, 0, true, false, true),
+            None
+        );
+        assert!(
+            scheduler.configure_warm_pending,
+            "configure-warm scan must remain pending while a cold semantic seed is active"
+        );
+        assert_eq!(
+            scheduler.tick_with_semantic_gate(warm + Duration::from_secs(1), 0, true, false, false),
+            Some(Tier2TriggerReason::ConfigureWarm)
+        );
+
+        assert!(scheduler.request_pull(true));
+        assert_eq!(
+            scheduler.tick_with_semantic_gate(
+                warm + TIER2_REFRESH_MIN_INTERVAL,
+                0,
+                true,
+                false,
+                true
+            ),
+            None
+        );
+        assert!(
+            scheduler.pull_demand_pending(),
+            "pull demand must not be consumed while a cold semantic seed is active"
+        );
+        assert_eq!(
+            scheduler.tick_with_semantic_gate(
+                warm + TIER2_REFRESH_MIN_INTERVAL + Duration::from_secs(1),
+                0,
+                true,
+                false,
+                false,
+            ),
+            Some(Tier2TriggerReason::Pull)
         );
     }
 

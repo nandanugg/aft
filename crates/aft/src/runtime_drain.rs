@@ -325,6 +325,9 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 // when the user needs to see "building".
                 status_changed = true;
             }
+            SemanticIndexEvent::ColdSeedGateCleared => {
+                ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
+            }
             SemanticIndexEvent::Ready(mut index) => {
                 mark_semantic_corpus_refresh_success(ctx);
                 let pending_paths = ctx.take_pending_semantic_index_paths();
@@ -344,6 +347,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                     SemanticIndexStatus::ready();
                 keep_receiver = false;
                 status_changed = true;
+                ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
             }
             SemanticIndexEvent::Failed(error) => {
                 let _ = ctx.take_pending_semantic_index_paths();
@@ -358,6 +362,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                     SemanticIndexStatus::Failed(error);
                 keep_receiver = false;
                 status_changed = true;
+                ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
             }
         }
     }
@@ -376,6 +381,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
         );
         keep_receiver = false;
         status_changed = true;
+        ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
     }
 
     if !keep_receiver {

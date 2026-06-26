@@ -1512,6 +1512,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     ctx.reset_tier2_refresh_scheduler();
+    let semantic_cold_seed_generation = ctx.reset_semantic_cold_seed_gate_for_configure();
+    if next_config.semantic_search && !is_worktree_bridge && !home_match {
+        ctx.schedule_semantic_cold_seed_gate_for_configure();
+    }
     // Project root (and thus tsconfig resolution) may have changed; drop the
     // status-bar membership cache so the next bar count re-resolves from disk.
     ctx.clear_tsconfig_membership_cache();
@@ -1837,6 +1841,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let semantic_config = semantic_config.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
+        let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
+        let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
+        let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
         let session_id_for_bg2 = log_ctx::current_session();
         thread::spawn(move || {
             log_ctx::with_session(session_id_for_bg2, || {
@@ -1848,6 +1855,24 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 // server-side can raise it freely.
                 let max_semantic_files = semantic_config.max_files;
                 let mut semantic_retry_attempt: usize = 0;
+                let set_cold_seed_active = || {
+                    if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        == semantic_cold_seed_generation_for_worker
+                    {
+                        semantic_cold_seed_active.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                };
+                let clear_cold_seed_active = || {
+                    if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        == semantic_cold_seed_generation_for_worker
+                    {
+                        semantic_cold_seed_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                };
+                let clear_cold_seed_gate_and_notify = || {
+                    clear_cold_seed_active();
+                    let _ = tx_progress.send(SemanticIndexEvent::ColdSeedGateCleared);
+                };
 
                 let build_once =
                     || -> Result<(SemanticIndex, crate::semantic_index::EmbeddingModel), String> {
@@ -1885,6 +1910,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 is_worktree_bridge_for_semantic,
                                 Some(&fingerprint_key),
                             ) {
+                                clear_cold_seed_gate_and_notify();
                                 // Try incremental refresh: re-embed only changed/new files,
                                 // drop entries for deleted files, keep everything else.
                                 // This is the hot path for restart on a project with a
@@ -2001,6 +2027,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             }
                         }
 
+                        set_cold_seed_active();
+
                         let files = match walk_semantic_project_files_bounded(
                             &root_clone,
                             max_semantic_files,
@@ -2114,6 +2142,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             // Surface "waiting for backend" as a building stage so
                             // the sidebar shows recovery-in-progress. If the
                             // receiver is gone (reconfigure superseded us), bail.
+                            clear_cold_seed_active();
                             if tx_progress
                                 .send(SemanticIndexEvent::Progress {
                                     stage: format!("waiting_for_embedding_backend: {clean}"),
@@ -2121,6 +2150,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     entries_done: None,
                                     entries_total: None,
                                 })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if tx_progress
+                                .send(SemanticIndexEvent::ColdSeedGateCleared)
                                 .is_err()
                             {
                                 return;
@@ -2161,7 +2196,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     }
                 };
 
-                let _ = tx.send(event);
+                if tx.send(event).is_err() {
+                    clear_cold_seed_active();
+                }
             });
         });
     }
@@ -2171,18 +2208,27 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     crate::callgraph::clear_workspace_package_cache();
 
     if next_config.callgraph_store && !home_match {
-        match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(_) => {
-                slog_debug!("callgraph store ready at configure");
-            }
-            CallgraphStoreAccess::Building => {
-                slog_info!("callgraph store warm build scheduled at configure");
-            }
-            CallgraphStoreAccess::Unavailable => {
-                slog_info!("callgraph store unavailable at configure; dead_code will retry later");
-            }
-            CallgraphStoreAccess::Error(error) => {
-                slog_warn!("callgraph store configure warm failed: {}", error);
+        if ctx.semantic_cold_seed_active() {
+            ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
+            slog_info!(
+                "callgraph store warm deferred until semantic cold seed gate clears or completes"
+            );
+        } else {
+            match ctx.callgraph_store_for_ops() {
+                CallgraphStoreAccess::Ready(_) => {
+                    slog_debug!("callgraph store ready at configure");
+                }
+                CallgraphStoreAccess::Building => {
+                    slog_info!("callgraph store warm build scheduled at configure");
+                }
+                CallgraphStoreAccess::Unavailable => {
+                    slog_info!(
+                        "callgraph store unavailable at configure; dead_code will retry later"
+                    );
+                }
+                CallgraphStoreAccess::Error(error) => {
+                    slog_warn!("callgraph store configure warm failed: {}", error);
+                }
             }
         }
     }
