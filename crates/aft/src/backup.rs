@@ -14,33 +14,41 @@ pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 #[cfg(test)]
 const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
 const V2_FORMAT_VERSION: &str = "v2";
+const MAX_RESTORE_OPERATION_LOCK_RETRIES: usize = 32;
 
 #[cfg(test)]
-type RestoreBeforeLockHook = (String, Box<dyn FnOnce() + Send>);
+type RestoreBeforeLockHook = (String, Box<dyn FnMut(usize) -> bool + Send>);
 
 #[cfg(test)]
 static RESTORE_BEFORE_LOCK_HOOK: Mutex<Option<RestoreBeforeLockHook>> = Mutex::new(None);
 
 #[cfg(test)]
-fn set_restore_before_lock_hook_for_tests(session: &str, hook: impl FnOnce() + Send + 'static) {
+fn set_restore_before_lock_hook_for_tests(
+    session: &str,
+    hook: impl FnMut(usize) -> bool + Send + 'static,
+) {
     *RESTORE_BEFORE_LOCK_HOOK.lock().unwrap() = Some((session.to_string(), Box::new(hook)));
 }
 
 #[cfg(test)]
-fn run_restore_before_lock_hook_for_tests(session: &str) {
+fn run_restore_before_lock_hook_for_tests(session: &str, attempt: usize) {
     let mut hook_slot = RESTORE_BEFORE_LOCK_HOOK.lock().unwrap();
-    if hook_slot
-        .as_ref()
-        .is_some_and(|(hook_session, _)| hook_session == session)
-    {
-        let (_, hook) = hook_slot.take().unwrap();
-        drop(hook_slot);
-        hook();
+    let Some((hook_session, mut hook)) = hook_slot.take() else {
+        return;
+    };
+    if hook_session != session {
+        *hook_slot = Some((hook_session, hook));
+        return;
+    }
+    drop(hook_slot);
+    let keep_hook = hook(attempt);
+    if keep_hook {
+        *RESTORE_BEFORE_LOCK_HOOK.lock().unwrap() = Some((hook_session, hook));
     }
 }
 
 #[cfg(not(test))]
-fn run_restore_before_lock_hook_for_tests(_session: &str) {}
+fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 
 /// Current on-disk backup metadata schema version.
 ///
@@ -496,18 +504,14 @@ impl BackupStore {
             candidate_keys = self.restore_operation_candidate_keys(session)?;
         }
 
-        let mut hook_ran = false;
-        loop {
+        for attempt in 0..MAX_RESTORE_OPERATION_LOCK_RETRIES {
             if candidate_keys.is_empty() {
                 return Err(AftError::NoUndoHistory {
                     path: "operation".to_string(),
                 });
             }
 
-            if !hook_ran {
-                run_restore_before_lock_hook_for_tests(session);
-                hook_ran = true;
-            }
+            run_restore_before_lock_hook_for_tests(session, attempt);
 
             let disk_locks = self.acquire_stack_disk_locks(session, &candidate_keys)?;
             let locked_keys: HashSet<PathBuf> = candidate_keys.iter().cloned().collect();
@@ -515,8 +519,9 @@ impl BackupStore {
             let current_key_set: HashSet<PathBuf> = current_keys.iter().cloned().collect();
             if !current_key_set.is_subset(&locked_keys) {
                 drop(disk_locks);
-                candidate_keys = current_key_set.into_iter().collect();
+                candidate_keys.extend(current_key_set);
                 candidate_keys.sort();
+                candidate_keys.dedup();
                 continue;
             }
 
@@ -542,7 +547,6 @@ impl BackupStore {
             }
             if !keys_to_restore.iter().all(|key| locked_keys.contains(key)) {
                 drop(disk_locks);
-                candidate_keys = locked_keys.into_iter().collect();
                 candidate_keys.extend(keys_to_restore);
                 candidate_keys.sort();
                 candidate_keys.dedup();
@@ -671,6 +675,11 @@ impl BackupStore {
                 warnings,
             });
         }
+
+        Err(AftError::IoError {
+            path: "operation".to_string(),
+            message: "backup stack changing under concurrent activity; retry".to_string(),
+        })
     }
 
     /// Pop the most recent backup for `(session, path)` and restore the file.
@@ -691,7 +700,11 @@ impl BackupStore {
                     .or_default()
                     .insert(key.to_path_buf(), entries);
             }
-            Ok(_) => {}
+            Ok(_) => {
+                if self.session_dir(session).is_some() {
+                    self.restore_in_memory_stack(session, &key, None);
+                }
+            }
             Err(error) => {
                 return Err(AftError::IoError {
                     path: key.display().to_string(),
@@ -1992,12 +2005,7 @@ impl BackupStore {
         let entries = match self.read_stack_from_disk_unlocked(session, key) {
             Ok(Some(entries)) => entries,
             Ok(None) => {
-                let disk_meta_present = self
-                    .read_disk_meta_value(session, key)
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if disk_meta_present {
+                if self.session_dir(session).is_some() {
                     self.restore_in_memory_stack(session, key, None);
                 }
                 if let Some(files) = self.disk_index.get_mut(session) {
@@ -4369,6 +4377,112 @@ mod tests {
     }
 
     #[test]
+    fn restore_latest_clears_stale_memory_when_disk_stack_disappears() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "stale-resurrection-session";
+        let path = project.path().join("stale-resurrection.txt");
+        fs::write(&path, "v0").unwrap();
+
+        let mut store_a = BackupStore::new();
+        store_a.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_a.snapshot(session, &path, "a captures v0").unwrap();
+        fs::write(&path, "v1").unwrap();
+
+        let mut store_b = BackupStore::new();
+        store_b.set_storage_dir(storage.path().to_path_buf(), 72);
+        let (restored, _) = store_b.restore_latest(session, &path).unwrap();
+        assert_eq!(restored.content, "v0");
+
+        fs::write(&path, "current after other restore").unwrap();
+        let error = store_a.restore_latest(session, &path).unwrap_err();
+
+        assert_eq!(error.code(), "no_undo_history");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "current after other restore"
+        );
+        let key = canonicalize_key(&path);
+        assert!(store_a
+            .entries
+            .get(session)
+            .and_then(|files| files.get(&key))
+            .is_none());
+
+        let snapshot_path = project.path().join("stale-snapshot.txt");
+        fs::write(&snapshot_path, "snapshot v0").unwrap();
+        let mut store_c = BackupStore::new();
+        store_c.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_c
+            .snapshot(session, &snapshot_path, "c captures v0")
+            .unwrap();
+        fs::write(&snapshot_path, "snapshot v1").unwrap();
+        let mut store_d = BackupStore::new();
+        store_d.set_storage_dir(storage.path().to_path_buf(), 72);
+        store_d.restore_latest(session, &snapshot_path).unwrap();
+
+        fs::write(&snapshot_path, "snapshot current").unwrap();
+        store_c
+            .snapshot(session, &snapshot_path, "c captures current")
+            .unwrap();
+        let mut fresh = BackupStore::new();
+        fresh.set_storage_dir(storage.path().to_path_buf(), 72);
+        let contents = fresh
+            .history(session, &snapshot_path)
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect::<Vec<_>>();
+        assert_eq!(contents, vec!["snapshot current".to_string()]);
+    }
+
+    #[test]
+    fn restore_last_operation_returns_retry_error_under_unbounded_key_churn() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "restore-churn-session";
+        let base_path = project.path().join("base.txt");
+        fs::write(&base_path, "base before").unwrap();
+        let mut base_store = BackupStore::new();
+        base_store.set_storage_dir(storage.path().to_path_buf(), 72);
+        base_store
+            .snapshot_with_op(session, &base_path, "base op", Some("op-base"))
+            .unwrap();
+        fs::write(&base_path, "base after").unwrap();
+
+        let churn_count = Arc::new(Mutex::new(0usize));
+        let hook_count = churn_count.clone();
+        let hook_project = project.path().to_path_buf();
+        let hook_storage = storage.path().to_path_buf();
+        set_restore_before_lock_hook_for_tests(session, move |_| {
+            let mut count = hook_count.lock().unwrap();
+            let churn_path = hook_project.join(format!("churn-{}.txt", *count));
+            fs::write(&churn_path, format!("churn before {}", *count)).unwrap();
+            let mut churn_store = BackupStore::new();
+            churn_store.set_storage_dir(hook_storage.clone(), 72);
+            let op_id = format!("op-churn-{}", *count);
+            churn_store
+                .snapshot_with_op(session, &churn_path, "churn op", Some(&op_id))
+                .unwrap();
+            fs::write(&churn_path, format!("churn after {}", *count)).unwrap();
+            *count += 1;
+            *count < MAX_RESTORE_OPERATION_LOCK_RETRIES
+        });
+
+        let mut restore_store = BackupStore::new();
+        restore_store.set_storage_dir(storage.path().to_path_buf(), 72);
+        let error = restore_store.restore_last_operation(session).unwrap_err();
+
+        assert_eq!(error.code(), "io_error");
+        assert!(error
+            .to_string()
+            .contains("backup stack changing under concurrent activity; retry"));
+        assert_eq!(
+            *churn_count.lock().unwrap(),
+            MAX_RESTORE_OPERATION_LOCK_RETRIES
+        );
+    }
+
+    #[test]
     fn restore_last_operation_rescans_stack_after_locking() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -4385,13 +4499,14 @@ mod tests {
 
         let hook_storage = storage.path().to_path_buf();
         let hook_path = path.clone();
-        set_restore_before_lock_hook_for_tests(session, move || {
+        set_restore_before_lock_hook_for_tests(session, move |_| {
             let mut store_b = BackupStore::new();
-            store_b.set_storage_dir(hook_storage, 72);
+            store_b.set_storage_dir(hook_storage.clone(), 72);
             store_b
                 .snapshot_with_op(session, &hook_path, "new op", Some("op-new"))
                 .unwrap();
             fs::write(&hook_path, "v2").unwrap();
+            false
         });
 
         let restored = store_a.restore_last_operation(session).unwrap();
