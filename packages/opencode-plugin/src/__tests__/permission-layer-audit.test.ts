@@ -306,6 +306,14 @@ describe("permission audit regressions", () => {
         calls.push({ command, params });
         return { success: true };
       },
+      toolCall: async (
+        _sessionID: string | undefined,
+        name: string,
+        rawArgs: Record<string, unknown> = {},
+      ) => {
+        calls.push({ command: name, params: rawArgs });
+        return { success: true, text: "ok" };
+      },
     };
     const pool = {
       getBridge: (cwd: string) => {
@@ -332,8 +340,8 @@ describe("permission audit regressions", () => {
     const editAsk = askCalls.find((call) => call.permission === "edit");
     expect(editAsk?.metadata?.filepath).toBe(expectedFile);
     expect(calls[0]).toMatchObject({
-      command: "organize_imports",
-      params: { file: expectedFile },
+      command: "aft_import",
+      params: { op: "organize", filePath: expectedFile },
     });
     expect(bridgeRoots[0]).toBe(project);
   });

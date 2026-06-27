@@ -1,0 +1,19 @@
+{
+  "tool_name": "aft_import",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "module": "react",
+    "added": false,
+    "already_present": true
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "add",
+      "filePath": "<PROJECT_ROOT>/src/main.ts",
+      "module": "react"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

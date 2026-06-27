@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, isEmptyParam, resolvePathArg } from "./_shared.js";
+import { callToolCall, isEmptyParam, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -107,27 +107,22 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         );
         if (permissionError) return permissionDeniedResponse(permissionError);
 
-        const commandMap: Record<string, string> = {
-          add: "add_import",
-          remove: "remove_import",
-          organize: "organize_imports",
-        };
-        const params: Record<string, unknown> = { file: filePath };
-        if (args.module !== undefined) params.module = args.module;
-        if (args.names !== undefined) params.names = args.names;
-        if (args.defaultImport !== undefined) params.default_import = args.defaultImport;
-        if (args.namespace !== undefined) params.namespace = args.namespace;
-        if (args.alias !== undefined) params.alias = args.alias;
-        if (args.modifiers !== undefined) params.modifiers = args.modifiers;
-        if (args.importKind !== undefined) params.import_kind = args.importKind;
-        if (args.typeOnly !== undefined) params.type_only = args.typeOnly;
-        if (args.removeName !== undefined) params.name = args.removeName;
-        if (args.validate !== undefined) params.validate = args.validate;
-        const response = await callBridge(ctx, context, commandMap[op], params);
+        const rawArgs: Record<string, unknown> = { op, filePath };
+        if (args.module !== undefined) rawArgs.module = args.module;
+        if (args.names !== undefined) rawArgs.names = args.names;
+        if (args.defaultImport !== undefined) rawArgs.defaultImport = args.defaultImport;
+        if (args.namespace !== undefined) rawArgs.namespace = args.namespace;
+        if (args.alias !== undefined) rawArgs.alias = args.alias;
+        if (args.modifiers !== undefined) rawArgs.modifiers = args.modifiers;
+        if (args.importKind !== undefined) rawArgs.importKind = args.importKind;
+        if (args.typeOnly !== undefined) rawArgs.typeOnly = args.typeOnly;
+        if (args.removeName !== undefined) rawArgs.removeName = args.removeName;
+        if (args.validate !== undefined) rawArgs.validate = args.validate;
+        const response = await callToolCall(ctx, context, "aft_import", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);
         }
-        return JSON.stringify(response);
+        return response.text;
       },
     },
   };

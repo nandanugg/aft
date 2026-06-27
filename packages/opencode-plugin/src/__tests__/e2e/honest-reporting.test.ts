@@ -1,7 +1,7 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
@@ -223,12 +223,9 @@ maybeDescribe("e2e honest reporting surfaces", () => {
         sdkCtx,
       ),
     );
-    const response = JSON.parse(output) as Record<string, unknown>;
-
-    expect(response.success).toBe(true);
-    expect(response.removed).toBe(false);
-    expect(String(response.message ?? response.reason ?? "")).toMatch(
-      /not[_ ]found|absent|missing/i,
-    );
+    expect(() => JSON.parse(output)).toThrow();
+    expect(output).toContain("not present missing-pkg");
+    expect(output).toContain(`file ${await realpath(h.path("imports.ts"))}`);
+    expect(output).toContain("scope entire import");
   });
 });

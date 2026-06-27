@@ -1,0 +1,3 @@
+removed pkg
+file <PROJECT_ROOT>/src/main.ts
+name alpha

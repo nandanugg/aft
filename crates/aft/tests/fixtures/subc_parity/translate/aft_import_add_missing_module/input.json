@@ -1,0 +1,8 @@
+{
+  "agent_args": {
+    "filePath": "<PROJECT_ROOT>/src/main.ts",
+    "op": "add"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "aft_import"
+}

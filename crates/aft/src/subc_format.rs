@@ -24,6 +24,10 @@ pub struct FormatContext {
     pub callgraph_include_unresolved: bool,
     pub zoom_target_label: Option<String>,
     pub ast_dry_run: bool,
+    pub import_op: Option<String>,
+    pub import_remove_name: Option<String>,
+    pub import_file_arg: Option<String>,
+    pub import_module_arg: Option<String>,
 }
 
 impl Default for FormatContext {
@@ -35,6 +39,10 @@ impl Default for FormatContext {
             callgraph_include_unresolved: false,
             zoom_target_label: None,
             ast_dry_run: false,
+            import_op: None,
+            import_remove_name: None,
+            import_file_arg: None,
+            import_module_arg: None,
         }
     }
 }
@@ -50,6 +58,10 @@ impl FormatContext {
             ),
             zoom_target_label: zoom_target_label_for_call(bare_name, arguments),
             ast_dry_run: ast_replace_dry_run_for_call(bare_name, arguments),
+            import_op: import_string_arg_for_call(bare_name, arguments, "op"),
+            import_remove_name: import_string_arg_for_call(bare_name, arguments, "removeName"),
+            import_file_arg: import_string_arg_for_call(bare_name, arguments, "filePath"),
+            import_module_arg: import_string_arg_for_call(bare_name, arguments, "module"),
         }
     }
 }
@@ -135,6 +147,17 @@ fn ast_replace_dry_run_for_call(bare_name: &str, arguments: &Value) -> bool {
         .is_some_and(coerce_boolean)
 }
 
+fn import_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
+    if bare_name != "aft_import" {
+        return None;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn coerce_boolean(value: &Value) -> bool {
     match value {
         Value::Bool(value) => *value,
@@ -168,6 +191,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "conflicts"
             | "ast_search"
             | "ast_replace"
+            | "aft_import"
     )
 }
 
@@ -218,7 +242,120 @@ pub fn format_response_with_context(
         "conflicts" => data["text"].as_str().unwrap_or_default().to_string(),
         "ast_search" => format_ast_search(data),
         "ast_replace" => format_ast_replace(data, ctx.ast_dry_run),
+        "aft_import" => format_import(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
+    }
+}
+
+fn import_string_field(response: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    response
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn import_number_field(response: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    response.get(key).and_then(import_number_value)
+}
+
+fn import_number_value(value: &Value) -> Option<String> {
+    let number = value.as_number()?;
+    if let Some(n) = number.as_i64() {
+        Some(n.to_string())
+    } else if let Some(n) = number.as_u64() {
+        Some(n.to_string())
+    } else {
+        number.as_f64().map(|n| n.to_string())
+    }
+}
+
+fn import_module_name(response: &serde_json::Map<String, Value>, ctx: &FormatContext) -> String {
+    import_string_field(response, "module")
+        .or_else(|| ctx.import_module_arg.clone())
+        .unwrap_or_else(|| "(module)".to_string())
+}
+
+fn import_file_name(response: &serde_json::Map<String, Value>, ctx: &FormatContext) -> String {
+    import_string_field(response, "file")
+        .or_else(|| ctx.import_file_arg.clone())
+        .unwrap_or_default()
+}
+
+fn format_import(data: &Value, ctx: &FormatContext) -> String {
+    let Some(response) = data.as_object() else {
+        return "No import result.".to_string();
+    };
+
+    match ctx.import_op.as_deref() {
+        Some("organize") => {
+            let group_text = response
+                .get("groups")
+                .and_then(Value::as_array)
+                .filter(|groups| !groups.is_empty())
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .map(|group| {
+                            let name = group
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown");
+                            let count = group
+                                .get("count")
+                                .and_then(import_number_value)
+                                .unwrap_or_else(|| "0".to_string());
+                            format!("{name}: {count}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+                .unwrap_or_else(|| "No imports found".to_string());
+            let removed_duplicates = import_number_field(response, "removed_duplicates")
+                .unwrap_or_else(|| "0".to_string());
+            [
+                format!("organized {}", import_file_name(response, ctx)),
+                format!("groups {group_text}"),
+                format!("duplicates removed {removed_duplicates}"),
+            ]
+            .join("\n")
+        }
+        Some("add") => {
+            let status = if response.get("already_present").and_then(Value::as_bool) == Some(true) {
+                "already present"
+            } else {
+                "added"
+            };
+            [
+                format!("{status} {}", import_module_name(response, ctx)),
+                format!("file {}", import_file_name(response, ctx)),
+                format!(
+                    "group {}",
+                    import_string_field(response, "group").unwrap_or_else(|| "—".to_string())
+                ),
+            ]
+            .join("\n")
+        }
+        Some("remove") => {
+            let module = import_module_name(response, ctx);
+            let status = if response.get("removed").and_then(Value::as_bool) == Some(false) {
+                format!("not present {module}")
+            } else {
+                format!("removed {module}")
+            };
+            let scope = ctx
+                .import_remove_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("name {name}"))
+                .unwrap_or_else(|| "scope entire import".to_string());
+            [
+                status,
+                format!("file {}", import_file_name(response, ctx)),
+                scope,
+            ]
+            .join("\n")
+        }
+        _ => "No import result.".to_string(),
     }
 }
 

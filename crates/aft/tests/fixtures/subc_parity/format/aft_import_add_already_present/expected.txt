@@ -1,0 +1,3 @@
+already present react
+file <PROJECT_ROOT>/src/main.ts
+group —

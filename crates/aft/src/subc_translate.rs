@@ -195,6 +195,7 @@ pub fn subc_translate_with_context(
         "conflicts" => translate_conflicts(agent_args),
         "ast_search" => translate_ast_search(agent_args),
         "ast_replace" => translate_ast_replace(agent_args),
+        "aft_import" => translate_import(agent_args),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
@@ -614,6 +615,65 @@ fn translate_ast_replace(args: &Value) -> Result<Translated, TranslateError> {
 
     Ok(Translated {
         command: "ast_replace".into(),
+        args: out,
+    })
+}
+
+fn insert_present_renamed(
+    out: &mut Map<String, Value>,
+    map_in: &Map<String, Value>,
+    from: &str,
+    to: &str,
+) {
+    if let Some(value) = map_in.get(from) {
+        out.insert(to.to_string(), value.clone());
+    }
+}
+
+fn translate_import(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let op = map_in
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request("aft_import: missing required param 'op'"))?;
+    let command = match op {
+        "add" => "add_import",
+        "remove" => "remove_import",
+        "organize" => "organize_imports",
+        other => {
+            return Err(invalid_request(format!(
+                "aft_import: invalid op {other:?}; expected 'add', 'remove', or 'organize'"
+            )));
+        }
+    };
+
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("aft_import: missing required param 'filePath'"))?;
+
+    if matches!(op, "add" | "remove") && map_in.get("module").map_or(true, is_empty_param) {
+        return Err(invalid_request(format!(
+            "'module' is required for '{op}' op"
+        )));
+    }
+
+    let mut out = Map::new();
+    out.insert("file".to_string(), Value::String(file_path.to_string()));
+    insert_present_renamed(&mut out, &map_in, "module", "module");
+    insert_present_renamed(&mut out, &map_in, "names", "names");
+    insert_present_renamed(&mut out, &map_in, "defaultImport", "default_import");
+    insert_present_renamed(&mut out, &map_in, "namespace", "namespace");
+    insert_present_renamed(&mut out, &map_in, "alias", "alias");
+    insert_present_renamed(&mut out, &map_in, "modifiers", "modifiers");
+    insert_present_renamed(&mut out, &map_in, "importKind", "import_kind");
+    insert_present_renamed(&mut out, &map_in, "typeOnly", "type_only");
+    insert_present_renamed(&mut out, &map_in, "removeName", "name");
+    insert_present_renamed(&mut out, &map_in, "validate", "validate");
+
+    Ok(Translated {
+        command: command.into(),
         args: out,
     })
 }

@@ -1,0 +1,8 @@
+{
+  "args": {
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "module": "pkg",
+    "name": "alpha"
+  },
+  "command": "remove_import"
+}

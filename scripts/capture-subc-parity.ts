@@ -20,6 +20,7 @@ import { astTools } from "../packages/opencode-plugin/src/tools/ast.ts";
 import { conflictTools } from "../packages/opencode-plugin/src/tools/conflicts.ts";
 import { createReadTool, hoistedTools } from "../packages/opencode-plugin/src/tools/hoisted.ts";
 import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
+import { importTools } from "../packages/opencode-plugin/src/tools/imports.ts";
 import { navigationTools } from "../packages/opencode-plugin/src/tools/navigation.ts";
 import { readingTools } from "../packages/opencode-plugin/src/tools/reading.ts";
 import { searchTools } from "../packages/opencode-plugin/src/tools/search.ts";
@@ -48,7 +49,8 @@ type BareToolName =
   | "callgraph"
   | "conflicts"
   | "ast_search"
-  | "ast_replace";
+  | "ast_replace"
+  | "aft_import";
 
 interface BridgeCall {
   command: string;
@@ -128,6 +130,24 @@ function makeRuntime(): Parameters<ToolDefinition["execute"]>[1] {
   return runtime as unknown as Parameters<ToolDefinition["execute"]>[1];
 }
 
+
+function translateAftImportToolCall(rawArgs: Record<string, unknown>): BridgeCall {
+  const op = rawArgs.op;
+  const command = op === "add" ? "add_import" : op === "remove" ? "remove_import" : "organize_imports";
+  const params: Record<string, unknown> = { file: rawArgs.filePath };
+  if (rawArgs.module !== undefined) params.module = rawArgs.module;
+  if (rawArgs.names !== undefined) params.names = rawArgs.names;
+  if (rawArgs.defaultImport !== undefined) params.default_import = rawArgs.defaultImport;
+  if (rawArgs.namespace !== undefined) params.namespace = rawArgs.namespace;
+  if (rawArgs.alias !== undefined) params.alias = rawArgs.alias;
+  if (rawArgs.modifiers !== undefined) params.modifiers = rawArgs.modifiers;
+  if (rawArgs.importKind !== undefined) params.import_kind = rawArgs.importKind;
+  if (rawArgs.typeOnly !== undefined) params.type_only = rawArgs.typeOnly;
+  if (rawArgs.removeName !== undefined) params.name = rawArgs.removeName;
+  if (rawArgs.validate !== undefined) params.validate = rawArgs.validate;
+  return { command, params };
+}
+
 function makeCtx(
   calls: BridgeCall[],
   responseForCall: (command: string, params: Record<string, unknown>) => Record<string, unknown>,
@@ -146,6 +166,11 @@ function makeCtx(
             name: string,
             rawArgs: Record<string, unknown> = {},
           ) => {
+            if (name === "aft_import") {
+              const translated = translateAftImportToolCall(rawArgs);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
             const command = name === "conflicts" ? "git_conflicts" : name;
             calls.push({ command, params: rawArgs });
             return responseForCall(command, rawArgs);
@@ -181,6 +206,7 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     conflicts: conflicts.aft_conflicts,
     ast_search: ast.ast_grep_search ?? ast.aft_ast_search,
     ast_replace: ast.ast_grep_replace ?? ast.aft_ast_replace,
+    aft_import: importTools(ctx).aft_import,
   };
 }
 
@@ -368,6 +394,11 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "ast_replace_translate_dry_run", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [`${PROJECT_ROOT}/src`], globs: [TS_INCLUDE_GLOB], dryRun: "true" } },
   { name: "ast_replace_translate_apply_default", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [], globs: [] } },
   { name: "ast_replace_missing_rewrite", tool_name: "ast_replace", expected_error: "ast_replace: missing required param 'rewrite'", agent_args: { pattern: "console.log($MSG)", lang: "typescript" } },
+  { name: "aft_import_add_translate_full", tool_name: "aft_import", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", names: ["alpha"], defaultImport: "DefaultImport", namespace: "ns", alias: "Alias", modifiers: ["type"], importKind: "function", typeOnly: true, validate: "syntax" } },
+  { name: "aft_import_remove_translate_name", tool_name: "aft_import", agent_args: { op: "remove", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", removeName: "alpha" } },
+  { name: "aft_import_organize_translate", tool_name: "aft_import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "aft_import_add_missing_module", tool_name: "aft_import", expected_error: "'module' is required for 'add' op", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "aft_import_missing_file_path", tool_name: "aft_import", expected_error: "aft_import: missing required param 'filePath'", agent_args: { op: "organize" } },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },
