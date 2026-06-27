@@ -151,6 +151,7 @@ export type {
   AftTransport,
   AftTransportOptions,
   ToolCallArguments,
+  ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---

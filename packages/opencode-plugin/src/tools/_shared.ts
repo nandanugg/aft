@@ -18,7 +18,12 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import type { BinaryBridge, BridgeRequestOptions, ToolCallResult } from "@cortexkit/aft-bridge";
+import type {
+  BinaryBridge,
+  BridgeRequestOptions,
+  ToolCallOptions,
+  ToolCallResult,
+} from "@cortexkit/aft-bridge";
 import { canonicalizeProjectRoot, timeoutForCommand } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
@@ -265,7 +270,7 @@ export async function callToolCall(
   runtime: ToolRuntime,
   name: string,
   rawArgs: Record<string, unknown> = {},
-  options?: BridgeRequestOptions,
+  options?: ToolCallOptions,
 ): Promise<ToolCallResult> {
   if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
     await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);

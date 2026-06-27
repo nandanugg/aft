@@ -22,6 +22,11 @@ export interface AftTransportOptions extends BridgeRequestOptions {
   markConfiguredOnSuccess?: boolean;
 }
 
+export interface ToolCallOptions extends AftTransportOptions {
+  /** Server-owned dry-run flag placed at the top level of the tool_call request. */
+  preview?: boolean;
+}
+
 export interface AftTransport<ToolCallContext = string | undefined> {
   /** Lifecycle and raw-command path; tool dispatch uses toolCall instead. */
   send(
@@ -38,6 +43,6 @@ export interface AftTransport<ToolCallContext = string | undefined> {
     context: ToolCallContext,
     name: string,
     rawArgs: ToolCallArguments,
-    opts?: AftTransportOptions,
+    opts?: ToolCallOptions,
   ): Promise<ToolCallResult>;
 }

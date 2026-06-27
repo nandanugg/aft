@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import type { BridgePool } from "@cortexkit/aft-bridge";
+import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
@@ -21,7 +21,7 @@ import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 
 type BridgeResponse = Record<string, unknown>;
-type SendCall = { command: string; params: Record<string, unknown> };
+type SendCall = { command: string; params: Record<string, unknown>; options?: ToolCallOptions };
 type AskCall = {
   permission?: string;
   patterns?: string[];
@@ -62,6 +62,7 @@ function createHarness(
   sendImpl: (
     command: string,
     params: Record<string, unknown>,
+    options?: ToolCallOptions,
   ) => Promise<BridgeResponse> | BridgeResponse = () => ({ success: true, text: "ok" }),
 ) {
   const calls: SendCall[] = [];
@@ -71,12 +72,17 @@ function createHarness(
       return await sendImpl(command, params);
     },
     toolCall: async (
-      sessionId: string | undefined,
+      _sessionID: string | undefined,
       name: string,
       rawArgs: Record<string, unknown> = {},
+      options?: ToolCallOptions,
     ) => {
-      calls.push({ command: name, params: { ...rawArgs, session_id: sessionId } });
-      return await sendImpl(name, rawArgs);
+      calls.push({
+        command: name,
+        params: rawArgs,
+        ...(options?.preview ? { options: { preview: true } } : {}),
+      });
+      return await sendImpl(name, rawArgs, options);
     },
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;
@@ -347,6 +353,21 @@ describe("permission audit regressions", () => {
         calls.push({ command, params });
         return { success: true, created: true };
       },
+      toolCall: async (
+        _sessionID: string | undefined,
+        name: string,
+        rawArgs: Record<string, unknown> = {},
+        options?: ToolCallOptions,
+      ) => {
+        calls.push({
+          command: name,
+          params: rawArgs,
+          ...(options?.preview ? { options: { preview: true } } : {}),
+        });
+        return options?.preview
+          ? { success: true, preview_diff: "Index: src/app.ts\n", text: "Preview ready." }
+          : { success: true, created: true, text: "Created new file." };
+      },
     };
     const pool = {
       getBridge: (cwd: string) => {
@@ -378,7 +399,8 @@ describe("permission audit regressions", () => {
     expect(editAsk?.patterns).toEqual(["src/app.ts"]);
     expect(calls[0]).toMatchObject({
       command: "write",
-      params: { file: expectedFile },
+      params: { filePath: "src/app.ts" },
+      options: { preview: true },
     });
     expect(bridgeRoots[0]).toBe(project);
   });

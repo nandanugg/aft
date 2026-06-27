@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { coerceBoolean, coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceStringArray } from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
@@ -332,18 +332,6 @@ async function readCurrentFileForPreview(filePath: string): Promise<string> {
   }
 }
 
-function previewDiffFromResponse(data: Record<string, unknown>, filePath: string): string {
-  const previewDiff = data.preview_diff;
-  if (typeof previewDiff === "string") return previewDiff;
-
-  const diff = data.diff as { before?: unknown; after?: unknown } | undefined;
-  if (typeof diff?.before === "string" && typeof diff.after === "string") {
-    return buildUnifiedDiff(filePath, diff.before, diff.after);
-  }
-
-  return "";
-}
-
 function virtualPatchContent(
   virtualFiles: Map<string, string | null>,
   filePath: string,
@@ -614,73 +602,27 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
         if (denial) return permissionDeniedResponse(denial);
       }
 
-      const currentContent = await readCurrentFileForPreview(filePath);
-      const previewDiff = buildUnifiedDiff(filePath, currentContent, content);
+      const rawArgs: Record<string, unknown> = { filePath: file, content };
+
+      const preview = await callToolCall(ctx, context, "write", rawArgs, { preview: true });
+      if (preview.success === false) {
+        throw new Error((preview.message as string) || "write preview failed");
+      }
 
       const denial = await askEditPermission(context, [relPath], {
         filepath: filePath,
-        diff: previewDiff,
+        diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
       });
       if (denial) return permissionDeniedResponse(denial);
 
-      const data = await callBridge(ctx, context, "write", {
-        file: filePath,
-        content,
-        create_dirs: true,
-        diagnostics: diagnosticsOnEditDefault(ctx),
-        include_diff_content: true,
-      });
+      const data = await callToolCall(ctx, context, "write", rawArgs);
 
       // Error response (e.g. path validation failure)
       if (data.success === false) {
         throw new Error((data.message as string) || "write failed");
       }
 
-      // Honesty: Rust reverts the write when the result fails syntax validation
-      // and returns `rolled_back: true` with success:true (the op completed, the
-      // file is unchanged). Saying "Created/File updated" here would be a lie —
-      // surface the rollback so the agent retries. Mirrors formatEditSummary,
-      // which OC's edit tool already uses.
-      if (data.rolled_back === true) {
-        return "Write rolled back: the content produced invalid syntax, so the file was left unchanged.";
-      }
-
-      let output = data.created ? "Created new file." : "File updated.";
-      if (data.formatted) output += " Auto-formatted.";
-      // v0.27.1: Rust returns `no_op: true` when post-write content is
-      // byte-identical to the pre-write state (e.g. agent wrote the same
-      // bytes that were already there, or a formatter normalized the
-      // change away). Surface this so the agent doesn't see "File updated"
-      // and assume real bytes changed. See GitHub #45.
-      if (data.no_op === true) {
-        output +=
-          " No net change — the written content is byte-identical to what was already on disk.";
-      }
-
-      // Append inline diagnostics if present
-      const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
-      if (diags && diags.length > 0) {
-        const errors = diags.filter((d) => d.severity === "error");
-        if (errors.length > 0) {
-          output += "\n\nLSP errors detected, please fix:\n";
-          for (const d of errors) {
-            output += `  Line ${d.line}: ${d.message}\n`;
-          }
-        }
-      }
-
-      // v0.17.3 honest reporting: when an LSP server didn't respond in time
-      // or its process exited mid-edit, surface that to the agent so they
-      // know diagnostics may be incomplete (rather than assuming silence
-      // means "clean").
-      const pendingServers = data.lsp_pending_servers as string[] | undefined;
-      const exitedServers = data.lsp_exited_servers as string[] | undefined;
-      if (pendingServers && pendingServers.length > 0) {
-        output += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
-      }
-      if (exitedServers && exitedServers.length > 0) {
-        output += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
-      }
+      const output = data.text;
 
       // Return UI metadata directly on the result. OpenCode's `fromPlugin`
       // (registry.ts) preserves a tool's returned `title`/`metadata` (since
@@ -692,9 +634,11 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       const diff = data.diff as
         | { before?: string; after?: string; additions?: number; deletions?: number }
         | undefined;
+      if (!diff) return output;
+
       const dp = relativeToWorktree(filePath, projectRoot);
-      const beforeContent = diff?.before ?? "";
-      const afterContent = diff?.after ?? content;
+      const beforeContent = diff.before ?? "";
+      const afterContent = diff.after ?? content;
       return {
         output,
         title: dp,
@@ -766,7 +710,7 @@ ${backupBehavior}
 - Auto-formats using project formatter if configured
 - Tree-sitter syntax validation on all edits
 - Symbol replace includes decorators, attributes, and doc comments in range
-- Response is a JSON string for the selected edit mode; key fields include success, diff, backup_id, syntax_valid, and mode-specific fields.`;
+- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.`;
 }
 
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
@@ -807,9 +751,9 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
     execute: async (args, context): Promise<ToolResult> => {
       // Footgun guard: top-level startLine/endLine are not valid params on
       // edit. They only exist nested inside `edits[]` for batch line-range
-      // mode. Without this guard, Zod silently strips the unknown keys and
-      // the call falls through mode resolution to the content-only-write
-      // branch, overwriting the entire file. Reject with a helpful pointer.
+      // mode. Without this guard, OpenCode schema handling can strip the
+      // unknown keys before the request reaches the server, producing an
+      // unrelated mode-resolution error instead of a useful batch-edit hint.
       const argsRecord = args as Record<string, unknown>;
       if (argsRecord.startLine !== undefined || argsRecord.endLine !== undefined) {
         throw new Error(
@@ -834,7 +778,6 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         if (denial) return permissionDeniedResponse(denial);
       }
 
-      const params: Record<string, unknown> = { file: filePath };
       const occurrence = coerceOptionalInt(
         args.occurrence,
         "occurrence",
@@ -842,182 +785,67 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
         Number.MAX_SAFE_INTEGER,
       );
 
-      // Route to appropriate Rust command
-      let command: string;
+      const rawArgs: Record<string, unknown> = { filePath: file };
+      for (const key of [
+        "appendContent",
+        "edits",
+        "symbol",
+        "content",
+        "oldString",
+        "newString",
+      ] as const) {
+        if (argsRecord[key] !== undefined) rawArgs[key] = argsRecord[key];
+      }
+      if (argsRecord.replaceAll !== undefined) {
+        rawArgs.replaceAll = coerceBoolean(argsRecord.replaceAll);
+      }
+      if (occurrence !== undefined) rawArgs.occurrence = occurrence;
 
-      if (typeof args.appendContent === "string") {
-        command = "edit_match";
-        params.op = "append";
-        params.append_content = args.appendContent;
-        params.create_dirs = true;
-      } else if (Array.isArray(args.edits)) {
-        // Batch mode — translate camelCase to snake_case for Rust
-        command = "batch";
-        params.edits = (args.edits as Array<Record<string, unknown>>).map((edit) => {
-          const translated: Record<string, unknown> = {};
-          for (const [key, value] of Object.entries(edit)) {
-            if (key === "oldString") translated.match = value;
-            else if (key === "newString") translated.replacement = value;
-            else if (key === "startLine") translated.line_start = value;
-            else if (key === "endLine") translated.line_end = value;
-            else translated[key] = value;
-          }
-          return translated;
-        });
-      } else if (
-        typeof args.symbol === "string" &&
-        typeof args.oldString !== "string" &&
-        args.content !== undefined
-      ) {
-        // Symbol replace — only when content is provided and oldString is NOT present
-        // (agents often pass symbol as "what to search for", not "replace whole symbol")
-        command = "edit_symbol";
-        params.symbol = args.symbol;
-        params.operation = "replace";
-        params.content = args.content;
-      } else if (typeof args.oldString === "string") {
-        // Find/replace mode — default newString to "" (deletion) if not provided
-        command = "edit_match";
-        params.match = args.oldString;
-        params.replacement = args.newString ?? "";
-        // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
-        if (coerceBoolean(args.replaceAll)) params.replace_all = true;
-        if (occurrence !== undefined) params.occurrence = occurrence;
-      } else {
-        // No mode-selecting parameter matched. We deliberately do NOT fall
-        // through to a content-only "write" mode here, even when `content` is
-        // present: that fallback was the disaster path (a typo or misnamed
-        // param like top-level startLine could silently overwrite the whole
-        // file). For full-file writes, use the dedicated `${writeToolName}`
-        // tool, which is unambiguous about its destructive intent.
-        const hint =
-          typeof args.content === "string"
-            ? ` To write the whole file, use the '${writeToolName}' tool. To edit existing content, provide 'oldString' (and optionally 'newString'), 'symbol' + 'content', or an 'edits' array.`
-            : " Provide 'oldString' (+ optional 'newString'), 'symbol' + 'content', or an 'edits' array.";
-        throw new Error(`edit: no edit mode resolved from arguments.${hint}`);
+      const preview = await callToolCall(ctx, context, "edit", rawArgs, { preview: true });
+      if (preview.success === false) {
+        throw new Error((preview.message as string) || "edit preview failed");
       }
 
-      const previewData = await callBridge(ctx, context, command, {
-        ...params,
-        preview: true,
-        include_diff_content: true,
-      });
-      if (previewData.success === false) {
-        throw new Error((previewData.message as string) || "edit preview failed");
-      }
-
-      const previewDiff = previewDiffFromResponse(previewData, filePath);
       const denial = await askEditPermission(context, [relPath], {
         filepath: filePath,
-        diff: previewDiff,
+        diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
       });
       if (denial) return permissionDeniedResponse(denial);
 
-      params.diagnostics = diagnosticsOnEditDefault(ctx);
-      // Request diff from Rust for UI metadata (avoids extra file reads in TS)
-      params.include_diff_content = true;
+      const data = await callToolCall(ctx, context, "edit", rawArgs);
 
-      const data = await callBridge(ctx, context, command, params);
-
-      // callBridge returns `{ success: false }` responses as DATA (it does not
-      // throw), so a failed edit (match-not-found, ambiguous, syntax rollback,
-      // glob with zero matches) must be surfaced as an error here. Otherwise
-      // formatEditSummary would report a false `Edited (+0/-0).` for an edit
-      // that never applied. Mirrors the write/apply_patch contract.
+      // tool_call returns `{ success: false }` responses as data, so failed
+      // edits (match-not-found, ambiguous, syntax rollback, or glob with zero
+      // matches) must still be surfaced as thrown tool errors.
       if (data.success === false) {
         throw new Error((data.message as string) || "edit failed");
       }
 
+      const output = data.text;
+      const diff = data.diff as
+        | { before?: string; after?: string; additions?: number; deletions?: number }
+        | undefined;
+      if (!diff) return output;
+
       // UI metadata returned directly on the result (see write tool for the
       // rationale; replaces the old metadata-store + after-hook merge that
       // intermittently lost the diff under duplicate plugin loads — GitHub #96).
-      let uiMeta: Record<string, unknown> | undefined;
-      let uiTitle: string | undefined;
-      if (data.success && data.diff) {
-        const diff = data.diff as {
-          before?: string;
-          after?: string;
-          additions?: number;
-          deletions?: number;
-        };
-        uiTitle = relativeToWorktree(filePath, projectRoot);
-        const beforeContent = diff.before ?? "";
-        const afterContent = diff.after ?? "";
-        uiMeta = {
-          diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
-          filediff: {
-            file: filePath,
-            before: beforeContent,
-            after: afterContent,
-            additions: diff.additions ?? 0,
-            deletions: diff.deletions ?? 0,
-          },
-          diagnostics: {},
-        };
-      }
-
-      // Agent-facing result is a compact summary sentence, NOT the raw Rust
-      // JSON envelope. The model supplied the path and the content, so echoing
-      // back the path, before/after, backup id, status-bar counts, etc. is
-      // pure token waste that scales with file size. The rich data stays in
-      // the UI `metadata` (stored above); the status-bar line is injected
-      // separately by the bridge. Matches the `write`/`apply_patch` contract
-      // and keeps OpenCode/Pi agent-facing output in parity.
-      let result = formatEditSummary(data as Record<string, unknown>);
-
-      const globSkipNote = formatGlobSkipReasonsNote(data.format_skip_reasons as unknown);
-      if (globSkipNote) result += `\n\n${globSkipNote}`;
-
-      // v0.27.1: surface `no_op: true` honestly. Rust sets this when the
-      // post-write file content is byte-identical to the pre-write state —
-      // either oldString === newString, a formatter normalized the change
-      // away, or the replacement matched what was already in the file.
-      // The match was satisfied (replacements > 0) but no net file change
-      // landed. Without this note, agents see `+0/-0` and assume the tool
-      // failed silently. See GitHub #45.
-      if (data.no_op === true) {
-        result +=
-          "\n\nNote: no net file change — the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
-      }
-
-      // Append inline diagnostics to output (matching write tool pattern)
-      const diags = data.lsp_diagnostics as Array<Record<string, unknown>> | undefined;
-      if (diags && diags.length > 0) {
-        const errors = diags.filter((d) => d.severity === "error");
-        if (errors.length > 0) {
-          const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
-          result += `\n\nLSP errors detected, please fix:\n${diagLines}`;
-        }
-      }
-      // v0.17.3 honest reporting: surface pending/exited servers so the
-      // agent doesn't mistake silence for "all clear" when an LSP server
-      // simply didn't respond before our wait_ms deadline.
-      const pendingServers = data.lsp_pending_servers as string[] | undefined;
-      const exitedServers = data.lsp_exited_servers as string[] | undefined;
-      if (pendingServers && pendingServers.length > 0) {
-        result += `\n\nNote: LSP server(s) did not respond in time: ${pendingServers.join(", ")}. Diagnostics may be incomplete; call aft_inspect for a checkpoint diagnostics snapshot.`;
-      }
-      if (exitedServers && exitedServers.length > 0) {
-        result += `\n\nNote: LSP server(s) exited during this edit: ${exitedServers.join(", ")}. Their diagnostics could not be collected.`;
-      }
-
-      if (uiMeta) {
-        return { output: result, title: uiTitle ?? "", metadata: uiMeta };
-      }
-      return result;
+      const beforeContent = diff.before ?? "";
+      const afterContent = diff.after ?? "";
+      const uiMeta = {
+        diff: buildUnifiedDiff(filePath, beforeContent, afterContent),
+        filediff: {
+          file: filePath,
+          before: beforeContent,
+          after: afterContent,
+          additions: diff.additions ?? 0,
+          deletions: diff.deletions ?? 0,
+        },
+        diagnostics: {},
+      };
+      return { output, title: relativeToWorktree(filePath, projectRoot), metadata: uiMeta };
     },
   };
-}
-
-function formatGlobSkipReasonsNote(reasons: unknown): string | undefined {
-  if (!Array.isArray(reasons)) return undefined;
-  const actionable = reasons
-    .filter((reason): reason is string => typeof reason === "string")
-    .filter((reason) =>
-      ["formatter_not_installed", "formatter_excluded_path", "timeout", "error"].includes(reason),
-    );
-  if (actionable.length === 0) return undefined;
-  return `Note: formatter skipped some glob edit result file(s): ${[...new Set(actionable)].sort().join(", ")}. See per-file format_skipped_reason values for details.`;
 }
 
 // ---------------------------------------------------------------------------

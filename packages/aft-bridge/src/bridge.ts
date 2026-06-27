@@ -8,7 +8,7 @@ import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
-import type { ToolCallArguments, ToolCallResult } from "./transport.js";
+import type { ToolCallArguments, ToolCallOptions, ToolCallResult } from "./transport.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
@@ -565,11 +565,17 @@ export class BinaryBridge {
     sessionId: string | undefined,
     name: string,
     rawArgs: ToolCallArguments = {},
-    options?: SendOptions,
+    options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
     const params: Record<string, unknown> = { name, arguments: rawArgs };
     if (sessionId) params.session_id = sessionId;
-    return (await this.send("tool_call", params, options)) as ToolCallResult;
+    const { preview, ...sendOptions } = options ?? {};
+    if (preview === true) params.preview = true;
+    return (await this.send(
+      "tool_call",
+      params,
+      Object.keys(sendOptions).length > 0 ? (sendOptions as SendOptions) : undefined,
+    )) as ToolCallResult;
   }
 
   private async sendWithVersionMismatchRetry(

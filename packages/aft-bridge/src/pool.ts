@@ -1,10 +1,10 @@
 import { homedir } from "node:os";
 
 import { error, getActiveLogger, log } from "./active-logger.js";
-import { BinaryBridge, type BridgeOptions, type BridgeRequestOptions } from "./bridge.js";
+import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
-import type { ToolCallArguments, ToolCallResult } from "./transport.js";
+import type { ToolCallArguments, ToolCallOptions, ToolCallResult } from "./transport.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // evict idle bridges after 30 minutes
 const DEFAULT_MAX_POOL_SIZE = 8;
@@ -246,7 +246,7 @@ export class BridgePool {
     runtime: BridgeToolCallRuntime,
     name: string,
     rawArgs: ToolCallArguments = {},
-    options?: BridgeRequestOptions,
+    options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
     return this.getBridge(projectRoot).toolCall(runtime.sessionID, name, rawArgs, options);
   }

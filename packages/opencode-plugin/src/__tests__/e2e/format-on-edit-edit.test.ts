@@ -109,6 +109,16 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
           data = response;
           return response;
         },
+        toolCall: async (
+          sessionID: string | undefined,
+          name: string,
+          rawArgs: Record<string, unknown> = {},
+          options?: Record<string, unknown>,
+        ) => {
+          const response = await h.bridge.toolCall(sessionID, name, rawArgs, options);
+          if (options?.preview !== true) data = response;
+          return response;
+        },
       }),
     } as unknown as PluginContext["pool"];
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
@@ -203,9 +213,8 @@ maybeDescribe("e2e format_on_edit edit tool", () => {
     expect(finalContent).not.toContain("export   const z=3");
     expect(data.formatted).toBe(true);
     expect(data.format_skipped_reason).toBeUndefined();
-    // Hoisted `edit` tool returns JSON-stringified Rust response, so the
-    // `formatted: true` signal is in the JSON output (the human-readable
-    // "Auto-formatted." string is only used by hoisted `write`).
+    // The edit tool returns the server's summary text, which contains the
+    // auto-formatting note indicated by the raw response's `formatted` field.
     expect(output).toContain("Auto-formatted.");
   });
 

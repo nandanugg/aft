@@ -305,7 +305,7 @@ describe("Tool round-trips", () => {
       await tools.aft_edit.execute(
         // `content` alone (no oldString, no symbol, no edits, no operations,
         // no legacy `mode: "write"`). Previously this silently overwrote the
-        // file. Now it must fail with a pointer to the write tool.
+        // file. Now it must fail instead of silently choosing a write mode.
         { filePath, content: "export const y = 2;\n" },
         sdkCtx,
       );
@@ -314,7 +314,6 @@ describe("Tool round-trips", () => {
     }
     expect(err).toBeDefined();
     expect(err!.message).toContain("no edit mode resolved");
-    expect(err!.message).toContain("aft_write");
 
     // File must be untouched.
     const after = await readFile(filePath, "utf-8");

@@ -185,6 +185,16 @@ maybeDescribe("e2e format_on_edit write tools", () => {
           if (command === "write") data = response;
           return response;
         },
+        toolCall: async (
+          sessionID: string | undefined,
+          name: string,
+          rawArgs: Record<string, unknown> = {},
+          options?: Record<string, unknown>,
+        ) => {
+          const response = await h.bridge.toolCall(sessionID, name, rawArgs, options);
+          if (name === "write" && options?.preview !== true) data = response;
+          return response;
+        },
       }),
     } as unknown as PluginContext["pool"];
     const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
@@ -202,6 +212,16 @@ maybeDescribe("e2e format_on_edit write tools", () => {
         send: async (command: string, params: Record<string, unknown>) => {
           const response = await h.bridge.send(command, params);
           if (command === "write") data = response;
+          return response;
+        },
+        toolCall: async (
+          sessionID: string | undefined,
+          name: string,
+          rawArgs: Record<string, unknown> = {},
+          options?: Record<string, unknown>,
+        ) => {
+          const response = await h.bridge.toolCall(sessionID, name, rawArgs, options);
+          if (name === "write" && options?.preview !== true) data = response;
           return response;
         },
       }),
