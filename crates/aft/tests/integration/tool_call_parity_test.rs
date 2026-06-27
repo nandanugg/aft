@@ -300,11 +300,32 @@ fn normalize_value(value: &mut Value, project_root: &Path) {
 }
 
 fn normalize_text(text: &str, project_root: &Path) -> String {
-    let mut roots = vec![project_root.to_string_lossy().to_string()];
+    // Base root forms: the raw path plus its canonicalized form (macOS /var ->
+    // /private/var, Windows verbatim prefixes, etc.).
+    let mut base_roots = vec![project_root.to_string_lossy().to_string()];
     if let Ok(canonical) = fs::canonicalize(project_root) {
-        roots.push(canonical.to_string_lossy().to_string());
+        base_roots.push(canonical.to_string_lossy().to_string());
     }
+
+    // The `status` tool is the only spine case rendered via serde_json
+    // `to_string_pretty`, which JSON-ESCAPES backslashes — so a Windows root
+    // embedded in that blob appears as `C:\\Users\\...` (doubled), not the raw
+    // `C:\Users\...` the path yields. Forward-slash `display()` variants also
+    // appear in some fields. Mask every form so the two temp-project processes'
+    // differing roots all collapse to the same token; otherwise this parity
+    // assertion fails Windows-only on `status_snapshot`.
+    let mut roots = Vec::new();
+    for base in base_roots {
+        let escaped = base.replace('\\', "\\\\");
+        let slashed = base.replace('\\', "/");
+        roots.push(escaped);
+        roots.push(slashed);
+        roots.push(base);
+    }
+    // Replace longer forms first so a shorter prefix never shadows a longer
+    // match (e.g. the escaped form is longer than the raw form).
     roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+    roots.dedup();
 
     let mut normalized = text.to_string();
     for root in roots {
