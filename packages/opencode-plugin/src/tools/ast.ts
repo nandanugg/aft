@@ -11,13 +11,7 @@ const z = tool.schema;
 import { coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import {
-  callBridge,
-  coerceOptionalInt,
-  isEmptyParam,
-  optionalInt,
-  resolvePathArg,
-} from "./_shared.js";
+import { callToolCall, isEmptyParam, optionalInt, resolvePathArg } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -25,41 +19,6 @@ import {
   resolveRelativePatterns,
   workspacePattern,
 } from "./permissions.js";
-
-/** Show output in opencode UI via metadata callback. */
-function showOutputToUser(context: unknown, output: string): void {
-  const ctx = context as {
-    metadata?: (input: { metadata: { output: string } }) => void | Promise<void>;
-  };
-  ctx.metadata?.({ metadata: { output } });
-}
-
-/**
- * Pull the server-side `hint` field out of an ast-grep response. Rust now
- * attaches a hint to zero-match responses when the pattern looks like a
- * common mistake (regex syntax, language-specific shape, today's Rust
- * match-arm `|` trap). See `crates/aft/src/ast_grep_hints.rs` for the rules.
- *
- * Plugin-side rendering is intentionally thin — all detection logic lives in
- * Rust so OpenCode and Pi behave identically.
- */
-function extractHint(response: Record<string, unknown>): string | null {
-  const hint = response.hint;
-  return typeof hint === "string" && hint.length > 0 ? hint : null;
-}
-
-type SkippedFile = { file?: string; reason?: string };
-
-function appendSkippedFiles(output: string, skippedFiles: SkippedFile[] | undefined): string {
-  if (!skippedFiles || skippedFiles.length === 0) return output;
-
-  const lines = skippedFiles.map((skipped) => {
-    const file = skipped.file ?? "unknown";
-    const reason = skipped.reason ?? "unknown reason";
-    return `  ${file}: ${reason}`;
-  });
-  return `${output}\n\nIncomplete: skipped ${skippedFiles.length} file(s)\n${lines.join("\n")}`;
-}
 
 async function resolveAstPaths(
   ctx: PluginContext,
@@ -124,100 +83,21 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
       const externalDenied = await checkAstPathsPermission(ctx, context, paths);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
-      const params: Record<string, unknown> = {
+      const rawArgs: Record<string, unknown> = {
         pattern: args.pattern,
         lang: args.lang,
       };
-      // Use isEmptyParam so empty arrays ([]) sent by GPT-family models don't
-      // get forwarded to Rust as "scope present" — let Rust default to whole
-      // project_root instead of round-tripping a useless empty scope.
-      if (!isEmptyParam(paths)) params.paths = paths;
-      if (!isEmptyParam(args.globs)) params.globs = args.globs;
-      const contextLines = coerceOptionalInt(
-        args.contextLines,
-        "contextLines",
-        1,
-        Number.MAX_SAFE_INTEGER,
-      );
-      if (contextLines !== undefined) params.context = contextLines;
-      const response = await callBridge(ctx, context, "ast_search", params);
+      if (paths !== undefined) rawArgs.paths = paths;
+      if (args.globs !== undefined) rawArgs.globs = args.globs;
+      if (args.contextLines !== undefined) rawArgs.contextLines = args.contextLines;
+      const response = await callToolCall(ctx, context, "ast_search", rawArgs);
 
       // Error response (e.g. invalid pattern)
       if (response.success === false) {
         throw new Error((response.message as string) || "ast_search failed");
       }
 
-      // Format output for readability
-      const data = response as {
-        ok?: boolean;
-        matches?: Array<{
-          file?: string;
-          line?: number;
-          text?: string;
-          meta_variables?: Record<string, string>;
-        }>;
-        total_matches?: number;
-        files_with_matches?: number;
-        files_searched?: number;
-        complete?: boolean;
-        skipped_files?: SkippedFile[];
-        no_files_matched_scope?: boolean;
-        scope_warnings?: string[];
-      };
-
-      const matchCount = data.total_matches ?? data.matches?.length ?? 0;
-      const filesSearched = data.files_searched ?? 0;
-      const filesWithMatches = data.files_with_matches ?? filesSearched;
-
-      let output: string;
-      if (data.no_files_matched_scope) {
-        // Scope (paths/globs) was syntactically valid but matched zero files — say so
-        // explicitly so agents don't read this as "I searched everywhere and found nothing."
-        output = "No files matched the scope (paths/globs resolved to zero files)";
-        if (data.scope_warnings && data.scope_warnings.length > 0) {
-          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
-        }
-      } else if (matchCount === 0) {
-        // Zero-match format is intentionally not documented in the description — it's
-        // self-explanatory text and documenting it would bloat the Returns section.
-        output = `No matches found (searched ${filesSearched} files)`;
-        if (data.scope_warnings && data.scope_warnings.length > 0) {
-          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
-        }
-        // Server-side hint for common pattern mistakes (attached by Rust
-        // when the pattern looks like regex syntax, language-specific shape
-        // mistake, or today's Rust match-arm `|` trap).
-        const hint = extractHint(response as Record<string, unknown>);
-        if (hint) {
-          output += `\n\n${hint}`;
-        }
-      } else {
-        output = `Found ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`;
-        if (data.matches) {
-          for (const m of data.matches) {
-            const relFile = m.file ?? "unknown";
-            const line = m.line ?? 0;
-            output += `${relFile}:${line}\n`;
-            if (m.text) {
-              output += `  ${m.text.trim()}\n`;
-            }
-            if (m.meta_variables && Object.keys(m.meta_variables).length > 0) {
-              for (const [k, v] of Object.entries(m.meta_variables)) {
-                output += `  ${k}: ${v}\n`;
-              }
-            }
-            output += "\n";
-          }
-        }
-      }
-
-      if (data.complete === false || (data.skipped_files?.length ?? 0) > 0) {
-        output = appendSkippedFiles(output, data.skipped_files);
-      }
-
-      // Show output in UI
-      showOutputToUser(context, output);
-      return output;
+      return response.text;
     },
   };
 
@@ -275,132 +155,22 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
         }
       }
 
-      const params: Record<string, unknown> = {
+      const rawArgs: Record<string, unknown> = {
         pattern: args.pattern,
         rewrite: args.rewrite,
         lang: args.lang,
       };
-      // Use isEmptyParam — see ast_search above for rationale.
-      if (!isEmptyParam(paths)) params.paths = paths;
-      if (!isEmptyParam(args.globs)) params.globs = args.globs;
-      // Normalize dryRun at the plugin-to-bridge boundary with coerceBoolean so
-      // a string "true" still sets dry_run to a real boolean and the replace stays preview-only.
-      params.dry_run = coerceBoolean(args.dryRun);
-      const response = await callBridge(ctx, context, "ast_replace", params);
+      if (paths !== undefined) rawArgs.paths = paths;
+      if (args.globs !== undefined) rawArgs.globs = args.globs;
+      rawArgs.dryRun = args.dryRun;
+      const response = await callToolCall(ctx, context, "ast_replace", rawArgs);
 
       // Error response (e.g. invalid pattern)
       if (response.success === false) {
         throw new Error((response.message as string) || "ast_replace failed");
       }
 
-      const data = response as {
-        ok?: boolean;
-        // Apply-mode shape (Rust commands/ast_replace.rs returns these in
-        // `matches[]` only on the `ast_search`-shaped path; `ast_replace`
-        // itself emits per-file results in `files[]`).
-        matches?: Array<{ file?: string; line?: number; text?: string; replacement?: string }>;
-        // Per-file results carry a unified diff string in dry-run mode and
-        // a write outcome in apply mode. See crates/aft/src/commands/ast_replace.rs.
-        files?: Array<{
-          file?: string;
-          replacements?: number;
-          diff?: string; // present in dry-run only
-          backup_id?: string; // present in apply mode when snapshot succeeded
-          ok?: boolean; // false on per-file write failure
-          error?: string;
-        }>;
-        total_matches?: number;
-        total_replacements?: number;
-        total_files?: number;
-        files_with_matches?: number;
-        files_searched?: number;
-        no_files_matched_scope?: boolean;
-        scope_warnings?: string[];
-      };
-
-      const matchCount = data.total_replacements ?? data.total_matches ?? data.matches?.length ?? 0;
-      const filesSearched = data.files_searched ?? data.total_files ?? 0;
-      const filesWithMatches = data.files_with_matches ?? data.total_files ?? filesSearched;
-
-      let output: string;
-      if (data.no_files_matched_scope) {
-        output = "No files matched the scope (paths/globs resolved to zero files)";
-        if (data.scope_warnings && data.scope_warnings.length > 0) {
-          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
-        }
-      } else if (matchCount === 0) {
-        output = `No matches found (searched ${filesSearched} files)`;
-        if (data.scope_warnings && data.scope_warnings.length > 0) {
-          output += `\n\nScope warnings:\n${data.scope_warnings.map((w) => `  ${w}`).join("\n")}`;
-        }
-        // Server-side hint when zero replacements happened. Especially
-        // important here: "0 replacements" looks like a clean no-op but
-        // can mean silent corruption (today's `|` bug). The hint tells
-        // the agent why the pattern matched nothing.
-        const hint = extractHint(response as Record<string, unknown>);
-        if (hint) {
-          output += `\n\n${hint}`;
-        }
-      } else {
-        output = isDryRun
-          ? `[DRY RUN] Would replace ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`
-          : `Replaced ${matchCount} match(es) in ${filesWithMatches} file(s) (${filesSearched} searched)\n\n`;
-
-        // Dry-run: render per-file unified diff so the agent can SEE the
-        // proposed change (catches anonymous-`$$$` and other rewrite bugs
-        // BEFORE applying). The Rust handler caps each diff at a sane size,
-        // and we additionally cap total diff bytes here so a 1000-file
-        // rewrite doesn't dump a megabyte of diff into the agent's context.
-        if (isDryRun && data.files && data.files.length > 0) {
-          const MAX_DIFF_BYTES = 8 * 1024; // 8 KB total preview budget
-          let used = 0;
-          let filesShown = 0;
-          for (const f of data.files) {
-            const relFile = f.file ?? "unknown";
-            const reps = f.replacements ?? 0;
-            const diff = f.diff ?? "";
-            if (used + diff.length > MAX_DIFF_BYTES) {
-              const remaining = data.files.length - filesShown;
-              if (remaining > 0) {
-                output += `\n... (${remaining} more file(s) omitted from preview to stay under ${MAX_DIFF_BYTES / 1024}KB; total ${matchCount} replacements across ${filesWithMatches} files)\n`;
-              }
-              break;
-            }
-            output += `${relFile} (${reps} replacement${reps === 1 ? "" : "s"}):\n`;
-            output += diff;
-            if (!diff.endsWith("\n")) output += "\n";
-            output += "\n";
-            used += diff.length;
-            filesShown += 1;
-          }
-        } else if (data.matches) {
-          // Apply-mode legacy path: render per-match before/after (this
-          // path is reached when the response carries `matches[]` rather
-          // than `files[]` — currently the search shape, kept for
-          // forward-compat with handler refactors).
-          for (const m of data.matches) {
-            const relFile = m.file ?? "unknown";
-            const line = m.line ?? 0;
-            output += `${relFile}:${line}\n`;
-            if (m.text && m.replacement) {
-              output += `  - ${m.text.trim()}\n`;
-              output += `  + ${m.replacement.trim()}\n`;
-            }
-            output += "\n";
-          }
-        } else if (data.files && data.files.length > 0) {
-          // Apply-mode + files[] only: list files with replacement counts
-          // (no diff in apply mode — the file is already on disk).
-          for (const f of data.files) {
-            const relFile = f.file ?? "unknown";
-            const reps = f.replacements ?? 0;
-            output += `  ${relFile}: ${reps} replacement${reps === 1 ? "" : "s"}\n`;
-          }
-        }
-      }
-
-      showOutputToUser(context, output);
-      return output;
+      return response.text;
     },
   };
 

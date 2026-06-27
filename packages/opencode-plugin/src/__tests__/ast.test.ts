@@ -23,11 +23,15 @@ function createSdkContext(directory: string): ToolContext {
 }
 
 describe("AST tool adapters", () => {
-  test('ast_grep_replace treats string dryRun "true" as preview (dry_run true)', async () => {
-    const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  test('ast_grep_replace treats string dryRun "true" as preview and forwards raw dryRun', async () => {
+    const calls: Array<{ name: string; rawArgs: Record<string, unknown> }> = [];
     const bridge = {
-      send: async (command: string, params: Record<string, unknown> = {}) => {
-        calls.push({ command, params });
+      toolCall: async (
+        _sessionId: string | undefined,
+        name: string,
+        rawArgs: Record<string, unknown> = {},
+      ) => {
+        calls.push({ name, rawArgs });
         return { success: true, dry_run: true, text: "preview" };
       },
     };
@@ -56,7 +60,8 @@ describe("AST tool adapters", () => {
     );
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.command).toBe("ast_replace");
-    expect(calls[0]?.params.dry_run).toBe(true);
+    expect(calls[0]?.name).toBe("ast_replace");
+    expect(calls[0]?.rawArgs.dryRun).toBe("true");
+    expect(calls[0]?.rawArgs).not.toHaveProperty("dry_run");
   });
 });

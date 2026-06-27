@@ -193,6 +193,8 @@ pub fn subc_translate_with_context(
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
         "conflicts" => translate_conflicts(agent_args),
+        "ast_search" => translate_ast_search(agent_args),
+        "ast_replace" => translate_ast_replace(agent_args),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
@@ -546,6 +548,84 @@ fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, Trans
         command: "grep".into(),
         args: out,
     })
+}
+
+fn translate_ast_search(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let pattern = map_in
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("ast_search: missing required param 'pattern'"))?;
+    let lang = map_in
+        .get("lang")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("ast_search: missing required param 'lang'"))?;
+
+    let mut out = Map::new();
+    out.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    out.insert("lang".to_string(), Value::String(lang.to_string()));
+    insert_non_empty_array(&mut out, &map_in, "paths");
+    insert_non_empty_array(&mut out, &map_in, "globs");
+    if let Some(context) = coerce_optional_int_result(
+        map_in.get("contextLines"),
+        "contextLines",
+        1,
+        9_007_199_254_740_991,
+    )? {
+        out.insert("context".to_string(), Value::Number(context.into()));
+    }
+
+    Ok(Translated {
+        command: "ast_search".into(),
+        args: out,
+    })
+}
+
+fn translate_ast_replace(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let pattern = map_in
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("ast_replace: missing required param 'pattern'"))?;
+    let rewrite = map_in
+        .get("rewrite")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request("ast_replace: missing required param 'rewrite'"))?;
+    let lang = map_in
+        .get("lang")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("ast_replace: missing required param 'lang'"))?;
+
+    let mut out = Map::new();
+    out.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    out.insert("rewrite".to_string(), Value::String(rewrite.to_string()));
+    out.insert("lang".to_string(), Value::String(lang.to_string()));
+    insert_non_empty_array(&mut out, &map_in, "paths");
+    insert_non_empty_array(&mut out, &map_in, "globs");
+    let dry_run = map_in
+        .get("dryRun")
+        .or_else(|| map_in.get("dry_run"))
+        .is_some_and(coerce_boolean);
+    out.insert("dry_run".to_string(), Value::Bool(dry_run));
+
+    Ok(Translated {
+        command: "ast_replace".into(),
+        args: out,
+    })
+}
+
+fn insert_non_empty_array(out: &mut Map<String, Value>, map_in: &Map<String, Value>, key: &str) {
+    if let Some(value) = map_in.get(key) {
+        if let Some(items) = value.as_array() {
+            if !items.is_empty() {
+                out.insert(key.to_string(), Value::Array(items.clone()));
+            }
+        }
+    }
 }
 
 fn translate_glob(args: &Value) -> Result<Translated, TranslateError> {

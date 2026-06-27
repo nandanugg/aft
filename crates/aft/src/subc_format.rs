@@ -23,6 +23,7 @@ pub struct FormatContext {
     pub callgraph_op: Option<String>,
     pub callgraph_include_unresolved: bool,
     pub zoom_target_label: Option<String>,
+    pub ast_dry_run: bool,
 }
 
 impl Default for FormatContext {
@@ -33,6 +34,7 @@ impl Default for FormatContext {
             callgraph_op: None,
             callgraph_include_unresolved: false,
             zoom_target_label: None,
+            ast_dry_run: false,
         }
     }
 }
@@ -47,6 +49,7 @@ impl FormatContext {
                 bare_name, arguments,
             ),
             zoom_target_label: zoom_target_label_for_call(bare_name, arguments),
+            ast_dry_run: ast_replace_dry_run_for_call(bare_name, arguments),
         }
     }
 }
@@ -122,6 +125,16 @@ fn zoom_target_label_for_call(bare_name: &str, arguments: &Value) -> Option<Stri
         .map(str::to_string)
 }
 
+fn ast_replace_dry_run_for_call(bare_name: &str, arguments: &Value) -> bool {
+    if bare_name != "ast_replace" {
+        return false;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get("dryRun").or_else(|| obj.get("dry_run")))
+        .is_some_and(coerce_boolean)
+}
+
 fn coerce_boolean(value: &Value) -> bool {
     match value {
         Value::Bool(value) => *value,
@@ -153,6 +166,8 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "inspect"
             | "callgraph"
             | "conflicts"
+            | "ast_search"
+            | "ast_replace"
     )
 }
 
@@ -201,6 +216,8 @@ pub fn format_response_with_context(
             ctx.callgraph_include_unresolved,
         ),
         "conflicts" => data["text"].as_str().unwrap_or_default().to_string(),
+        "ast_search" => format_ast_search(data),
+        "ast_replace" => format_ast_replace(data, ctx.ast_dry_run),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }
@@ -606,6 +623,256 @@ fn format_grep(data: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{body}\n\nFound {total_matches} match across {files_with_matches} file")
+}
+
+fn format_ast_search(data: &Value) -> String {
+    let matches = data.get("matches").and_then(Value::as_array);
+    let match_count = data
+        .get("total_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| matches.map(|m| m.len() as u64).unwrap_or(0));
+    let files_searched = data
+        .get("files_searched")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let files_with_matches = data
+        .get("files_with_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(files_searched);
+
+    let mut output = if data.get("no_files_matched_scope").and_then(Value::as_bool) == Some(true) {
+        let mut output =
+            "No files matched the scope (paths/globs resolved to zero files)".to_string();
+        append_scope_warnings(&mut output, data);
+        output
+    } else if match_count == 0 {
+        let mut output = format!("No matches found (searched {files_searched} files)");
+        append_scope_warnings(&mut output, data);
+        append_hint(&mut output, data);
+        output
+    } else {
+        let mut output = format!(
+            "Found {match_count} match(es) in {files_with_matches} file(s) ({files_searched} searched)\n\n"
+        );
+        if let Some(matches) = matches {
+            for m in matches {
+                let rel_file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
+                let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+                output.push_str(&format!("{rel_file}:{line}\n"));
+                if let Some(text) = m.get("text").and_then(Value::as_str) {
+                    output.push_str(&format!("  {}\n", text.trim()));
+                }
+                if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
+                    if !meta_vars.is_empty() {
+                        for (key, value) in meta_vars {
+                            output.push_str(&format!("  {key}: {}\n", js_template_string(value)));
+                        }
+                    }
+                }
+                output.push('\n');
+            }
+        }
+        output
+    };
+
+    if data.get("complete").and_then(Value::as_bool) == Some(false)
+        || data
+            .get("skipped_files")
+            .and_then(Value::as_array)
+            .is_some_and(|skipped| !skipped.is_empty())
+    {
+        output = append_ast_skipped_files(output, data.get("skipped_files"));
+    }
+    output
+}
+
+fn format_ast_replace(data: &Value, dry_run: bool) -> String {
+    let matches = data.get("matches").and_then(Value::as_array);
+    let match_count = data
+        .get("total_replacements")
+        .or_else(|| data.get("total_matches"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| matches.map(|m| m.len() as u64).unwrap_or(0));
+    let files_searched = data
+        .get("files_searched")
+        .or_else(|| data.get("total_files"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let files_with_matches = data
+        .get("files_with_matches")
+        .or_else(|| data.get("total_files"))
+        .and_then(Value::as_u64)
+        .unwrap_or(files_searched);
+
+    if data.get("no_files_matched_scope").and_then(Value::as_bool) == Some(true) {
+        let mut output =
+            "No files matched the scope (paths/globs resolved to zero files)".to_string();
+        append_scope_warnings(&mut output, data);
+        return output;
+    }
+
+    if match_count == 0 {
+        let mut output = format!("No matches found (searched {files_searched} files)");
+        append_scope_warnings(&mut output, data);
+        append_hint(&mut output, data);
+        return output;
+    }
+
+    let mut output = if dry_run {
+        format!(
+            "[DRY RUN] Would replace {match_count} match(es) in {files_with_matches} file(s) ({files_searched} searched)\n\n"
+        )
+    } else {
+        format!(
+            "Replaced {match_count} match(es) in {files_with_matches} file(s) ({files_searched} searched)\n\n"
+        )
+    };
+
+    if dry_run {
+        if let Some(files) = data.get("files").and_then(Value::as_array) {
+            if !files.is_empty() {
+                append_ast_replace_dry_run_files(
+                    &mut output,
+                    files,
+                    match_count,
+                    files_with_matches,
+                );
+            }
+        }
+    } else if let Some(matches) = matches {
+        for m in matches {
+            let rel_file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
+            let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+            output.push_str(&format!("{rel_file}:{line}\n"));
+            if let (Some(text), Some(replacement)) = (
+                m.get("text").and_then(Value::as_str),
+                m.get("replacement").and_then(Value::as_str),
+            ) {
+                output.push_str(&format!("  - {}\n", text.trim()));
+                output.push_str(&format!("  + {}\n", replacement.trim()));
+            }
+            output.push('\n');
+        }
+    } else if let Some(files) = data.get("files").and_then(Value::as_array) {
+        if !files.is_empty() {
+            for f in files {
+                let rel_file = f.get("file").and_then(Value::as_str).unwrap_or("unknown");
+                let replacements = f.get("replacements").and_then(Value::as_u64).unwrap_or(0);
+                let suffix = if replacements == 1 { "" } else { "s" };
+                output.push_str(&format!(
+                    "  {rel_file}: {replacements} replacement{suffix}\n"
+                ));
+            }
+        }
+    }
+
+    output
+}
+
+fn append_ast_replace_dry_run_files(
+    output: &mut String,
+    files: &[Value],
+    match_count: u64,
+    files_with_matches: u64,
+) {
+    const MAX_DIFF_BYTES: usize = 8 * 1024;
+    let mut used = 0usize;
+    for (index, f) in files.iter().enumerate() {
+        let rel_file = f.get("file").and_then(Value::as_str).unwrap_or("unknown");
+        let replacements = f.get("replacements").and_then(Value::as_u64).unwrap_or(0);
+        let diff = f.get("diff").and_then(Value::as_str).unwrap_or("");
+        if used + diff.len() > MAX_DIFF_BYTES {
+            let remaining = files.len().saturating_sub(index);
+            if remaining > 0 {
+                output.push_str(&format!(
+                    "\n... ({remaining} more file(s) omitted from preview to stay under {}KB; total {match_count} replacements across {files_with_matches} files)\n",
+                    MAX_DIFF_BYTES / 1024
+                ));
+            }
+            break;
+        }
+        let suffix = if replacements == 1 { "" } else { "s" };
+        output.push_str(&format!(
+            "{rel_file} ({replacements} replacement{suffix}):\n"
+        ));
+        output.push_str(diff);
+        if !diff.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('\n');
+        used += diff.len();
+    }
+}
+
+fn append_scope_warnings(output: &mut String, data: &Value) {
+    let warnings = string_array(data.get("scope_warnings"));
+    if !warnings.is_empty() {
+        output.push_str("\n\nScope warnings:\n");
+        output.push_str(
+            &warnings
+                .iter()
+                .map(|warning| format!("  {warning}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+}
+
+fn append_hint(output: &mut String, data: &Value) {
+    if let Some(hint) = data
+        .get("hint")
+        .and_then(Value::as_str)
+        .filter(|hint| !hint.is_empty())
+    {
+        output.push_str("\n\n");
+        output.push_str(hint);
+    }
+}
+
+fn append_ast_skipped_files(output: String, skipped_files: Option<&Value>) -> String {
+    let Some(skipped_files) = skipped_files.and_then(Value::as_array) else {
+        return output;
+    };
+    if skipped_files.is_empty() {
+        return output;
+    }
+    let lines = skipped_files
+        .iter()
+        .map(|skipped| {
+            let file = skipped
+                .get("file")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = skipped
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown reason");
+            format!("  {file}: {reason}")
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{output}\n\nIncomplete: skipped {} file(s)\n{}",
+        skipped_files.len(),
+        lines.join("\n")
+    )
+}
+
+fn js_template_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_template_string(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_string(),
+    }
 }
 
 // Mirrors packages/opencode-plugin/src/tools/semantic.ts semanticTools.

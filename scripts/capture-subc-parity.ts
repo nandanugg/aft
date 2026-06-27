@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
+import { astTools } from "../packages/opencode-plugin/src/tools/ast.ts";
 import { conflictTools } from "../packages/opencode-plugin/src/tools/conflicts.ts";
 import { createReadTool, hoistedTools } from "../packages/opencode-plugin/src/tools/hoisted.ts";
 import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
@@ -45,7 +46,9 @@ type BareToolName =
   | "zoom"
   | "inspect"
   | "callgraph"
-  | "conflicts";
+  | "conflicts"
+  | "ast_search"
+  | "ast_replace";
 
 interface BridgeCall {
   command: string;
@@ -78,6 +81,10 @@ function setupProjectRoot(): void {
   writeFileSync(join(RAW_PROJECT_ROOT, "packages/app/index.tsx"), "export const App = () => null;\n", "utf-8");
   PROJECT_ROOT = realpathSync(RAW_PROJECT_ROOT);
 }
+
+const AST_REPLACE_LARGE_DIFF = `${"x".repeat(8 * 1024 + 1)}\n`;
+const TS_INCLUDE_GLOB = "**" + "/" + "*.ts";
+const TS_TEST_EXCLUDE_GLOB = "!**" + "/" + "*.test.ts";
 
 function sortKeysDeep(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
@@ -158,6 +165,7 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
   const hoisted = hoistedTools(ctx);
   const grepTools = searchTools(ctx);
   const conflicts = conflictTools(ctx);
+  const ast = astTools(ctx);
   return {
     status: undefined,
     read: createReadTool(ctx),
@@ -171,6 +179,8 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     inspect: inspectTools(ctx).aft_inspect,
     callgraph: navigationTools(ctx).aft_callgraph,
     conflicts: conflicts.aft_conflicts,
+    ast_search: ast.ast_grep_search ?? ast.aft_ast_search,
+    ast_replace: ast.ast_grep_replace ?? ast.aft_ast_replace,
   };
 }
 
@@ -351,6 +361,13 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "glob_tool_missing_pattern", tool_name: "glob", expected_error: "glob: missing required param 'pattern'", agent_args: {} },
   { name: "conflicts_tool_default_translate", tool_name: "conflicts", agent_args: {} },
   { name: "conflicts_tool_path_translate", tool_name: "conflicts", agent_args: { path: `${PROJECT_ROOT}/src` } },
+  { name: "ast_search_translate_full", tool_name: "ast_search", agent_args: { pattern: "console.log($MSG)", lang: "typescript", paths: [`${PROJECT_ROOT}/src`], globs: [TS_INCLUDE_GLOB, TS_TEST_EXCLUDE_GLOB], contextLines: 2 } },
+  { name: "ast_search_translate_empty_scope", tool_name: "ast_search", agent_args: { pattern: "console.log($MSG)", lang: "typescript", paths: [], globs: [] } },
+  { name: "ast_search_missing_pattern", tool_name: "ast_search", expected_error: "ast_search: missing required param 'pattern'", agent_args: { lang: "typescript" } },
+  { name: "ast_search_missing_lang", tool_name: "ast_search", expected_error: "ast_search: missing required param 'lang'", agent_args: { pattern: "console.log($MSG)" } },
+  { name: "ast_replace_translate_dry_run", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [`${PROJECT_ROOT}/src`], globs: [TS_INCLUDE_GLOB], dryRun: "true" } },
+  { name: "ast_replace_translate_apply_default", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [], globs: [] } },
+  { name: "ast_replace_missing_rewrite", tool_name: "ast_replace", expected_error: "ast_replace: missing required param 'rewrite'", agent_args: { pattern: "console.log($MSG)", lang: "typescript" } },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },
@@ -395,6 +412,13 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "conflicts_tool_no_conflicts_text", tool_name: "conflicts", agent_args: {}, native_response_json: { id: "1", success: true, text: `No merge conflicts found.\nChecked repo root: ${PROJECT_ROOT}`, file_count: 0, conflict_count: 0, checked_root: PROJECT_ROOT } },
   { name: "conflicts_tool_with_conflicts_text", tool_name: "conflicts", agent_args: {}, native_response_json: { id: "1", success: true, text: `1 file, 1 conflict\nChecked repo root: ${PROJECT_ROOT}\n\n── src/main.ts [1 conflict] ──\n   1: before\n   2: <<<<<<< HEAD\n   3: ours\n   4: =======\n   5: theirs\n   6: >>>>>>> branch\n   7: after`, file_count: 1, conflict_count: 1, checked_root: PROJECT_ROOT } },
   { name: "conflicts_tool_error", tool_name: "conflicts", agent_args: { path: "missing" }, native_response_json: { id: "1", success: false, code: "not_a_git_repository", message: `path is not inside a git repository: ${PROJECT_ROOT}/missing` } },
+  { name: "ast_search_found_with_meta_vars", tool_name: "ast_search", agent_args: { pattern: "console.log($MSG)", lang: "typescript", paths: ["src/main.ts"] }, native_response_json: { id: "1", success: true, matches: [{ file: "src/main.ts", line: 3, text: "console.log(\"alpha\")", meta_variables: { $MSG: "\"alpha\"" } }, { file: "src/main.ts", line: 8, text: "console.log(value)", meta_variables: { $MSG: "value" } }], total_matches: 2, files_with_matches: 1, files_searched: 4, complete: true, skipped_files: [] } },
+  { name: "ast_search_zero_match_with_hint", tool_name: "ast_search", agent_args: { pattern: "function $NAME", lang: "typescript" }, native_response_json: { id: "1", success: true, matches: [], total_matches: 0, files_with_matches: 0, files_searched: 4, complete: true, skipped_files: [], scope_warnings: ["src/generated → no files"], hint: "Hint: JS/TS function patterns need params and body. Try: \"function $NAME($$$) { $$$ }\" (or `export async function ...`)." } },
+  { name: "ast_search_no_files_matched_scope", tool_name: "ast_search", agent_args: { pattern: "console.log($MSG)", lang: "typescript", paths: ["empty"] }, native_response_json: { id: "1", success: true, matches: [], total_matches: 0, files_with_matches: 0, files_searched: 0, no_files_matched_scope: true, scope_warnings: ["empty → no files"], complete: true, skipped_files: [] } },
+  { name: "ast_search_skipped_files", tool_name: "ast_search", agent_args: { pattern: "console.log($MSG)", lang: "typescript" }, native_response_json: { id: "1", success: true, matches: [{ file: "src/main.ts", line: 3, text: "console.log(\"alpha\")", meta_variables: { $MSG: "\"alpha\"" } }], total_matches: 1, files_with_matches: 1, files_searched: 3, complete: false, skipped_files: [{ file: "src/bad.ts", reason: "read_error: permission denied" }, { file: "src/unknown.ts" }] } },
+  { name: "ast_replace_dry_run_diff_overflow", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", dryRun: true }, native_response_json: { id: "1", success: true, files: [{ file: "src/main.ts", replacements: 1, diff: "--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-console.log(\"alpha\")\n+logger.info(\"alpha\")\n" }, { file: "src/large.ts", replacements: 5, diff: AST_REPLACE_LARGE_DIFF }], total_replacements: 6, total_files: 2, files_with_matches: 2, files_searched: 4, no_files_matched_scope: false, scope_warnings: [], dry_run: true } },
+  { name: "ast_replace_apply_files_counts", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", dryRun: false }, native_response_json: { id: "1", success: true, files: [{ file: "src/main.ts", replacements: 1 }, { file: "src/other.ts", replacements: 2 }], total_replacements: 3, total_files: 2, files_with_matches: 2, files_searched: 5, no_files_matched_scope: false, scope_warnings: [], dry_run: false } },
+  { name: "ast_replace_zero_match_with_hint", tool_name: "ast_replace", agent_args: { pattern: "function $NAME", rewrite: "function $NAME($$$) { $$$ }", lang: "typescript", dryRun: true }, native_response_json: { id: "1", success: true, files: [], total_replacements: 0, total_files: 0, files_with_matches: 0, files_searched: 4, no_files_matched_scope: false, scope_warnings: ["src/generated → no files"], hint: "Hint: JS/TS function patterns need params and body. Try: \"function $NAME($$$) { $$$ }\" (or `export async function ...`).", dry_run: true } },
   { name: "search_text_honesty", tool_name: "search", agent_args: { query: "value" }, native_response_json: { id: "1", success: true, text: "1. src/main.ts", more_available: true, fully_degraded: true, complete: false } },
   { name: "search_no_text_honesty", tool_name: "search", agent_args: { query: "value" }, native_response_json: { id: "1", success: true, more_available: true, engine_capped: true, fully_degraded: true, complete: false } },
   { name: "search_error", tool_name: "search", agent_args: { query: "value" }, native_response_json: { id: "1", success: false, code: "semantic_unavailable", message: "semantic index unavailable" } },
