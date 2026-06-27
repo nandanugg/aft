@@ -22,6 +22,7 @@ pub struct FormatContext {
     pub outline_mode: OutlineMode,
     pub callgraph_op: Option<String>,
     pub callgraph_include_unresolved: bool,
+    pub zoom_target_label: Option<String>,
 }
 
 impl Default for FormatContext {
@@ -31,6 +32,7 @@ impl Default for FormatContext {
             outline_mode: OutlineMode::Text,
             callgraph_op: None,
             callgraph_include_unresolved: false,
+            zoom_target_label: None,
         }
     }
 }
@@ -44,6 +46,7 @@ impl FormatContext {
             callgraph_include_unresolved: callgraph_include_unresolved_for_call(
                 bare_name, arguments,
             ),
+            zoom_target_label: zoom_target_label_for_call(bare_name, arguments),
         }
     }
 }
@@ -107,6 +110,18 @@ fn callgraph_include_unresolved_for_call(bare_name: &str, arguments: &Value) -> 
         .is_some_and(coerce_boolean)
 }
 
+fn zoom_target_label_for_call(bare_name: &str, arguments: &Value) -> Option<String> {
+    if bare_name != "zoom" {
+        return None;
+    }
+    let obj = arguments.as_object()?;
+    obj.get("filePath")
+        .or_else(|| obj.get("url"))
+        .and_then(Value::as_str)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+}
+
 fn coerce_boolean(value: &Value) -> bool {
     match value {
         Value::Bool(value) => *value,
@@ -129,6 +144,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "grep"
             | "search"
             | "outline"
+            | "zoom"
             | "inspect"
             | "callgraph"
     )
@@ -169,6 +185,7 @@ pub fn format_response_with_context(
         "grep" => format_grep(data),
         "search" => format_search(data),
         "outline" => format_outline(response, ctx.outline_mode),
+        "zoom" => format_zoom(data, ctx),
         "inspect" => format_inspect(response),
         "status" => format_status(data),
         "callgraph" => format_callgraph(
@@ -742,6 +759,169 @@ fn format_outline_text(data: &Value) -> String {
         lines.len(),
         lines.join("\n")
     )
+}
+
+// Format zoom responses as plain text so direct calls and server-side calls
+// produce identical output.
+fn format_zoom(data: &Value, ctx: &FormatContext) -> String {
+    let target_label = ctx.zoom_target_label.as_deref().unwrap_or("(no target)");
+    if let Some((names, responses)) = unwrap_rust_zoom_batch_envelope(data) {
+        return format_zoom_batch_result(target_label, &names, &responses);
+    }
+    format_zoom_text(target_label, data)
+}
+
+fn unwrap_rust_zoom_batch_envelope(data: &Value) -> Option<(Vec<String>, Vec<Value>)> {
+    let symbols = data.get("symbols")?.as_array()?;
+    if symbols.is_empty() {
+        return None;
+    }
+
+    let mut names = Vec::with_capacity(symbols.len());
+    let mut responses = Vec::with_capacity(symbols.len());
+    for entry in symbols {
+        let row = entry.as_object()?;
+        let name = row.get("name")?.as_str()?;
+        let response = row.get("response")?;
+        if response.is_null() {
+            return None;
+        }
+        names.push(name.to_string());
+        responses.push(response.clone());
+    }
+    Some((names, responses))
+}
+
+fn format_zoom_batch_result(target_label: &str, symbols: &[String], responses: &[Value]) -> String {
+    let entries = symbols
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let response = responses.get(index);
+            if response
+                .and_then(|r| r.get("success"))
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                let message = response
+                    .and_then(|r| r.get("message"))
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or("zoom failed");
+                return (false, format!("Symbol \"{name}\" not found: {message}"));
+            }
+            match response {
+                Some(response) => (true, format_zoom_text(target_label, response)),
+                None => (
+                    false,
+                    format!("Symbol \"{name}\" not found: missing zoom response"),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let complete = entries.iter().all(|(success, _)| *success);
+    let mut sections = Vec::new();
+    if !complete {
+        sections.push("Incomplete zoom results: one or more symbols failed.".to_string());
+    }
+    sections.extend(entries.into_iter().map(|(_, content)| content));
+    sections.join("\n\n")
+}
+
+fn format_zoom_text(target_label: &str, response: &Value) -> String {
+    let range = response.get("range");
+    let start_line = range
+        .and_then(|range| range.get("start_line"))
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    let end_line = range
+        .and_then(|range| range.get("end_line"))
+        .and_then(Value::as_i64)
+        .unwrap_or(start_line);
+    let kind = response
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("symbol");
+    let name = response.get("name").and_then(Value::as_str).unwrap_or("");
+    let content_text = response
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let context_before = string_array(response.get("context_before"));
+    let context_after = string_array(response.get("context_after"));
+
+    let header = if kind == "lines" {
+        format!("{target_label}:{start_line}-{end_line}")
+    } else {
+        format!("{target_label}:{start_line}-{end_line} [{kind} {name}]")
+            .trim_end()
+            .to_string()
+    };
+
+    let mut content_lines = content_text.split('\n').collect::<Vec<_>>();
+    if content_lines.last() == Some(&"") {
+        content_lines.pop();
+    }
+
+    let last_displayed_line = end_line + context_after.len() as i64;
+    let gutter_width = last_displayed_line.max(1).to_string().len();
+    let mut out = vec![header, String::new()];
+
+    let mut line_no = start_line - context_before.len() as i64;
+    for text in &context_before {
+        out.push(format_zoom_line(line_no, gutter_width, text));
+        line_no += 1;
+    }
+    for text in content_lines {
+        out.push(format_zoom_line(line_no, gutter_width, text));
+        line_no += 1;
+    }
+    for text in &context_after {
+        out.push(format_zoom_line(line_no, gutter_width, text));
+        line_no += 1;
+    }
+
+    let annotations = response.get("annotations");
+    let calls_out = annotations
+        .and_then(|annotations| annotations.get("calls_out"))
+        .and_then(Value::as_array);
+    if let Some(calls_out) = calls_out.filter(|calls| !calls.is_empty()) {
+        out.push(String::new());
+        out.push("──── calls_out".to_string());
+        for call in calls_out {
+            out.push(format_zoom_call_ref(call));
+        }
+    }
+
+    let called_by = annotations
+        .and_then(|annotations| annotations.get("called_by"))
+        .and_then(Value::as_array);
+    if let Some(called_by) = called_by.filter(|calls| !calls.is_empty()) {
+        out.push(String::new());
+        out.push("──── called_by".to_string());
+        for call in called_by {
+            out.push(format_zoom_call_ref(call));
+        }
+    }
+
+    out.join("\n")
+}
+
+fn format_zoom_line(line_no: i64, gutter_width: usize, text: &str) -> String {
+    format!("{line_no:>gutter_width$}: {text}")
+}
+
+fn format_zoom_call_ref(call: &Value) -> String {
+    let name = call.get("name").and_then(Value::as_str).unwrap_or("");
+    let line = call.get("line").and_then(Value::as_i64).unwrap_or(0);
+    let extra = call
+        .get("extra_count")
+        .and_then(Value::as_i64)
+        .filter(|count| *count > 0)
+        .map(|count| format!(" +{count}"))
+        .unwrap_or_default();
+    format!("  {name} (line {line}){extra}")
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts inspectTools.

@@ -1,0 +1,9 @@
+{
+  "args": {
+    "context_lines": 1,
+    "end_line": 3,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "start_line": 2
+  },
+  "command": "zoom"
+}

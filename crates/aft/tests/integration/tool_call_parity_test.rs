@@ -172,11 +172,27 @@ fn parity_cases() -> Vec<ParityCase> {
             tool: "read",
             arguments: json!({"filePath": "src/missing.txt"}),
         },
+        ParityCase {
+            label: "zoom_single_symbol",
+            tool: "zoom",
+            arguments: json!({"filePath": "src/zoom.ts", "symbols": "helper", "contextLines": 1}),
+        },
+        ParityCase {
+            label: "zoom_multi_symbol_partial",
+            tool: "zoom",
+            arguments: json!({"filePath": "src/zoom.ts", "symbols": ["helper", "missingSymbol"]}),
+        },
+        ParityCase {
+            label: "zoom_line_range",
+            tool: "zoom",
+            arguments: json!({"filePath": "docs/zoom.md", "startLine": 1, "endLine": 3}),
+        },
     ]
 }
 
 fn create_fixture_project(root: &Path) {
     fs::create_dir_all(root.join("src")).expect("create src dir");
+    fs::create_dir_all(root.join("docs")).expect("create docs dir");
     fs::write(
         root.join("src/read.txt"),
         "alpha\nneedle in a haystack\nomega\n",
@@ -189,6 +205,13 @@ fn create_fixture_project(root: &Path) {
         "// TODO: keep the parity fixture visible to inspect\nfn main() {}\n",
     )
     .expect("write todo fixture");
+    fs::write(
+        root.join("src/zoom.ts"),
+        "export function helper(): string {\n  return 'ok';\n}\n\nexport function caller(): string {\n  return helper();\n}\n",
+    )
+    .expect("write zoom fixture");
+    fs::write(root.join("docs/zoom.md"), "# Zoom Doc\n\nIntro line\n")
+        .expect("write zoom docs fixture");
 }
 
 fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {

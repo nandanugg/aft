@@ -181,6 +181,7 @@ pub fn subc_translate_with_context(
         "grep" => translate_grep(agent_args, project_root),
         "search" => translate_search(agent_args),
         "outline" => translate_outline(agent_args, project_root),
+        "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
         other => Err(invalid_request(format!(
@@ -756,6 +757,104 @@ fn translate_outline(args: &Value, project_root: &Path) -> Result<Translated, Tr
 
     Ok(Translated {
         command: "outline".into(),
+        args: out,
+    })
+}
+
+fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+
+    if map_in.contains_key("targets") {
+        return Err(invalid_request("zoom targets handled separately"));
+    }
+
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let url = map_in
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+
+    match (file_path, url) {
+        (None, None) => {
+            return Err(invalid_request(
+                "Provide exactly one of 'filePath', 'url', or 'targets'",
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(invalid_request(
+                "Provide exactly ONE of 'filePath' or 'url' — not both",
+            ));
+        }
+        _ => {}
+    }
+
+    let mut out = Map::new();
+    if let Some(url) = url {
+        out.insert("file".to_string(), Value::String(url.to_string()));
+    } else if let Some(file_path) = file_path {
+        insert_resolved_file(&mut out, project_root, file_path);
+    }
+
+    if let Some(symbols) = map_in.get("symbols") {
+        if !is_empty_param(symbols) {
+            match symbols {
+                Value::String(symbol) => {
+                    out.insert("symbol".to_string(), Value::String(symbol.to_string()));
+                }
+                Value::Array(items) => {
+                    let joined = items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !joined.is_empty() {
+                        out.insert("symbol".to_string(), Value::String(joined));
+                    }
+                }
+                _ => {
+                    return Err(invalid_request(
+                        "'symbols' must be a string or array of strings",
+                    ))
+                }
+            }
+        }
+    }
+
+    if let Some(context_lines) = coerce_optional_int_result(
+        map_in.get("contextLines"),
+        "contextLines",
+        1,
+        9_007_199_254_740_991,
+    )? {
+        out.insert(
+            "context_lines".to_string(),
+            Value::Number(context_lines.into()),
+        );
+    }
+
+    if let Some(start_line) = coerce_optional_int_result(
+        map_in.get("startLine"),
+        "startLine",
+        1,
+        9_007_199_254_740_991,
+    )? {
+        out.insert("start_line".to_string(), Value::Number(start_line.into()));
+    }
+    if let Some(end_line) =
+        coerce_optional_int_result(map_in.get("endLine"), "endLine", 1, 9_007_199_254_740_991)?
+    {
+        out.insert("end_line".to_string(), Value::Number(end_line.into()));
+    }
+
+    if map_in.get("callgraph").is_some_and(coerce_boolean) {
+        out.insert("callgraph".to_string(), Value::Bool(true));
+    }
+
+    Ok(Translated {
+        command: "zoom".into(),
         args: out,
     })
 }

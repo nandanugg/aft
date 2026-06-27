@@ -3,7 +3,6 @@ import {
   coerceTargetParam,
   formatZoomMultiTargetResult,
   formatZoomText,
-  unwrapRustZoomBatchEnvelope,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -324,71 +323,27 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
         }
 
-        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
-        const file = hasUrl
-          ? (args.url as string)
-          : await resolvePathArg(ctx, context, args.filePath as string);
+        // URL mode passes through to Rust; Rust fetches, validates, and caches.
+        // File mode still resolves locally before dispatch so external-directory
+        // permission checks approve the same path the server will read.
         if (!hasUrl) {
+          const file = await resolvePathArg(ctx, context, args.filePath as string);
           const permissionDenied = await assertPathExternalPermissions(ctx, context, file);
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
         }
 
-        // Header label — what the agent typed, not the on-disk cache path.
-        const targetLabel = (hasUrl ? (args.url as string) : (args.filePath as string)) ?? file;
+        const rawArgs: Record<string, unknown> = hasUrl
+          ? { url: args.url }
+          : { filePath: args.filePath };
+        if (hasSymbols) rawArgs.symbols = args.symbols;
+        if (contextLines !== undefined) rawArgs.contextLines = contextLines;
+        if (wantCallgraph) rawArgs.callgraph = true;
 
-        // Normalize symbols → array (or undefined if not provided).
-        // String input is treated as a single-element array; single-string
-        // shortcut still returns the raw zoom text instead of a batch wrapper
-        // so the happy path doesn't show "Incomplete" framing.
-        const symbolsArray: string[] | undefined = hasSymbols
-          ? typeof args.symbols === "string"
-            ? [args.symbols]
-            : (args.symbols as string[])
-          : undefined;
-
-        if (symbolsArray) {
-          const results = await Promise.all(
-            symbolsArray.map((sym) => {
-              const params: Record<string, unknown> = { file, symbol: sym };
-              if (contextLines !== undefined) params.context_lines = contextLines;
-              if (wantCallgraph) params.callgraph = true;
-              return callBridge(ctx, context, "zoom", params).catch((err) => ({
-                success: false,
-                message: err instanceof Error ? err.message : String(err),
-              }));
-            }),
-          );
-          if (symbolsArray.length === 1) {
-            const response = results[0] ?? { success: false, message: "missing zoom response" };
-            const rustBatch = unwrapRustZoomBatchEnvelope(response as Record<string, unknown>);
-            if (rustBatch) {
-              const batch = formatZoomBatchResult(
-                targetLabel,
-                rustBatch.names,
-                rustBatch.responses,
-              );
-              return withMeta(batch.text);
-            }
-            if ((response as { success?: boolean }).success === false) {
-              throw new Error(
-                ((response as { message?: string }).message as string) || "zoom failed",
-              );
-            }
-            return withMeta(formatZoomText(targetLabel, response as Record<string, unknown>));
-          }
-          return withMeta(formatZoomBatchResult(targetLabel, symbolsArray, results).text);
+        const response = await callToolCall(ctx, context, "zoom", rawArgs);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "zoom failed");
         }
-
-        // No symbols specified: zoom by line-range fallback (or whole file).
-        const params: Record<string, unknown> = { file };
-        if (contextLines !== undefined) params.context_lines = contextLines;
-        if (wantCallgraph) params.callgraph = true;
-
-        const data = await callBridge(ctx, context, "zoom", params);
-        if (data.success === false) {
-          throw new Error((data.message as string) || "zoom failed");
-        }
-        return withMeta(formatZoomText(targetLabel, data));
+        return withMeta(response.text);
       },
     },
   };

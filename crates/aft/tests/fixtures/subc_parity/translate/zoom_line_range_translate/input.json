@@ -1,0 +1,10 @@
+{
+  "agent_args": {
+    "contextLines": 1,
+    "endLine": 3,
+    "filePath": "src/main.ts",
+    "startLine": 2
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "zoom"
+}

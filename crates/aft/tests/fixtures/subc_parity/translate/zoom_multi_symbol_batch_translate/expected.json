@@ -1,0 +1,7 @@
+{
+  "args": {
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "symbol": "run missing"
+  },
+  "command": "zoom"
+}

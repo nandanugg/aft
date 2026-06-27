@@ -300,7 +300,7 @@ describe("reading tool adapters", () => {
   test("aft_zoom treats empty-content targets shapes as not provided (GPT empty-param regression)", async () => {
     const root = await tempProject();
     await Bun.write(`${root}/src/a.ts`, "export function foo() {}\nexport function bar() {}\n");
-    const { sendCalls, tools } = createMockReadingHarness(() => ({
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
       file: "src/a.ts",
       symbol: "foo",
@@ -319,10 +319,17 @@ describe("reading tool adapters", () => {
       },
       createMockSdkContext(root),
     );
-    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: { filePath: "src/a.ts", symbols: "foo" },
+      },
+    ]);
 
     // Single object form, same all-empty pattern.
-    sendCalls.length = 0;
+    toolCallCalls.length = 0;
     await tools.aft_zoom.execute(
       {
         filePath: "src/a.ts",
@@ -331,13 +338,21 @@ describe("reading tool adapters", () => {
       },
       createMockSdkContext(root),
     );
-    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: { filePath: "src/a.ts", symbols: "foo" },
+      },
+    ]);
   });
 
-  test("aft_zoom string symbols renders Rust batch envelope from one bridge call", async () => {
+  test("aft_zoom string symbols forwards one tool_call and returns server-rendered batch text", async () => {
     const root = await tempProject();
-    const { sendCalls, tools } = createMockReadingHarness(() => ({
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
       success: true,
+      text: "server-rendered batch text",
       complete: true,
       symbols: [
         {
@@ -376,22 +391,22 @@ describe("reading tool adapters", () => {
       ),
     );
 
-    expect(sendCalls).toHaveLength(1);
-    expect(sendCalls[0]?.params).toMatchObject({
-      file: join(root, "src/job.rs"),
-      symbol: "a b",
-    });
-    expect(text).toContain("[function a]");
-    expect(text).toContain("function a() {}");
-    expect(text).toContain("[function b]");
-    expect(text).toContain("function b() {}");
-    expect(text).not.toContain("Incomplete zoom results");
+    expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: { filePath: "src/job.rs", symbols: "a b" },
+      },
+    ]);
+    expect(text).toBe("server-rendered batch text");
   });
 
-  test("aft_zoom string symbols shows incomplete framing when Rust batch has a failure", async () => {
+  test("aft_zoom string symbols returns server-rendered incomplete framing", async () => {
     const root = await tempProject();
     const { tools } = createMockReadingHarness(() => ({
       success: true,
+      text: 'Incomplete zoom results\n\nfunction a() {}\n\nSymbol "missing" not found:',
       complete: false,
       symbols: [
         {
@@ -453,8 +468,9 @@ describe("reading tool adapters", () => {
 
   test("aft_zoom threads callgraph true to all zoom request shapes and omits it by default", async () => {
     const root = await tempProject();
-    const { sendCalls, tools } = createMockReadingHarness((_command, params) => ({
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness((_command, params) => ({
       success: true,
+      text: "ok",
       name: (params.symbol as string | undefined) ?? "lines",
       kind: params.symbol ? "function" : "lines",
       range: { start_line: 1, end_line: 1 },
@@ -476,16 +492,32 @@ describe("reading tool adapters", () => {
 
     expect(sendCalls.map((call) => call.params)).toEqual([
       expect.objectContaining({ file: join(root, "src/a.ts"), symbol: "foo", callgraph: true }),
-      expect.objectContaining({ file: join(root, "src/a.ts"), symbol: "foo", callgraph: true }),
-      expect.objectContaining({ file: join(root, "src/a.ts"), callgraph: true }),
+    ]);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: { filePath: "src/a.ts", symbols: ["foo"], callgraph: true },
+      },
+      {
+        sessionId: "reading-session",
+        name: "zoom",
+        rawArgs: { filePath: "src/a.ts", callgraph: true },
+      },
     ]);
 
     sendCalls.length = 0;
+    toolCallCalls.length = 0;
     await tools.aft_zoom.execute(
       { filePath: "src/a.ts", symbols: "foo" },
       createMockSdkContext(root),
     );
-    expect(sendCalls[0]?.params).toMatchObject({ file: join(root, "src/a.ts"), symbol: "foo" });
-    expect(sendCalls[0]?.params).not.toHaveProperty("callgraph");
+    expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls[0]).toEqual({
+      sessionId: "reading-session",
+      name: "zoom",
+      rawArgs: { filePath: "src/a.ts", symbols: "foo" },
+    });
+    expect(toolCallCalls[0]?.rawArgs).not.toHaveProperty("callgraph");
   });
 });

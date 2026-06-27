@@ -167,6 +167,39 @@ fn subc_translate_matches_typescript_golden_fixtures() {
 }
 
 #[test]
+fn zoom_translate_matches_typescript_golden_fixtures() {
+    let root = fixtures_root();
+    let mut cases: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap_or_else(|e| panic!("read fixtures dir {}: {e}", root.display()))
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("zoom_"))
+        })
+        .collect();
+    cases.sort();
+
+    assert!(
+        cases.len() >= 4,
+        "expected >=4 zoom translate parity fixtures, found {}",
+        cases.len()
+    );
+
+    let failures = cases
+        .iter()
+        .filter_map(|dir| assert_case(dir))
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "{} zoom translate parity mismatch(es):\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+#[test]
 fn main_dispatch_has_no_agent_edit_or_search_aliases() {
     let src = include_str!("../../src/main.rs");
     for pat in ["\"edit\" =>", "\"search\" =>"] {
