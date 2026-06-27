@@ -48,6 +48,7 @@ pub mod semantic_search;
 pub mod state;
 pub mod status;
 pub mod symbol_render;
+pub mod tool_call;
 pub mod trace_data;
 pub mod trace_to;
 pub mod trace_to_symbol;

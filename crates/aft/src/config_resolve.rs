@@ -1106,6 +1106,10 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
         config.experimental_lsp_ty = value;
     }
 
+    if let Some(value) = lsp.and_then(|lsp| lsp.diagnostics_on_edit) {
+        config.diagnostics_on_edit = value;
+    }
+
     if let Some(servers) = lsp.and_then(|lsp| lsp.servers.as_ref()) {
         config.lsp_servers = servers
             .iter()

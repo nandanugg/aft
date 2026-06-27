@@ -187,6 +187,9 @@ pub struct Config {
     pub lsp_servers: Vec<UserServerDef>,
     /// Lowercase LSP server IDs disabled by user config.
     pub disabled_lsp: HashSet<String>,
+    /// Whether the system should request inline diagnostics after a tool call edits or writes a file.
+    #[serde(skip)]
+    pub diagnostics_on_edit: bool,
     /// Extra directories to search when resolving LSP binaries.
     /// The plugin populates these from its own auto-install cache (e.g.
     /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so a binary AFT
@@ -262,6 +265,7 @@ impl Default for Config {
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),
+            diagnostics_on_edit: false,
             lsp_paths_extra: Vec::new(),
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),

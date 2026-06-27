@@ -207,6 +207,15 @@ fn main() {
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
+                let attach_command = if req.command == "tool_call" {
+                    req.params
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("tool_call")
+                        .to_string()
+                } else {
+                    req.command.clone()
+                };
                 let session_id_for_log = req.session_id.clone();
                 // P3-02/P3-03 seam: request-root identity is absent in
                 // standalone; the selected single runtime is the root today.
@@ -221,9 +230,13 @@ fn main() {
                             &mut response,
                             runtime,
                             &session_id,
-                            &command,
+                            &attach_command,
                         );
-                        aft::response_finalize::attach_status_bar(&mut response, runtime, &command);
+                        aft::response_finalize::attach_status_bar(
+                            &mut response,
+                            runtime,
+                            &attach_command,
+                        );
                         response
                     }
                     Err(payload) => {
@@ -458,6 +471,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    aft::commands::tool_call::register_dispatch(dispatch);
     match req.command.as_str() {
         "ping" => Response::success(&req.id, serde_json::json!({ "command": "pong" })),
         "version" => Response::success(
@@ -465,6 +479,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
         ),
         "echo" => handle_echo(&req),
+        "tool_call" => aft::commands::tool_call::handle(&req, ctx),
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
