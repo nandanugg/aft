@@ -13,6 +13,7 @@ pub struct Translated {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranslateContext {
     pub diagnostics_on_edit: bool,
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +194,7 @@ fn insert_common_mutation_flags(out: &mut Map<String, Value>, ctx: TranslateCont
         Value::Bool(ctx.diagnostics_on_edit),
     );
     out.insert("include_diff_content".to_string(), Value::Bool(true));
+    out.insert("preview".to_string(), Value::Bool(ctx.preview));
 }
 
 fn translate_read(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {

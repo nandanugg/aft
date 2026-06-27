@@ -4,7 +4,8 @@
     "create_dirs": true,
     "diagnostics": false,
     "file": "<PROJECT_ROOT>/src/new.ts",
-    "include_diff_content": true
+    "include_diff_content": true,
+    "preview": false
   },
   "command": "write"
 }

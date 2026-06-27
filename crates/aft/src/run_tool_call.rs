@@ -24,13 +24,15 @@ pub enum ToolCallOutcome {
     Unary(ToolCallResult),
 }
 
-/// Single owner of per-call context (Oracle #4). diagnostics_on_edit has ONE source here.
+/// Server-owned settings for a single `tool_call` request.
+/// These fields cannot be supplied through the agent's arguments object.
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
     pub project_root: PathBuf,
     pub session_id: Option<String>,
     pub request_id: String,
     pub diagnostics_on_edit: bool,
+    pub preview: bool,
 }
 
 pub fn run_tool_call(
@@ -40,17 +42,19 @@ pub fn run_tool_call(
     app_ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
 ) -> ToolCallOutcome {
+    let sanitized_args = strip_agent_preview_arg(args);
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         bare_name,
-        args,
+        &sanitized_args,
         ctx.project_root.as_path(),
     );
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
+        preview: ctx.preview,
     };
     let (command, translated_args) = match crate::subc_translate::subc_translate_with_context(
         bare_name,
-        args,
+        &sanitized_args,
         ctx.project_root.as_path(),
         translate_context,
     ) {
@@ -64,7 +68,7 @@ pub fn run_tool_call(
             ));
         }
         Err(_) => {
-            let map = args.as_object().cloned().unwrap_or_default();
+            let map = sanitized_args.as_object().cloned().unwrap_or_default();
             (bare_name.to_string(), map)
         }
     };
@@ -96,6 +100,19 @@ pub fn run_tool_call(
         &format_context,
         response,
     ))
+}
+
+fn strip_agent_preview_arg(args: &Value) -> Value {
+    let Some(map) = args.as_object() else {
+        return args.clone();
+    };
+    if !map.contains_key("preview") {
+        return args.clone();
+    }
+
+    let mut sanitized = map.clone();
+    sanitized.remove("preview");
+    Value::Object(sanitized)
 }
 
 fn tool_call_result_from_response(

@@ -116,6 +116,7 @@ fn assert_case(dir: &Path) -> Option<String> {
 
     let ctx = TranslateContext {
         diagnostics_on_edit: input.diagnostics_on_edit.unwrap_or(false),
+        preview: false,
     };
     let actual = match subc_translate_with_context(
         &input.tool_name,

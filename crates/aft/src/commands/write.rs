@@ -72,6 +72,19 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         String::new()
     };
 
+    if edit::wants_preview(&req.params) {
+        let mut result = serde_json::json!({
+            "file": file,
+            "created": !existed,
+            "formatted": false,
+        });
+        if existed && original == content {
+            result["no_op"] = serde_json::json!(true);
+        }
+        edit::attach_preview_diff(&mut result, &req.params, file, &original, content);
+        return Response::success(&req.id, result);
+    }
+
     // Auto-backup existing files before overwriting. For create-only writes,
     // record a tombstone so operation undo removes the created file.
     let backup_id = if existed {

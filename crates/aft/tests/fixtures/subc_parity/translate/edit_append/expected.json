@@ -5,7 +5,8 @@
     "diagnostics": true,
     "file": "<PROJECT_ROOT>/src/main.ts",
     "include_diff_content": true,
-    "op": "append"
+    "op": "append",
+    "preview": false
   },
   "command": "edit_match"
 }

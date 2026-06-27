@@ -10,7 +10,8 @@
       }
     ],
     "file": "<PROJECT_ROOT>/src/main.ts",
-    "include_diff_content": true
+    "include_diff_content": true,
+    "preview": false
   },
   "command": "batch"
 }

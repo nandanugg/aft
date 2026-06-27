@@ -216,6 +216,7 @@ fn direct_request(id: &str, tool: &str, arguments: &Value, project_root: &Path) 
         project_root,
         TranslateContext {
             diagnostics_on_edit: false,
+            preview: false,
         },
     )
     .unwrap_or_else(|error| panic!("translate {tool} failed: {}", error.message));

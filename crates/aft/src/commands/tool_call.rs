@@ -51,6 +51,11 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let preview = req
+        .params
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let config = ctx.config();
     let project_root = config
         .project_root
@@ -61,6 +66,7 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         session_id: Some(req.session().to_string()),
         request_id: req.id.clone(),
         diagnostics_on_edit: config.diagnostics_on_edit,
+        preview,
     };
 
     match run_tool_call(name, &arguments, &tool_ctx, ctx, dispatch) {

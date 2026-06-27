@@ -1937,6 +1937,7 @@ async fn handle_tool_call(
         session_id: Some(identity.session.clone()),
         request_id: request_id.clone(),
         diagnostics_on_edit,
+        preview: false,
     };
     let arguments_for_run = call.arguments.clone();
     let bare_name_for_run = bare_name.clone();
