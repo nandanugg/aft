@@ -18,7 +18,7 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import type { BinaryBridge, BridgeRequestOptions, ToolCallResult } from "@cortexkit/aft-bridge";
 import { canonicalizeProjectRoot, timeoutForCommand } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
@@ -242,6 +242,48 @@ export async function callBridge(
     response = await bridgeFor(ctx, runtime).send(
       command,
       merged,
+      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+    );
+  } finally {
+    markBridgeEnd();
+  }
+  ingestBgCompletions(runtime.sessionID, response.bg_completions);
+  return response;
+}
+
+/**
+ * Dispatch one hoisted agent tool through the server-side `tool_call` command.
+ *
+ * The helper mirrors `callBridge()`: it warms the session-directory cache,
+ * routes to the project-keyed bridge, applies the bare tool's timeout budget,
+ * records the same perf marks, and ingests background-completion sidecars from
+ * the raw response exactly once. The returned object is the full Rust response
+ * plus the server-rendered `text` field.
+ */
+export async function callToolCall(
+  ctx: PluginContext,
+  runtime: ToolRuntime,
+  name: string,
+  rawArgs: Record<string, unknown> = {},
+  options?: BridgeRequestOptions,
+): Promise<ToolCallResult> {
+  if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
+    await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
+  }
+
+  const timeoutMs = timeoutForCommand(name);
+  const sendOptions = {
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    configureWarningClient: ctx.client,
+    ...options,
+  };
+  markBridgeStart();
+  let response: Awaited<ReturnType<BinaryBridge["toolCall"]>>;
+  try {
+    response = await bridgeFor(ctx, runtime).toolCall(
+      runtime.sessionID,
+      name,
+      rawArgs,
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
   } finally {

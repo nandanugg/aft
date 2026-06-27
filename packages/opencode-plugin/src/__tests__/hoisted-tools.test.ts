@@ -90,6 +90,14 @@ function createMockHoistedHarness(
       calls.push({ command, params });
       return await sendImpl(command, params);
     },
+    toolCall: async (
+      _sessionID: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown> = {},
+    ) => {
+      calls.push({ command: name, params: rawArgs });
+      return await sendImpl(name, rawArgs);
+    },
   };
 
   const pool = {
@@ -133,6 +141,7 @@ describe("Hoisted tool execute handlers", () => {
       expect(command).toBe("read");
       return {
         success: true,
+        text: "Read image attachment (image/png, 32×16, 1 KB).",
         attachments: [
           {
             kind: "image",
@@ -172,6 +181,7 @@ describe("Hoisted tool execute handlers", () => {
       expect(command).toBe("read");
       return {
         success: true,
+        text: "Read PDF attachment (128 bytes).",
         attachments: [
           {
             kind: "pdf",
@@ -1512,6 +1522,7 @@ describe("Hoisted tool execute handlers", () => {
 
     const { calls, tools } = createMockHoistedHarness(async () => ({
       success: true,
+      text: "Binary file (512 bytes)",
       binary: true,
       message: "Binary file (512 bytes)",
     }));
@@ -1522,8 +1533,7 @@ describe("Hoisted tool execute handlers", () => {
     expect(calls[0]).toEqual({
       command: "read",
       params: {
-        file: resolve(tmpDir, "artifact.bin"),
-        session_id: "test",
+        filePath: "artifact.bin",
       },
     });
   });
@@ -1536,11 +1546,12 @@ describe("Hoisted tool execute handlers", () => {
     const { tools } = createMockHoistedHarness(async () => {
       callIndex += 1;
       if (callIndex === 1) {
-        return { success: true, entries: ["a.ts", "src/"] };
+        return { success: true, text: "a.ts\nsrc/", entries: ["a.ts", "src/"] };
       }
 
       return {
         success: true,
+        text: "1: one\n2: two\n(Showing lines 1-2 of 10. Use startLine/endLine to read other sections.)",
         content: "1: one\n2: two",
         truncated: true,
         start_line: 1,
@@ -1566,6 +1577,7 @@ describe("Hoisted tool execute handlers", () => {
 
     const { tools } = createMockHoistedHarness(async () => ({
       success: true,
+      text: "1: one\n2: two\n3: three",
       content: "1: one\n2: two\n3: three",
       // truncated:false means the response IS the whole file — no footer needed.
       truncated: false,
@@ -1589,10 +1601,11 @@ describe("Hoisted tool execute handlers", () => {
 
     const { tools } = createMockHoistedHarness(async () => ({
       success: true,
+      text: "130: ...\n190: ...",
       content: "130: ...\n190: ...",
-      // Rust still reports truncated:true because the response is a slice
-      // of the file (end_line < total_lines). The plugin must NOT key the
-      // hint off this flag alone — it needs to know the agent picked the slice.
+      // Rust sets truncated:true for any file slice (end_line < total_lines).
+      // The server must not base its truncation hint only on that flag; it must
+      // also check whether the agent explicitly chose the slice via startLine/endLine.
       truncated: true,
       start_line: 130,
       end_line: 190,
@@ -1623,6 +1636,7 @@ describe("Hoisted tool execute handlers", () => {
 
     const { tools } = createMockHoistedHarness(async () => ({
       success: true,
+      text: "100: ...\n150: ...",
       content: "100: ...\n150: ...",
       truncated: true,
       start_line: 100,
@@ -1646,8 +1660,9 @@ describe("Hoisted tool execute handlers", () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
-    const { tools } = createMockHoistedHarness(async () => ({
+    const { calls, tools } = createMockHoistedHarness(async () => ({
       success: true,
+      text: "10: ...\n29: ...",
       content: "10: ...\n29: ...",
       truncated: true,
       start_line: 10,
@@ -1663,6 +1678,10 @@ describe("Hoisted tool execute handlers", () => {
     expect(result).toBe("10: ...\n29: ...");
     expect(result).not.toContain("Use startLine/endLine");
     expect(result).not.toContain("(Lines");
+    expect(calls[0]).toEqual({
+      command: "read",
+      params: { filePath: "small.ts", startLine: 10, endLine: 29 },
+    });
   });
 
   test("write distinguishes new files from updates", async () => {

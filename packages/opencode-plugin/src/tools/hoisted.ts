@@ -11,12 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-  coerceBoolean,
-  coerceStringArray,
-  formatEditSummary,
-  formatReadFooter as formatSharedReadFooter,
-} from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceStringArray, formatEditSummary } from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
@@ -24,6 +19,7 @@ import { applyUpdateChunks, type Hunk as PatchHunk, parsePatch } from "../patch-
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
+  callToolCall,
   coerceOptionalInt,
   optionalInt,
   resolvePathFromProjectRoot,
@@ -44,17 +40,6 @@ function relativeToWorktree(fp: string, worktree: string): string {
   return path.relative(worktree, fp);
 }
 
-/**
- * Build the navigation footer for a `read` response.
- *
- * The pure clamping/range logic lives in aft-bridge. OpenCode keeps the
- * host-specific parameter hint (`startLine/endLine`) here so existing
- * agent-facing output stays byte-for-byte identical.
- */
-function formatReadFooter(agentSpecifiedRange: boolean, data: Record<string, unknown>): string {
-  return formatSharedReadFooter(agentSpecifiedRange, data, { rangeHint: "startLine/endLine" });
-}
-
 type ReadAttachment = {
   kind?: unknown;
   mime?: unknown;
@@ -67,30 +52,6 @@ type ReadAttachment = {
 
 function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
   return Array.isArray(data.attachments) ? (data.attachments as ReadAttachment[]) : [];
-}
-
-function formatAttachmentSize(bytes: unknown): string | undefined {
-  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return undefined;
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} KB`;
-  return `${bytes} bytes`;
-}
-
-function formatReadAttachmentOutput(attachment: ReadAttachment): string {
-  const mime = typeof attachment.mime === "string" ? attachment.mime : "application/octet-stream";
-  const size = formatAttachmentSize(attachment.bytes);
-  if (attachment.kind === "image" || mime.startsWith("image/")) {
-    const dimensions =
-      typeof attachment.width === "number" && typeof attachment.height === "number"
-        ? `, ${attachment.width}×${attachment.height}`
-        : "";
-    const resized = attachment.resized === true ? ", resized" : "";
-    return `Read image (${mime}${dimensions}${resized}${size ? `, ${size}` : ""}).`;
-  }
-  if (attachment.kind === "pdf" || mime === "application/pdf") {
-    return `Read PDF${size ? ` (${size})` : ""}.`;
-  }
-  return `Read attachment (${mime}${size ? `, ${size}` : ""}).`;
 }
 
 /** Test-only export. Production code uses buildUnifiedDiff directly. */
@@ -566,23 +527,23 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
-      // Always use Rust read command — simple file reading only
-      const params: Record<string, unknown> = { file: filePath };
-      if (startLine !== undefined) params.start_line = startLine;
-      if (endLine !== undefined) params.end_line = endLine;
-      // Only send limit if we did NOT convert offset to startLine/endLine
-      if (rawLimit !== undefined && rawOffset === undefined) params.limit = rawLimit;
+      const rawArgs: Record<string, unknown> = { filePath: file };
+      if (startLine !== undefined) rawArgs.startLine = startLine;
+      if (endLine !== undefined) rawArgs.endLine = endLine;
+      // Only send limit if we did NOT convert offset to startLine/endLine.
+      if (rawLimit !== undefined && rawOffset === undefined) rawArgs.limit = rawLimit;
 
-      const data = await callBridge(ctx, context, "read", params);
+      const response = await callToolCall(ctx, context, "read", rawArgs);
 
       // Error response (e.g. file not found)
-      if (data.success === false) {
-        throw new Error((data.message as string) || "read failed");
+      if (response.success === false) {
+        throw new Error((response.message as string) || "read failed");
       }
 
       const dp = relativeToWorktree(filePath, projectRoot) || file;
+      const output = response.text;
 
-      const attachments = readAttachments(data);
+      const attachments = readAttachments(response);
       if (attachments.length > 0) {
         const toolAttachments = attachments
           .filter(
@@ -597,10 +558,6 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         if (toolAttachments.length > 0) {
           const first = attachments[0];
           const firstMime = typeof first.mime === "string" ? first.mime : "";
-          const output =
-            typeof data.content === "string" && data.content.length > 0
-              ? data.content
-              : formatReadAttachmentOutput(first);
           return {
             output,
             title: dp,
@@ -615,32 +572,6 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           };
         }
       }
-
-      // Directory response
-      if (data.entries) {
-        return {
-          output: (data.entries as string[]).join("\n"),
-          title: dp,
-          metadata: { title: dp },
-        };
-      }
-
-      // Binary response
-      if (data.binary) {
-        return { output: data.message as string, title: dp, metadata: { title: dp } };
-      }
-
-      // File content — already line-numbered from Rust
-      let output = data.content as string;
-
-      // Three-case footer: see formatReadFooter() doc.
-      const agentSpecifiedRange =
-        rawStartLine !== undefined ||
-        rawEndLine !== undefined ||
-        rawOffset !== undefined ||
-        rawLimit !== undefined;
-      const footer = formatReadFooter(agentSpecifiedRange, data);
-      if (footer) output += footer;
 
       return { output, title: dp, metadata: { title: dp } };
     },

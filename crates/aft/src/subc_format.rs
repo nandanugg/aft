@@ -392,6 +392,22 @@ fn format_read(data: &Value, agent_specified_range: bool) -> String {
 
 fn format_read_attachments(data: &Value) -> Option<String> {
     let attachments = data.get("attachments")?.as_array()?;
+    let has_host_attachment = attachments.iter().any(|attachment| {
+        attachment.get("mime").and_then(Value::as_str).is_some()
+            && attachment.get("data").and_then(Value::as_str).is_some()
+    });
+    if !has_host_attachment {
+        return None;
+    }
+
+    if let Some(content) = data
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+    {
+        return Some(content.to_string());
+    }
+
     let first = attachments.first()?.as_object()?;
     let kind = first.get("kind").and_then(Value::as_str).unwrap_or("file");
     let mime = first
@@ -402,12 +418,6 @@ fn format_read_attachments(data: &Value) -> Option<String> {
         .get("bytes")
         .and_then(Value::as_u64)
         .map(format_attachment_size);
-    let extra_count = attachments.len().saturating_sub(1);
-    let suffix = if extra_count > 0 {
-        format!("; +{extra_count} more")
-    } else {
-        String::new()
-    };
 
     if kind == "image" || mime.starts_with("image/") {
         let dimensions = match (
@@ -417,23 +427,22 @@ fn format_read_attachments(data: &Value) -> Option<String> {
             (Some(width), Some(height)) => format!(", {width}×{height}"),
             _ => String::new(),
         };
+        let resized = if first.get("resized").and_then(Value::as_bool) == Some(true) {
+            ", resized"
+        } else {
+            ""
+        };
         let size = size.map(|size| format!(", {size}")).unwrap_or_default();
-        return Some(format!(
-            "[image attachment: {mime}{dimensions}{size}{suffix} — inline delivery pending MCP image support]"
-        ));
+        return Some(format!("Read image ({mime}{dimensions}{resized}{size})."));
     }
 
     if kind == "pdf" || mime == "application/pdf" {
-        let size = size.map(|size| format!(", {size}")).unwrap_or_default();
-        return Some(format!(
-            "[pdf attachment: {mime}{size}{suffix} — inline delivery pending MCP file support]"
-        ));
+        let size = size.map(|size| format!(" ({size})")).unwrap_or_default();
+        return Some(format!("Read PDF{size}."));
     }
 
     let size = size.map(|size| format!(", {size}")).unwrap_or_default();
-    Some(format!(
-        "[attachment: {mime}{size}{suffix} — inline delivery pending MCP file support]"
-    ))
+    Some(format!("Read attachment ({mime}{size})."))
 }
 
 fn format_attachment_size(bytes: u64) -> String {
