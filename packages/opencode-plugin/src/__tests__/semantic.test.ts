@@ -8,6 +8,12 @@ import { mockAsk, mockAskDeny, noopAsk } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
+type ToolCallCall = {
+  sessionId: string | undefined;
+  name: string;
+  rawArgs: Record<string, unknown>;
+  options?: Record<string, unknown>;
+};
 type BridgeCall = { projectRoot: string };
 
 function createMockClient(): any {
@@ -51,11 +57,21 @@ function createMockSemanticHarness(
   ) => Promise<BridgeResponse> | BridgeResponse,
 ) {
   const sendCalls: SendCall[] = [];
+  const toolCallCalls: ToolCallCall[] = [];
   const bridgeCalls: BridgeCall[] = [];
   const bridge = {
     send: async (command: string, params: Record<string, unknown> = {}) => {
       sendCalls.push({ command, params });
       return await sendImpl(command, params);
+    },
+    toolCall: async (
+      sessionId: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown> = {},
+      options?: Record<string, unknown>,
+    ) => {
+      toolCallCalls.push({ sessionId, name, rawArgs, options });
+      return await sendImpl(name, rawArgs);
     },
   };
 
@@ -69,6 +85,7 @@ function createMockSemanticHarness(
   return {
     bridgeCalls,
     sendCalls,
+    toolCallCalls,
     tools: semanticTools(createPluginContext(pool, config)),
   };
 }
@@ -102,23 +119,28 @@ describe("semanticTools", () => {
         },
       ],
     };
-    const { bridgeCalls, sendCalls, tools } = createMockSemanticHarness({}, () => bridgeResponse);
+    const { bridgeCalls, sendCalls, toolCallCalls, tools } = createMockSemanticHarness(
+      {},
+      () => bridgeResponse,
+    );
 
     const output = await tools.aft_search.execute(
       { query: "authentication logic", topK: 5 },
       sdkCtx,
     );
 
-    // Bridge now keyed by project root only; the session lives in params via callBridge helper.
+    // The mock records server-side tool calls separately from direct bridge sends.
     expect(bridgeCalls.length).toBe(1);
-    expect(sendCalls).toEqual([
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([
       {
-        command: "semantic_search",
-        params: {
+        sessionId: "semantic-session",
+        name: "search",
+        rawArgs: {
           query: "authentication logic",
-          top_k: 5,
-          session_id: "semantic-session",
+          topK: 5,
         },
+        options: expect.objectContaining({ timeoutMs: 60_000 }),
       },
     ]);
     // The agent gets exactly Rust's clean text — no JSON dump, no leaked
@@ -130,23 +152,23 @@ describe("semanticTools", () => {
     expect(output).not.toContain('"source"');
   });
 
-  test("maps includeTests to the bridge include_tests param", async () => {
+  test("passes includeTests through as a raw tool_call argument", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
-    const { sendCalls, tools } = createMockSemanticHarness({}, () => ({
+    const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
       success: true,
       text: "ok",
     }));
 
     await tools.aft_search.execute({ query: "fixtures", includeTests: true }, sdkCtx);
 
-    expect(sendCalls[0].params.include_tests).toBe(true);
+    expect(toolCallCalls[0].rawArgs.includeTests).toBe(true);
   });
 
   test("rejects blank queries before permission or bridge calls", async () => {
     const ask = mockAsk();
     const sdkCtx = createMockSdkContext("/tmp/project", ask);
     const sendImpl = mock(() => ({ success: true, text: "should not call" }));
-    const { sendCalls, tools } = createMockSemanticHarness({}, sendImpl);
+    const { sendCalls, toolCallCalls, tools } = createMockSemanticHarness({}, sendImpl);
 
     await expect(tools.aft_search.execute({ query: "   " }, sdkCtx)).rejects.toThrow(
       "invalid params",
@@ -154,15 +176,15 @@ describe("semanticTools", () => {
 
     expect(ask).not.toHaveBeenCalled();
     expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([]);
     expect(sendImpl).not.toHaveBeenCalled();
   });
 
-  test("appends only degraded/partial flags (more-available/capped live in Rust text)", async () => {
+  test("returns server-rendered honesty text without appending plugin-side notes", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
     const { tools } = createMockSemanticHarness({}, () => ({
       success: true,
-      // Rust text already carries the count + "more results available" note.
-      text: "partial results\n\nFound 2 result(s). More results available; raise topK to see more.",
+      text: "partial results\n\nFound 2 result(s). More results available; raise topK to see more.\nSearch status: fully degraded; partial/incomplete.",
       more_available: true,
       engine_capped: true,
       fully_degraded: true,
@@ -175,8 +197,6 @@ describe("semanticTools", () => {
     // Rust's text is preserved verbatim...
     expect(output).toContain("partial results");
     expect(output).toContain("More results available; raise topK to see more.");
-    // ...and only the flags NOT in text are appended (degraded/partial), not
-    // a duplicate "more results available; enumeration capped".
     expect(output).toContain("Search status: fully degraded; partial/incomplete.");
     expect(output).not.toContain("enumeration capped");
     expect(output).not.toContain("Structured response");
@@ -188,6 +208,7 @@ describe("semanticTools", () => {
       success: false,
       code: "semantic_search_unavailable",
       message: "Semantic search unavailable: ONNX Runtime not installed.",
+      text: "semantic_search: semantic_search_unavailable — Semantic search unavailable: ONNX Runtime not installed.",
     }));
 
     await expect(
@@ -203,6 +224,7 @@ describe("semanticTools", () => {
       success: false,
       code: "permission_required",
       message: "grep permission required",
+      text: "semantic_search: permission_required — grep permission required",
     }));
 
     await expect(tools.aft_search.execute({ query: "TODO", topK: 5 }, sdkCtx)).rejects.toThrow(
@@ -214,7 +236,7 @@ describe("semanticTools", () => {
     for (const hint of ["regex", "literal", "auto"] as const) {
       const ask = mockAsk();
       const sdkCtx = createMockSdkContext("/tmp/project", ask);
-      const { sendCalls, tools } = createMockSemanticHarness({}, () => ({
+      const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
         success: true,
         text: "ok",
       }));
@@ -222,12 +244,12 @@ describe("semanticTools", () => {
       await tools.aft_search.execute({ query: "TODO", hint }, sdkCtx);
 
       expect(ask).toHaveBeenCalledTimes(1);
-      expect(sendCalls[0].params.hint).toBe(hint);
+      expect(toolCallCalls[0].rawArgs.hint).toBe(hint);
     }
 
     const semanticAsk = mockAsk();
     const semanticCtx = createMockSdkContext("/tmp/project", semanticAsk);
-    const { sendCalls, tools } = createMockSemanticHarness({}, () => ({
+    const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
       success: true,
       text: "ok",
     }));
@@ -235,17 +257,18 @@ describe("semanticTools", () => {
     await tools.aft_search.execute({ query: "auth flow", hint: "semantic" }, semanticCtx);
 
     expect(semanticAsk).not.toHaveBeenCalled();
-    expect(sendCalls[0].params.hint).toBe("semantic");
+    expect(toolCallCalls[0].rawArgs.hint).toBe("semantic");
   });
 
   test("permission denied returns an error envelope without bridge call", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project", mockAskDeny("Denied by policy"));
     const sendImpl = mock(() => ({ success: true, text: "should not call" }));
-    const { sendCalls, tools } = createMockSemanticHarness({}, sendImpl);
+    const { sendCalls, toolCallCalls, tools } = createMockSemanticHarness({}, sendImpl);
 
     const output = await tools.aft_search.execute({ query: "TODO", hint: "literal" }, sdkCtx);
 
     expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([]);
     expect(sendImpl).not.toHaveBeenCalled();
     expect(output).toContain("permission_denied");
     expect(output).toContain("Denied by policy");

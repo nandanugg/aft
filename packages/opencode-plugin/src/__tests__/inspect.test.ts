@@ -6,7 +6,6 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import {
   createInspectTier2IdleScheduler,
   inspectTools,
-  renderInspectDiagnostics,
   shouldRegisterInspectTool,
 } from "../tools/inspect.js";
 import type { PluginContext } from "../types.js";
@@ -16,6 +15,12 @@ type BridgeResponse = Record<string, unknown>;
 type SendCall = {
   command: string;
   params: Record<string, unknown>;
+  options?: Record<string, unknown>;
+};
+type ToolCallCall = {
+  sessionId: string | undefined;
+  name: string;
+  rawArgs: Record<string, unknown>;
   options?: Record<string, unknown>;
 };
 
@@ -66,6 +71,7 @@ function createInspectHarness(
   ) => Promise<BridgeResponse> | BridgeResponse,
 ) {
   const sendCalls: SendCall[] = [];
+  const toolCallCalls: ToolCallCall[] = [];
   const localBridge = {
     send: async (
       command: string,
@@ -75,12 +81,22 @@ function createInspectHarness(
       sendCalls.push({ command, params, options });
       return await sendImpl(command, params);
     },
+    toolCall: async (
+      sessionId: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown> = {},
+      options?: Record<string, unknown>,
+    ) => {
+      toolCallCalls.push({ sessionId, name, rawArgs, options });
+      return await sendImpl(name, rawArgs);
+    },
   };
   const pool = {
     getBridge: () => localBridge,
   } as unknown as BridgePool;
   return {
     sendCalls,
+    toolCallCalls,
     tools: inspectTools(createPluginContext(pool, {})),
   };
 }
@@ -101,21 +117,25 @@ describe("aft_inspect tool", () => {
   });
 
   test("sends corrected inspect field names to the bridge", async () => {
-    const { sendCalls, tools } = createInspectHarness(() => ({ success: true, summary: {} }));
+    const { sendCalls, toolCallCalls, tools } = createInspectHarness(() => ({
+      success: true,
+      text: "ok",
+    }));
 
     await tools.aft_inspect.execute(
       { sections: ["todos", "dead_code"], scope: "src", topK: 7 },
       createMockSdkContext("/repo"),
     );
 
-    expect(sendCalls).toEqual([
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([
       {
-        command: "inspect",
-        params: {
+        sessionId: "inspect-session",
+        name: "inspect",
+        rawArgs: {
           sections: ["todos", "dead_code"],
           scope: "/repo/src",
           topK: 7,
-          session_id: "inspect-session",
         },
         options: expect.objectContaining({
           keepBridgeOnTimeout: true,
@@ -126,87 +146,34 @@ describe("aft_inspect tool", () => {
   });
 
   test("normalizes empty sections and scope sentinels", async () => {
-    const { sendCalls, tools } = createInspectHarness(() => ({ success: true, summary: {} }));
+    const { toolCallCalls, tools } = createInspectHarness(() => ({ success: true, text: "ok" }));
 
     await tools.aft_inspect.execute(
       { sections: [], scope: "", topK: undefined },
       createMockSdkContext("/repo"),
     );
 
-    expect(sendCalls[0]?.params.sections).toBeUndefined();
-    expect(sendCalls[0]?.params.scope).toBeUndefined();
-    expect(sendCalls[0]?.params.topK).toBeUndefined();
+    expect(toolCallCalls[0]?.rawArgs.sections).toBeUndefined();
+    expect(toolCallCalls[0]?.rawArgs.scope).toBeUndefined();
+    expect(toolCallCalls[0]?.rawArgs.topK).toBeUndefined();
   });
 
-  test("renders diagnostics counts, sentinels, and details defensively", () => {
-    expect(
-      renderInspectDiagnostics({
-        summary: { diagnostics: { errors: 1, warnings: 2, info: 0, hints: 3 } },
-        details: {
-          diagnostics: [
-            {
-              file: "src/app.ts",
-              line: 7,
-              column: 2,
-              severity: "error",
-              message: "bad type",
-              source: "tsserver",
-            },
-          ],
-        },
-      }),
-    ).toContain("diagnostics: 1 errors, 2 warnings, 0 info, 3 hints");
-
-    const pending = renderInspectDiagnostics({
-      summary: {
-        diagnostics: {
-          status: "pending",
-          servers_pending: ["typescript-language-server"],
-          servers_not_installed: ["pyright"],
-        },
-      },
-    });
-    expect(pending).toContain("diagnostics: pending");
-    expect(pending).toContain("typescript-language-server");
-    expect(pending).toContain("pyright");
-    expect(pending).not.toContain("0 errors");
-
-    // Partial result with counts-so-far AND a pending server: must show BOTH
-    // the already-found counts and the pending signal, so real errors found by
-    // one server aren't hidden while another server is still working.
-    const partial = renderInspectDiagnostics({
-      summary: {
-        diagnostics: {
-          errors: 2,
-          warnings: 0,
-          info: 0,
-          hints: 0,
-          status: "pending",
-          servers_pending: ["oxlint"],
-        },
-      },
-    });
-    expect(partial).toContain("2 errors");
-    expect(partial).toContain("so far");
-    expect(partial).toContain("oxlint");
-  });
-
-  test("returns the Rust text body with diagnostics appended (no JSON dump)", async () => {
+  test("returns the server-rendered Rust text body without JSON fallback", async () => {
+    const rendered =
+      "Duplicates: 2 (top by cost):\n  1083  a.ts == b.ts\nDead code: 1 (rust 1):\n  x.rs::foo\n\ndiagnostics: 1 errors, 0 warnings, 0 info, 2 hints";
     const { tools } = createInspectHarness(() => ({
       success: true,
-      text: "Duplicates: 2 (top by cost):\n  1083  a.ts == b.ts\nDead code: 1 (rust 1):\n  x.rs::foo",
+      text: rendered,
       summary: { diagnostics: { errors: 1, warnings: 0, info: 0, hints: 2 } },
     }));
 
     const result = await tools.aft_inspect.execute({}, createMockSdkContext("/repo"));
     const text = typeof result === "string" ? result : (result.output as string);
 
-    // Rust body is surfaced verbatim …
+    expect(text).toBe(rendered);
     expect(text).toContain("Duplicates: 2 (top by cost):");
     expect(text).toContain("  x.rs::foo");
-    // … with the diagnostics line appended after it …
     expect(text).toContain("diagnostics: 1 errors, 0 warnings, 0 info, 2 hints");
-    // … and never the raw JSON fallback.
     expect(text).not.toContain('"success"');
     expect(text).not.toContain("scanner_state");
   });

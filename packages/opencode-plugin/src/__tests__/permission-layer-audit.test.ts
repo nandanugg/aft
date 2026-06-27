@@ -70,6 +70,14 @@ function createHarness(
       calls.push({ command, params });
       return await sendImpl(command, params);
     },
+    toolCall: async (
+      sessionId: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown> = {},
+    ) => {
+      calls.push({ command: name, params: { ...rawArgs, session_id: sessionId } });
+      return await sendImpl(name, rawArgs);
+    },
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;
   return { calls, tools: toolFactory(createPluginContext(pool)) };

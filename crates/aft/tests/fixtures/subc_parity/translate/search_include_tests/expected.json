@@ -1,0 +1,8 @@
+{
+  "args": {
+    "include_tests": true,
+    "query": "fixtures",
+    "top_k": 7
+  },
+  "command": "semantic_search"
+}

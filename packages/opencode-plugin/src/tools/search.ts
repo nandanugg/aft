@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
+  callToolCall,
   expandTilde,
   resolvePathFromProjectRoot,
   resolveProjectRoot,
@@ -21,55 +22,8 @@ type SearchPathKind = "file" | "directory";
 type SearchPathTarget = { target: string; kind: SearchPathKind };
 type SearchPathArgSplit = { paths: string[]; missing: string[] };
 
-type GrepMatch = {
-  file?: string;
-  line?: number;
-  line_text?: string;
-  text?: string;
-};
-
-type GrepResponse = {
-  text?: string;
-  matches?: GrepMatch[];
-  total_matches?: number;
-  files_with_matches?: number;
-};
-
 function arg(schema: unknown): ToolArg {
   return schema as ToolArg;
-}
-
-function formatGrepOutput(response: GrepResponse): string {
-  if (typeof response.text === "string") {
-    return response.text;
-  }
-
-  const matches = Array.isArray(response.matches) ? response.matches : [];
-  const totalMatches = response.total_matches ?? matches.length;
-  const filesWithMatches = response.files_with_matches ?? new Set(matches.map((m) => m.file)).size;
-
-  if (matches.length === 0) {
-    return `Found ${totalMatches} match across ${filesWithMatches} file`;
-  }
-
-  const body = matches
-    .map((match) => {
-      const file = match.file ?? "unknown";
-      const line = match.line ?? 0;
-      const text = match.line_text ?? match.text ?? "";
-      return `${file}:${line}: ${text}`;
-    })
-    .join("\n");
-
-  return `${body}\n\nFound ${totalMatches} match across ${filesWithMatches} file`;
-}
-
-/** Ensure glob patterns match files in subdirectories — prefix with **\/ if no path separator. */
-function normalizeGlob(pattern: string): string {
-  if (!pattern.includes("/") && !pattern.startsWith("**/")) {
-    return `**/${pattern}`;
-  }
-  return pattern;
 }
 
 function absoluteSearchPath(projectRoot: string, target: string): string {
@@ -242,15 +196,10 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         }
       }
 
-      const response = await callBridge(ctx, context, "grep", {
-        pattern,
-        case_sensitive: true,
-        include: includeArg
-          ? splitIncludeArg(includeArg).map(normalizeGlob).filter(Boolean)
-          : undefined,
-        path: bridgePath,
-        max_results: 100,
-      });
+      const rawArgs: Record<string, unknown> = { pattern };
+      if (includeArg !== undefined) rawArgs.include = includeArg;
+      if (bridgePath !== undefined) rawArgs.path = bridgePath;
+      const response = await callToolCall(ctx, context, "grep", rawArgs);
 
       if (response.success === false) {
         throw new Error((response.message as string) || "grep failed");
@@ -260,10 +209,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         response.complete = false;
       }
 
-      return appendSkippedSearchPaths(
-        formatGrepOutput(response as GrepResponse),
-        pathSplit?.missing ?? [],
-      );
+      return appendSkippedSearchPaths(response.text, pathSplit?.missing ?? []);
     },
   };
 

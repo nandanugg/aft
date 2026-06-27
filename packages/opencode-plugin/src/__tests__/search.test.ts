@@ -11,6 +11,12 @@ import { noopAsk } from "./test-helpers";
 
 type BridgeResponse = Record<string, unknown>;
 type SendCall = { command: string; params: Record<string, unknown> };
+type ToolCallCall = {
+  sessionId: string | undefined;
+  name: string;
+  rawArgs: Record<string, unknown>;
+  options?: Record<string, unknown>;
+};
 type BridgeCall = { projectRoot: string };
 type AskCall = {
   permission?: string;
@@ -74,11 +80,21 @@ function createMockSearchHarness(
   ) => Promise<BridgeResponse> | BridgeResponse,
 ) {
   const sendCalls: SendCall[] = [];
+  const toolCallCalls: ToolCallCall[] = [];
   const bridgeCalls: BridgeCall[] = [];
   const bridge = {
     send: async (command: string, params: Record<string, unknown> = {}) => {
       sendCalls.push({ command, params });
       return await sendImpl(command, params);
+    },
+    toolCall: async (
+      sessionId: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown> = {},
+      options?: Record<string, unknown>,
+    ) => {
+      toolCallCalls.push({ sessionId, name, rawArgs, options });
+      return await sendImpl(name, rawArgs);
     },
   };
 
@@ -92,6 +108,7 @@ function createMockSearchHarness(
   return {
     bridgeCalls,
     sendCalls,
+    toolCallCalls,
     tools: searchTools(createPluginContext(pool, config)),
   };
 }
@@ -115,7 +132,7 @@ describe("searchTools", () => {
 
   test("returns grep response.text when provided and uses session-scoped bridges", async () => {
     const sdkCtx = createMockSdkContext("/tmp/project");
-    const { bridgeCalls, sendCalls, tools } = createMockSearchHarness(
+    const { bridgeCalls, sendCalls, toolCallCalls, tools } = createMockSearchHarness(
       { hoist_builtin_tools: true },
       () => ({
         success: true,
@@ -131,18 +148,17 @@ describe("searchTools", () => {
 
     const output = await tools.grep.execute({ pattern: "dispatch" }, sdkCtx);
 
-    // Bridge is project-keyed now; sessionID travels in params via callBridge.
+    // The mock records server-side tool calls separately from direct bridge sends.
     expect(bridgeCalls.length).toBe(1);
-    expect(sendCalls).toHaveLength(1);
-    expect(sendCalls[0]?.command).toBe("grep");
-    expect(sendCalls[0]?.params).toEqual({
-      pattern: "dispatch",
-      case_sensitive: true,
-      include: undefined,
-      path: undefined,
-      max_results: 100,
-      session_id: "search-session",
-    });
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "search-session",
+        name: "grep",
+        rawArgs: { pattern: "dispatch" },
+        options: expect.objectContaining({ timeoutMs: 60_000 }),
+      },
+    ]);
     expect(output).toBe(
       [
         "── src/main.rs (2 matches) ──",
@@ -189,40 +205,37 @@ describe("searchTools", () => {
     expect(output).toBe(["src/one.ts", "src/two.ts"].join("\n"));
   });
 
-  test("brace-aware include forwards a single glob with a brace alternation intact (regression)", async () => {
-    // Regression: naive String.split(",") used to chop "**/*.{vue,ts}"
-    // into ["**/*.{vue", "ts}"], yielding the user-facing
-    // "unclosed alternate group; missing '}'" globset error.
-    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+  test("grep forwards include strings for server-side brace-aware translation", async () => {
+    // The server splits include globs, so the plugin forwards brace groups unchanged.
+    const include = "**/" + "*.{vue,ts,tsx}";
+    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+      success: true,
+      text: "ok",
+    }));
+    await tools.grep.execute({ pattern: "foo", include }, createMockSdkContext());
+    expect(toolCallCalls[0]?.rawArgs.include).toBe(include);
+  });
+
+  test("grep forwards mixed comma includes without plugin-side normalization", async () => {
+    const nestedVueTsx = "**/" + "*.{vue,tsx}";
+    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
       success: true,
       text: "ok",
     }));
     await tools.grep.execute(
-      { pattern: "foo", include: "**/*.{vue,ts,tsx}" },
+      { pattern: "foo", include: `*.ts,${nestedVueTsx}` },
       createMockSdkContext(),
     );
-    expect(sendCalls[0]?.params.include).toEqual(["**/*.{vue,ts,tsx}"]);
+    expect(toolCallCalls[0]?.rawArgs.include).toBe(`*.ts,${nestedVueTsx}`);
   });
 
-  test("brace-aware include preserves brace groups while still splitting top-level commas", async () => {
-    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-      success: true,
-      text: "ok",
-    }));
-    await tools.grep.execute(
-      { pattern: "foo", include: "*.ts,**/*.{vue,tsx}" },
-      createMockSdkContext(),
-    );
-    expect(sendCalls[0]?.params.include).toEqual(["**/*.ts", "**/*.{vue,tsx}"]);
-  });
-
-  test("backward-compatible: comma-separated includes without braces still split", async () => {
-    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+  test("grep forwards comma-separated includes for server normalization", async () => {
+    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
       success: true,
       text: "ok",
     }));
     await tools.grep.execute({ pattern: "foo", include: "*.tsx,*.ts" }, createMockSdkContext());
-    expect(sendCalls[0]?.params.include).toEqual(["**/*.tsx", "**/*.ts"]);
+    expect(toolCallCalls[0]?.rawArgs.include).toBe("*.tsx,*.ts");
   });
 
   test("grep checks external permission per parsed multi-path fragment", async () => {
@@ -234,10 +247,13 @@ describe("searchTools", () => {
       fs.mkdirSync(inside, { recursive: true });
       fs.mkdirSync(external, { recursive: true });
       const askCalls: AskCall[] = [];
-      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-        success: true,
-        text: "ok",
-      }));
+      const { toolCallCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => ({
+          success: true,
+          text: "ok",
+        }),
+      );
 
       await tools.grep.execute(
         { pattern: "TODO", path: `${inside} ${external}` },
@@ -248,7 +264,7 @@ describe("searchTools", () => {
       expect(externalAsks).toHaveLength(1);
       expect(externalAsks[0]?.patterns).toEqual([path.join(external, "*").replaceAll("\\", "/")]);
       expect(externalAsks[0]?.metadata?.filepath).toBe(external);
-      expect(sendCalls[0]?.params.path).toBe(`${inside} ${external}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${inside} ${external}`);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -299,7 +315,7 @@ describe("searchTools", () => {
         complete: true,
         text: "src/hit.ts:1: const value = 'needle';\n\nFound 1 match across 1 file",
       };
-      const { sendCalls, tools } = createMockSearchHarness(
+      const { toolCallCalls, tools } = createMockSearchHarness(
         { hoist_builtin_tools: true },
         () => bridgeResponse,
       );
@@ -309,7 +325,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(sendCalls[0]?.params.path).toBe(src);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(src);
       expect(output).toContain("src/hit.ts:1");
       expect(output).toContain(`Skipped 1 path not found: ${missing}`);
       expect(bridgeResponse.complete).toBe(false);
@@ -327,7 +343,7 @@ describe("searchTools", () => {
       fs.mkdirSync(src, { recursive: true });
       fs.mkdirSync(e2e, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "ok" };
-      const { sendCalls, tools } = createMockSearchHarness(
+      const { toolCallCalls, tools } = createMockSearchHarness(
         { hoist_builtin_tools: true },
         () => bridgeResponse,
       );
@@ -337,7 +353,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(sendCalls[0]?.params.path).toBe(`${src} ${e2e}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${src} ${e2e}`);
       expect(output).toBe("ok");
       expect(output).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
@@ -353,11 +369,14 @@ describe("searchTools", () => {
       fs.mkdirSync(project, { recursive: true });
       const missingA = path.join(project, "missing-a");
       const missingB = path.join(project, "missing-b");
-      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-        success: false,
-        code: "path_not_found",
-        message: "path_not_found",
-      }));
+      const { toolCallCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => ({
+          success: false,
+          code: "path_not_found",
+          message: "path_not_found",
+        }),
+      );
 
       let thrown: unknown;
       try {
@@ -371,7 +390,7 @@ describe("searchTools", () => {
 
       expect(thrown).toBeInstanceOf(Error);
       expect((thrown as Error).message).toBe("path_not_found");
-      expect(sendCalls[0]?.params.path).toBe(`${missingA} ${missingB}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${missingA} ${missingB}`);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -384,7 +403,7 @@ describe("searchTools", () => {
       const spaced = path.join(project, "with space");
       fs.mkdirSync(spaced, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "ok" };
-      const { sendCalls, tools } = createMockSearchHarness(
+      const { toolCallCalls, tools } = createMockSearchHarness(
         { hoist_builtin_tools: true },
         () => bridgeResponse,
       );
@@ -394,7 +413,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(sendCalls[0]?.params.path).toBe(fs.realpathSync(spaced));
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(fs.realpathSync(spaced));
       expect(output).toBe("ok");
       expect(output).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);

@@ -21,6 +21,7 @@ export const LONG_RUNNING_COMMAND_TIMEOUT_MS: Record<string, number> = {
   inspect: 60_000,
   grep: 60_000,
   glob: 60_000,
+  search: 60_000,
   semantic_search: 60_000,
 };
 

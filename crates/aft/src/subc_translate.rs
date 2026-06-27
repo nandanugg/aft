@@ -542,6 +542,9 @@ fn translate_search(args: &Value) -> Result<Translated, TranslateError> {
             out.insert("hint".to_string(), hint.clone());
         }
     }
+    if let Some(include_tests) = map_in.get("includeTests").and_then(Value::as_bool) {
+        out.insert("include_tests".to_string(), Value::Bool(include_tests));
+    }
 
     Ok(Translated {
         command: "semantic_search".into(),

@@ -1,31 +1,10 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, coerceOptionalInt, isEmptyParam, optionalInt } from "./_shared.js";
+import { callToolCall, coerceOptionalInt, isEmptyParam, optionalInt } from "./_shared.js";
 import { askGrepPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
-
-function semanticHonestyNote(response: Record<string, unknown>): string | undefined {
-  const notes: string[] = [];
-  if (response.more_available === true) notes.push("more results available");
-  if (response.engine_capped === true) notes.push("enumeration capped");
-  if (response.fully_degraded === true) notes.push("fully degraded");
-  if (response.complete === false) notes.push("partial/incomplete");
-  return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
-}
-
-/**
- * Honesty flags NOT already conveyed by Rust's `text` (which carries the count
- * line and the "more results available; raise topK" note). Only degraded /
- * partial states need appending so the agent doesn't over-trust the results.
- */
-function extraHonestyNote(response: Record<string, unknown>): string | undefined {
-  const notes: string[] = [];
-  if (response.fully_degraded === true) notes.push("fully degraded");
-  if (response.complete === false) notes.push("partial/incomplete");
-  return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
-}
 
 type ToolArg = ToolDefinition["args"][string];
 
@@ -87,37 +66,24 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         if (denied) return permissionDeniedResponse(denied);
       }
 
-      const bridgeParams: Record<string, unknown> = {
-        query,
-        top_k: coerceOptionalInt(args.topK, "topK", 1, 100) ?? 10,
-      };
-      if (hint) bridgeParams.hint = hint;
-      if (typeof args.includeTests === "boolean") bridgeParams.include_tests = args.includeTests;
-      const response = await callBridge(ctx, context, "semantic_search", bridgeParams);
+      const rawArgs: Record<string, unknown> = { query };
+      const topK = coerceOptionalInt(args.topK, "topK", 1, 100);
+      if (topK !== undefined) rawArgs.topK = topK;
+      if (hint) rawArgs.hint = hint;
+      if (typeof args.includeTests === "boolean") rawArgs.includeTests = args.includeTests;
+      const response = await callToolCall(ctx, context, "search", rawArgs);
 
       if (response.success === false) {
         const message =
-          typeof response.message === "string" && response.message.length > 0
-            ? response.message
-            : "semantic_search failed";
-        const code =
-          typeof response.code === "string" && response.code.length > 0 ? response.code : undefined;
-        throw new Error(code ? `semantic_search: ${code} — ${message}` : message);
+          typeof response.text === "string" && response.text.length > 0
+            ? response.text
+            : typeof response.message === "string" && response.message.length > 0
+              ? response.message
+              : "semantic_search failed";
+        throw new Error(message);
       }
 
-      // Rust's `text` is the agent-facing rendering: ranked rows, rank-tiered
-      // snippets, count line, more-available note, and a conditional zoom hint.
-      // We deliberately do NOT dump the structured response — the full-path,
-      // score, semantic_score, hybrid_boosted JSON was pure clutter the agent
-      // never acted on (and inflated token cost). Honesty flags (degraded /
-      // partial) that aren't already in `text` are appended as a short note.
-      if (typeof response.text === "string" && response.text.length > 0) {
-        const note = extraHonestyNote(response);
-        return note ? `${response.text}\n${note}` : response.text;
-      }
-
-      // No text (shouldn't happen on success) — fall back to a minimal note.
-      return semanticHonestyNote(response) ?? "No results.";
+      return response.text;
     },
   };
 
