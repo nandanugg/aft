@@ -822,13 +822,18 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             emit_configure_bash_completed_if_requested(&req, ctx);
             response
         }
-        // `glob` is the executor-mechanics vehicle: a real PureRead-lane native
-        // command (so reader-concurrency scenarios get the reader pool) that the
-        // subc translator passes through verbatim. The `case` arg drives which
-        // synthetic scenario the fake daemon plays. We deliberately do NOT reuse
-        // the agent `read` tool here — that goes through arg translation, which
-        // must stay testable in isolation (subc_translate_test.rs).
-        "glob" => match req.params.get("case").and_then(Value::as_str) {
+        // `echo` is the executor-mechanics vehicle: a transport primitive that is
+        // PureRead-lane (so reader-concurrency scenarios get the reader pool) and
+        // has NO subc translate arm, so the translator passes it through verbatim
+        // (falling through `unsupported_tool` to this stub dispatch with raw args).
+        // The `case` arg drives which synthetic scenario the fake daemon plays.
+        // We deliberately use a transport primitive, NOT an agent tool (read/glob/
+        // grep/…): agent tools go through arg translation + formatting (tested in
+        // isolation in subc_translate_test.rs), and — as the B-track cutover of
+        // `glob` to a translated tool showed — squatting on a real agent-tool name
+        // breaks the moment that tool is cut over. `echo` can never be an agent
+        // tool, so this vehicle is immune to future cutovers.
+        "echo" => match req.params.get("case").and_then(Value::as_str) {
             Some("overlap") => state.overlap_read(req.id),
             Some("fast") => Response::success(
                 req.id,
@@ -1608,7 +1613,7 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     // 1. Overlap: three PureRead calls on one route must all reach dispatch
     // before any is released.
     for corr in 100..103 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "overlap" })).await;
+        send_tool_call(&mut stream, 1, corr, "echo", json!({ "case": "overlap" })).await;
     }
     state.wait_until("overlap reads started", |inner| inner.overlap_started == 3);
     state.assert_overlap();
@@ -1627,7 +1632,7 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     )
     .await;
     state.wait_until("heavy started", |inner| inner.heavy_started);
-    send_tool_call(&mut stream, 1, 201, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 201, "echo", json!({ "case": "fast" })).await;
     let fast = read_frame_timeout(&mut stream, "fast read response").await;
     assert_eq!(fast.header.ty, FrameType::Response);
     assert_eq!(fast.header.channel, 1);
@@ -1645,7 +1650,7 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     // route 1's read epoch is released.
     let epoch_base = state.begin_epoch_wave();
     for corr in 300..302 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
+        send_tool_call(&mut stream, 1, corr, "echo", json!({ "case": "epoch" })).await;
     }
     state.wait_until("epoch reads started", |inner| {
         inner.epoch_started == epoch_base + 2
@@ -1661,12 +1666,12 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     let epoch_corrs = collect_response_corrs(&mut stream, 2).await;
     assert_eq!(epoch_corrs, HashSet::from([300, 301]));
 
-    send_tool_call(&mut stream, 1, 400, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 400, "echo", json!({ "case": "fast" })).await;
     let route1_read = read_frame_timeout(&mut stream, "route 1 read response").await;
     assert_eq!(route1_read.header.channel, 1);
     assert_eq!(route1_read.header.corr, 400);
     assert_tool_project_root(&route1_read, &root1);
-    send_tool_call(&mut stream, 2, 401, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 2, 401, "echo", json!({ "case": "fast" })).await;
     let route2_read = read_frame_timeout(&mut stream, "route 2 read response").await;
     assert_eq!(route2_read.header.channel, 2);
     assert_eq!(route2_read.header.corr, 401);
@@ -1692,7 +1697,7 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     // reads leave the shared per-root epoch.
     let same_root_epoch_base = state.begin_epoch_wave();
     for corr in 410..412 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
+        send_tool_call(&mut stream, 1, corr, "echo", json!({ "case": "epoch" })).await;
     }
     state.wait_until("same-root epoch reads started", |inner| {
         inner.epoch_started == same_root_epoch_base + 2
@@ -1713,7 +1718,7 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
         0,
         "same-root configure should start only after route 1 reads drain"
     );
-    send_tool_call(&mut stream, 4, 420, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 4, 420, "echo", json!({ "case": "fast" })).await;
     let route4_read = read_frame_timeout(&mut stream, "route 4 read response").await;
     assert_eq!(route4_read.header.channel, 4);
     assert_eq!(route4_read.header.corr, 420);
@@ -1790,7 +1795,7 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
             .and_then(Value::as_str),
         Some("session-1")
     );
-    send_tool_call(&mut stream, 4, 50, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 4, 50, "echo", json!({ "case": "fast" })).await;
     expect_tool_response_without_configure_warning_for_message(
         &mut stream,
         50,
@@ -2016,7 +2021,7 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
     state.wait_until("slow route 12 configure started", |inner| {
         inner.slow_configure_started > pending_tool_base
     });
-    send_tool_call(&mut stream, 12, 1201, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 12, 1201, "echo", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 12, 1201, "route_not_bound").await;
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(pending_tool_base + 1);
@@ -2061,7 +2066,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
     tokio::time::sleep(Duration::from_millis(150)).await;
-    send_tool_call(&mut stream, 10, 1111, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 10, 1111, "echo", json!({ "case": "fast" })).await;
     expect_error_frame_skipping_optional_ack(&mut stream, 10, 1111, "route_not_bound", 110).await;
 
     send_connection_goodbye(&mut stream).await;
@@ -2235,7 +2240,7 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
         &mut stream,
         1,
         80,
-        "glob",
+        "echo",
         json!({ "case": "status_bar", "dead_code": 21 }),
     )
     .await;
@@ -2283,13 +2288,13 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     // observe it — that persistence is what corr 120/121 verify.
     settle_until_bg_completion(&mut stream, 1, 8400, &task_id).await;
 
-    send_tool_call(&mut stream, 1, 120, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 120, "echo", json!({ "case": "fast" })).await;
     let first_after_completion = read_frame_timeout(&mut stream, "first completion read").await;
     assert_eq!(first_after_completion.header.corr, 120);
     let first_after_completion_response = tool_response_json(&first_after_completion);
     assert_bg_completion(&first_after_completion_response, &task_id);
 
-    send_tool_call(&mut stream, 1, 121, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 121, "echo", json!({ "case": "fast" })).await;
     let second_after_completion = read_frame_timeout(&mut stream, "second completion read").await;
     assert_eq!(second_after_completion.header.corr, 121);
     let second_after_completion_response = tool_response_json(&second_after_completion);
@@ -2300,7 +2305,7 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     // exercised because counts were populated above.
     let finalizer_epoch_base = state.begin_epoch_wave();
     for corr in 122..124 {
-        send_tool_call(&mut stream, 1, corr, "glob", json!({ "case": "epoch" })).await;
+        send_tool_call(&mut stream, 1, corr, "echo", json!({ "case": "epoch" })).await;
     }
     state.wait_until("finalizer epoch reads started", |inner| {
         inner.epoch_started == finalizer_epoch_base + 2
@@ -2361,7 +2366,7 @@ async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
     // asserting it on a specific response corr.
     settle_until_bg_completion(&mut stream, 4, 4250, &task_id_s4).await;
 
-    send_tool_call(&mut stream, 4, 425, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 4, 425, "echo", json!({ "case": "fast" })).await;
     let s4_after_completion = read_frame_timeout(&mut stream, "session-4 completion read").await;
     assert_eq!(s4_after_completion.header.corr, 425);
     assert_bg_completion_matching(
@@ -2370,7 +2375,7 @@ async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
         "subc-session-4-bg",
     );
 
-    send_tool_call(&mut stream, 1, 426, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 426, "echo", json!({ "case": "fast" })).await;
     let s1_after_s4_bg = read_frame_timeout(&mut stream, "session-1 after session-4 bg").await;
     assert_eq!(s1_after_s4_bg.header.corr, 426);
     let s1_after_s4_body = tool_response_json(&s1_after_s4_bg);
@@ -2481,7 +2486,7 @@ async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
             .expect("route 1 goodbye"),
     )
     .await;
-    send_tool_call(&mut stream, 1, 4311, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 1, 4311, "echo", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 1, 4311, "route_not_bound").await;
     state.release_deferred_pushes();
     send_route_bind_with_session(&mut stream, 7, 47, &root1, "session-1").await;
@@ -2512,7 +2517,7 @@ async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
             .expect("route 7 goodbye"),
     )
     .await;
-    send_tool_call(&mut stream, 7, 4321, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 7, 4321, "echo", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 7, 4321, "route_not_bound").await;
     state.release_deferred_pushes();
     send_route_bind_with_session(&mut stream, 8, 48, &root1, "session-1").await;
@@ -2625,7 +2630,7 @@ async fn drive_failed_new_root_daemon(input: FakeDaemonInput) {
     .await;
     assert_eq!(sentinel_pushes.len(), 1);
     assert_eq!(push_seq(&sentinel_pushes[0]), Some(1));
-    send_tool_call(&mut stream, 5, 550, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 5, 550, "echo", json!({ "case": "fast" })).await;
     expect_error_frame(&mut stream, 5, 550, "route_not_bound").await;
 
     send_connection_goodbye(&mut stream).await;
@@ -2693,7 +2698,7 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
         ready["total_callers"].as_u64().unwrap_or(0) >= 1,
         "ready callers response should contain the built result: {ready:?}"
     );
-    send_tool_call(&mut stream, 2, 700, "glob", json!({ "case": "fast" })).await;
+    send_tool_call(&mut stream, 2, 700, "echo", json!({ "case": "fast" })).await;
     let route2_after_maintenance =
         read_frame_timeout(&mut stream, "route 2 read after route 3 maintenance").await;
     assert_eq!(route2_after_maintenance.header.channel, 2);
@@ -3772,7 +3777,7 @@ async fn settle_until_bg_completion(
 ) {
     for attempt in 0..120 {
         let corr = first_corr + attempt;
-        send_tool_call(stream, channel, corr, "glob", json!({ "case": "fast" })).await;
+        send_tool_call(stream, channel, corr, "echo", json!({ "case": "fast" })).await;
         let frame = read_frame_timeout(stream, "bg-completion settle read").await;
         assert_eq!(frame.header.corr, corr);
         let response = tool_response_json(&frame);
