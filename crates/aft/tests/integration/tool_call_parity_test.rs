@@ -404,9 +404,19 @@ fn normalize_value(value: &mut Value, project_root: &Path) {
         }
         Value::Object(map) => {
             // These fields are intentionally volatile: grep reports wall-clock timing,
-            // backup ids are per-operation identifiers, and cache keys derive from the
-            // temporary root path. The parity assertion keeps every stable field intact.
-            for key in ["search_ms", "backup_id", "project_cache_key"] {
+            // backup ids are per-operation identifiers, cache keys derive from the
+            // temporary root path, and `tier2_last_run` is a wall-clock unix-seconds
+            // stamp the inspect scanner sets independently in each process — the direct
+            // and tool_call runs each trigger their own tier2 scan, so under CI load the
+            // two stamps can straddle a one-second tick (same flake class as the
+            // callgraph `indexed_at`/`updated_at` columns). The parity assertion keeps
+            // every stable field intact.
+            for key in [
+                "search_ms",
+                "backup_id",
+                "project_cache_key",
+                "tier2_last_run",
+            ] {
                 if map.contains_key(key) {
                     map.insert(key.to_string(), Value::String(format!("<{key}>")));
                 }
