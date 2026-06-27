@@ -171,19 +171,31 @@ describe("searchTools", () => {
   });
 
   test("returns glob response.text when provided", async () => {
-    const { tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-      success: true,
-      text: [
-        "21 files matching src/**/*.ts",
-        "",
-        "src/ (21 files)",
-        "  one.ts, two.ts, three.ts, four.ts, five.ts, ...",
-      ].join("\n"),
-      files: ["src/one.ts", "src/two.ts"],
-    }));
+    const { sendCalls, toolCallCalls, tools } = createMockSearchHarness(
+      { hoist_builtin_tools: true },
+      () => ({
+        success: true,
+        text: [
+          "21 files matching src/**/*.ts",
+          "",
+          "src/ (21 files)",
+          "  one.ts, two.ts, three.ts, four.ts, five.ts, ...",
+        ].join("\n"),
+        files: ["src/one.ts", "src/two.ts"],
+      }),
+    );
 
     const output = await tools.glob.execute({ pattern: "src/**/*.ts" }, createMockSdkContext());
 
+    expect(sendCalls).toEqual([]);
+    expect(toolCallCalls).toEqual([
+      {
+        sessionId: "search-session",
+        name: "glob",
+        rawArgs: { pattern: "src/**/*.ts" },
+        options: expect.objectContaining({ timeoutMs: 60_000 }),
+      },
+    ]);
     expect(output).toBe(
       [
         "21 files matching src/**/*.ts",
@@ -192,17 +204,6 @@ describe("searchTools", () => {
         "  one.ts, two.ts, three.ts, four.ts, five.ts, ...",
       ].join("\n"),
     );
-  });
-
-  test("falls back to newline-joined glob paths when text is unavailable", async () => {
-    const { tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-      success: true,
-      files: ["src/one.ts", "src/two.ts"],
-    }));
-
-    const output = await tools.glob.execute({ pattern: "src/**/*.ts" }, createMockSdkContext());
-
-    expect(output).toBe(["src/one.ts", "src/two.ts"].join("\n"));
   });
 
   test("grep forwards include strings for server-side brace-aware translation", async () => {
@@ -279,10 +280,14 @@ describe("searchTools", () => {
       fs.mkdirSync(inside, { recursive: true });
       fs.mkdirSync(external, { recursive: true });
       const askCalls: AskCall[] = [];
-      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-        success: true,
-        files: [],
-      }));
+      const { sendCalls, toolCallCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => ({
+          success: true,
+          text: "",
+          files: [],
+        }),
+      );
 
       const raw = await tools.glob.execute(
         { pattern: "**/*.ts", path: `${inside} ${external}` },
@@ -298,6 +303,7 @@ describe("searchTools", () => {
       expect(JSON.parse(raw).message).toBe("external denied");
       expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
       expect(sendCalls).toHaveLength(0);
+      expect(toolCallCalls).toHaveLength(0);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -430,7 +436,7 @@ describe("searchTools", () => {
       const missing = path.join(project, "test");
       fs.mkdirSync(src, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "src/hit.ts" };
-      const { sendCalls, tools } = createMockSearchHarness(
+      const { toolCallCalls, tools } = createMockSearchHarness(
         { hoist_builtin_tools: true },
         () => bridgeResponse,
       );
@@ -440,7 +446,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(sendCalls[0]?.params.path).toBe(src);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(src);
       expect(output).toContain("src/hit.ts");
       expect(output).toContain(`Skipped 1 path not found: ${missing}`);
       expect(bridgeResponse.complete).toBe(false);
@@ -458,7 +464,7 @@ describe("searchTools", () => {
       fs.mkdirSync(src, { recursive: true });
       fs.mkdirSync(e2e, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "src/a.ts\ne2e/b.ts" };
-      const { sendCalls, tools } = createMockSearchHarness(
+      const { toolCallCalls, tools } = createMockSearchHarness(
         { hoist_builtin_tools: true },
         () => bridgeResponse,
       );
@@ -468,7 +474,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(sendCalls[0]?.params.path).toBe(`${src} ${e2e}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${src} ${e2e}`);
       expect(output).toBe("src/a.ts\ne2e/b.ts");
       expect(output).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
@@ -484,11 +490,14 @@ describe("searchTools", () => {
       fs.mkdirSync(project, { recursive: true });
       const missingA = path.join(project, "missing-a");
       const missingB = path.join(project, "missing-b");
-      const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
-        success: false,
-        code: "path_not_found",
-        message: "path_not_found",
-      }));
+      const { toolCallCalls, tools } = createMockSearchHarness(
+        { hoist_builtin_tools: true },
+        () => ({
+          success: false,
+          code: "path_not_found",
+          message: "path_not_found",
+        }),
+      );
 
       let thrown: unknown;
       try {
@@ -502,7 +511,7 @@ describe("searchTools", () => {
 
       expect(thrown).toBeInstanceOf(Error);
       expect((thrown as Error).message).toBe("path_not_found");
-      expect(sendCalls[0]?.params.path).toBe(`${missingA} ${missingB}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${missingA} ${missingB}`);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -515,7 +524,7 @@ describe("searchTools", () => {
       const spaced = path.join(project, "with space");
       fs.mkdirSync(spaced, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "with space/a.ts" };
-      const { sendCalls, tools } = createMockSearchHarness(
+      const { toolCallCalls, tools } = createMockSearchHarness(
         { hoist_builtin_tools: true },
         () => bridgeResponse,
       );
@@ -525,7 +534,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(sendCalls[0]?.params.path).toBe(fs.realpathSync(spaced));
+      expect(toolCallCalls[0]?.rawArgs.path).toBe(fs.realpathSync(spaced));
       expect(output).toBe("with space/a.ts");
       expect(output).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
@@ -537,14 +546,15 @@ describe("searchTools", () => {
   test("glob splits exact absolute file patterns into path and basename", async () => {
     const project = "/tmp/search-tests";
     const absoluteFile = path.join(project, "src", "exact.ts");
-    const { sendCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
       success: true,
+      text: absoluteFile,
       files: [absoluteFile],
     }));
 
     await tools.glob.execute({ pattern: absoluteFile }, createMockSdkContext(project));
 
-    expect(sendCalls[0]?.params).toMatchObject({
+    expect(toolCallCalls[0]?.rawArgs).toMatchObject({
       pattern: "exact.ts",
       path: path.dirname(absoluteFile),
     });

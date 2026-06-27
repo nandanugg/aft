@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import {
-  callBridge,
+  callToolCall,
   expandTilde,
   isEmptyParam,
   resolvePathFromProjectRoot,
@@ -29,7 +29,7 @@ export function conflictTools(ctx: PluginContext): Record<string, ToolDefinition
           .optional(),
       },
       execute: async (args, context): Promise<string> => {
-        const params: Record<string, unknown> = {};
+        const rawArgs: Record<string, unknown> = {};
         if (!isEmptyParam(args?.path)) {
           // `path` points at a repo/worktree to inspect — gate it through the
           // external-directory permission like the other path-taking tools, so
@@ -45,13 +45,13 @@ export function conflictTools(ctx: PluginContext): Record<string, ToolDefinition
           // Send the SAME resolved path the permission check approved (closes the
           // check-vs-use gap and gives Rust an absolute path it won't re-resolve
           // against a possibly-different cwd).
-          params.path = resolved;
+          rawArgs.path = resolved;
         }
-        const response = await callBridge(ctx, context, "git_conflicts", params);
+        const response = await callToolCall(ctx, context, "conflicts", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || "git_conflicts failed");
         }
-        return response.text as string;
+        return response.text;
       },
     },
   };

@@ -1,0 +1,6 @@
+{
+  "args": {
+    "pattern": "**/*.ts"
+  },
+  "command": "glob"
+}

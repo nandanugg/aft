@@ -146,11 +146,13 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "write"
             | "edit"
             | "grep"
+            | "glob"
             | "search"
             | "outline"
             | "zoom"
             | "inspect"
             | "callgraph"
+            | "conflicts"
     )
 }
 
@@ -187,6 +189,7 @@ pub fn format_response_with_context(
         "write" => format_write_response(data),
         "read" => format_read(data, ctx.agent_specified_range),
         "grep" => format_grep(data),
+        "glob" => data["text"].as_str().unwrap_or_default().to_string(),
         "search" => format_search(data),
         "outline" => format_outline(response, ctx.outline_mode),
         "zoom" => format_zoom(data, ctx),
@@ -197,6 +200,7 @@ pub fn format_response_with_context(
             data,
             ctx.callgraph_include_unresolved,
         ),
+        "conflicts" => data["text"].as_str().unwrap_or_default().to_string(),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }

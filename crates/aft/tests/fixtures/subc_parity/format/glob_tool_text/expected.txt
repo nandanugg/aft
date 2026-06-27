@@ -1,0 +1,4 @@
+2 files matching **/*.ts
+
+src/main.ts
+packages/app/index.tsx

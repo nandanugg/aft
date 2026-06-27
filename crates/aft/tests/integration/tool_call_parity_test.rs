@@ -219,6 +219,11 @@ fn parity_cases() -> Vec<ParityCase> {
             arguments: json!({"pattern": "needle", "path": "src"}),
         },
         ParityCase {
+            label: "glob_matches",
+            tool: "glob",
+            arguments: json!({"pattern": "**/*.txt", "path": "src"}),
+        },
+        ParityCase {
             label: "search_literal",
             tool: "search",
             arguments: json!({"query": "needle", "hint": "literal", "topK": 5}),
@@ -247,6 +252,11 @@ fn parity_cases() -> Vec<ParityCase> {
             label: "read_missing_file_error",
             tool: "read",
             arguments: json!({"filePath": "src/missing.txt"}),
+        },
+        ParityCase {
+            label: "conflicts_not_git_repo_error",
+            tool: "conflicts",
+            arguments: json!({}),
         },
         ParityCase {
             label: "zoom_single_symbol",

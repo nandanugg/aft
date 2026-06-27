@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "glob: missing required param 'pattern'"
+  }
+}

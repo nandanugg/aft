@@ -186,11 +186,13 @@ pub fn subc_translate_with_context(
         "write" => translate_write(agent_args, project_root, ctx),
         "edit" => translate_edit(agent_args, project_root, ctx),
         "grep" => translate_grep(agent_args, project_root),
+        "glob" => translate_glob(agent_args),
         "search" => translate_search(agent_args),
         "outline" => translate_outline(agent_args, project_root),
         "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
+        "conflicts" => translate_conflicts(agent_args),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
@@ -542,6 +544,30 @@ fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, Trans
 
     Ok(Translated {
         command: "grep".into(),
+        args: out,
+    })
+}
+
+fn translate_glob(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let pattern = map_in
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("glob: missing required param 'pattern'"))?;
+
+    let mut out = Map::new();
+    out.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    if let Some(path_val) = map_in.get("path") {
+        if !is_empty_param(path_val) {
+            if let Some(path_str) = path_val.as_str() {
+                out.insert("path".to_string(), Value::String(path_str.to_string()));
+            }
+        }
+    }
+
+    Ok(Translated {
+        command: "glob".into(),
         args: out,
     })
 }
@@ -984,6 +1010,23 @@ fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, Trans
 
     Ok(Translated {
         command: "zoom".into(),
+        args: out,
+    })
+}
+
+fn translate_conflicts(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let mut out = Map::new();
+    if let Some(path_val) = map_in.get("path") {
+        if !is_empty_param(path_val) {
+            if let Some(path_str) = path_val.as_str() {
+                out.insert("path".to_string(), Value::String(path_str.to_string()));
+            }
+        }
+    }
+
+    Ok(Translated {
+        command: "git_conflicts".into(),
         args: out,
     })
 }

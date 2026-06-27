@@ -172,7 +172,12 @@ describe("Lane G plugin orchestration regressions", () => {
     const asks: Array<Record<string, unknown>> = [];
     const ctx = {
       config: { search_index: true },
-      pool: { getBridge: () => ({ send: async () => ({ success: true, files: [] }) }) },
+      pool: {
+        getBridge: () => ({
+          send: async () => ({ success: true, files: [] }),
+          toolCall: async () => ({ success: true, text: "", files: [] }),
+        }),
+      },
     } as unknown as PluginContext;
     const sdkCtx = {
       directory: project,

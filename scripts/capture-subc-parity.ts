@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
+import { conflictTools } from "../packages/opencode-plugin/src/tools/conflicts.ts";
 import { createReadTool, hoistedTools } from "../packages/opencode-plugin/src/tools/hoisted.ts";
 import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
 import { navigationTools } from "../packages/opencode-plugin/src/tools/navigation.ts";
@@ -32,7 +33,19 @@ const PROJECT_ROOT_TOKEN = "<PROJECT_ROOT>";
 const HOME_ROOT = homedir();
 const HOME_ROOT_TOKEN = "<HOME>";
 
-type BareToolName = "status" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "zoom" | "inspect" | "callgraph";
+type BareToolName =
+  | "status"
+  | "read"
+  | "write"
+  | "edit"
+  | "grep"
+  | "glob"
+  | "search"
+  | "outline"
+  | "zoom"
+  | "inspect"
+  | "callgraph"
+  | "conflicts";
 
 interface BridgeCall {
   command: string;
@@ -121,6 +134,15 @@ function makeCtx(
             calls.push({ command, params });
             return responseForCall(command, params);
           },
+          toolCall: async (
+            _sessionId: string | undefined,
+            name: string,
+            rawArgs: Record<string, unknown> = {},
+          ) => {
+            const command = name === "conflicts" ? "git_conflicts" : name;
+            calls.push({ command, params: rawArgs });
+            return responseForCall(command, rawArgs);
+          },
         }) as unknown as ReturnType<BridgePool["getBridge"]>,
     } as unknown as BridgePool,
     client: { lsp: {}, find: {} } as PluginContext["client"],
@@ -135,17 +157,20 @@ function makeCtx(
 function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefined> {
   const hoisted = hoistedTools(ctx);
   const grepTools = searchTools(ctx);
+  const conflicts = conflictTools(ctx);
   return {
     status: undefined,
     read: createReadTool(ctx),
     write: hoisted.write,
     edit: hoisted.edit,
     grep: grepTools.grep ?? grepTools.aft_grep,
+    glob: grepTools.glob ?? grepTools.aft_glob,
     search: semanticTools(ctx).aft_search,
     outline: readingTools(ctx).aft_outline,
     zoom: readingTools(ctx).aft_zoom,
     inspect: inspectTools(ctx).aft_inspect,
     callgraph: navigationTools(ctx).aft_callgraph,
+    conflicts: conflicts.aft_conflicts,
   };
 }
 
@@ -250,7 +275,7 @@ function writeTranslateCase(caseDef: TranslateCase, expected: unknown): void {
   mkdirSync(dir, { recursive: true });
   writeJson(join(dir, "input.json"), {
     tool_name: caseDef.tool_name,
-    agent_args: caseDef.agent_args,
+    agent_args: replaceStablePaths(caseDef.agent_args),
     project_root: PROJECT_ROOT_TOKEN,
     ...(caseDef.diagnostics_on_edit === undefined
       ? {}
@@ -320,6 +345,12 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "edit_replace_occurrence_zero", tool_name: "edit", agent_args: { filePath: "src/main.ts", oldString: "value", newString: "answer", occurrence: 0 } },
   { name: "grep_include_braces", tool_name: "grep", agent_args: { pattern: "value", include: "*.ts,**/*.{vue,tsx}" } },
   { name: "grep_multi_path_existing_and_missing", tool_name: "grep", agent_args: { pattern: "value", path: "src docs missing-dir" } },
+  { name: "glob_tool_match_translate", tool_name: "glob", agent_args: { pattern: "**/*.ts" } },
+  { name: "glob_tool_no_match_translate", tool_name: "glob", agent_args: { pattern: "**/*.zzz" } },
+  { name: "glob_tool_path_scoped_translate", tool_name: "glob", agent_args: { pattern: "**/*.ts", path: `${PROJECT_ROOT}/src` } },
+  { name: "glob_tool_missing_pattern", tool_name: "glob", expected_error: "glob: missing required param 'pattern'", agent_args: {} },
+  { name: "conflicts_tool_default_translate", tool_name: "conflicts", agent_args: {} },
+  { name: "conflicts_tool_path_translate", tool_name: "conflicts", agent_args: { path: `${PROJECT_ROOT}/src` } },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },
@@ -358,6 +389,12 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "grep_text", tool_name: "grep", agent_args: { pattern: "value" }, native_response_json: { id: "1", success: true, text: "src/main.ts:1: const value = 1;" } },
   { name: "grep_matches_fallback", tool_name: "grep", agent_args: { pattern: "value" }, native_response_json: { id: "1", success: true, matches: [{ file: "src/main.ts", line: 1, line_text: "const value = 1;" }], total_matches: 1, files_with_matches: 1 } },
   { name: "grep_empty_fallback", tool_name: "grep", agent_args: { pattern: "missing" }, native_response_json: { id: "1", success: true, matches: [], total_matches: 0, files_with_matches: 0 } },
+  { name: "glob_tool_text", tool_name: "glob", agent_args: { pattern: "**/*.ts" }, native_response_json: { id: "1", success: true, text: "2 files matching **/*.ts\n\nsrc/main.ts\npackages/app/index.tsx", files: ["src/main.ts", "packages/app/index.tsx"], total: 2, truncated: false } },
+  { name: "glob_tool_no_match_text", tool_name: "glob", agent_args: { pattern: "**/*.zzz" }, native_response_json: { id: "1", success: true, text: "0 files matching **/*.zzz", files: [], total: 0, truncated: false } },
+  { name: "glob_tool_path_scoped_text", tool_name: "glob", agent_args: { pattern: "**/*.ts", path: "src" }, native_response_json: { id: "1", success: true, text: "1 file matching **/*.ts\n\nsrc/main.ts", files: ["src/main.ts"], total: 1, truncated: false } },
+  { name: "conflicts_tool_no_conflicts_text", tool_name: "conflicts", agent_args: {}, native_response_json: { id: "1", success: true, text: `No merge conflicts found.\nChecked repo root: ${PROJECT_ROOT}`, file_count: 0, conflict_count: 0, checked_root: PROJECT_ROOT } },
+  { name: "conflicts_tool_with_conflicts_text", tool_name: "conflicts", agent_args: {}, native_response_json: { id: "1", success: true, text: `1 file, 1 conflict\nChecked repo root: ${PROJECT_ROOT}\n\n── src/main.ts [1 conflict] ──\n   1: before\n   2: <<<<<<< HEAD\n   3: ours\n   4: =======\n   5: theirs\n   6: >>>>>>> branch\n   7: after`, file_count: 1, conflict_count: 1, checked_root: PROJECT_ROOT } },
+  { name: "conflicts_tool_error", tool_name: "conflicts", agent_args: { path: "missing" }, native_response_json: { id: "1", success: false, code: "not_a_git_repository", message: `path is not inside a git repository: ${PROJECT_ROOT}/missing` } },
   { name: "search_text_honesty", tool_name: "search", agent_args: { query: "value" }, native_response_json: { id: "1", success: true, text: "1. src/main.ts", more_available: true, fully_degraded: true, complete: false } },
   { name: "search_no_text_honesty", tool_name: "search", agent_args: { query: "value" }, native_response_json: { id: "1", success: true, more_available: true, engine_capped: true, fully_degraded: true, complete: false } },
   { name: "search_error", tool_name: "search", agent_args: { query: "value" }, native_response_json: { id: "1", success: false, code: "semantic_unavailable", message: "semantic index unavailable" } },

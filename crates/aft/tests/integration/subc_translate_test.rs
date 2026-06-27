@@ -62,6 +62,27 @@ fn project_root_for_input(raw: &str) -> PathBuf {
     }
 }
 
+fn expand_project_root_tokens(value: Value, project_root: &Path) -> Value {
+    let root = project_root.to_string_lossy();
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| expand_project_root_tokens(item, project_root))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                out.insert(key, expand_project_root_tokens(value, project_root));
+            }
+            Value::Object(out)
+        }
+        Value::String(s) => Value::String(s.replace(PROJECT_ROOT_TOKEN, root.as_ref())),
+        other => other,
+    }
+}
+
 fn replace_project_root(value: Value, project_root: &Path) -> Value {
     let root = project_root.to_string_lossy();
     match value {
@@ -118,15 +139,12 @@ fn assert_case(dir: &Path) -> Option<String> {
         diagnostics_on_edit: input.diagnostics_on_edit.unwrap_or(false),
         preview: false,
     };
-    let actual = match subc_translate_with_context(
-        &input.tool_name,
-        &input.agent_args,
-        &project_root,
-        ctx,
-    ) {
-        Ok(t) => json!({ "command": t.command, "args": t.args }),
-        Err(err) => json!({ "error": { "code": err.code, "message": err.message } }),
-    };
+    let agent_args = expand_project_root_tokens(input.agent_args, &project_root);
+    let actual =
+        match subc_translate_with_context(&input.tool_name, &agent_args, &project_root, ctx) {
+            Ok(t) => json!({ "command": t.command, "args": t.args }),
+            Err(err) => json!({ "error": { "code": err.code, "message": err.message } }),
+        };
     let actual = pretty_sorted(replace_project_root(actual, &project_root));
     let expected = fs::read_to_string(dir.join("expected.json")).expect("read expected.json");
     if actual == expected {

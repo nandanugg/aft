@@ -4,7 +4,6 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { z } from "zod";
 import type { PluginContext } from "../types.js";
 import {
-  callBridge,
   callToolCall,
   expandTilde,
   resolvePathFromProjectRoot,
@@ -274,10 +273,9 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         }
       }
 
-      const response = await callBridge(ctx, context, "glob", {
-        pattern: globPattern,
-        path: bridgePath,
-      });
+      const rawArgs: Record<string, unknown> = { pattern: globPattern };
+      if (bridgePath !== undefined) rawArgs.path = bridgePath;
+      const response = await callToolCall(ctx, context, "glob", rawArgs);
 
       if (response.success === false) {
         throw new Error((response.message as string) || "glob failed");
@@ -287,18 +285,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         response.complete = false;
       }
 
-      if (typeof response.text === "string") {
-        return appendSkippedSearchPaths(response.text, pathSplit?.missing ?? []);
-      }
-
-      if (Array.isArray(response.files)) {
-        return appendSkippedSearchPaths(response.files.join("\n"), pathSplit?.missing ?? []);
-      }
-
-      return appendSkippedSearchPaths(
-        (response.text as string) || JSON.stringify(response),
-        pathSplit?.missing ?? [],
-      );
+      return appendSkippedSearchPaths(response.text, pathSplit?.missing ?? []);
     },
   };
 
