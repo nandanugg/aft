@@ -6,7 +6,6 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { callToolCall } from "../../tools/_shared.js";
 import { readingTools } from "../../tools/reading.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk } from "../test-helpers";
@@ -155,21 +154,6 @@ maybeDescribe("e2e aft_zoom tool_call cutover", () => {
     } finally {
       await close(server);
     }
-  });
-
-  test("line-range zoom is formatted by tool_call", async () => {
-    const h = await harness();
-
-    const response = await callToolCall(createPluginContext(h), createToolContext(h), "zoom", {
-      filePath: "sample.md",
-      startLine: 1,
-      endLine: 3,
-    });
-
-    expect(response.success).toBe(true);
-    expect(response.text).toContain("sample.md:1-3");
-    expect(response.text).toContain("1: # Project Title");
-    expect(response.text).toContain("3: Intro paragraph for the document.");
   });
 
   test("large containers render the member-signature menu", async () => {

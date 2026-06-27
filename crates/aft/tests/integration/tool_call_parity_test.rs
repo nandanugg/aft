@@ -259,11 +259,6 @@ fn parity_cases() -> Vec<ParityCase> {
             arguments: json!({"filePath": "src/zoom.ts", "symbols": ["helper", "missingSymbol"]}),
         },
         ParityCase {
-            label: "zoom_line_range",
-            tool: "zoom",
-            arguments: json!({"filePath": "docs/zoom.md", "startLine": 1, "endLine": 3}),
-        },
-        ParityCase {
             label: "zoom_multi_target_all_success",
             tool: "zoom",
             arguments: json!({

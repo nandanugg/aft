@@ -942,13 +942,19 @@ fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, Trans
                     out.insert("symbol".to_string(), Value::String(symbol.to_string()));
                 }
                 Value::Array(items) => {
-                    let joined = items
+                    // Pass the array THROUGH to the leaf (handle_zoom's
+                    // parse_zoom_symbol_names handles a `symbols` array natively,
+                    // one lookup per element). Joining into one space-separated
+                    // string would break multi-heading markdown/HTML zoom, whose
+                    // heading names legitimately contain spaces.
+                    let names: Vec<Value> = items
                         .iter()
                         .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !joined.is_empty() {
-                        out.insert("symbol".to_string(), Value::String(joined));
+                        .filter(|name| !name.is_empty())
+                        .map(|name| Value::String(name.to_string()))
+                        .collect();
+                    if !names.is_empty() {
+                        out.insert("symbols".to_string(), Value::Array(names));
                     }
                 }
                 _ => {
@@ -970,20 +976,6 @@ fn translate_zoom(args: &Value, project_root: &Path) -> Result<Translated, Trans
             "context_lines".to_string(),
             Value::Number(context_lines.into()),
         );
-    }
-
-    if let Some(start_line) = coerce_optional_int_result(
-        map_in.get("startLine"),
-        "startLine",
-        1,
-        9_007_199_254_740_991,
-    )? {
-        out.insert("start_line".to_string(), Value::Number(start_line.into()));
-    }
-    if let Some(end_line) =
-        coerce_optional_int_result(map_in.get("endLine"), "endLine", 1, 9_007_199_254_740_991)?
-    {
-        out.insert("end_line".to_string(), Value::Number(end_line.into()));
     }
 
     if map_in.get("callgraph").is_some_and(coerce_boolean) {
