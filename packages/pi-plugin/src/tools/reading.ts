@@ -3,13 +3,7 @@
  * Structural overview and symbol/section inspection.
  */
 
-import {
-  coerceBoolean,
-  coerceTargetParam,
-  formatZoomMultiTargetResult,
-  formatZoomText,
-  unwrapRustZoomBatchEnvelope,
-} from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceTargetParam } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -18,7 +12,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, callToolCall, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, coerceOptionalInt, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
@@ -120,19 +114,6 @@ export interface ReadingSurface {
   zoom: boolean;
 }
 
-interface ZoomBatchSymbolResult {
-  name: string;
-  success: boolean;
-  content?: string;
-  error?: string;
-}
-
-interface ZoomBatchResult {
-  complete: boolean;
-  symbols: ZoomBatchSymbolResult[];
-  text: string;
-}
-
 function zoomExtraCallSites(call: Record<string, unknown>): string {
   const extraCount = call.extra_count;
   return typeof extraCount === "number" && Number.isInteger(extraCount) && extraCount > 0
@@ -150,6 +131,61 @@ export function buildOutlineSections(text: string, theme: Theme): string[] {
   return [theme.fg("accent", lines[0]), lines.slice(1).join("\n")];
 }
 
+function renderZoomRecord(
+  record: Record<string, unknown>,
+  targetLabel: string,
+  theme: Theme,
+): string {
+  const name = asString(record.name) ?? "(unknown symbol)";
+  const kind = asString(record.kind) ?? "symbol";
+  const range = asRecord(record.range);
+  const startLine = range && typeof range.start_line === "number" ? range.start_line : undefined;
+  const endLine = range && typeof range.end_line === "number" ? range.end_line : undefined;
+  const location =
+    startLine !== undefined
+      ? `${shortenPath(targetLabel)}:${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ""}`
+      : shortenPath(targetLabel);
+  const lines = [`${theme.fg("accent", name)} ${theme.fg("muted", `[${kind}] ${location}`)}`];
+
+  const content = asString(record.content);
+  if (content) {
+    lines.push(
+      content
+        .split("\n")
+        .map((line) => `  ${line}`)
+        .join("\n"),
+    );
+  }
+
+  const annotations = asRecord(record.annotations);
+  const callsOut = annotations ? asRecords(annotations.calls_out) : [];
+  const calledBy = annotations ? asRecords(annotations.called_by) : [];
+  if (callsOut.length > 0) {
+    lines.push(
+      `${theme.fg("muted", "calls out")}`,
+      callsOut
+        .map(
+          (call) =>
+            `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
+        )
+        .join("\n"),
+    );
+  }
+  if (calledBy.length > 0) {
+    lines.push(
+      `${theme.fg("muted", "called by")}`,
+      calledBy
+        .map(
+          (call) =>
+            `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
+        )
+        .join("\n"),
+    );
+  }
+
+  return lines.join("\n");
+}
+
 /** Exported for renderer unit tests. */
 export function buildZoomSections(
   args: Static<typeof ZoomParams>,
@@ -157,11 +193,13 @@ export function buildZoomSections(
   theme: Theme,
 ): string[] {
   const batch = asRecord(payload);
-  const batchItems = Array.isArray(batch?.symbols)
-    ? (batch.symbols as unknown[])
-    : Array.isArray(batch?.entries)
-      ? (batch.entries as unknown[])
-      : null;
+  const batchItems = Array.isArray(batch?.targets)
+    ? (batch.targets as unknown[])
+    : Array.isArray(batch?.symbols)
+      ? (batch.symbols as unknown[])
+      : Array.isArray(batch?.entries)
+        ? (batch.entries as unknown[])
+        : null;
   if (batchItems) {
     const header =
       batch?.complete === false ? [theme.fg("warning", "Incomplete zoom results")] : [];
@@ -170,22 +208,33 @@ export function buildZoomSections(
       ...batchItems.map((item) => {
         const record = asRecord(item);
         if (!record) return theme.fg("muted", "No zoom result available.");
-        const name = asString(record.name) ?? "(unknown symbol)";
+        const response = asRecord(record.response) ?? record;
+        const name = asString(record.name) ?? asString(response.name) ?? "(unknown symbol)";
         const itemTargetLabel = asString(record.targetLabel) ?? zoomTargetLabel(args);
-        if (record.success === false) {
+        if (response.success === false || record.success === false) {
           const location = record.targetLabel ? ` in ${shortenPath(itemTargetLabel)}` : "";
           return theme.fg(
             "error",
-            `Symbol "${name}" not found${location}: ${asString(record.error) ?? "zoom failed"}`,
+            `Symbol "${name}" not found${location}: ${asString(response.message) ?? asString(record.error) ?? "zoom failed"}`,
+          );
+        }
+        if (record.response) {
+          return renderZoomRecord(
+            { ...response, name: asString(response.name) ?? name },
+            itemTargetLabel,
+            theme,
           );
         }
         const content = asString(record.content);
-        return [
-          `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(itemTargetLabel))}`,
-          content,
-        ]
-          .filter(Boolean)
-          .join("\n");
+        if (content) {
+          return [
+            `${theme.fg("accent", name)} ${theme.fg("muted", shortenPath(itemTargetLabel))}`,
+            content,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+        return renderZoomRecord(record, itemTargetLabel, theme);
       }),
     ];
   }
@@ -197,57 +246,7 @@ export function buildZoomSections(
     .map((item) => {
       const record = asRecord(item);
       if (!record) return theme.fg("muted", "No zoom result available.");
-
-      const name = asString(record.name) ?? "(unknown symbol)";
-      const kind = asString(record.kind) ?? "symbol";
-      const range = asRecord(record.range);
-      const startLine =
-        range && typeof range.start_line === "number" ? range.start_line : undefined;
-      const endLine = range && typeof range.end_line === "number" ? range.end_line : undefined;
-      const targetLabel = zoomTargetLabel(args);
-      const location =
-        startLine !== undefined
-          ? `${shortenPath(targetLabel)}:${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ""}`
-          : shortenPath(targetLabel);
-      const lines = [`${theme.fg("accent", name)} ${theme.fg("muted", `[${kind}] ${location}`)}`];
-
-      const content = asString(record.content);
-      if (content) {
-        lines.push(
-          content
-            .split("\n")
-            .map((line) => `  ${line}`)
-            .join("\n"),
-        );
-      }
-
-      const annotations = asRecord(record.annotations);
-      const callsOut = annotations ? asRecords(annotations.calls_out) : [];
-      const calledBy = annotations ? asRecords(annotations.called_by) : [];
-      if (callsOut.length > 0) {
-        lines.push(
-          `${theme.fg("muted", "calls out")}`,
-          callsOut
-            .map(
-              (call) =>
-                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
-            )
-            .join("\n"),
-        );
-      }
-      if (calledBy.length > 0) {
-        lines.push(
-          `${theme.fg("muted", "called by")}`,
-          calledBy
-            .map(
-              (call) =>
-                `  ↳ ${asString(call.name) ?? "(unknown)"}${typeof call.line === "number" ? `:${call.line}` : ""}${zoomExtraCallSites(call)}`,
-            )
-            .join("\n"),
-        );
-      }
-
-      return lines.join("\n");
+      return renderZoomRecord(record, zoomTargetLabel(args), theme);
     })
     .filter(Boolean);
 }
@@ -426,8 +425,15 @@ export function registerReadingTools(
         const hasUrl = !isEmptyParam(params.url);
         const hasTargets = hasTargetsProvided(params.targets);
         const hasSymbols = !isEmptyParam(params.symbols);
-        // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
+        // Coerce stringified booleans and numbers here so they reach the server
+        // in the same form the main client sends.
         const wantCallgraph = coerceBoolean(params.callgraph);
+        const contextLines = coerceOptionalInt(
+          params.contextLines,
+          "contextLines",
+          1,
+          Number.MAX_SAFE_INTEGER,
+        );
 
         // Multi-target mode (cross-file). Mutually exclusive with the other
         // modes so the agent doesn't accidentally provide overlapping inputs
@@ -456,27 +462,16 @@ export function registerReadingTools(
             targets.map((t) => resolvePathArg(extCtx.cwd, t.filePath)),
           );
           await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
-          const responses = await Promise.all(
-            targets.map((t, index) => {
-              const req: Record<string, unknown> = {
-                file: resolvedTargets[index],
-                symbol: t.symbol,
-              };
-              if (params.contextLines !== undefined) req.context_lines = params.contextLines;
-              if (wantCallgraph) req.callgraph = true;
-              return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
-                success: false,
-                message: err instanceof Error ? err.message : String(err),
-              }));
-            }),
-          );
-          const entries = targets.map((t, i) => ({
-            targetLabel: t.filePath,
-            name: t.symbol,
-            response: responses[i] ?? { success: false, message: "missing zoom response" },
-          }));
-          const batch = formatZoomMultiTargetResult(entries);
-          return textResult(batch.text, batch);
+
+          const rawArgs: Record<string, unknown> = { targets };
+          if (contextLines !== undefined) rawArgs.contextLines = contextLines;
+          if (wantCallgraph) rawArgs.callgraph = true;
+
+          const response = await callToolCall(bridge, "zoom", rawArgs, extCtx);
+          if (response.success === false) {
+            throw new Error(response.text || response.message || "zoom failed");
+          }
+          return textResult(response.text, response);
         }
 
         if (!hasFilePath && !hasUrl) {
@@ -486,77 +481,26 @@ export function registerReadingTools(
           throw new Error("Provide exactly ONE of 'filePath' or 'url' — not both");
         }
 
-        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
-        const file = hasUrl
-          ? (params.url as string)
-          : await resolvePathArg(extCtx.cwd, params.filePath as string);
-        if (!hasUrl) await assertReadPathPermissions(extCtx, ctx, file);
-
-        // Header label — what the agent typed, not the on-disk cache path.
-        const targetLabel = (hasUrl ? params.url : params.filePath) ?? file;
-
-        // Normalize symbols → array (or undefined if not provided).
-        // String input is treated as a single-element array; the single-symbol
-        // shortcut returns the raw zoom text instead of a batch wrapper so the
-        // happy path doesn't show "Incomplete" framing.
-        const symbolsArray: string[] | undefined = hasSymbols
-          ? typeof params.symbols === "string"
-            ? [params.symbols]
-            : (params.symbols as string[])
-          : undefined;
-
-        if (symbolsArray) {
-          const results = await Promise.all(
-            symbolsArray.map((sym) => {
-              const req: Record<string, unknown> = { file, symbol: sym };
-              if (params.contextLines !== undefined) req.context_lines = params.contextLines;
-              if (wantCallgraph) req.callgraph = true;
-              return callBridge(bridge, "zoom", req, extCtx).catch((err) => ({
-                success: false,
-                message: err instanceof Error ? err.message : String(err),
-              }));
-            }),
-          );
-          if (symbolsArray.length === 1) {
-            const response = results[0] ?? { success: false, message: "missing zoom response" };
-            const rustBatch = unwrapRustZoomBatchEnvelope(response as Record<string, unknown>);
-            if (rustBatch) {
-              const batch = formatZoomBatchResult(
-                targetLabel,
-                rustBatch.names,
-                rustBatch.responses,
-              );
-              return textResult(batch.text, batch);
-            }
-            if ((response as { success?: boolean }).success === false) {
-              throw new Error(
-                ((response as { message?: string }).message as string) || "zoom failed",
-              );
-            }
-            return textResult(
-              formatZoomText(targetLabel, response as Record<string, unknown>),
-              response,
-            );
-          }
-          const batch = formatZoomBatchResult(targetLabel, symbolsArray, results);
-          return textResult(batch.text, batch);
+        // URL mode passes through to Rust; Rust fetches, validates, and caches.
+        // File mode still resolves locally before dispatch so external-directory
+        // permission checks approve the same path the server will read.
+        if (!hasUrl) {
+          const file = await resolvePathArg(extCtx.cwd, params.filePath as string);
+          await assertReadPathPermissions(extCtx, ctx, file);
         }
 
-        // No symbols specified: zoom by line-range fallback (or whole file).
-        const req: Record<string, unknown> = { file };
-        if (params.contextLines !== undefined) req.context_lines = params.contextLines;
-        if (wantCallgraph) req.callgraph = true;
-        const response = await callBridge(bridge, "zoom", req, extCtx);
+        const rawArgs: Record<string, unknown> = hasUrl
+          ? { url: params.url }
+          : { filePath: params.filePath };
+        if (hasSymbols) rawArgs.symbols = params.symbols;
+        if (contextLines !== undefined) rawArgs.contextLines = contextLines;
+        if (wantCallgraph) rawArgs.callgraph = true;
+
+        const response = await callToolCall(bridge, "zoom", rawArgs, extCtx);
         if (response.success === false) {
-          throw new Error((response.message as string) || "zoom failed");
+          throw new Error(response.text || response.message || "zoom failed");
         }
-        // The agent gets the formatted plain-text view; the Pi UI renderer
-        // needs the raw response as a structured payload so it can produce
-        // its own pretty box (name + kind + location header + indented body).
-        // Without `details` the renderer would fall back to JSON.parse on the
-        // formatted text (which isn't JSON) and print "No zoom result
-        // available" even though the agent sees the real content.
-        return textResult(formatZoomText(targetLabel, response), response);
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderZoomCall(args, theme, context);
@@ -566,44 +510,4 @@ export function registerReadingTools(
       },
     });
   }
-}
-
-/**
- * Format multi-symbol zoom results as plain text. Successful entries use
- * `formatZoomText` (line-numbered, no JSON escapes); failures render as
- * `Symbol "name" not found: <reason>`. Sections are blank-line separated.
- *
- * Exported for regression tests. Output is byte-identical to the OpenCode
- * plugin's formatZoomBatchResult — both hosts share `formatZoomText` from
- * `@cortexkit/aft-bridge` so the agent sees the same shape across hosts.
- */
-export function formatZoomBatchResult(
-  targetLabel: string,
-  symbols: string[],
-  responses: Record<string, unknown>[],
-): ZoomBatchResult {
-  const entries = symbols.map((name, index): ZoomBatchSymbolResult => {
-    const response = responses[index] ?? { success: false, message: "missing zoom response" };
-    if (response.success === false) {
-      const message =
-        typeof response.message === "string" && response.message.length > 0
-          ? response.message
-          : "zoom failed";
-      return { name, success: false, error: message };
-    }
-    return { name, success: true, content: formatZoomText(targetLabel, response) };
-  });
-  const complete = entries.every((entry) => entry.success);
-  const sections: string[] = [];
-  if (!complete) {
-    sections.push("Incomplete zoom results: one or more symbols failed.");
-  }
-  for (const entry of entries) {
-    if (entry.success) {
-      sections.push(entry.content ?? "");
-    } else {
-      sections.push(`Symbol "${entry.name}" not found: ${entry.error ?? "zoom failed"}`);
-    }
-  }
-  return { complete, symbols: entries, text: sections.join("\n\n") };
 }

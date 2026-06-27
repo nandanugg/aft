@@ -6,7 +6,6 @@
 
 import { describe, expect, test } from "bun:test";
 import {
-  formatZoomBatchResult,
   renderOutlineCall,
   renderOutlineResult,
   renderZoomCall,
@@ -83,21 +82,31 @@ describe("reading renderers", () => {
     expect(empty).toContain("No outline available");
   });
 
-  test("multi-target zoom renders entries payloads with per-target labels", () => {
+  test("multi-target zoom renders server targets envelope with per-target labels", () => {
     const batch = {
       complete: true,
-      entries: [
+      targets: [
         {
           targetLabel: "src/a.ts",
           name: "foo",
-          success: true,
-          content: "src/a.ts:1-1 [function foo]\n\n1: export function foo() {}",
+          response: {
+            success: true,
+            name: "foo",
+            kind: "function",
+            range: { start_line: 1, end_line: 1 },
+            content: "export function foo() {}",
+          },
         },
         {
           targetLabel: "src/b.ts",
           name: "bar",
-          success: true,
-          content: "src/b.ts:2-2 [function bar]\n\n2: export function bar() {}",
+          response: {
+            success: true,
+            name: "bar",
+            kind: "function",
+            range: { start_line: 2, end_line: 2 },
+            content: "export function bar() {}",
+          },
         },
       ],
       text: "",
@@ -123,30 +132,41 @@ describe("reading renderers", () => {
     );
 
     expect(rendered).not.toContain("No zoom result available");
-    expect(rendered).toContain("foo src/a.ts");
-    expect(rendered).toContain("bar src/b.ts");
+    expect(rendered).toContain("foo [function] src/a.ts:1");
+    expect(rendered).toContain("bar [function] src/b.ts:2");
     expect(rendered).toContain("export function foo");
     expect(rendered).toContain("export function bar");
   });
 
   test("batched zoom keeps successes visible when another symbol fails", () => {
-    const batch = formatZoomBatchResult(
-      "sample.ts",
-      ["run", "Missing"],
-      [
+    const batch = {
+      complete: false,
+      symbols: [
         {
-          success: true,
           name: "run",
-          kind: "function",
-          range: { start_line: 1, end_line: 1, start_col: 0, end_col: 24 },
-          content: "export function run() {}",
-          context_before: [],
-          context_after: [],
-          annotations: { calls_out: [], called_by: [] },
+          response: {
+            success: true,
+            name: "run",
+            kind: "function",
+            range: { start_line: 1, end_line: 1, start_col: 0, end_col: 24 },
+            content: "export function run() {}",
+            context_before: [],
+            context_after: [],
+            annotations: { calls_out: [], called_by: [] },
+          },
         },
-        { success: false, message: "symbol not found" },
+        { name: "Missing", response: { success: false, message: "symbol not found" } },
       ],
-    );
+      text: [
+        "Incomplete zoom results: one or more symbols failed.",
+        "",
+        "sample.ts:1-1 [function run]",
+        "",
+        "1: export function run() {}",
+        "",
+        'Symbol "Missing" not found: symbol not found',
+      ].join("\n"),
+    };
     const rendered = renderToString(
       renderZoomResult(
         makeResult(batch.text, batch),
@@ -158,12 +178,8 @@ describe("reading renderers", () => {
 
     expect(batch.complete).toBe(false);
     expect(batch.text).toContain("Incomplete zoom results");
-    // Successful entries are now formatted as plain text via formatZoomText —
-    // line-numbered, no JSON escapes.
-    expect(batch.text).toContain("sample.ts:1-1 [function run]");
-    expect(batch.text).toContain("export function run() {}");
-    expect(batch.text).toContain('Symbol "Missing" not found: symbol not found');
     expect(rendered).toContain("Incomplete zoom results");
+    expect(rendered).toContain("run [function] sample.ts:1");
     expect(rendered).toContain("export function run() {}");
     expect(rendered).toContain("symbol not found");
   });
