@@ -72,7 +72,7 @@
 **State and diagnostics layer:**
 - Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
 - Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`
-- Contains: `AppContext`, undo history, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels
+- Contains: `AppContext`, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/` and `callgraph_store/`), `serde`
 - Used by: All command handlers through `AppContext`
 
@@ -94,14 +94,15 @@
 
 1. Configure project root and initialize file watching -- `crates/aft/src/commands/configure.rs`
 2. Query workspace-wide call dependencies via the persisted background-built callgraph store -- `crates/aft/src/callgraph_store/mod.rs`
-3. Serve navigation commands such as callers, call-tree, impact, trace-to, and trace-data using the callgraph store adapter -- `crates/aft/src/commands/call_tree.rs`, `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`, `crates/aft/src/commands/trace_to.rs`, `crates/aft/src/commands/trace_to_symbol.rs`, `crates/aft/src/commands/callgraph_store_adapter.rs`
+3. Serve navigation commands such as callers, call-tree, impact, trace-to, and trace-data using the callgraph store adapter -- `crates/aft/src/commands/call_tree.rs`, `crates/aft/src/commands/callers.rs`, `crates/aft/src/commands/impact.rs`, `crates/aft/src/commands/trace_data.rs`, `crates/aft/src/commands/trace_to.rs`, `crates/aft/src/commands/trace_to_symbol.rs`, `crates/aft/src/commands/callgraph_store_adapter.rs`. By default, hide test files from results (controlled via the `includeTests` parameter) and collapse unresolved stdlib or external leaf calls in `call_tree` unless `includeUnresolved` is active. Truncate and return a summary (`hub_summary`) when results exceed 20 entries to save token context cost.
+4. Serve symbol-level zoom inspection (`aft_zoom`), which fetches a symbol's implementation. If the target is a large container (class, struct, interface, etc., exceeding 150 lines), it renders a member-signature menu instead of the full body. For standard functions, it dedupes outgoing (`calls_out`) and incoming (`called_by`) call sites by name, aggregating duplicate occurrences under `extra_count` to minimize context token cost.
 
 **Search and retrieval flow:**
 
 1. Index project files using a disk-backed, pread-based trigram search index that keeps memory overhead bounded -- `crates/aft/src/search_index.rs`
-2. Optionally index with dense embeddings (fastembed, OpenAI-compatible, or Ollama) -- `crates/aft/src/semantic_index.rs`
-3. Classify query shape (prose vs code) using the query shape parser -- `crates/aft/src/query_shape.rs`
-4. Serve `grep` (trigram, full-text) and `aft_search` (semantic + hybrid) queries, applying query-shape-dependent ranking priors to boost definitions and protect exact identifier matches from embedding noise -- `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`
+2. Optionally index with dense embeddings (fastembed, OpenAI-compatible, or Ollama) -- `crates/aft/src/semantic_index.rs`. Serialize cold semantic warmups by gating callgraph store building and Tier 2 diagnostics refreshes behind active cold semantic index seeds.
+3. Classify query shape (prose vs code) using the query shape parser -- `crates/aft/src/query_shape.rs`. Identify "type-concept identifier queries" (TitleCase PascalCase types combined with lowercase concepts) to trigger definition semantic priors.
+4. Serve `grep` (trigram, full-text) and `aft_search` (semantic + hybrid) queries, applying query-shape-dependent ranking priors to boost definitions and protect exact identifier matches from embedding noise -- `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`. Downrank generated documentation artifacts (e.g. minified CSS/JS, maps, SVGs) in lexical and hybrid search results.
 
 **File read flow:**
 
@@ -153,7 +154,7 @@
 **CallGraphStore:**
 - Purpose: Persisted SQLite database of project-wide call dependencies.
 - Location: `crates/aft/src/callgraph_store/mod.rs`
-- Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Returns a `Building` status during cold builds.
+- Pattern: Background-built SQLite schema containing resolved and name-only call edges, refreshed incrementally on file edits, and queried by navigation commands. Returns a `Building` status during cold builds. Cold-build warming is deferred while a cold semantic index seed is actively collecting or embedding.
 
 **CallGraph:**
 - Purpose: Cache per-file local call data and resolve immediate import edges.
@@ -294,4 +295,4 @@
 
 **Caching:** Cache resolved binaries in `~/.cache/aft/bin` through `packages/aft-bridge/src/downloader.ts`, cache session bridges in `packages/aft-bridge/src/pool.ts`, cache tool availability in `crates/aft/src/format.rs`, cache call-graph state in `crates/aft/src/callgraph.rs`, cache trigram search indexes on disk via `crates/aft/src/search_index.rs`, cache semantic embeddings on disk via `crates/aft/src/semantic_index.rs`, and cache symbol data on disk via `crates/aft/src/symbol_cache_disk.rs`.
 
-**Storage:** Store undo snapshots in `crates/aft/src/backup.rs`, named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state, callgraph edges and nodes) in `crates/aft/src/db/`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.
+**Storage:** Store undo snapshots in `crates/aft/src/backup.rs` using the append-only v2 layout (indexing files under `<session_hash>/<path_hash>/` with locks to support multi-session project-shared bridges) governed by configured backup policies (`backup.enabled`, `backup.max_depth`, `backup.max_file_size`). Store named checkpoints in `crates/aft/src/checkpoint.rs`, database tables (backups, bash tasks, compression events, state, callgraph edges and nodes) in `crates/aft/src/db/`, pending UI metadata in `packages/opencode-plugin/src/metadata-store.ts`, and downloaded binaries in the cache directory managed by `packages/aft-bridge/src/downloader.ts`. Storage lives under the CortexKit shared root (`~/.local/share/cortexkit/aft/`), migrated from the legacy path via `crates/aft/src/migrate_storage.rs`.
