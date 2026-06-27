@@ -13,10 +13,10 @@ import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-co
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import {
-  BridgeError,
   bridgeFor,
-  callBridge,
+  callToolCall,
   coerceOptionalInt,
+  formatBridgeErrorMessage,
   isEmptyParam,
   optionalInt,
   textResult,
@@ -156,37 +156,36 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       }
 
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const req: Record<string, unknown> = {
+      const rawArgs: Record<string, unknown> = {
         op: params.op,
-        file: filePath,
+        filePath: params.filePath,
         symbol: params.symbol,
       };
       const depth = coerceOptionalInt(params.depth, "depth", 1, Number.MAX_SAFE_INTEGER);
-      if (depth !== undefined) req.depth = depth;
-      if (!isEmptyParam(params.expression)) req.expression = params.expression;
-      if (!isEmptyParam(params.toSymbol)) req.toSymbol = params.toSymbol;
-      if (toFile !== undefined) req.toFile = toFile;
+      if (depth !== undefined) rawArgs.depth = depth;
+      if (!isEmptyParam(params.expression)) rawArgs.expression = params.expression;
+      if (!isEmptyParam(params.toSymbol)) rawArgs.toSymbol = params.toSymbol;
+      if (!isEmptyParam(params.toFile)) rawArgs.toFile = params.toFile;
       if (!isEmptyParam(params.includeTests))
-        req.include_tests = coerceBoolean(params.includeTests);
-      try {
-        const response = await callBridge(bridge, params.op, req, extCtx);
-        return textResult(
+        rawArgs.includeTests = coerceBoolean(params.includeTests);
+      if (!isEmptyParam(params.includeUnresolved))
+        rawArgs.includeUnresolved = coerceBoolean(params.includeUnresolved);
+      const response = await callToolCall(bridge, "callgraph", rawArgs, extCtx);
+      if (response.success === false) {
+        const code = typeof response.code === "string" ? response.code : "";
+        const text = response.text || formatBridgeErrorMessage(params.op, response, rawArgs);
+        if (CALLGRAPH_SOFT_CODES.has(code)) {
+          return textResult(text, response);
+        }
+        throw new Error(text || response.message || "callgraph failed");
+      }
+      return textResult(
+        response.text ||
           formatCallgraphSections(params.op, response, PLAIN_CALLGRAPH_THEME, {
             includeUnresolved: coerceBoolean(params.includeUnresolved),
           }).join("\n"),
-          response,
-        );
-      } catch (error) {
-        // Read-only navigation negatives ("symbol isn't here", "no path between
-        // them", "store still building") are legitimate answers, not failures —
-        // return them as a plain (non-error) result so the UI doesn't render red.
-        // Genuine errors (invalid_request, boundary violations, unknown codes)
-        // keep throwing so they surface as errors.
-        if (error instanceof BridgeError && CALLGRAPH_SOFT_CODES.has(error.code)) {
-          return textResult(error.message);
-        }
-        throw error;
-      }
+        response,
+      );
     },
     renderCall(args, theme, context) {
       return renderNavigateCall(args, theme, context);

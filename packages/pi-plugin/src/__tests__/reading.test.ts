@@ -13,6 +13,10 @@ import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./t
 
 const tempRoots: string[] = [];
 
+function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
+  return call.params.arguments as Record<string, unknown>;
+}
+
 async function tempProject(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "aft-pi-reading-"));
   tempRoots.push(root);
@@ -31,21 +35,22 @@ describe("reading tool adapters", () => {
 
     await executeTool(tools.get("aft_outline")!, { target: ["src/a.ts", "src/b.ts"] });
 
-    expect(calls[0].command).toBe("outline");
-    expect(calls[0].params).toEqual({ files: ["src/a.ts", "src/b.ts"] });
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params.name).toBe("outline");
+    expect(toolArgs(calls[0])).toEqual({ target: ["src/a.ts", "src/b.ts"] });
   });
 
   test("aft_outline detects directories and sends an absolute directory path", async () => {
     const root = await tempProject();
     await mkdir(join(root, "src"));
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true, files: [] }));
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "files" }));
     registerReadingTools(api, makePluginContext(bridge), { outline: true, zoom: false });
 
     await executeTool(tools.get("aft_outline")!, { target: "src" }, { cwd: root } as never);
 
-    expect(calls[0].command).toBe("outline");
-    expect(calls[0].params).toEqual({ directory: join(root, "src") });
+    expect(calls[0].command).toBe("tool_call");
+    expect(toolArgs(calls[0])).toEqual({ target: "src" });
   });
 
   test("aft_outline treats missing local paths as file targets and lets Rust report errors", async () => {
@@ -58,7 +63,8 @@ describe("reading tool adapters", () => {
       cwd: root,
     } as never);
 
-    expect(calls[0].params).toEqual({ file: "src/missing.ts" });
+    expect(calls[0].params.name).toBe("outline");
+    expect(toolArgs(calls[0])).toEqual({ target: "src/missing.ts" });
   });
 
   test("aft_outline files:true appends a walk-cap footer after the file table", async () => {
@@ -68,7 +74,14 @@ describe("reading tool adapters", () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({
       success: true,
-      text: "path | language | symbols",
+      text: [
+        "path | language | symbols",
+        "",
+        "⚠ Partial result: walk truncated at 200 files. 12 additional files in this directory were not indexed.",
+        "Unchecked files:",
+        ...uncheckedFiles.slice(0, 10).map((file) => `  ${file}`),
+        "  ... +2 more",
+      ].join("\n"),
       complete: false,
       walk_truncated: true,
       unchecked_files: uncheckedFiles,
@@ -79,7 +92,7 @@ describe("reading tool adapters", () => {
       cwd: root,
     } as never)) as { content: Array<{ text: string }> };
 
-    expect(calls[0].params).toEqual({ directory: join(root, "src"), files: true });
+    expect(toolArgs(calls[0])).toEqual({ target: "src", files: true });
     expect(result.content[0].text).toContain("path | language | symbols");
     expect(result.content[0].text).toContain(
       "⚠ Partial result: walk truncated at 200 files. 12 additional files in this directory were not indexed.",

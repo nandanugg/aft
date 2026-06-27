@@ -32,13 +32,13 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(text).toContain("SampleService");
   });
 
-  test("outline single file keeps text details shape", async () => {
+  test("outline single file keeps text plus structured details", async () => {
     await writeFile(harness.path("single.ts"), "export function single() { return 1; }\n", "utf8");
 
     const result = await harness.callTool("aft_outline", { target: "single.ts" });
     const text = harness.text(result);
 
-    expect(result.details).toBeUndefined();
+    expect(result.details).toMatchObject({ success: true, complete: true });
     expect(text).toContain("single.ts");
     expect(text).toContain("single");
   });
@@ -52,7 +52,7 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(text).toContain("imports.ts");
   });
 
-  test("outline array target keeps text details shape", async () => {
+  test("outline array target keeps text plus structured details", async () => {
     await writeFile(harness.path("array-a.ts"), "export function arrayA() { return 1; }\n", "utf8");
     await writeFile(harness.path("array-b.ts"), "export function arrayB() { return 2; }\n", "utf8");
 
@@ -61,7 +61,7 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     });
     const text = harness.text(result);
 
-    expect(result.details).toBeUndefined();
+    expect(result.details).toMatchObject({ success: true, complete: true });
     expect(text).toContain("array-a.ts");
     expect(text).toContain("array-b.ts");
     expect(text).toContain("arrayA");

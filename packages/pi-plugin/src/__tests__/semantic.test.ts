@@ -14,6 +14,10 @@ function schemaAccepts(schema: unknown, value: unknown): boolean {
   return Value.Check(schema as TSchema, value);
 }
 
+function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
+  return call.params.arguments as Record<string, unknown>;
+}
+
 describe("aft_search adapter", () => {
   test("maps topK and hint to bridge params and carries structured details", async () => {
     const { api, tools } = makeMockApi();
@@ -38,12 +42,13 @@ describe("aft_search adapter", () => {
       includeTests: true,
     })) as { content: Array<{ text: string }>; details: Record<string, unknown> };
 
-    expect(calls[0].command).toBe("semantic_search");
-    expect(calls[0].params).toEqual({
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params.name).toBe("search");
+    expect(toolArgs(calls[0])).toEqual({
       query: "retry logic",
-      top_k: 7,
+      topK: 7,
       hint: "literal",
-      include_tests: true,
+      includeTests: true,
     });
     expect(result.content[0].text).toBe("ready results");
     expect(result.details.interpreted_as).toBe("hybrid");
@@ -66,18 +71,18 @@ describe("aft_search adapter", () => {
     registerSemanticTool(api, makePluginContext(bridge));
 
     await expect(executeTool(tools.get("aft_search")!, { query: "retry logic" })).rejects.toThrow(
-      "semantic_search_unavailable",
+      "Semantic search unavailable",
     );
   });
 
   test("omits top_k when topK is not provided to preserve Rust defaults", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
     registerSemanticTool(api, makePluginContext(bridge));
 
     await executeTool(tools.get("aft_search")!, { query: "auth flow" });
 
-    expect(calls[0].params).toEqual({ query: "auth flow" });
+    expect(toolArgs(calls[0])).toEqual({ query: "auth flow" });
   });
 
   test("rejects blank queries before bridge calls", async () => {

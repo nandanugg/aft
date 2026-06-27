@@ -11,6 +11,10 @@ import {
   makePluginContext,
 } from "./tool-test-utils.js";
 
+function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
+  return call.params.arguments as Record<string, unknown>;
+}
+
 describe("Pi aft_inspect surface", () => {
   test("registers at recommended surface unless explicitly disabled", () => {
     expect(__test__.resolveToolSurface({ tool_surface: "recommended" }).inspect).toBe(true);
@@ -119,12 +123,12 @@ describe("Pi aft_inspect adapter", () => {
       makeExtContext("/repo", "pi-session"),
     );
 
-    expect(calls[0].command).toBe("inspect");
-    expect(calls[0].params).toEqual({
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params).toMatchObject({ name: "inspect", session_id: "pi-session" });
+    expect(toolArgs(calls[0])).toEqual({
       sections: "todos",
       scope: ["src", "tests"],
       topK: 9,
-      session_id: "pi-session",
     });
     expect(calls[0].options).toMatchObject({
       keepBridgeOnTimeout: true,
@@ -143,9 +147,9 @@ describe("Pi aft_inspect adapter", () => {
       makeExtContext("/repo", "pi-session"),
     );
 
-    expect(calls[0].params.sections).toBeUndefined();
-    expect(calls[0].params.scope).toBeUndefined();
-    expect(calls[0].params.topK).toBeUndefined();
+    expect(toolArgs(calls[0]).sections).toBeUndefined();
+    expect(toolArgs(calls[0]).scope).toBeUndefined();
+    expect(toolArgs(calls[0]).topK).toBeUndefined();
   });
 
   test("fires a quiet Tier 2 run when inspect returns cold pending categories", async () => {
@@ -177,7 +181,7 @@ describe("Pi aft_inspect adapter", () => {
       "duplicates",
     ]);
     expect(calls).toHaveLength(2);
-    expect(calls[0].command).toBe("inspect");
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[1].command).toBe("inspect_tier2_run");
     expect(calls[1].params).toEqual({
       categories: ["dead_code", "unused_exports", "duplicates"],
@@ -210,7 +214,7 @@ describe("Pi aft_inspect adapter", () => {
 
     expect(result.details.scanner_state.stale_categories).toEqual(["unused_exports"]);
     expect(calls).toHaveLength(2);
-    expect(calls[0].command).toBe("inspect");
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[1].command).toBe("inspect_tier2_run");
     expect(calls[1].params).toEqual({
       categories: ["unused_exports"],
@@ -218,7 +222,7 @@ describe("Pi aft_inspect adapter", () => {
     });
   });
 
-  test("returns the Rust text body with diagnostics appended (no JSON dump)", async () => {
+  test("returns the Rust tool_call text body without plugin JSON fallback", async () => {
     const { api, tools } = makeMockApi();
     const { bridge } = makeMockBridge(() => ({
       success: true,
@@ -234,10 +238,11 @@ describe("Pi aft_inspect adapter", () => {
     )) as { content: Array<{ type: string; text: string }> };
     const text = result.content[0]?.text ?? "";
 
-    // Rust body verbatim, diagnostics appended after it, no JSON fallback.
+    // The result text is the raw output; this plugin does not add a diagnostics
+    // line or convert the result to a JSON object.
     expect(text).toContain("Duplicates: 2 (top by cost):");
     expect(text).toContain("  x.rs::foo");
-    expect(text).toContain("diagnostics 1 errors/0 warnings/0 info/2 hints");
+    expect(text).not.toContain("diagnostics 1 errors/0 warnings/0 info/2 hints");
     expect(text).not.toContain('"success"');
     expect(text).not.toContain("scanner_state");
   });
@@ -290,7 +295,11 @@ describe("Pi aft_inspect adapter", () => {
     expect(result.details.scanner_state.pending_categories).toEqual([]);
     expect(result.details.summary.dead_code.count).toBe(1);
     expect(result.details.summary.unused_exports.count).toBe(2);
-    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls.map((call) => call.command)).toEqual([
+      "tool_call",
+      "inspect_tier2_run",
+      "tool_call",
+    ]);
   });
 
   test("does not double-trigger while a Tier 2 run is already in flight", async () => {
@@ -313,7 +322,11 @@ describe("Pi aft_inspect adapter", () => {
     await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
     await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
 
-    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls.map((call) => call.command)).toEqual([
+      "tool_call",
+      "inspect_tier2_run",
+      "tool_call",
+    ]);
     expect(calls[1].params.categories).toEqual(["dead_code", "unused_exports", "duplicates"]);
   });
 
@@ -337,7 +350,11 @@ describe("Pi aft_inspect adapter", () => {
     await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
     await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
 
-    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls.map((call) => call.command)).toEqual([
+      "tool_call",
+      "inspect_tier2_run",
+      "tool_call",
+    ]);
     expect(calls[1].params.categories).toEqual(["dead_code"]);
   });
 
@@ -362,7 +379,11 @@ describe("Pi aft_inspect adapter", () => {
     await Promise.resolve();
     await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
 
-    expect(calls.map((call) => call.command)).toEqual(["inspect", "inspect_tier2_run", "inspect"]);
+    expect(calls.map((call) => call.command)).toEqual([
+      "tool_call",
+      "inspect_tier2_run",
+      "tool_call",
+    ]);
     expect(calls[1].params.categories).toEqual(["dead_code"]);
   });
 
@@ -393,9 +414,9 @@ describe("Pi aft_inspect adapter", () => {
       await executeTool(tools.get("aft_inspect")!, {}, makeExtContext("/repo", "pi-session"));
 
       expect(calls.map((call) => call.command)).toEqual([
-        "inspect",
+        "tool_call",
         "inspect_tier2_run",
-        "inspect",
+        "tool_call",
         "inspect_tier2_run",
       ]);
       expect(calls[1].params.categories).toEqual(["dead_code"]);

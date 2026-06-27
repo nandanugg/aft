@@ -26,6 +26,10 @@ async function tempRoot(): Promise<string> {
   return root;
 }
 
+function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
+  return call.params.arguments as Record<string, unknown>;
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -33,9 +37,12 @@ afterEach(async () => {
 describe("hoisted tool adapters", () => {
   test("read maps offset/limit to inclusive start_line/end_line and appends footer", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
       success: true,
-      content: "1: a\n2: b",
+      text:
+        params.offset === undefined
+          ? "1: a\n2: b\n(Showing lines 1-2 of 10. Use offset/limit to read other sections.)"
+          : "1: a\n2: b",
       truncated: true,
       start_line: 1,
       end_line: 2,
@@ -55,7 +62,9 @@ describe("hoisted tool adapters", () => {
       limit: 3,
     })) as { content: Array<{ text: string }> };
 
-    expect(calls[0].params).toEqual({ file: "src/app.ts", start_line: 5, end_line: 7 });
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params.name).toBe("read");
+    expect(toolArgs(calls[0])).toEqual({ filePath: "src/app.ts", offset: 5, limit: 3 });
     expect(ranged.content[0].text).not.toContain("Use offset/limit");
 
     const unbounded = (await executeTool(tools.get("read")!, { path: "src/app.ts" })) as {
@@ -170,7 +179,7 @@ describe("hoisted tool adapters", () => {
     expect(result.content[0].text).toContain("PDFs aren't supported on the Pi harness yet.");
   });
 
-  test("edit appendContent uses append op instead of match/replacement fields", async () => {
+  test("edit appendContent forwards raw agent args through tool_call preview and mutate", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
     registerHoistedTools(api, makePluginContext(bridge), {
@@ -188,13 +197,14 @@ describe("hoisted tool adapters", () => {
       appendContent: "\nnext",
     });
 
-    expect(calls[0].command).toBe("edit_match");
-    expect(calls[0].params).toEqual({
-      op: "append",
-      file: "README.md",
-      append_content: "\nnext",
-      diagnostics: false,
-      include_diff_content: true,
+    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
+    expect(calls[0].params).toMatchObject({ name: "edit", preview: true });
+    expect(calls[1].params).toMatchObject({ name: "edit" });
+    expect(toolArgs(calls[1])).toEqual({
+      filePath: "README.md",
+      oldString: "ignored",
+      newString: "ignored",
+      appendContent: "\nnext",
     });
   });
 
@@ -219,14 +229,14 @@ describe("hoisted tool adapters", () => {
       newString: "after",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls[0].command).toBe("edit_match");
-    expect(calls[0].params).toMatchObject({
-      file: "src/app.ts",
-      match: "before",
-      replacement: "after",
-      diagnostics: false,
-      include_diff_content: true,
+    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
+    expect(calls[0].params).toMatchObject({ name: "edit", preview: true });
+    expect(toolArgs(calls[1])).toMatchObject({
+      filePath: "src/app.ts",
+      oldString: "before",
+      newString: "after",
     });
+    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
     expect(result.content[0].text).not.toContain("LSP diagnostics");
     expect(result.details.diagnostics).toBeUndefined();
   });
@@ -258,7 +268,7 @@ describe("hoisted tool adapters", () => {
       newString: "after",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls[0].params.diagnostics).toBe(true);
+    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
     expect(result.details.diagnostics).toEqual(diagnostics);
     expect(result.content[0].text).toContain("LSP diagnostics");
     expect(result.content[0].text).toContain("Broken edit");
@@ -284,13 +294,14 @@ describe("hoisted tool adapters", () => {
       { cwd: root } as never,
     );
 
-    expect(calls[0].command).toBe("grep");
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params.name).toBe("grep");
     // Rust grep does not consume context_lines, so Pi no longer advertises or
     // forwards it (parity with OpenCode grep, which never exposed it).
-    expect(calls[0].params).toEqual({
+    expect(toolArgs(calls[0])).toEqual({
       pattern: "console",
       path: join(root, "src"),
-      include: ["*.ts", "**/*.{tsx,jsx}"],
+      include: "*.ts,**/*.{tsx,jsx}",
     });
   });
 
@@ -312,10 +323,10 @@ describe("hoisted tool adapters", () => {
 
     await executeTool(tools.get("grep")!, { pattern: "oauth", path: "~/" }, { cwd: home } as never);
 
-    expect(calls[0].command).toBe("grep");
+    expect(calls[0].command).toBe("tool_call");
     // When the expanded path equals the home directory itself, stat()
     // succeeds and resolvePathArg returns the absolute form.
-    expect(calls[0].params).toEqual({ pattern: "oauth", path: home });
+    expect(toolArgs(calls[0])).toEqual({ pattern: "oauth", path: home });
   });
 
   test("grep searches existing fragments and reports skipped missing paths", async () => {
@@ -342,8 +353,8 @@ describe("hoisted tool adapters", () => {
       { cwd: root } as never,
     )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
 
-    expect(calls[0].command).toBe("grep");
-    expect(calls[0].params.path).toBe(join(root, "src"));
+    expect(calls[0].command).toBe("tool_call");
+    expect(toolArgs(calls[0]).path).toBe(join(root, "src"));
     expect(result.content[0].text).toContain("src/app.ts:1");
     expect(result.content[0].text).toContain(`Skipped 1 path not found: ${missing}`);
     expect(result.details.complete).toBe(false);
@@ -373,8 +384,8 @@ describe("hoisted tool adapters", () => {
       { cwd: root } as never,
     )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
 
-    expect(calls[0].command).toBe("grep");
-    expect(calls[0].params.path).toBe(`${join(root, "src")} ${join(root, "e2e")}`);
+    expect(calls[0].command).toBe("tool_call");
+    expect(toolArgs(calls[0]).path).toBe(`${join(root, "src")} ${join(root, "e2e")}`);
     expect(result.content[0].text).toBe("ok");
     expect(result.content[0].text).not.toContain("Skipped");
     expect(result.details.complete).toBe(true);
@@ -410,8 +421,8 @@ describe("hoisted tool adapters", () => {
     }
 
     expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as { code?: string }).code).toBe("path_not_found");
-    expect(calls[0].params.path).toBe(`${missingA} ${missingB}`);
+    expect((thrown as Error).message).toContain("grep: search path does not exist");
+    expect(toolArgs(calls[0]).path).toBe(`${missingA} ${missingB}`);
   });
 
   test("grep treats an existing single path containing a space as one path", async () => {
@@ -437,8 +448,8 @@ describe("hoisted tool adapters", () => {
       { cwd: root } as never,
     )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
 
-    expect(calls[0].command).toBe("grep");
-    expect(calls[0].params.path).toBe(join(root, "with space"));
+    expect(calls[0].command).toBe("tool_call");
+    expect(toolArgs(calls[0]).path).toBe(join(root, "with space"));
     expect(result.content[0].text).toBe("ok");
     expect(result.content[0].text).not.toContain("Skipped");
     expect(result.details.complete).toBe(true);
@@ -460,12 +471,11 @@ describe("hoisted tool adapters", () => {
       content: "export {};\n",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls[0].command).toBe("write");
-    expect(calls[0].params).toEqual({
-      file: "src/app.ts",
+    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
+    expect(calls[0].params).toMatchObject({ name: "write", preview: true });
+    expect(toolArgs(calls[1])).toEqual({
+      filePath: "src/app.ts",
       content: "export {};\n",
-      diagnostics: false,
-      include_diff_content: true,
     });
     expect(result.content[0].text).not.toContain("LSP diagnostics");
     expect(result.details.diagnostics).toBeUndefined();
@@ -490,7 +500,7 @@ describe("hoisted tool adapters", () => {
       filePath: "src/app.ts",
       content: "export {};\n",
     });
-    expect(calls[0].params.diagnostics).toBe(true);
+    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
 
     // The per-call `diagnostics` param was removed (agents never used it; the
     // status bar + aft_inspect are the agent-facing diagnostics paths). A
@@ -500,7 +510,7 @@ describe("hoisted tool adapters", () => {
       content: "export {};\n",
       diagnostics: false,
     });
-    expect(calls[1].params.diagnostics).toBe(true);
+    expect(toolArgs(calls[3])).not.toHaveProperty("diagnostics");
   });
 
   test("write surfaces LSP payload when diagnostics_on_edit is configured", async () => {
@@ -528,8 +538,8 @@ describe("hoisted tool adapters", () => {
       content: "export {};\n",
     })) as { content: Array<{ text: string }>; details: { diagnostics?: unknown[] } };
 
-    expect(calls[0].command).toBe("write");
-    expect(calls[0].params.diagnostics).toBe(true);
+    expect(calls.map((call) => call.command)).toEqual(["tool_call", "tool_call"]);
+    expect(toolArgs(calls[1])).not.toHaveProperty("diagnostics");
     expect(result.details.diagnostics).toEqual(diagnostics);
     expect(result.content[0].text).toContain("LSP diagnostics");
     expect(result.content[0].text).toContain("Broken write");
@@ -603,9 +613,9 @@ describe("hoisted tool adapters", () => {
       extCtx as never,
     );
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0].command).toBe("write");
-    expect(calls[0].params).toMatchObject({ file: externalPath, content: "x" });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].params).toMatchObject({ name: "write", preview: true });
+    expect(toolArgs(calls[1])).toMatchObject({ filePath: externalPath, content: "x" });
   });
 
   test("formatReadFooter only hints when Rust clamped an unbounded read", () => {

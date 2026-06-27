@@ -2,7 +2,12 @@
  * Shared helpers used by every Pi tool wrapper.
  */
 
-import type { BinaryBridge, BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import type {
+  BinaryBridge,
+  BridgeRequestOptions,
+  ToolCallOptions,
+  ToolCallResult,
+} from "@cortexkit/aft-bridge";
 import { formatBridgeErrorMessage, timeoutForCommand } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -98,6 +103,35 @@ export async function callBridge(
       typeof response.code === "string" ? response.code : "",
     );
   }
+  ingestBgCompletions(sessionId, response.bg_completions);
+  return response;
+}
+
+/**
+ * Wrapper that calls a tool on the Pi agent. It supplies the session ID and
+ * timeout, forwards warnings, gathers any follow-up data, and returns the raw
+ * response plus the text summary the model will receive.
+ */
+export async function callToolCall(
+  bridge: BinaryBridge,
+  name: string,
+  rawArgs: Record<string, unknown> = {},
+  extCtx?: ExtensionContext,
+  options?: ToolCallOptions,
+): Promise<ToolCallResult> {
+  const timeoutMs = timeoutForCommand(name);
+  const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
+  const sendOptions = {
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    configureWarningClient: extCtx,
+    ...options,
+  };
+  const response = await bridge.toolCall(
+    sessionId,
+    name,
+    rawArgs,
+    Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+  );
   ingestBgCompletions(sessionId, response.bg_completions);
   return response;
 }

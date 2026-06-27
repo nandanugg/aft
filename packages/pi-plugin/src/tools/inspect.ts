@@ -10,7 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
@@ -393,29 +393,18 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       const sections = normalizeStringOrArray(params.sections);
       const scope = await resolveAndGateScope(extCtx, ctx, normalizeStringOrArray(params.scope));
       const topK = validateOptionalTopK(params.topK);
-      const response = await callBridge(bridge, "inspect", { sections, scope, topK }, extCtx, {
+      const rawArgs: Record<string, unknown> = {};
+      if (sections !== undefined) rawArgs.sections = sections;
+      if (scope !== undefined) rawArgs.scope = scope;
+      if (topK !== undefined) rawArgs.topK = topK;
+      const response = await callToolCall(bridge, "inspect", rawArgs, extCtx, {
         keepBridgeOnTimeout: true,
       });
-      runPendingTier2Categories(bridge, tier2RefreshCategories(response), extCtx);
-      const body = response.text as string | undefined;
-      if (typeof body === "string") {
-        // Rust builds the compact body (duplicates/dead_code/unused_exports/
-        // todos). The diagnostics line is rendered plugin-side (it owns the
-        // partial/pending honesty logic) and appended after the body, matching
-        // the OpenCode `appendRenderedDiagnostics` flow. The status bar is added
-        // by the global tool_result hook.
-        // Diagnostics summary line + (when present) the detail rows. Rust now
-        // always includes diagnostics detail in `details` (a bare count isn't
-        // actionable), so render it for the agent here — matching OpenCode's
-        // appendRenderedDiagnostics. The detail section self-suppresses when
-        // there are no diagnostics, so the clean case stays summary-only.
-        const diagnosticsSummary = diagnosticsSummaryPart(asRecord(response.summary));
-        const diagnosticsDetail = diagnosticsDetailSection(asRecord(response.details));
-        const diagnostics = [diagnosticsSummary, diagnosticsDetail].filter(Boolean).join("\n");
-        const text = diagnostics ? (body ? `${body}\n\n${diagnostics}` : diagnostics) : body;
-        return textResult(text, response);
+      if (response.success === false) {
+        throw new Error(response.text || response.message || "inspect failed");
       }
-      return textResult(JSON.stringify(response, null, 2), response);
+      runPendingTier2Categories(bridge, tier2RefreshCategories(response), extCtx);
+      return textResult(response.text, response);
     },
     renderCall(args, theme, context) {
       return renderInspectCall(args, theme, context);

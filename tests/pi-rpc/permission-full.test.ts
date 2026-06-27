@@ -66,7 +66,7 @@ async function withPiTool(
 }
 
 describe("permission matrix (real Pi RPC)", () => {
-  test("project-internal edit does not ask for external-directory permission", async () => {
+  test("project-internal edit asks for mutation permission and applies after approval", async () => {
     let uiRequestSeen = false;
     const toolEnd = await withPiTool(
       {
@@ -77,8 +77,9 @@ describe("permission matrix (real Pi RPC)", () => {
         message: "Edit the project file inside.txt.",
         setup: async (env) => writeFile(join(env.workdir, "inside.txt"), "before content\n"),
         onClient: (client) => {
-          client.onExtensionUIRequest(() => {
+          client.onExtensionUIRequest((request) => {
             uiRequestSeen = true;
+            client.sendExtensionUIResponse({ id: request.id as string, confirmed: true });
           });
         },
         afterTool: async (env) => {
@@ -87,9 +88,35 @@ describe("permission matrix (real Pi RPC)", () => {
       },
     );
     expect(toolEnd.isError).toBe(false);
-    expect(uiRequestSeen).toBe(false);
+    expect(uiRequestSeen).toBe(true);
     // Compact agent-facing summary — path is no longer echoed in the headline.
     expect(JSON.stringify(toolEnd.result)).toContain("Edited (");
+  }, 120_000);
+
+  test("project-internal edit denied after preview leaves file unchanged", async () => {
+    let uiRequestSeen = false;
+    const toolEnd = await withPiTool(
+      {
+        name: "edit",
+        arguments: { filePath: "denied.txt", oldString: "before", newString: "after" },
+      },
+      {
+        message: "Try editing denied.txt, but deny the preview.",
+        setup: async (env) => writeFile(join(env.workdir, "denied.txt"), "before content\n"),
+        onClient: (client) => {
+          client.onExtensionUIRequest((request) => {
+            uiRequestSeen = true;
+            client.sendExtensionUIResponse({ id: request.id as string, confirmed: false });
+          });
+        },
+        afterTool: async (env) => {
+          expect(await readFile(join(env.workdir, "denied.txt"), "utf8")).toBe("before content\n");
+        },
+      },
+    );
+    expect(uiRequestSeen).toBe(true);
+    expect(toolEnd.isError).toBe(true);
+    expect(JSON.stringify(toolEnd.result).toLowerCase()).toContain("permission denied");
   }, 120_000);
 
   test("external edit under strict mode is hard-blocked at the plugin layer (no prompt)", async () => {
@@ -134,11 +161,10 @@ describe("permission matrix (real Pi RPC)", () => {
     }
   }, 120_000);
 
-  test("external edit under Pi default (restrict_to_project_root: false) skips prompt and succeeds", async () => {
-    // The Pi default: no plugin-side prompt, Rust accepts external paths.
-    // This is the path the v0.31.0 hang fix unblocked — agents calling
-    // grep/write/edit on `~/Work/...` no longer get stuck on an
-    // unanswerable ui.confirm prompt.
+  test("external edit under Pi default (restrict_to_project_root: false) asks mutation permission and succeeds", async () => {
+    // The Pi default permits external paths, yet the mutation preview still
+    // asks for permission before changing the file. This covers agents editing
+    // paths like ~/Work/... without getting stuck at an unanswered prompt.
     const outsideDir = await mkdtemp(join(tmpdir(), "aft-pi-rpc-outside-default-"));
     try {
       const target = join(outsideDir, "default-edit.txt");
@@ -152,13 +178,14 @@ describe("permission matrix (real Pi RPC)", () => {
         {
           message: `Edit ${target}.`,
           onClient: (client) => {
-            client.onExtensionUIRequest(() => {
+            client.onExtensionUIRequest((request) => {
               uiRequestSeen = true;
+              client.sendExtensionUIResponse({ id: request.id as string, confirmed: true });
             });
           },
         },
       );
-      expect(uiRequestSeen).toBe(false);
+      expect(uiRequestSeen).toBe(true);
       expect(toolEnd.isError).toBe(false);
       expect(await readFile(target, "utf8")).toBe("modified content\n");
     } finally {

@@ -30,6 +30,7 @@ async function withPiTool(
     message: string;
     setup?: (env: PiIsolatedEnv) => Promise<void>;
     afterTool?: (env: PiIsolatedEnv, toolEnd: Record<string, unknown>) => Promise<void>;
+    confirmUi?: boolean;
   },
 ) {
   const env = createPiIsolatedEnv();
@@ -49,6 +50,12 @@ async function withPiTool(
       workdir: env.workdir,
     });
     client = spawned.client;
+    client.onExtensionUIRequest((request) => {
+      client?.sendExtensionUIResponse({
+        id: request.id as string,
+        confirmed: opts.confirmUi ?? true,
+      });
+    });
     expect(spawned.child.pid).toBeGreaterThan(0);
     expect((await client.sendCommand({ type: "prompt", message: opts.message })).success).toBe(
       true,
@@ -75,8 +82,9 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
         afterTool: async (env, event) => {
           expect(existsSync(join(env.workdir, "created.txt"))).toBe(true);
           expect(await readFile(join(env.workdir, "created.txt"), "utf8")).toBe("hello\n");
-          // Compact agent-facing summary (no path echo); diff body lives in details.
-          expect(resultText(event)).toContain("Created file");
+          // The text the agent sees from the tool_call is only a compact
+          // summary; the full diff body lives in the details field instead.
+          expect(resultText(event)).toContain("Created new file.");
           expect(resultText(event)).toContain("diff");
         },
       },

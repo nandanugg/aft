@@ -3,7 +3,6 @@
  * Structural overview and symbol/section inspection.
  */
 
-import { stat } from "node:fs/promises";
 import {
   coerceBoolean,
   coerceTargetParam,
@@ -19,7 +18,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callBridge, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
@@ -345,100 +344,35 @@ export function registerReadingTools(
         const filesMode = coerceBoolean(params.files);
         const hasIncludeTests = !isEmptyParam(params.includeTests);
         const includeTests = coerceBoolean(params.includeTests);
-        const isArray = Array.isArray(target) && target.length > 0;
+        const rawArgs: Record<string, unknown> = {
+          target,
+          ...(filesMode ? { files: true } : {}),
+          ...(hasIncludeTests ? { includeTests } : {}),
+        };
 
-        if (filesMode) {
-          if (Array.isArray(target)) {
-            if (target.length === 0) {
-              throw new Error("'target' must be a non-empty string or array of strings");
-            }
-            const resolvedTargets = await Promise.all(
-              target.map((entry) => resolvePathArg(extCtx.cwd, entry)),
-            );
-            await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
-            const response = await callBridge(
-              bridge,
-              "outline",
-              { target: resolvedTargets, files: true },
-              extCtx,
-            );
-            if (response.success === false) {
-              throw new Error((response.message as string) || "outline failed");
-            }
-            return textResult(formatOutlineFilesText(response), response);
-          }
-
-          if (typeof target !== "string" || target.length === 0) {
+        if (Array.isArray(target)) {
+          if (target.length === 0) {
             throw new Error("'target' must be a non-empty string or array of strings");
           }
-
-          const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
-          let isDirectory = false;
-          try {
-            const st = await stat(resolvedTarget);
-            isDirectory = st.isDirectory();
-          } catch {
-            // Let Rust report missing paths with its structured error shape.
-          }
-
-          await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
-          const request = isDirectory
-            ? { directory: resolvedTarget, files: true }
-            : { file: resolvedTarget, files: true };
-          const response = await callBridge(bridge, "outline", request, extCtx);
-          if (response.success === false) {
-            throw new Error((response.message as string) || "outline failed");
-          }
-          return textResult(formatOutlineFilesText(response), response);
-        }
-
-        // URL mode: pass through to Rust; Rust fetches, validates, and caches.
-        if (typeof target === "string" && isUrl(target)) {
-          const response = await callBridge(bridge, "outline", { file: target }, extCtx);
-          if (response.success === false) {
-            throw new Error((response.message as string) || "outline failed");
-          }
-          return textResult(formatOutlineText(response));
-        }
-
-        // Multi-file mode
-        if (isArray) {
           const resolvedTargets = await Promise.all(
             (target as string[]).map((entry) => resolvePathArg(extCtx.cwd, entry)),
           );
           await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
-          const response = await callBridge(bridge, "outline", { files: resolvedTargets }, extCtx);
-          return textResult(formatOutlineText(response));
+        } else {
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
+          }
+          if (!(!filesMode && isUrl(target))) {
+            const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
+            await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
+          }
         }
 
-        if (typeof target !== "string" || target.length === 0) {
-          throw new Error("'target' must be a non-empty string or array of strings");
+        const response = await callToolCall(bridge, "outline", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "outline failed");
         }
-
-        // Stat to disambiguate file vs directory
-        const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
-        let isDirectory = false;
-        try {
-          const st = await stat(resolvedTarget);
-          isDirectory = st.isDirectory();
-        } catch {
-          // path doesn't exist locally — fall through to single-file mode and let
-          // Rust report the real error
-        }
-
-        await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
-        if (isDirectory) {
-          const response = await callBridge(
-            bridge,
-            "outline",
-            { directory: resolvedTarget, ...(hasIncludeTests ? { includeTests } : {}) },
-            extCtx,
-          );
-          return textResult(JSON.stringify(response, null, 2), response);
-        }
-
-        const response = await callBridge(bridge, "outline", { file: resolvedTarget }, extCtx);
-        return textResult(formatOutlineText(response));
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderOutlineCall(args, theme, context);
@@ -672,73 +606,4 @@ export function formatZoomBatchResult(
     }
   }
   return { complete, symbols: entries, text: sections.join("\n\n") };
-}
-
-/**
- * Format an outline response into agent-readable text, appending honest skip
- * reporting when files were intentionally skipped (parse error, unsupported
- * language, file not found, too large). Without this, agents only see the tree
- * and assume all input files were processed.
- */
-interface SkippedOutlineFile {
-  file: string;
-  reason: string;
-}
-
-const MAX_UNCHECKED_FILES_IN_FOOTER = 10;
-
-function formatOutlineText(response: Record<string, unknown>): string {
-  const text = (response.text as string | undefined) ?? "";
-  const skipped = response.skipped_files as SkippedOutlineFile[] | undefined;
-  if (!skipped || skipped.length === 0) {
-    return text;
-  }
-  const lines = skipped.map(({ file, reason }) => `  ${file} — ${reason}`).join("\n");
-  const header = text.length > 0 ? `${text}\n\n` : "";
-  return `${header}Skipped ${skipped.length} file(s):\n${lines}`;
-}
-
-export function formatOutlineFilesText(response: Record<string, unknown>): string {
-  const text = formatOutlineText(response);
-  const uncheckedFiles = Array.isArray(response.unchecked_files)
-    ? response.unchecked_files.filter(
-        (file): file is string => typeof file === "string" && file.length > 0,
-      )
-    : [];
-  const isPartial =
-    response.complete === false || response.walk_truncated === true || uncheckedFiles.length > 0;
-
-  if (!isPartial) {
-    return text;
-  }
-
-  const footer: string[] = [];
-  if (response.walk_truncated === true) {
-    const uncheckedCount = uncheckedFiles.length;
-    const suffix =
-      uncheckedCount > 0
-        ? ` ${uncheckedCount} additional files in this directory were not indexed.`
-        : " Some files in this directory were not indexed.";
-    footer.push(`⚠ Partial result: walk truncated at 200 files.${suffix}`);
-  } else {
-    const suffix =
-      uncheckedFiles.length > 0
-        ? ` ${uncheckedFiles.length} files in this directory were not indexed.`
-        : " Some files in this directory were not indexed.";
-    footer.push(`⚠ Partial result:${suffix}`);
-  }
-
-  if (uncheckedFiles.length > 0) {
-    footer.push("Unchecked files:");
-    footer.push(
-      ...uncheckedFiles.slice(0, MAX_UNCHECKED_FILES_IN_FOOTER).map((file) => `  ${file}`),
-    );
-    const remaining = uncheckedFiles.length - MAX_UNCHECKED_FILES_IN_FOOTER;
-    if (remaining > 0) {
-      footer.push(`  ... +${remaining} more`);
-    }
-  }
-
-  const header = text.length > 0 ? `${text}\n\n` : "";
-  return `${header}${footer.join("\n")}`;
 }

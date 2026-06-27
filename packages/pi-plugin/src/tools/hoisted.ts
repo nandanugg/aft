@@ -36,22 +36,13 @@ import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
-  callBridge,
+  callToolCall,
   coerceOptionalInt,
   contentResult,
   optionalInt,
   textResult,
 } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
-
-// Diagnostics on edit are config-driven only (`lsp.diagnostics_on_edit`).
-// There is deliberately NO per-call `diagnostics` param: agents never used it,
-// and the agent-facing diagnostics paths are the status bar (passive,
-// automatic E/W on tool results) and aft_inspect (active pull). The config
-// knob remains for users whose models won't call aft_inspect.
-function diagnosticsOnEditDefault(ctx: PluginContext): boolean {
-  return ctx.config.lsp?.diagnostics_on_edit ?? false;
-}
 
 type ReadAttachment = {
   kind?: unknown;
@@ -97,6 +88,33 @@ function modelSupportsImages(extCtx: { model?: { input?: unknown } }): boolean {
 
 const NON_VISION_IMAGE_NOTE =
   "[Current model does not support images. The image will be omitted from this request.]";
+
+type ConfirmableExtensionContext = {
+  hasUI?: boolean;
+  signal?: AbortSignal;
+  ui?: {
+    confirm?: (title: string, message: string, opts?: { signal?: AbortSignal }) => Promise<boolean>;
+  };
+};
+
+async function assertMutationPermission(
+  extCtx: ConfirmableExtensionContext,
+  action: "edit" | "write",
+  filePath: string,
+  previewDiff: unknown,
+): Promise<void> {
+  if (extCtx.hasUI !== true || typeof extCtx.ui?.confirm !== "function") return;
+  const diff = typeof previewDiff === "string" && previewDiff.trim().length > 0 ? previewDiff : "";
+  const message = diff
+    ? `AFT wants to ${action} ${filePath}.\n\nDiff preview:\n${diff}`
+    : `AFT wants to ${action} ${filePath}.`;
+  const confirmed = await extCtx.ui.confirm(`Allow AFT ${action}?`, message, {
+    signal: extCtx.signal,
+  });
+  if (!confirmed) {
+    throw new Error(`${action}: permission denied`);
+  }
+}
 
 /**
  * Local shape for Pi's render context — the real type is exposed by
@@ -367,25 +385,21 @@ export function registerHoistedTools(
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
-        const req: Record<string, unknown> = {
-          file: filePath,
-        };
-        if (offset !== undefined) {
-          req.start_line = offset;
-          if (limit !== undefined) {
-            req.end_line = offset + limit - 1;
-          }
-        } else if (limit !== undefined) {
-          req.end_line = limit;
+        const rawArgs: Record<string, unknown> = { filePath: params.path };
+        if (offset !== undefined) rawArgs.offset = offset;
+        if (limit !== undefined) rawArgs.limit = limit;
+        const response = await callToolCall(bridge, "read", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "read failed");
         }
-        const response = await callBridge(bridge, "read", req, extCtx);
+        const agentText = response.text;
         const attachments = readAttachments(response);
         if (attachments.length > 0) {
           const first = attachments[0];
           const mime = typeof first.mime === "string" ? first.mime : "";
           const note =
-            typeof response.content === "string" && response.content.length > 0
-              ? response.content
+            typeof agentText === "string" && agentText.length > 0
+              ? agentText
               : formatReadAttachmentText(first);
           if (first.kind === "image" || mime.startsWith("image/")) {
             if (typeof first.data === "string" && modelSupportsImages(extCtx)) {
@@ -404,23 +418,7 @@ export function registerHoistedTools(
           }
           return textResult(note, response);
         }
-        if (Array.isArray(response.entries)) {
-          return textResult((response.entries as string[]).join("\n"));
-        }
-        let text = (response.content as string | undefined) ?? "";
-
-        // Two-case footer (kept aligned with the OpenCode plugin's
-        // formatReadFooter — see docs there for case A/B rationale).
-        // Pi previously discarded `truncated`/`total_lines` entirely, so
-        // an agent that read a 500-line file with no range got back
-        // default-clamped 100 lines with NO signal that 400 more lines
-        // existed. This restores Case A (hint when agent didn't choose)
-        // while avoiding the patronizing hint when the agent already
-        // chose a range (Case B → no footer).
-        const agentSpecifiedRange = offset !== undefined || limit !== undefined;
-        const footer = formatReadFooter(agentSpecifiedRange, response);
-        if (footer) text += footer;
-        return textResult(text);
+        return textResult(agentText, response);
       },
     });
   }
@@ -444,26 +442,27 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        // Resolve ~ / relative ONCE and use the same value for the permission
-        // check and the bridge. Previously the check expanded ~ but the bridge
-        // got the raw `~/...`, which Rust treats literally — creating a literal
-        // `~` directory under the project root instead of writing to home.
+        // Resolve ~ and relative paths before the permission check. Pass the
+        // original filePath string in the request so the path the agent
+        // receives stays exactly as provided.
         const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(
-          bridge,
-          "write",
-          {
-            file: filePath,
-            content: params.content,
-            diagnostics: diagnosticsOnEditDefault(ctx),
-            include_diff_content: true,
-          },
-          extCtx,
-        );
+        const rawArgs: Record<string, unknown> = {
+          filePath: params.filePath,
+          content: params.content,
+        };
+        const preview = await callToolCall(bridge, "write", rawArgs, extCtx, { preview: true });
+        if (preview.success === false) {
+          throw new Error(preview.text || preview.message || "write preview failed");
+        }
+        await assertMutationPermission(extCtx, "write", filePath, preview.preview_diff);
+        const response = await callToolCall(bridge, "write", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "write failed");
+        }
         return buildMutationResult(response);
       },
       renderCall(args, theme, context) {
@@ -496,49 +495,37 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
-        // Resolve ~ / relative ONCE (see the write handler) and use it for the
-        // permission check and the bridge, so Rust receives the real target
-        // instead of a literal `~/...`.
+        // Resolve ~ and relative paths before the permission check. Pass the
+        // original filePath string in the request so the path the agent
+        // receives stays exactly as provided.
         const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
-
-        // Append mode: explicitly route through the Rust `append` op, which
-        // creates the file (and parent dirs) when missing and appends without
-        // reading the whole file first. oldString/newString are ignored when
-        // appendContent is set, matching the OpenCode-side hoisted edit shape.
-        if (typeof params.appendContent === "string") {
-          const req: Record<string, unknown> = {
-            op: "append",
-            file: filePath,
-            append_content: params.appendContent,
-            diagnostics: diagnosticsOnEditDefault(ctx),
-            include_diff_content: true,
-          };
-          const response = await callBridge(bridge, "edit_match", req, extCtx);
-          return buildMutationResult(response);
+        const rawArgs: Record<string, unknown> = { filePath: params.filePath };
+        for (const key of ["appendContent", "oldString", "newString"] as const) {
+          if (params[key] !== undefined) rawArgs[key] = params[key];
         }
-
-        const req: Record<string, unknown> = {
-          file: filePath,
-          match: params.oldString ?? "",
-          replacement: params.newString ?? "",
-          diagnostics: diagnosticsOnEditDefault(ctx),
-          include_diff_content: true,
-        };
         // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
-        if (coerceBoolean(params.replaceAll)) req.replace_all = true;
+        if (params.replaceAll !== undefined) rawArgs.replaceAll = coerceBoolean(params.replaceAll);
         const occurrence = coerceOptionalInt(
           params.occurrence,
           "occurrence",
           0,
           Number.MAX_SAFE_INTEGER,
         );
-        if (occurrence !== undefined) req.occurrence = occurrence;
+        if (occurrence !== undefined) rawArgs.occurrence = occurrence;
 
-        const response = await callBridge(bridge, "edit_match", req, extCtx);
+        const preview = await callToolCall(bridge, "edit", rawArgs, extCtx, { preview: true });
+        if (preview.success === false) {
+          throw new Error(preview.text || preview.message || "edit preview failed");
+        }
+        await assertMutationPermission(extCtx, "edit", filePath, preview.preview_diff);
+        const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "edit failed");
+        }
         return buildMutationResult(response);
       },
       renderCall(args, theme, context) {
@@ -582,10 +569,13 @@ export function registerHoistedTools(
           }
           req.path = await bridgeSearchPathArg(extCtx.cwd, pathSplit);
         }
-        if (params.include) req.include = splitIncludeGlobs(params.include);
-        if (params.caseSensitive !== undefined) req.case_sensitive = params.caseSensitive;
+        if (params.include) req.include = params.include;
+        if (params.caseSensitive !== undefined) req.caseSensitive = params.caseSensitive;
 
-        const response = await callBridge(bridge, "grep", req, extCtx);
+        const response = await callToolCall(bridge, "grep", req, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "grep failed");
+        }
         if (pathSplit && pathSplit.missing.length > 0) {
           response.complete = false;
         }
@@ -658,34 +648,22 @@ export function buildMutationResult(
     firstChangedLine = piDiff.firstChangedLine;
   }
 
-  // Agent-facing text: compact summary header (shared with OpenCode via
-  // formatEditSummary) + conditional notices below. The header deliberately
-  // omits the file path and the diff body: the agent supplied both the path
-  // and the content, so echoing them back wastes tokens proportional to file
-  // size. The line-numbered diff stays in `details.diff` for the TUI renderer
-  // (which sources the path from the call args, not this text). This keeps the
-  // OpenCode and Pi agent-facing edit output byte-identical in shape.
-  let text = formatEditSummary(response as Record<string, unknown>);
-  if (noOp) {
-    // Surface the no-op signal explicitly so the agent can distinguish "the
-    // tool failed silently" from "the edit matched but produced no net change".
-    // Common causes: oldString equals newString, or a formatter normalized
-    // the replacement back to the original.
-    text +=
-      "\n\nNote: no net file change \u2014 the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
-  }
-  // Surface non-benign format-skip reasons in agent-facing text. Benign
-  // reasons (no formatter configured for the language, language unsupported)
-  // are silent because the agent can't act on them. The actionable reasons
-  // — formatter binary missing, formatter timed out, formatter crashed,
-  // formatter excluded the path via project config — get a one-line note
-  // pointing at the right remediation.
-  const skipNote = formatSkipReasonNote(formatSkippedReason);
-  if (skipNote) text += `\n\n${skipNote}`;
-  const globSkipNote = formatGlobSkipReasonsNote(globFormatSkipReasons);
-  if (globSkipNote) text += `\n\n${globSkipNote}`;
-  if (diagnostics && diagnostics.length > 0) {
-    text += `\n\nLSP diagnostics:\n${formatDiagnosticsText(diagnostics)}`;
+  let text = response.text as string | undefined;
+  if (typeof text !== "string") {
+    // Fallback only for unit tests and legacy cases where response.text is
+    // missing. Normally the caller has already provided the summary text.
+    text = formatEditSummary(response as Record<string, unknown>);
+    if (noOp) {
+      text +=
+        "\n\nNote: no net file change \u2014 the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
+    }
+    const skipNote = formatSkipReasonNote(formatSkippedReason);
+    if (skipNote) text += `\n\n${skipNote}`;
+    const globSkipNote = formatGlobSkipReasonsNote(globFormatSkipReasons);
+    if (globSkipNote) text += `\n\n${globSkipNote}`;
+    if (diagnostics && diagnostics.length > 0) {
+      text += `\n\nLSP diagnostics:\n${formatDiagnosticsText(diagnostics)}`;
+    }
   }
 
   return {

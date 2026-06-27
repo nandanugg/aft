@@ -78,6 +78,20 @@ export function makeMockBridge(
       calls.push({ command, params, options });
       return handler(command, params, options);
     },
+    async toolCall(
+      sessionId: string | undefined,
+      name: string,
+      rawArgs: Record<string, unknown>,
+      options?: Record<string, unknown>,
+    ) {
+      const { preview, ...sendOptions } = options ?? {};
+      const params: Record<string, unknown> = { name, arguments: rawArgs };
+      if (sessionId) params.session_id = sessionId;
+      if (preview === true) params.preview = true;
+      const normalizedOptions = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
+      calls.push({ command: "tool_call", params, options: normalizedOptions });
+      return handler(name, rawArgs, normalizedOptions);
+    },
   } as unknown as BinaryBridge;
   return { bridge, calls };
 }

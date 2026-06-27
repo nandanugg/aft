@@ -357,7 +357,7 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
     expect(h.text(wrapped)).not.toContain("Note: formatter");
   });
 
-  test("Pi response shape parity: actionable skip reasons surface a one-line note in agent text", async () => {
+  test("Pi response shape parity: actionable skip reasons stay in structured details", async () => {
     // formatter_not_installed (non-benign) verifies the note path. Configure
     // explicit formatter=prettier with NO prettier on the harness's PATH /
     // node_modules. Rust recognizes the explicit name (so it doesn't fall
@@ -375,6 +375,6 @@ maybeDescribe("e2e Pi format_on_edit parity", () => {
     const wrappedDetails = detailsOf(wrapped);
     expect(wrappedDetails.formatted).toBe(false);
     expect(wrappedDetails.formatSkippedReason).toBe("formatter_not_installed");
-    expect(h.text(wrapped)).toContain("formatter binary not installed");
+    expect(h.text(wrapped)).not.toContain("formatter binary not installed");
   });
 });

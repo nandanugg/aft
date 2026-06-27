@@ -7,7 +7,7 @@
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import {
   asNumber,
   asRecord,
@@ -29,19 +29,6 @@ function semanticHonestyNote(response: Record<string, unknown>, theme: Theme): s
   if (response.fully_degraded === true) notes.push("fully degraded");
   if (response.complete === false) notes.push("partial/incomplete");
   return notes.length > 0 ? theme.fg("warning", `Search status: ${notes.join("; ")}.`) : undefined;
-}
-
-/**
- * Degraded/partial flags NOT already conveyed by Rust's `text` (which carries
- * the count line and the "more results available; raise topK" note). Appended
- * to the agent text so the agent doesn't over-trust degraded results. The rich
- * TUI renderer keeps its own fuller status line separately.
- */
-function extraAgentHonestyNote(response: Record<string, unknown>): string | undefined {
-  const notes: string[] = [];
-  if (response.fully_degraded === true) notes.push("fully degraded");
-  if (response.complete === false) notes.push("partial/incomplete");
-  return notes.length > 0 ? `Search status: ${notes.join("; ")}.` : undefined;
 }
 
 const SearchParams = Type.Object({
@@ -227,26 +214,14 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
 
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const req: Record<string, unknown> = { query: params.query };
-      if (params.topK !== undefined) req.top_k = params.topK;
+      if (params.topK !== undefined) req.topK = params.topK;
       if (params.hint !== undefined) req.hint = params.hint;
-      if (params.includeTests !== undefined) req.include_tests = params.includeTests;
-      // Pi has no grep-style permission prompt; callBridge throws success:false
-      // envelopes so the host renders them via renderErrorResult below.
-      const response = await callBridge(bridge, "semantic_search", req, extCtx);
-      // Rust's `text` is the clean agent-facing rendering (ranked rows,
-      // rank-tiered snippets, count line, more-available + zoom hints). The
-      // full structured response still flows to the rich TUI renderer below.
-      // Only degraded/partial flags that `text` doesn't already carry are
-      // appended to the agent text.
-      // Never fall back to JSON.stringify(response) — that re-opens the exact
-      // structured dump the redesign removed (full paths/scores/ids the agent
-      // never acts on). On the should-never-happen path where Rust returns
-      // success without `text`, emit a minimal note instead, matching the
-      // OpenCode plugin's fallback.
-      let agentText = (response.text as string | undefined) ?? "No results.";
-      const extra = extraAgentHonestyNote(response);
-      if (extra) agentText = `${agentText}\n${extra}`;
-      return textResult(agentText, response);
+      if (params.includeTests !== undefined) req.includeTests = params.includeTests;
+      const response = await callToolCall(bridge, "search", req, extCtx);
+      if (response.success === false) {
+        throw new Error(response.text || response.message || "search failed");
+      }
+      return textResult(response.text, response);
     },
     renderCall(args, theme, context) {
       return renderSemanticCall(args, theme, context);

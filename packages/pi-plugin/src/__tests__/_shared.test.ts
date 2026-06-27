@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import {
   bridgeFor,
   callBridge,
+  callToolCall,
   jsonTextResult,
   stripSuccess,
   textResult,
@@ -56,6 +57,34 @@ describe("tool shared helpers", () => {
     expect(calls[0].options?.transportTimeoutMs).toBe(70_000);
     expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
     expect(calls[0].options?.configureWarningClient).toBeDefined();
+  });
+
+  test("callToolCall propagates raw agent args, session id, preview flag, and timeout", async () => {
+    const { bridge, calls } = makeMockBridge((_command, params) => ({
+      success: true,
+      text: "ok",
+      params,
+    }));
+    const extCtx = makeExtContext("/repo", "pi-session-123");
+
+    const response = await callToolCall(
+      bridge,
+      "edit",
+      { filePath: "a.ts", oldString: "a", newString: "b" },
+      extCtx,
+      { preview: true },
+    );
+
+    expect(response.params).toEqual({ filePath: "a.ts", oldString: "a", newString: "b" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params).toEqual({
+      name: "edit",
+      arguments: { filePath: "a.ts", oldString: "a", newString: "b" },
+      session_id: "pi-session-123",
+      preview: true,
+    });
+    expect(calls[0].options?.configureWarningClient).toBe(extCtx);
   });
 
   test("callBridge throws Rust error messages instead of exposing failure payloads", async () => {

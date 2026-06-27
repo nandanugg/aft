@@ -18,6 +18,10 @@ async function expectRejectMessage(action: () => Promise<unknown>): Promise<stri
   throw new Error("expected action to reject");
 }
 
+function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
+  return call.params.arguments as Record<string, unknown>;
+}
+
 describe("aft_callgraph adapter", () => {
   test("dispatches to the selected op and maps filePath to file", async () => {
     const { api, tools } = makeMockApi();
@@ -37,10 +41,11 @@ describe("aft_callgraph adapter", () => {
     expect(result.content[0]?.text).toContain("affected call site");
     expect(result.content[0]?.text).not.toContain('"success"');
     expect(result.details).toMatchObject({ success: true, total_affected: 0 });
-    expect(calls[0].command).toBe("impact");
-    expect(calls[0].params).toEqual({
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params.name).toBe("callgraph");
+    expect(toolArgs(calls[0])).toEqual({
       op: "impact",
-      file: "src/app.ts",
+      filePath: "src/app.ts",
       symbol: "run",
       depth: 4,
     });
@@ -89,8 +94,8 @@ describe("aft_callgraph adapter", () => {
     expect(expanded.content[0]?.text).toContain("Some [src/app.ts:3] [unresolved]");
     expect(expanded.content[0]?.text).not.toContain("unresolved external calls");
     expect(calls).toHaveLength(2);
-    expect(calls[0].params).not.toHaveProperty("includeUnresolved");
-    expect(calls[1].params).not.toHaveProperty("includeUnresolved");
+    expect(toolArgs(calls[0])).not.toHaveProperty("includeUnresolved");
+    expect(toolArgs(calls[1]).includeUnresolved).toBe(true);
   });
 
   test("trace_data requires expression before bridge dispatch", async () => {
@@ -120,8 +125,8 @@ describe("aft_callgraph adapter", () => {
       expression: "config.apiKey",
     });
 
-    expect(calls[0].command).toBe("trace_data");
-    expect(calls[0].params).toMatchObject({ expression: "config.apiKey" });
+    expect(calls[0].command).toBe("tool_call");
+    expect(toolArgs(calls[0])).toMatchObject({ op: "trace_data", expression: "config.apiKey" });
   });
 
   test("trace_to_symbol requires and forwards target fields", async () => {
@@ -147,8 +152,9 @@ describe("aft_callgraph adapter", () => {
     });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].command).toBe("trace_to_symbol");
-    expect(calls[0].params).toMatchObject({
+    expect(calls[0].command).toBe("tool_call");
+    expect(toolArgs(calls[0])).toMatchObject({
+      op: "trace_to_symbol",
       toSymbol: "target",
       toFile: "src/target.ts",
       depth: 3,
