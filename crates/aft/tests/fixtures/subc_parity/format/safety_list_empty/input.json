@@ -1,0 +1,14 @@
+{
+  "tool_name": "safety",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "checkpoints": []
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "list"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

@@ -747,7 +747,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      expect(command).toBe("aft_delete");
+      expect(command).toBe("delete");
       const files = (params.files as string[]) ?? [];
       return {
         success: true,
@@ -768,7 +768,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      expect(command).toBe("aft_delete");
+      expect(command).toBe("delete");
       return { success: false, message: "bridge delete refused" };
     });
 
@@ -782,7 +782,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      expect(command).toBe("aft_delete");
+      expect(command).toBe("delete");
       const files = (params.files as string[]) ?? [];
       const deleted: Array<{ file: string; backup_id: string | null }> = [];
       const skipped: Array<{ file: string; reason: string }> = [];
@@ -815,7 +815,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command, params) => {
-      expect(command).toBe("aft_delete");
+      expect(command).toBe("delete");
       const files = (params.files as string[]) ?? [];
       return {
         success: true,
@@ -836,7 +836,7 @@ describe("Hoisted tool execute handlers", () => {
     sdkCtx = createMockSdkContext(tmpDir);
 
     const { tools } = createMockHoistedHarness(async (command) => {
-      expect(command).toBe("aft_move");
+      expect(command).toBe("move");
       return { success: false, message: "Destination already exists" };
     });
 

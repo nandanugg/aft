@@ -292,7 +292,7 @@ fn parity_cases() -> Vec<ParityCase> {
         },
         ParityCase {
             label: "safety_list_empty",
-            tool: "aft_safety",
+            tool: "safety",
             arguments: json!({"op": "list"}),
         },
     ]

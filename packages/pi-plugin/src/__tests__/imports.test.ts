@@ -40,7 +40,7 @@ describe("aft_import adapter", () => {
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toEqual({
-      name: "aft_import",
+      name: "import",
       arguments: {
         op: "add",
         filePath: "src/app.ts",
@@ -68,7 +68,7 @@ describe("aft_import adapter", () => {
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      name: "aft_import",
+      name: "import",
       arguments: {
         op: "remove",
         filePath: "src/app.ts",

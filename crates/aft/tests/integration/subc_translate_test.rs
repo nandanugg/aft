@@ -227,14 +227,14 @@ fn refactor_translate_matches_typescript_golden_fixtures() {
             p.is_dir()
                 && p.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("aft_refactor_"))
+                    .is_some_and(|name| name.starts_with("refactor_"))
         })
         .collect();
     cases.sort();
 
     assert!(
         cases.len() >= 7,
-        "expected >=7 aft_refactor translate parity fixtures, found {}",
+        "expected >=7 refactor translate parity fixtures, found {}",
         cases.len()
     );
 
@@ -244,7 +244,7 @@ fn refactor_translate_matches_typescript_golden_fixtures() {
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty(),
-        "{} aft_refactor translate parity mismatch(es):\n\n{}",
+        "{} refactor translate parity mismatch(es):\n\n{}",
         failures.len(),
         failures.join("\n\n")
     );
@@ -260,14 +260,14 @@ fn safety_translate_matches_typescript_golden_fixtures() {
             p.is_dir()
                 && p.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("aft_safety_"))
+                    .is_some_and(|name| name.starts_with("safety_"))
         })
         .collect();
     cases.sort();
 
     assert!(
         cases.len() >= 8,
-        "expected >=8 aft_safety translate parity fixtures, found {}",
+        "expected >=8 safety translate parity fixtures, found {}",
         cases.len()
     );
 
@@ -277,7 +277,7 @@ fn safety_translate_matches_typescript_golden_fixtures() {
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty(),
-        "{} aft_safety translate parity mismatch(es):\n\n{}",
+        "{} safety translate parity mismatch(es):\n\n{}",
         failures.len(),
         failures.join("\n\n")
     );

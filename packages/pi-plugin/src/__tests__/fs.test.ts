@@ -34,7 +34,7 @@ describe("fs tool adapters", () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].params).toEqual({
-      name: "aft_delete",
+      name: "delete",
       arguments: {
         files: ["ok.ts", "locked.ts"],
         recursive: false,
@@ -94,7 +94,7 @@ describe("fs tool adapters", () => {
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      name: "aft_move",
+      name: "move",
       arguments: { filePath: "src/old.ts", destination: "src/new.ts" },
     });
     expect(result.content[0].text).toBe("Moved src/old.ts → src/new.ts");

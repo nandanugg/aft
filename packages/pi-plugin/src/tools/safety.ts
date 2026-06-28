@@ -230,7 +230,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       if (filePath) rawArgs.filePath = filePath;
       if (params.name) rawArgs.name = params.name;
       if (files) rawArgs.files = files;
-      const response = await callToolCall(bridge, "aft_safety", rawArgs, extCtx);
+      const response = await callToolCall(bridge, "safety", rawArgs, extCtx);
       if (response.success === false) {
         throw new Error(response.text || response.message || `${params.op} failed`);
       }

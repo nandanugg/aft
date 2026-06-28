@@ -185,7 +185,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       if (params.typeOnly !== undefined) rawArgs.typeOnly = params.typeOnly;
       if (params.validate !== undefined) rawArgs.validate = params.validate;
 
-      const response = await callToolCall(bridge, "aft_import", rawArgs, extCtx);
+      const response = await callToolCall(bridge, "import", rawArgs, extCtx);
       if (response.success === false) {
         throw new Error(response.text || response.message || `${params.op} failed`);
       }

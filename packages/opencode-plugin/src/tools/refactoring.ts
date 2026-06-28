@@ -168,7 +168,7 @@ export function refactoringTools(ctx: PluginContext): Record<string, ToolDefinit
         );
         if (hints) rawArgs.lsp_hints = hints;
 
-        const response = await callToolCall(ctx, context, "aft_refactor", rawArgs);
+        const response = await callToolCall(ctx, context, "refactor", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);
         }

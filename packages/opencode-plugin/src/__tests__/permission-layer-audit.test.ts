@@ -341,7 +341,7 @@ describe("permission audit regressions", () => {
     const editAsk = askCalls.find((call) => call.permission === "edit");
     expect(editAsk?.metadata?.filepath).toBe(expectedFile);
     expect(calls[0]).toMatchObject({
-      command: "aft_import",
+      command: "import",
       params: { op: "organize", filePath: expectedFile },
     });
     expect(bridgeRoots[0]).toBe(project);
@@ -635,7 +635,7 @@ describe("permission audit regressions", () => {
 
     expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls[0]?.command).toBe("aft_safety");
+    expect(calls[0]?.command).toBe("safety");
   });
 
   test("aft_safety checkpoint preflight warms session root before resolving relative files", async () => {
@@ -690,7 +690,7 @@ describe("permission audit regressions", () => {
     expect(raw).toBe("ok");
     expect(externalAsk?.metadata?.filepath).toBe(expectedApprovedPath);
     expect(calls[0]).toMatchObject({
-      command: "aft_safety",
+      command: "safety",
       params: { op: "checkpoint", name: "snap", files: ["../outside.ts"] },
     });
     expect(bridgeRoots[0]).toBe(project);
@@ -732,7 +732,7 @@ describe("permission audit regressions", () => {
 
     expect(raw).toBe("ok");
     expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "safety"]);
   });
 
   test("aft_safety undo without filePath previews, asks edit, then calls bridge without file param", async () => {
@@ -757,7 +757,7 @@ describe("permission audit regressions", () => {
     expect(raw).toBe("ok");
     expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
     expect(askCalls[0]?.patterns).toEqual(["inside.ts"]);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "safety"]);
     expect(calls[0]?.params).not.toHaveProperty("file");
     expect(calls[1]?.params).not.toHaveProperty("filePath");
   });
@@ -795,7 +795,7 @@ describe("permission audit regressions", () => {
 
     expect(calls[0]?.command).toBe("undo_preview");
     expect(calls[0]?.params).toMatchObject({ file: "inside.ts" });
-    expect(calls[1]?.command).toBe("aft_safety");
+    expect(calls[1]?.command).toBe("safety");
     expect(calls[1]?.params).toMatchObject({ op: "undo", filePath: "inside.ts" });
   });
 
@@ -814,7 +814,7 @@ describe("permission audit regressions", () => {
 
     expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "safety"]);
   });
 
   test("aft_safety undo preview internal paths do not ask external_directory", async () => {
@@ -830,7 +830,7 @@ describe("permission audit regressions", () => {
     await tools.aft_safety.execute({ op: "undo" }, sdkCtx);
 
     expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "safety"]);
   });
 
   test("aft_safety restore preflights external checkpoint paths", async () => {
@@ -848,7 +848,7 @@ describe("permission audit regressions", () => {
 
     expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "aft_safety"]);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "safety"]);
   });
 
   test("aft_safety restore internal checkpoint paths do not ask external_directory", async () => {
@@ -864,7 +864,7 @@ describe("permission audit regressions", () => {
     await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx);
 
     expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
-    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "aft_safety"]);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "safety"]);
   });
 
   test("aft_safety checkpoint checks a single external filePath", async () => {
@@ -881,7 +881,7 @@ describe("permission audit regressions", () => {
 
     expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls[0]?.command).toBe("aft_safety");
+    expect(calls[0]?.command).toBe("safety");
     expect(calls[0]?.params).toMatchObject({ op: "checkpoint", filePath: externalFile });
   });
 

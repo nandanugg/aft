@@ -886,6 +886,36 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         },
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "read" => aft::commands::read::handle_read(&req, ctx),
+        "write" => aft::commands::write::handle_write(&req, ctx),
+        "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
+        "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
+        "move_file" => aft::commands::move_file::handle_move_file(&req, ctx),
+        "add_import" => aft::commands::add_import::handle_add_import(&req, ctx),
+        "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
+        "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
+        "glob" => aft::commands::glob::handle_glob(&req, ctx),
+        "grep" => aft::commands::grep::handle_grep(&req, ctx),
+        "outline" => aft::commands::outline::handle_outline(&req, ctx),
+        "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
+        "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
+        "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
+        "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
+        "impact" => aft::commands::impact::handle_impact(&req, ctx),
+        "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
+        "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
+        "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),
+        "ast_replace" => aft::commands::ast_replace::handle_ast_replace(&req, ctx),
+        "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),
+        "extract_function" => aft::commands::extract_function::handle_extract_function(&req, ctx),
+        "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
+        "undo" => aft::commands::undo::handle_undo(&req, ctx),
+        "edit_history" => aft::commands::edit_history::handle_edit_history(&req, ctx),
+        "checkpoint" => aft::commands::checkpoint::handle_checkpoint(&req, ctx),
+        "restore_checkpoint" => {
+            aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
+        }
+        "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
         "semantic_search" => state.heavy(req.id),
         "subc_test_echo_session" => {
             let session = req.session().to_string();
@@ -1050,6 +1080,35 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
+    run_subc_bridge_test_inner(name, watchdog, env_setup, driver, after, true);
+}
+
+fn run_subc_bridge_production_test<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(name, watchdog, Vec::new, driver, after, false);
+}
+
+fn run_subc_bridge_test_inner<E, F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    env_setup: E,
+    driver: F,
+    after: A,
+    allow_native_passthrough: bool,
+) where
+    E: FnOnce() -> Vec<EnvVarGuard>,
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
     let _serial = bridge_test_serial_guard();
     let _env_guards = env_setup();
     let state = Arc::new(BridgeState::default());
@@ -1133,13 +1192,23 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
     // Inject a hermetic (nonexistent) user config path so the W5 local read
     // never touches a real ~/.config/cortexkit/aft.jsonc on the dev/CI machine.
     let user_config_path = roots.storage.path().join("nonexistent-user-aft.jsonc");
-    let run_result = run_subc_mode_for_test(
-        &conn_path,
-        ctx,
-        executor,
-        bridge_dispatch,
-        Some(user_config_path),
-    );
+    let run_result = if allow_native_passthrough {
+        run_subc_mode_for_test(
+            &conn_path,
+            ctx,
+            executor,
+            bridge_dispatch,
+            Some(user_config_path),
+        )
+    } else {
+        run_subc_mode(
+            &conn_path,
+            ctx,
+            executor,
+            bridge_dispatch,
+            Some(user_config_path),
+        )
+    };
     let join_result = daemon.join();
     clear_bridge_state();
 
@@ -1351,6 +1420,16 @@ fn subc_bridge_callgraph_maintenance_is_per_root() {
         "subc_bridge_callgraph_maintenance_is_per_root",
         Duration::from_secs(60),
         drive_callgraph_maintenance_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_new_manifest_tools_route_in_production() {
+    run_subc_bridge_production_test(
+        "subc_bridge_new_manifest_tools_route_in_production",
+        Duration::from_secs(90),
+        drive_manifest_reachability_daemon,
         |_, _, _| {},
     );
 }
@@ -3191,6 +3270,238 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
     assert_tool_project_root(&route2_after_maintenance, &root2);
 
     send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_manifest_reachability_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    prepare_manifest_reachability_fixture(&root1);
+
+    send_route_bind_with_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        json!({
+            "callgraph_store": true,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let glob_text =
+        expect_manifest_tool_success(&mut stream, 100, "glob", json!({ "pattern": "src/*.ts" }))
+            .await;
+    assert!(glob_text.contains("sample.ts"), "glob text: {glob_text:?}");
+
+    let zoom_text = expect_manifest_tool_success(
+        &mut stream,
+        101,
+        "zoom",
+        json!({ "filePath": "src/sample.ts", "symbols": "sample" }),
+    )
+    .await;
+    assert!(
+        zoom_text.contains("function sample"),
+        "zoom text: {zoom_text:?}"
+    );
+
+    let callgraph_text = poll_manifest_callgraph_until_ready(
+        &mut stream,
+        110,
+        json!({
+            "op": "callers",
+            "filePath": "src/graph.rs",
+            "symbol": "callee",
+            "depth": 1,
+        }),
+    )
+    .await;
+    assert!(
+        callgraph_text.contains("caller"),
+        "callgraph text: {callgraph_text:?}"
+    );
+
+    let conflicts_text =
+        expect_manifest_tool_success(&mut stream, 200, "conflicts", json!({})).await;
+    assert!(
+        conflicts_text.contains("No merge conflicts found"),
+        "conflicts text: {conflicts_text:?}"
+    );
+
+    let ast_search_text = expect_manifest_tool_success(
+        &mut stream,
+        201,
+        "ast_search",
+        json!({
+            "pattern": "console.log($MSG)",
+            "lang": "typescript",
+            "paths": ["src/sample.ts"],
+        }),
+    )
+    .await;
+    assert!(
+        ast_search_text.contains("Found 1 match"),
+        "ast_search text: {ast_search_text:?}"
+    );
+
+    expect_manifest_tool_success(
+        &mut stream,
+        300,
+        "apply_patch",
+        json!({
+            "patchText": "*** Begin Patch\n*** Update File: patch-target.txt\n@@\n-old\n+new\n*** End Patch\n"
+        }),
+    )
+    .await;
+    expect_manifest_tool_success(
+        &mut stream,
+        301,
+        "ast_replace",
+        json!({
+            "pattern": "console.log($MSG)",
+            "rewrite": "logger.info($MSG)",
+            "lang": "typescript",
+            "paths": ["src/sample.ts"],
+            "dryRun": true,
+        }),
+    )
+    .await;
+    expect_manifest_tool_success(
+        &mut stream,
+        302,
+        "delete",
+        json!({ "files": ["delete-target.txt"] }),
+    )
+    .await;
+    expect_manifest_tool_success(
+        &mut stream,
+        303,
+        "move",
+        json!({ "filePath": "move-source.txt", "destination": "moved/move-target.txt" }),
+    )
+    .await;
+    expect_manifest_tool_success(
+        &mut stream,
+        304,
+        "import",
+        json!({
+            "op": "add",
+            "filePath": root1.join("src/import-target.ts").to_string_lossy(),
+            "module": "node:path",
+            "names": ["join"],
+        }),
+    )
+    .await;
+    expect_manifest_tool_reaches_dispatch(
+        &mut stream,
+        305,
+        "refactor",
+        json!({
+            "op": "move",
+            "filePath": "src/missing.ts",
+            "symbol": "missingSymbol",
+            "destination": "src/missing-dest.ts",
+        }),
+    )
+    .await;
+    expect_manifest_tool_success(&mut stream, 306, "safety", json!({ "op": "list" })).await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+fn prepare_manifest_reachability_fixture(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).expect("create manifest reachability src dir");
+    std::fs::write(
+        root.join("src/sample.ts"),
+        "export function sample() { return 'sample'; }\nconsole.log('ast');\n",
+    )
+    .expect("write sample fixture");
+    std::fs::write(
+        root.join("src/graph.rs"),
+        "pub fn caller() { callee(); }\npub fn callee() {}\n",
+    )
+    .expect("write callgraph fixture");
+    std::fs::write(root.join("src/import-target.ts"), "const value = 1;\n")
+        .expect("write import fixture");
+    std::fs::write(root.join("patch-target.txt"), "old\n").expect("write patch fixture");
+    std::fs::write(root.join("delete-target.txt"), "delete me\n").expect("write delete fixture");
+    std::fs::write(root.join("move-source.txt"), "move me\n").expect("write move fixture");
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(root)
+        .status()
+        .expect("run git init for conflicts fixture");
+    assert!(status.success(), "git init failed for conflicts fixture");
+}
+
+async fn expect_manifest_tool_success(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) -> String {
+    let (text, is_error) = expect_manifest_tool_frame(stream, corr, name, arguments).await;
+    assert!(!is_error, "{name} should succeed over subc, got {text:?}");
+    text
+}
+
+async fn expect_manifest_tool_reaches_dispatch(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) -> String {
+    expect_manifest_tool_frame(stream, corr, name, arguments)
+        .await
+        .0
+}
+
+async fn expect_manifest_tool_frame(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+) -> (String, bool) {
+    send_tool_call(stream, 1, corr, name, arguments).await;
+    let frame = read_frame_timeout(stream, "manifest reachability tool response").await;
+    assert_eq!(frame.header.channel, 1, "unexpected channel for {name}");
+    assert_eq!(frame.header.corr, corr, "unexpected corr for {name}");
+    let text = tool_result_text(&frame);
+    assert!(
+        !text.contains("not in the AFT tool manifest") && !text.contains("unknown_tool"),
+        "{name} was rejected before dispatch: {text:?}"
+    );
+    (text, tool_result_is_error(&frame))
+}
+
+async fn poll_manifest_callgraph_until_ready(
+    stream: &mut tokio::net::TcpStream,
+    first_corr: u64,
+    arguments: Value,
+) -> String {
+    for attempt in 0..80 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let text = expect_manifest_tool_reaches_dispatch(
+            stream,
+            first_corr + attempt,
+            "callgraph",
+            arguments.clone(),
+        )
+        .await;
+        if text.contains("caller") {
+            return text;
+        }
+        assert!(
+            text.to_ascii_lowercase().contains("building"),
+            "callgraph should build or become ready, got {text:?}"
+        );
+    }
+    panic!("callgraph store did not become ready for manifest reachability test");
 }
 
 async fn send_route_bind(

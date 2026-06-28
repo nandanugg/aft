@@ -2976,7 +2976,27 @@ fn response_is_internal_error(response: &Response) -> bool {
 fn is_subc_agent_core_tool(name: &str) -> bool {
     matches!(
         name,
-        "status" | "bash" | "read" | "write" | "edit" | "grep" | "search" | "outline" | "inspect"
+        "status"
+            | "bash"
+            | "read"
+            | "write"
+            | "edit"
+            | "apply_patch"
+            | "grep"
+            | "glob"
+            | "search"
+            | "outline"
+            | "zoom"
+            | "inspect"
+            | "callgraph"
+            | "conflicts"
+            | "ast_search"
+            | "ast_replace"
+            | "delete"
+            | "move"
+            | "import"
+            | "refactor"
+            | "safety"
     )
 }
 
@@ -2994,6 +3014,7 @@ fn command_lane(command: &str) -> Lane {
         | "edit_history"
         | "checkpoint_paths"
         | "list_checkpoints"
+        | "conflicts"
         | "glob"
         | "grep"
         | "git_conflicts"
@@ -3013,8 +3034,8 @@ fn command_lane(command: &str) -> Lane {
         | "lsp_find_references"
         | "lsp_prepare_rename" => Lane::SerialLspStatus,
 
-        "semantic_search" | "search" | "callers" | "impact" | "call_tree" | "trace_to"
-        | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => Lane::HeavyInit,
+        "semantic_search" | "search" | "callgraph" | "callers" | "impact" | "call_tree"
+        | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => Lane::HeavyInit,
 
         "bash"
         | "bash_ack_completions"
@@ -3074,10 +3095,10 @@ fn tool_schema(name: &str) -> Value {
     })
 }
 
-/// AFT's subc-mode capability manifest. BARE tool names (the gateway owns the
-/// `aft_` prefix); ModuleManaged concurrency (AFT schedules internally);
-/// FirstParty trust. Minimal-but-conformant tool set for the spike — the full
-/// bare set is locked before the gateway fronts AFT.
+/// AFT's subc-mode capability manifest. It uses bare internal tool names
+/// because the gateway adds any `aft_` prefix for agent-facing displays; AFT
+/// schedules concurrent calls itself; the gateway runs AFT directly without a
+/// sandbox. The manifest lists every tool an agent can call over subc.
 fn build_manifest() -> ModuleManifest {
     let tool = |name: &str, execution_mode: ExecutionMode| Tool {
         name: name.to_string(),
@@ -3100,12 +3121,24 @@ fn build_manifest() -> ModuleManifest {
                 tool("status", ExecutionMode::Pure),
                 tool("bash", ExecutionMode::Mutating),
                 tool("read", ExecutionMode::Pure),
+                tool("write", ExecutionMode::Mutating),
+                tool("edit", ExecutionMode::Mutating),
+                tool("apply_patch", ExecutionMode::Mutating),
                 tool("grep", ExecutionMode::Pure),
+                tool("glob", ExecutionMode::Pure),
                 tool("search", ExecutionMode::Pure),
                 tool("outline", ExecutionMode::Pure),
+                tool("zoom", ExecutionMode::Pure),
                 tool("inspect", ExecutionMode::Pure),
-                tool("edit", ExecutionMode::Mutating),
-                tool("write", ExecutionMode::Mutating),
+                tool("callgraph", ExecutionMode::Pure),
+                tool("conflicts", ExecutionMode::Pure),
+                tool("ast_search", ExecutionMode::Pure),
+                tool("ast_replace", ExecutionMode::Mutating),
+                tool("delete", ExecutionMode::Mutating),
+                tool("move", ExecutionMode::Mutating),
+                tool("import", ExecutionMode::Mutating),
+                tool("refactor", ExecutionMode::Mutating),
+                tool("safety", ExecutionMode::Mutating),
             ],
             identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
             concurrency: Concurrency::ModuleManaged,
@@ -3894,8 +3927,28 @@ mod tests {
         );
     }
 
-    const CORE_TOOLS: [&str; 8] = [
-        "status", "read", "grep", "search", "outline", "inspect", "edit", "write",
+    const CORE_TOOLS: [&str; 21] = [
+        "status",
+        "bash",
+        "read",
+        "write",
+        "edit",
+        "apply_patch",
+        "grep",
+        "glob",
+        "search",
+        "outline",
+        "zoom",
+        "inspect",
+        "callgraph",
+        "conflicts",
+        "ast_search",
+        "ast_replace",
+        "delete",
+        "move",
+        "import",
+        "refactor",
+        "safety",
     ];
 
     fn is_bare_placeholder_schema(schema: &Value) -> bool {
@@ -3959,21 +4012,50 @@ mod tests {
 
         // Readers warm AFT's own index/cache/symbol artifacts (internal ctx
         // mutation), not the user's observable workspace, so they are Pure.
-        for name in ["status", "read", "grep", "search", "outline", "inspect"] {
+        for name in [
+            "status",
+            "read",
+            "grep",
+            "glob",
+            "search",
+            "outline",
+            "zoom",
+            "inspect",
+            "callgraph",
+            "conflicts",
+            "ast_search",
+        ] {
             assert_eq!(
                 by_name[name].execution_mode,
                 ExecutionMode::Pure,
                 "{name} produces no observable side effect and must be Pure"
             );
         }
-        // Only edit/write produce observable file writes -> Mutating.
-        for name in ["edit", "write"] {
+        // Mutating tools can write files, change safety state, or spawn processes.
+        for name in [
+            "bash",
+            "write",
+            "edit",
+            "apply_patch",
+            "ast_replace",
+            "delete",
+            "move",
+            "import",
+            "refactor",
+            "safety",
+        ] {
             assert_eq!(
                 by_name[name].execution_mode,
                 ExecutionMode::Mutating,
                 "{name} writes files and must be Mutating"
             );
         }
+    }
+
+    #[test]
+    fn subc_agent_lanes_classify_new_read_tools() {
+        assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
+        assert_eq!(command_lane("conflicts"), Lane::PureRead);
     }
 }
 

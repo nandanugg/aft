@@ -23,7 +23,7 @@ describe("aft_safety adapter", () => {
     expect(calls[0]).toMatchObject({
       command: "tool_call",
       params: {
-        name: "aft_safety",
+        name: "safety",
         arguments: { op: "checkpoint", name: "before-edit", filePath: "src/app.ts" },
       },
     });
@@ -55,7 +55,7 @@ describe("aft_safety adapter", () => {
     expect(calls.map((call) => call.command)).toEqual(["undo_preview", "tool_call"]);
     expect(calls[0].params).toEqual({});
     expect(calls[1].params).toMatchObject({
-      name: "aft_safety",
+      name: "safety",
       arguments: { op: "undo" },
     });
   });
@@ -76,7 +76,7 @@ describe("aft_safety adapter", () => {
     expect(calls[1]).toMatchObject({
       command: "tool_call",
       params: {
-        name: "aft_safety",
+        name: "safety",
         arguments: { op: "undo", filePath: "src/app.ts" },
       },
     });
@@ -102,7 +102,7 @@ describe("aft_safety adapter", () => {
     expect(calls[1]).toMatchObject({
       command: "tool_call",
       params: {
-        name: "aft_safety",
+        name: "safety",
         arguments: {
           op: "restore",
           name: "before-edit",

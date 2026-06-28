@@ -173,7 +173,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         if (filePathArg !== undefined) rawArgs.filePath = filePathArg;
         if (payloadFiles.length > 0) rawArgs.files = payloadFiles;
 
-        const response = await callToolCall(ctx, context, "aft_safety", rawArgs);
+        const response = await callToolCall(ctx, context, "safety", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);
         }

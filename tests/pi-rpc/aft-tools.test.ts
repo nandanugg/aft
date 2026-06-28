@@ -700,22 +700,27 @@ describe("AFT Pi tools (real Pi RPC)", () => {
         (await client.sendCommand({ type: "prompt", message: "Run two callgraph checks." }))
           .success,
       ).toBe(true);
-      const first = await client.waitForEvent(
-        (event) => event.type === "tool_execution_end" && event.toolName === "aft_callgraph",
-        30_000,
-      );
-      const second = await client.waitForEvent(
+      const callerResult = await client.waitForEvent(
         (event) =>
           event.type === "tool_execution_end" &&
           event.toolName === "aft_callgraph" &&
-          event.toolCallId !== first.toolCallId,
+          event.isError === false &&
+          resultText(event).includes("caller"),
+        30_000,
+      );
+      const missingSymbolResult = await client.waitForEvent(
+        (event) =>
+          event.type === "tool_execution_end" &&
+          event.toolName === "aft_callgraph" &&
+          event.isError === false &&
+          resultText(event).includes("symbol_not_found"),
         30_000,
       );
 
-      expect(first.isError).toBe(false);
-      expect(resultText(first)).toContain("caller");
-      expect(second.isError).toBe(false);
-      expect(resultText(second)).toContain("symbol_not_found");
+      expect(callerResult.isError).toBe(false);
+      expect(resultText(callerResult)).toContain("caller");
+      expect(missingSymbolResult.isError).toBe(false);
+      expect(resultText(missingSymbolResult)).toContain("symbol_not_found");
     } finally {
       await client?.close();
       await aimock.close();

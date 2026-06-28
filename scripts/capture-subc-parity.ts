@@ -53,11 +53,11 @@ type BareToolName =
   | "conflicts"
   | "ast_search"
   | "ast_replace"
-  | "aft_delete"
-  | "aft_move"
-  | "aft_import"
-  | "aft_refactor"
-  | "aft_safety";
+  | "delete"
+  | "move"
+  | "import"
+  | "refactor"
+  | "safety";
 
 interface BridgeCall {
   command: string;
@@ -266,27 +266,27 @@ function makeCtx(
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
-            if (name === "aft_import") {
+            if (name === "import") {
               const translated = translateAftImportToolCall(rawArgs);
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
-            if (name === "aft_refactor") {
+            if (name === "refactor") {
               const translated = translateAftRefactorToolCall(rawArgs);
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
-            if (name === "aft_safety") {
+            if (name === "safety") {
               const translated = translateAftSafetyToolCall(rawArgs);
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
-            if (name === "aft_delete") {
+            if (name === "delete") {
               const translated = translateAftDeleteToolCall(rawArgs);
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
-            if (name === "aft_move") {
+            if (name === "move") {
               const translated = translateAftMoveToolCall(rawArgs);
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
@@ -334,11 +334,11 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     conflicts: conflicts.aft_conflicts,
     ast_search: ast.ast_grep_search ?? ast.aft_ast_search,
     ast_replace: ast.ast_grep_replace ?? ast.aft_ast_replace,
-    aft_delete: hoisted.aft_delete,
-    aft_move: hoisted.aft_move,
-    aft_import: importTools(ctx).aft_import,
-    aft_refactor: refactoringTools(ctx).aft_refactor,
-    aft_safety: safetyTools(ctx).aft_safety,
+    delete: hoisted.aft_delete,
+    move: hoisted.aft_move,
+    import: importTools(ctx).aft_import,
+    refactor: refactoringTools(ctx).aft_refactor,
+    safety: safetyTools(ctx).aft_safety,
   };
 }
 
@@ -557,35 +557,35 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "ast_replace_translate_dry_run", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [`${PROJECT_ROOT}/src`], globs: [TS_INCLUDE_GLOB], dryRun: "true" } },
   { name: "ast_replace_translate_apply_default", tool_name: "ast_replace", agent_args: { pattern: "console.log($MSG)", rewrite: "logger.info($MSG)", lang: "typescript", paths: [], globs: [] } },
   { name: "ast_replace_missing_rewrite", tool_name: "ast_replace", expected_error: "ast_replace: missing required param 'rewrite'", agent_args: { pattern: "console.log($MSG)", lang: "typescript" } },
-  { name: "aft_delete_translate_files_recursive", tool_name: "aft_delete", agent_args: { files: [`${PROJECT_ROOT}/src/delete-me.ts`, `${PROJECT_ROOT}/docs/delete-me.md`], recursive: "true" } },
-  { name: "aft_delete_empty_files", tool_name: "aft_delete", expected_error: "delete: 'files' must be a non-empty array of paths", agent_args: { files: [] } },
-  { name: "aft_move_translate_paths", tool_name: "aft_move", agent_args: { filePath: "src/move-from.ts", destination: "src/move-to.ts" } },
-  { name: "aft_import_add_translate_full", tool_name: "aft_import", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", names: ["alpha"], defaultImport: "DefaultImport", namespace: "ns", alias: "Alias", modifiers: ["type"], importKind: "function", typeOnly: true, validate: "syntax" } },
-  { name: "aft_import_remove_translate_name", tool_name: "aft_import", agent_args: { op: "remove", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", removeName: "alpha" } },
-  { name: "aft_import_organize_translate", tool_name: "aft_import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
-  { name: "aft_import_add_missing_module", tool_name: "aft_import", expected_error: "'module' is required for 'add' op", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts` } },
-  { name: "aft_import_missing_file_path", tool_name: "aft_import", expected_error: "aft_import: missing required param 'filePath'", agent_args: { op: "organize" } },
-  { name: "aft_refactor_move_translate_full", tool_name: "aft_refactor", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, scope: "exports" } },
-  { name: "aft_refactor_extract_translate", tool_name: "aft_refactor", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, name: "computeValue", startLine: 2, endLine: 4 } },
-  { name: "aft_refactor_inline_translate", tool_name: "aft_refactor", agent_args: { op: "inline", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "helper", callSiteLine: 6 } },
-  { name: "aft_refactor_missing_symbol_for_move", tool_name: "aft_refactor", expected_error: "'symbol' is required for 'move' op", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, destination: `${PROJECT_ROOT}/src/moved.ts` } },
-  { name: "aft_refactor_missing_name_for_extract", tool_name: "aft_refactor", expected_error: "'name' is required for 'extract' op", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, startLine: 2, endLine: 4 } },
-  { name: "aft_refactor_missing_filePath", tool_name: "aft_refactor", expected_error: "aft_refactor: missing required param 'filePath'", agent_args: { op: "move", symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` } },
+  { name: "delete_translate_files_recursive", tool_name: "delete", agent_args: { files: [`${PROJECT_ROOT}/src/delete-me.ts`, `${PROJECT_ROOT}/docs/delete-me.md`], recursive: "true" } },
+  { name: "delete_empty_files", tool_name: "delete", expected_error: "delete: 'files' must be a non-empty array of paths", agent_args: { files: [] } },
+  { name: "move_translate_paths", tool_name: "move", agent_args: { filePath: "src/move-from.ts", destination: "src/move-to.ts" } },
+  { name: "import_add_translate_full", tool_name: "import", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", names: ["alpha"], defaultImport: "DefaultImport", namespace: "ns", alias: "Alias", modifiers: ["type"], importKind: "function", typeOnly: true, validate: "syntax" } },
+  { name: "import_remove_translate_name", tool_name: "import", agent_args: { op: "remove", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", removeName: "alpha" } },
+  { name: "import_organize_translate", tool_name: "import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "import_add_missing_module", tool_name: "import", expected_error: "'module' is required for 'add' op", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "import_missing_file_path", tool_name: "import", expected_error: "aft_import: missing required param 'filePath'", agent_args: { op: "organize" } },
+  { name: "refactor_move_translate_full", tool_name: "refactor", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, scope: "exports" } },
+  { name: "refactor_extract_translate", tool_name: "refactor", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, name: "computeValue", startLine: 2, endLine: 4 } },
+  { name: "refactor_inline_translate", tool_name: "refactor", agent_args: { op: "inline", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "helper", callSiteLine: 6 } },
+  { name: "refactor_missing_symbol_for_move", tool_name: "refactor", expected_error: "'symbol' is required for 'move' op", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, destination: `${PROJECT_ROOT}/src/moved.ts` } },
+  { name: "refactor_missing_name_for_extract", tool_name: "refactor", expected_error: "'name' is required for 'extract' op", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, startLine: 2, endLine: 4 } },
+  { name: "refactor_missing_filePath", tool_name: "refactor", expected_error: "aft_refactor: missing required param 'filePath'", agent_args: { op: "move", symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` } },
   {
-    name: "aft_refactor_lsp_hints_passthrough",
-    tool_name: "aft_refactor",
+    name: "refactor_lsp_hints_passthrough",
+    tool_name: "refactor",
     agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` },
     input_agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, lsp_hints: { symbols: [{ name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 4, kind: "function" }] } },
     lsp_symbols: [{ name: "run", kind: 12, location: { uri: `file://${PROJECT_ROOT}/src/main.ts`, range: { start: { line: 4 } } } }],
   },
-  { name: "aft_safety_undo_file", tool_name: "aft_safety", agent_args: { op: "undo", filePath: `${PROJECT_ROOT}/src/main.ts` } },
-  { name: "aft_safety_history_file", tool_name: "aft_safety", agent_args: { op: "history", filePath: `${PROJECT_ROOT}/src/main.ts` } },
-  { name: "aft_safety_checkpoint_files", tool_name: "aft_safety", agent_args: { op: "checkpoint", name: "before-edit", files: [`${PROJECT_ROOT}/src/main.ts`, "docs/guide.md"] } },
-  { name: "aft_safety_checkpoint_filePath", tool_name: "aft_safety", agent_args: { op: "checkpoint", name: "single-file", filePath: "src/main.ts" } },
-  { name: "aft_safety_restore_name", tool_name: "aft_safety", agent_args: { op: "restore", name: "before-edit" } },
-  { name: "aft_safety_list", tool_name: "aft_safety", agent_args: { op: "list" } },
-  { name: "aft_safety_missing_filePath_for_history", tool_name: "aft_safety", expected_error: "'filePath' is required for 'history' op", agent_args: { op: "history" } },
-  { name: "aft_safety_missing_name_for_checkpoint", tool_name: "aft_safety", expected_error: "'name' is required for 'checkpoint' op", agent_args: { op: "checkpoint" } },
+  { name: "safety_undo_file", tool_name: "safety", agent_args: { op: "undo", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "safety_history_file", tool_name: "safety", agent_args: { op: "history", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "safety_checkpoint_files", tool_name: "safety", agent_args: { op: "checkpoint", name: "before-edit", files: [`${PROJECT_ROOT}/src/main.ts`, "docs/guide.md"] } },
+  { name: "safety_checkpoint_filePath", tool_name: "safety", agent_args: { op: "checkpoint", name: "single-file", filePath: "src/main.ts" } },
+  { name: "safety_restore_name", tool_name: "safety", agent_args: { op: "restore", name: "before-edit" } },
+  { name: "safety_list", tool_name: "safety", agent_args: { op: "list" } },
+  { name: "safety_missing_filePath_for_history", tool_name: "safety", expected_error: "'filePath' is required for 'history' op", agent_args: { op: "history" } },
+  { name: "safety_missing_name_for_checkpoint", tool_name: "safety", expected_error: "'name' is required for 'checkpoint' op", agent_args: { op: "checkpoint" } },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },

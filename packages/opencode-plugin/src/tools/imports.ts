@@ -118,7 +118,7 @@ export function importTools(ctx: PluginContext): Record<string, ToolDefinition> 
         if (args.typeOnly !== undefined) rawArgs.typeOnly = args.typeOnly;
         if (args.removeName !== undefined) rawArgs.removeName = args.removeName;
         if (args.validate !== undefined) rawArgs.validate = args.validate;
-        const response = await callToolCall(ctx, context, "aft_import", rawArgs);
+        const response = await callToolCall(ctx, context, "import", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);
         }

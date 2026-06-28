@@ -24,7 +24,7 @@ describe("aft_refactor adapter", () => {
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      name: "aft_refactor",
+      name: "refactor",
       arguments: {
         op: "extract",
         filePath: "src/app.ts",
@@ -50,7 +50,7 @@ describe("aft_refactor adapter", () => {
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      name: "aft_refactor",
+      name: "refactor",
       arguments: {
         op: "inline",
         filePath: "src/app.ts",
@@ -76,7 +76,7 @@ describe("aft_refactor adapter", () => {
 
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      name: "aft_refactor",
+      name: "refactor",
       arguments: {
         op: "move",
         filePath: "src/app.ts",

@@ -175,7 +175,7 @@ fn ast_replace_dry_run_for_call(bare_name: &str, arguments: &Value) -> bool {
 }
 
 fn import_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
-    if bare_name != "aft_import" {
+    if bare_name != "import" {
         return None;
     }
     arguments
@@ -186,7 +186,7 @@ fn import_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> 
 }
 
 fn refactor_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
-    if bare_name != "aft_refactor" {
+    if bare_name != "refactor" {
         return None;
     }
     arguments
@@ -197,7 +197,7 @@ fn refactor_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -
 }
 
 fn move_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
-    if bare_name != "aft_move" {
+    if bare_name != "move" {
         return None;
     }
     arguments
@@ -208,7 +208,7 @@ fn move_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Op
 }
 
 fn safety_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
-    if bare_name != "aft_safety" {
+    if bare_name != "safety" {
         return None;
     }
     arguments
@@ -230,10 +230,9 @@ fn coerce_boolean(value: &Value) -> bool {
     }
 }
 
-// Return true for tools whose text output is formatted on the server for the
-// agent. This list is larger than the subc manifest in subc.rs because zoom and
-// callgraph are routed through NDJSON tool_call today, but their responses still
-// need Rust formatting here.
+// Return true for agent tools whose text output is formatted on the server.
+// The capability manifest and this formatter both identify tools by their bare
+// internal routing names, without the agent-facing `aft_` prefix.
 fn is_core_agent_tool(bare_name: &str) -> bool {
     matches!(
         bare_name,
@@ -252,11 +251,11 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "conflicts"
             | "ast_search"
             | "ast_replace"
-            | "aft_delete"
-            | "aft_move"
-            | "aft_import"
-            | "aft_refactor"
-            | "aft_safety"
+            | "delete"
+            | "move"
+            | "import"
+            | "refactor"
+            | "safety"
     )
 }
 
@@ -309,11 +308,11 @@ pub fn format_response_with_context(
         "conflicts" => data["text"].as_str().unwrap_or_default().to_string(),
         "ast_search" => format_ast_search(data),
         "ast_replace" => format_ast_replace(data, ctx.ast_dry_run),
-        "aft_delete" => format_delete(data),
-        "aft_move" => format_move(data, ctx),
-        "aft_import" => format_import(data, ctx),
-        "aft_refactor" => format_refactor(data, ctx),
-        "aft_safety" => format_safety(data, ctx),
+        "delete" => format_delete(data),
+        "move" => format_move(data, ctx),
+        "import" => format_import(data, ctx),
+        "refactor" => format_refactor(data, ctx),
+        "safety" => format_safety(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }

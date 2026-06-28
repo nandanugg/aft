@@ -199,11 +199,11 @@ pub fn subc_translate_with_context(
         "conflicts" => translate_conflicts(agent_args),
         "ast_search" => translate_ast_search(agent_args),
         "ast_replace" => translate_ast_replace(agent_args),
-        "aft_delete" => translate_delete(agent_args, project_root),
-        "aft_move" => translate_move(agent_args, project_root),
-        "aft_import" => translate_import(agent_args),
-        "aft_refactor" => translate_refactor(agent_args),
-        "aft_safety" => translate_safety(agent_args),
+        "delete" => translate_delete(agent_args, project_root),
+        "move" => translate_move(agent_args, project_root),
+        "import" => translate_import(agent_args),
+        "refactor" => translate_refactor(agent_args),
+        "safety" => translate_safety(agent_args),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),

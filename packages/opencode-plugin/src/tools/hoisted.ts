@@ -929,7 +929,7 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
 
       // Single batched call so every file shares one op_id; one `aft_safety
       // undo` then restores the whole delete atomically.
-      const response = await callToolCall(ctx, context, "aft_delete", {
+      const response = await callToolCall(ctx, context, "delete", {
         files: absolutePaths,
         recursive,
       });
@@ -1009,7 +1009,7 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
         }),
       );
 
-      const result = await callToolCall(ctx, context, "aft_move", {
+      const result = await callToolCall(ctx, context, "move", {
         filePath: args.filePath as string,
         destination: args.destination as string,
       });

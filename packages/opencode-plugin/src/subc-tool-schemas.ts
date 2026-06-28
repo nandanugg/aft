@@ -7,10 +7,16 @@ import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 
+import { astTools } from "./tools/ast.js";
 import { createBashTool } from "./tools/bash.js";
+import { conflictTools } from "./tools/conflicts.js";
 import { createReadTool, hoistedTools } from "./tools/hoisted.js";
+import { importTools } from "./tools/imports.js";
 import { inspectTools } from "./tools/inspect.js";
+import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
+import { refactoringTools } from "./tools/refactoring.js";
+import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
@@ -24,15 +30,27 @@ const STATUS_SCHEMA = {
 } as const;
 
 const BARE_TOOL_ORDER = [
-  "bash",
-  "edit",
-  "grep",
-  "inspect",
-  "outline",
-  "read",
-  "search",
   "status",
+  "bash",
+  "read",
   "write",
+  "edit",
+  "apply_patch",
+  "grep",
+  "glob",
+  "search",
+  "outline",
+  "zoom",
+  "inspect",
+  "callgraph",
+  "conflicts",
+  "ast_search",
+  "ast_replace",
+  "delete",
+  "move",
+  "import",
+  "refactor",
+  "safety",
 ] as const;
 
 export type SubcBareToolName = (typeof BARE_TOOL_ORDER)[number];
@@ -64,18 +82,51 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   const ctx = makeSubcSchemaStubCtx();
   const bash = createBashTool(ctx);
   const read = createReadTool(ctx);
-  const { write, edit } = hoistedTools(ctx);
-  if (!write || !edit) {
-    throw new Error("hoistedTools must expose write and edit");
+  const hoisted = hoistedTools(ctx);
+  const {
+    write,
+    edit,
+    apply_patch: applyPatch,
+    aft_delete: deleteTool,
+    aft_move: moveTool,
+  } = hoisted;
+  if (!write || !edit || !applyPatch || !deleteTool || !moveTool) {
+    throw new Error("hoistedTools must expose write, edit, apply_patch, aft_delete, and aft_move");
   }
   const grepTools = searchTools(ctx);
   const grepTool = grepTools.grep ?? grepTools.aft_grep;
-  if (!grepTool) {
-    throw new Error("searchTools must expose grep or aft_grep");
+  const globTool = grepTools.glob ?? grepTools.aft_glob;
+  if (!grepTool || !globTool) {
+    throw new Error("searchTools must expose grep/glob or aft_grep/aft_glob");
   }
   const search = semanticTools(ctx).aft_search;
-  const outline = readingTools(ctx).aft_outline;
+  const reading = readingTools(ctx);
+  const outline = reading.aft_outline;
+  const zoom = reading.aft_zoom;
   const inspect = inspectTools(ctx).aft_inspect;
+  const callgraph = navigationTools(ctx).aft_callgraph;
+  const conflicts = conflictTools(ctx).aft_conflicts;
+  const ast = astTools(ctx);
+  const astSearch = ast.ast_grep_search ?? ast.aft_ast_search;
+  const astReplace = ast.ast_grep_replace ?? ast.aft_ast_replace;
+  const importTool = importTools(ctx).aft_import;
+  const refactor = refactoringTools(ctx).aft_refactor;
+  const safety = safetyTools(ctx).aft_safety;
+  if (
+    !search ||
+    !outline ||
+    !zoom ||
+    !inspect ||
+    !callgraph ||
+    !conflicts ||
+    !astSearch ||
+    !astReplace ||
+    !importTool ||
+    !refactor ||
+    !safety
+  ) {
+    throw new Error("all subc manifest tools must expose an agent tool schema");
+  }
 
   const bashSchema = argsToJsonSchema(bash);
   const bashProperties = (bashSchema.properties ??= {}) as Record<string, unknown>;
@@ -95,10 +146,22 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     read: argsToJsonSchema(read),
     write: argsToJsonSchema(write),
     edit: argsToJsonSchema(edit),
+    apply_patch: argsToJsonSchema(applyPatch),
     grep: argsToJsonSchema(grepTool),
+    glob: argsToJsonSchema(globTool),
     search: argsToJsonSchema(search),
     outline: argsToJsonSchema(outline),
+    zoom: argsToJsonSchema(zoom),
     inspect: argsToJsonSchema(inspect),
+    callgraph: argsToJsonSchema(callgraph),
+    conflicts: argsToJsonSchema(conflicts),
+    ast_search: argsToJsonSchema(astSearch),
+    ast_replace: argsToJsonSchema(astReplace),
+    delete: argsToJsonSchema(deleteTool),
+    move: argsToJsonSchema(moveTool),
+    import: argsToJsonSchema(importTool),
+    refactor: argsToJsonSchema(refactor),
+    safety: argsToJsonSchema(safety),
   };
 }
 

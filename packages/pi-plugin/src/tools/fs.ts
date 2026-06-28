@@ -170,7 +170,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         // `aft_safety undo` then restores the whole delete atomically.
         const response = await callToolCall(
           bridge,
-          "aft_delete",
+          "delete",
           {
             files,
             // Coerce at the boundary, like `files`: a stringified "true" from the
@@ -235,7 +235,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const response = await callToolCall(
           bridge,
-          "aft_move",
+          "move",
           {
             filePath: params.filePath,
             destination: params.destination,
