@@ -5,7 +5,7 @@ use aft::context::{App, AppContext, SemanticIndexStatus};
 use aft::log_ctx;
 use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
-use aft::response_finalize::PendingResponses;
+use aft::response_finalize::{DispatchOutcome, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -154,6 +154,7 @@ fn main() {
     // push frames emitted. Without the wake, the sidebar can stay stuck
     // on "loading" indefinitely until the next request happens to arrive.
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+    const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
     let mut pending = PendingResponses::default();
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
     thread::spawn(move || {
@@ -171,7 +172,12 @@ fn main() {
             break;
         }
 
-        let line_result = match line_rx.recv_timeout(DRAIN_INTERVAL) {
+        let recv_timeout = if pending.is_empty() {
+            DRAIN_INTERVAL
+        } else {
+            PENDING_POLL_INTERVAL
+        };
+        let line_result = match line_rx.recv_timeout(recv_timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Periodic drain so push frames flow even without requests.
@@ -230,37 +236,47 @@ fn main() {
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
                 let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
-                    log_ctx::with_session(session_id_for_log, || dispatch(req, runtime))
+                    log_ctx::with_session(session_id_for_log, || dispatch_outcome(req, runtime))
                 }));
                 match dispatch_result {
-                    Ok(mut response) => {
+                    Ok(DispatchOutcome::Immediate(mut response)) => {
                         aft::response_finalize::finalize_response(
                             &mut response,
                             runtime,
                             &session_id,
                             &attach_command,
                         );
-                        response
+                        Some(response)
+                    }
+                    Ok(DispatchOutcome::Deferred(pending_response)) => {
+                        pending.register(pending_response);
+                        None
                     }
                     Err(payload) => {
                         shutdown_after_response = true;
-                        dispatch_panic_response(request_id, &command, payload.as_ref())
+                        Some(dispatch_panic_response(
+                            request_id,
+                            &command,
+                            payload.as_ref(),
+                        ))
                     }
                 }
             }
             Err(e) => {
                 aft::slog_error!("parse error: {} — input: {}", e, trimmed);
-                Response::error(
+                Some(Response::error(
                     "_parse_error",
                     "parse_error",
                     format!("failed to parse request: {}", e),
-                )
+                ))
             }
         };
 
-        if let Err(e) = write_response(registry.current(), &response) {
-            aft::slog_error!("stdout write error: {}", e);
-            break;
+        if let Some(response) = response {
+            if let Err(e) = write_response(registry.current(), &response) {
+                aft::slog_error!("stdout write error: {}", e);
+                break;
+            }
         }
         drain_configure_warning_events_for_registry(&registry);
         if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
@@ -642,6 +658,17 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             )
         }
     }
+}
+
+fn dispatch_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome {
+    aft::commands::tool_call::register_dispatch(dispatch);
+    if req.command == "bash"
+        && aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req)
+    {
+        let spawn_response = aft::commands::bash::handle(&req, ctx);
+        return aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response);
+    }
+    DispatchOutcome::Immediate(dispatch(req, ctx))
 }
 
 fn handle_echo(req: &RawRequest) -> Response {

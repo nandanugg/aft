@@ -174,6 +174,9 @@ pub struct Config {
     pub bash_long_running_reminder_enabled: bool,
     /// Milliseconds between long-running bash reminders (default: 10 minutes).
     pub bash_long_running_reminder_interval_ms: u64,
+    /// Milliseconds to wait before a foreground bash task is promoted to background handling.
+    #[serde(skip, default = "default_foreground_wait_window_ms")]
+    pub foreground_wait_window_ms: u64,
     /// Enable OpenCode-style bash permission prompts (default: false).
     pub bash_permissions: bool,
     /// Maximum file size to fully index in bytes (default: 1MB).
@@ -257,6 +260,7 @@ impl Default for Config {
             max_background_bash_tasks: 8,
             bash_long_running_reminder_enabled: true,
             bash_long_running_reminder_interval_ms: 600_000,
+            foreground_wait_window_ms: default_foreground_wait_window_ms(),
             bash_permissions: false,
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
@@ -275,4 +279,8 @@ impl Default for Config {
             diagnostic_cache_size: 5000,
         }
     }
+}
+
+fn default_foreground_wait_window_ms() -> u64 {
+    8_000
 }

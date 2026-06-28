@@ -7,6 +7,7 @@ pub mod bash;
 pub mod bash_drain_completions;
 pub mod bash_kill;
 pub mod bash_notify;
+pub mod bash_orchestrate;
 pub mod bash_promote;
 pub mod bash_regex_match;
 pub mod bash_status;

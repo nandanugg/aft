@@ -15,7 +15,7 @@ use crate::config::{
     BackupConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
 };
 
-const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
+const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 8_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
 
 // Semantic budget clamps — restored from the deleted configure-time
@@ -1154,17 +1154,16 @@ struct ResolvedBashConfig {
 
 fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
     let bash = resolve_bash_config(raw);
-    // These fields are plugin-registration/runtime-only today, but resolving
-    // them here keeps the Rust port byte-faithful to the TypeScript ladder and
-    // the unit tests lock their values for the future configure wire.
-    let _registration_only = (
-        bash.enabled,
-        bash.subagent_background,
-        bash.foreground_wait_window_ms,
-    );
+    // Resolve enabled and subagent_background, then discard them, because Rust
+    // does not use those two bash settings at runtime yet. Doing the resolution
+    // here keeps user config overriding project config in the same way as the
+    // bash fields below, so a later response can expose the values without
+    // changing how config files are interpreted.
+    let _registration_only = (bash.enabled, bash.subagent_background);
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
     config.experimental_bash_background = bash.background;
+    config.foreground_wait_window_ms = bash.foreground_wait_window_ms;
     if let Some(value) = bash.long_running_reminder_enabled {
         config.bash_long_running_reminder_enabled = value;
     }
@@ -1968,6 +1967,15 @@ mod tests {
             FOREGROUND_WAIT_WINDOW_MIN_MS
         );
         assert!(bash.subagent_background);
+
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{ "bash": { "foreground_wait_window_ms": 1 } }"#,
+        )]);
+        assert_eq!(
+            result.config.foreground_wait_window_ms,
+            FOREGROUND_WAIT_WINDOW_MIN_MS
+        );
     }
 
     #[test]
