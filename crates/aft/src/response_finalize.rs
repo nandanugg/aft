@@ -1,6 +1,78 @@
 use crate::context::AppContext;
 use crate::protocol::Response;
 
+/// Apply finalizers in the established response order: background completions first, then status bar counts.
+pub fn finalize_response(
+    response: &mut Response,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+) {
+    attach_bg_completions(response, ctx, session_id, attach_command);
+    attach_status_bar(response, ctx, attach_command);
+}
+
+pub enum DispatchOutcome {
+    Immediate(Response),
+    Deferred(PendingResponse),
+}
+
+pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response>>;
+
+pub struct PendingResponse {
+    pub request_id: String,
+    pub session_id: String,
+    pub attach_command: String,
+    pub poll: PendingResponsePoll,
+}
+
+pub struct ResolvedPending {
+    pub response: Response,
+    pub session_id: String,
+    pub attach_command: String,
+}
+
+#[derive(Default)]
+pub struct PendingResponses {
+    entries: Vec<PendingResponse>,
+}
+
+impl PendingResponses {
+    pub fn register(&mut self, pending: PendingResponse) {
+        self.entries
+            .retain(|entry| entry.request_id != pending.request_id);
+        self.entries.push(pending);
+    }
+
+    pub fn poll_ready(&mut self, ctx: &AppContext) -> Vec<ResolvedPending> {
+        let mut ready = Vec::new();
+        let mut waiting = Vec::with_capacity(self.entries.len());
+
+        for mut pending in self.entries.drain(..) {
+            if let Some(response) = (pending.poll)(ctx) {
+                ready.push(ResolvedPending {
+                    response,
+                    session_id: pending.session_id,
+                    attach_command: pending.attach_command,
+                });
+            } else {
+                waiting.push(pending);
+            }
+        }
+
+        self.entries = waiting;
+        ready
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn drain_on_shutdown(&mut self) {
+        self.entries.clear();
+    }
+}
+
 pub fn attach_bg_completions(
     response: &mut Response,
     ctx: &AppContext,

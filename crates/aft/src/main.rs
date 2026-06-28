@@ -5,6 +5,7 @@ use aft::context::{App, AppContext, SemanticIndexStatus};
 use aft::log_ctx;
 use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
+use aft::response_finalize::PendingResponses;
 use aft::runtime_registry::RuntimeRegistry;
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -153,6 +154,7 @@ fn main() {
     // push frames emitted. Without the wake, the sidebar can stay stuck
     // on "loading" indefinitely until the next request happens to arrive.
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+    let mut pending = PendingResponses::default();
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
     thread::spawn(move || {
         let stdin = io::stdin();
@@ -175,7 +177,10 @@ fn main() {
                 // Periodic drain so push frames flow even without requests.
                 // Cheap on the idle path: each drain just checks try_recv
                 // on a channel and bails if empty.
-                drain_runtime_events(&registry);
+                if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
+                    aft::slog_error!("stdout write error: {}", e);
+                    break;
+                }
                 if shutdown_requested.load(Ordering::SeqCst) {
                     break;
                 }
@@ -203,7 +208,10 @@ fn main() {
                 // Drain search index FIRST so watcher events apply to the latest index.
                 // If reversed, watcher updates applied to the old index would be lost
                 // when the background-built index replaces it.
-                drain_runtime_events(&registry);
+                if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
+                    aft::slog_error!("stdout write error: {}", e);
+                    break;
+                }
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
@@ -226,15 +234,10 @@ fn main() {
                 }));
                 match dispatch_result {
                     Ok(mut response) => {
-                        aft::response_finalize::attach_bg_completions(
+                        aft::response_finalize::finalize_response(
                             &mut response,
                             runtime,
                             &session_id,
-                            &attach_command,
-                        );
-                        aft::response_finalize::attach_status_bar(
-                            &mut response,
-                            runtime,
                             &attach_command,
                         );
                         response
@@ -265,6 +268,7 @@ fn main() {
         }
     }
 
+    pending.drain_on_shutdown();
     for runtime in registry.iter() {
         runtime.lsp().shutdown_all();
         runtime.bash_background().detach();
@@ -283,6 +287,58 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
     }
+}
+
+fn drain_runtime_events_and_write_pending(
+    registry: &RuntimeRegistry,
+    pending: &mut PendingResponses,
+) -> io::Result<usize> {
+    drain_runtime_events(registry);
+    write_ready_pending(registry.current(), pending)
+}
+
+fn write_ready_pending(ctx: &AppContext, pending: &mut PendingResponses) -> io::Result<usize> {
+    finalize_ready_pending(ctx, pending, |response| write_response(ctx, response))
+}
+
+#[cfg(test)]
+fn drain_runtime_events_and_write_pending_to_writer(
+    registry: &RuntimeRegistry,
+    pending: &mut PendingResponses,
+    writer: &mut impl Write,
+) -> io::Result<usize> {
+    drain_runtime_events(registry);
+    write_ready_pending_to_writer(registry.current(), pending, writer)
+}
+
+#[cfg(test)]
+fn write_ready_pending_to_writer(
+    ctx: &AppContext,
+    pending: &mut PendingResponses,
+    writer: &mut impl Write,
+) -> io::Result<usize> {
+    finalize_ready_pending(ctx, pending, |response| {
+        write_response_to_writer(writer, response)
+    })
+}
+
+fn finalize_ready_pending(
+    ctx: &AppContext,
+    pending: &mut PendingResponses,
+    mut write: impl FnMut(&Response) -> io::Result<()>,
+) -> io::Result<usize> {
+    let ready = pending.poll_ready(ctx);
+    let count = ready.len();
+    for mut resolved in ready {
+        aft::response_finalize::finalize_response(
+            &mut resolved.response,
+            ctx,
+            &resolved.session_id,
+            &resolved.attach_command,
+        );
+        write(&resolved.response)?;
+    }
+    Ok(count)
 }
 
 fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
@@ -675,6 +731,10 @@ fn write_response(ctx: &AppContext, response: &Response) -> io::Result<()> {
     let mut writer = stdout_writer
         .lock()
         .map_err(|_| io::Error::other("stdout writer lock poisoned"))?;
+    write_response_to_writer(&mut *writer, response)
+}
+
+fn write_response_to_writer(writer: &mut impl Write, response: &Response) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, response)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
@@ -686,6 +746,363 @@ fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod pending_response_tests {
+    use super::{drain_runtime_events_and_write_pending_to_writer, write_ready_pending_to_writer};
+    use aft::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use aft::bash_background::BgTaskStatus;
+    use aft::config::Config;
+    use aft::context::{App, AppContext};
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::{ConfigureWarningsFrame, Response};
+    use aft::response_finalize::{
+        attach_bg_completions, attach_status_bar, finalize_response, PendingResponse,
+        PendingResponses,
+    };
+    use aft::runtime_registry::RuntimeRegistry;
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct FinalizeFixture {
+        _root: TempDir,
+        _storage: TempDir,
+        ctx: AppContext,
+    }
+
+    fn make_ctx_with_root(root: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            },
+        )
+    }
+
+    fn make_runtime_registry(root: &Path) -> RuntimeRegistry {
+        let app = App::default_shared();
+        let ctx = AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            },
+        );
+        RuntimeRegistry::standalone(app, ctx)
+    }
+
+    fn install_pending_completion(
+        ctx: &AppContext,
+        storage: &Path,
+        root: &Path,
+        session_id: &str,
+        task_id: &str,
+    ) {
+        let paths = task_paths(storage, session_id, task_id);
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            session_id.to_string(),
+            "echo done".to_string(),
+            root.to_path_buf(),
+            Some(root.to_path_buf()),
+            None,
+            true,
+            true,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task(&paths.json, &metadata).unwrap();
+        std::fs::write(&paths.stdout, "done\n").unwrap();
+        ctx.bash_background()
+            .replay_session_for_project(storage, session_id, root)
+            .unwrap();
+    }
+
+    fn fixture_with_completion_and_status(session_id: &str, task_id: &str) -> FinalizeFixture {
+        let root = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        install_pending_completion(&ctx, storage.path(), root.path(), session_id, task_id);
+        ctx.update_status_bar_tier2(Some(3), Some(4), Some(5), Some(6), false);
+        FinalizeFixture {
+            _root: root,
+            _storage: storage,
+            ctx,
+        }
+    }
+
+    fn line_values(writer: &[u8]) -> Vec<serde_json::Value> {
+        let output = std::str::from_utf8(writer).unwrap();
+        output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn finalize_response_matches_inline_finalizers() {
+        let session_id = "session-finalize";
+        let inline_fixture = fixture_with_completion_and_status(session_id, "task-finalize");
+        let mut inline = Response::success("req-finalize", serde_json::json!({"value": true}));
+        attach_bg_completions(&mut inline, &inline_fixture.ctx, session_id, "read");
+        attach_status_bar(&mut inline, &inline_fixture.ctx, "read");
+
+        let helper_fixture = fixture_with_completion_and_status(session_id, "task-finalize");
+        let mut helper = Response::success("req-finalize", serde_json::json!({"value": true}));
+        finalize_response(&mut helper, &helper_fixture.ctx, session_id, "read");
+
+        assert_eq!(
+            serde_json::to_value(&helper).unwrap(),
+            serde_json::to_value(&inline).unwrap()
+        );
+        assert_eq!(helper.data["bg_completions"][0]["task_id"], "task-finalize");
+        assert_eq!(helper.data["status_bar"]["dead_code"], 3);
+    }
+
+    #[test]
+    fn pending_registry_writes_once_after_resolution_and_finalizes() {
+        let session_id = "session-registry";
+        let fixture = fixture_with_completion_and_status(session_id, "task-registry");
+        let mut pending = PendingResponses::default();
+        let poll_calls = Rc::new(Cell::new(0usize));
+        let calls_for_poll = Rc::clone(&poll_calls);
+        pending.register(PendingResponse {
+            request_id: "pending-registry".to_string(),
+            session_id: session_id.to_string(),
+            attach_command: "read".to_string(),
+            poll: Box::new(move |_| {
+                let next = calls_for_poll.get() + 1;
+                calls_for_poll.set(next);
+                if next <= 2 {
+                    None
+                } else {
+                    Some(Response::success(
+                        "pending-registry",
+                        serde_json::json!({"ready": true}),
+                    ))
+                }
+            }),
+        });
+
+        let mut writer = Vec::new();
+        for expected_calls in 1..=2 {
+            assert_eq!(
+                write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
+                0
+            );
+            assert!(writer.is_empty());
+            assert_eq!(poll_calls.get(), expected_calls);
+        }
+
+        assert_eq!(
+            write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        assert!(pending.is_empty());
+        assert_eq!(poll_calls.get(), 3);
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "pending-registry");
+        assert_eq!(values[0]["bg_completions"][0]["task_id"], "task-registry");
+        assert_eq!(values[0]["status_bar"]["dead_code"], 3);
+
+        assert_eq!(
+            write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
+            0
+        );
+        assert_eq!(line_values(&writer).len(), 1);
+        assert_eq!(poll_calls.get(), 3);
+    }
+
+    #[test]
+    fn tick_drains_runtime_events_and_polls_pending() {
+        let root = TempDir::new().unwrap();
+        let registry = make_runtime_registry(root.path());
+        let drain_frames = Arc::new(AtomicUsize::new(0));
+        let frames_for_sender = Arc::clone(&drain_frames);
+        registry
+            .current()
+            .set_progress_sender(Some(Arc::new(Box::new(move |_| {
+                frames_for_sender.fetch_add(1, Ordering::SeqCst);
+            }))));
+        let generation = registry.current().advance_configure_generation();
+        registry
+            .current()
+            .configure_warnings_sender()
+            .send((
+                generation,
+                ConfigureWarningsFrame {
+                    frame_type: "configure_warnings",
+                    session_id: Some("session-drain".to_string()),
+                    project_root: root.path().display().to_string(),
+                    source_file_count: 0,
+                    warnings: Vec::new(),
+                },
+            ))
+            .unwrap();
+
+        let mut pending = PendingResponses::default();
+        let poll_calls = Rc::new(Cell::new(0usize));
+        let calls_for_poll = Rc::clone(&poll_calls);
+        pending.register(PendingResponse {
+            request_id: "pending-drain".to_string(),
+            session_id: "session-drain".to_string(),
+            attach_command: "read".to_string(),
+            poll: Box::new(move |_| {
+                calls_for_poll.set(calls_for_poll.get() + 1);
+                None
+            }),
+        });
+        let mut writer = Vec::new();
+
+        assert_eq!(
+            drain_runtime_events_and_write_pending_to_writer(&registry, &mut pending, &mut writer)
+                .unwrap(),
+            0
+        );
+        assert_eq!(drain_frames.load(Ordering::SeqCst), 1);
+        assert_eq!(poll_calls.get(), 1);
+        assert!(writer.is_empty());
+        assert!(!pending.is_empty());
+    }
+
+    #[test]
+    fn long_pending_response_is_polled_each_tick_without_writing_until_ready() {
+        let root = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        let mut pending = PendingResponses::default();
+        let poll_calls = Rc::new(Cell::new(0usize));
+        let calls_for_poll = Rc::clone(&poll_calls);
+        pending.register(PendingResponse {
+            request_id: "pending-long".to_string(),
+            session_id: "session-long".to_string(),
+            attach_command: "read".to_string(),
+            poll: Box::new(move |_| {
+                let next = calls_for_poll.get() + 1;
+                calls_for_poll.set(next);
+                if next <= 50 {
+                    None
+                } else {
+                    Some(Response::success(
+                        "pending-long",
+                        serde_json::json!({"ready_after_ticks": next}),
+                    ))
+                }
+            }),
+        });
+        let mut writer = Vec::new();
+
+        for expected_calls in 1..=50 {
+            assert_eq!(
+                write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+                0
+            );
+            assert!(writer.is_empty());
+            assert_eq!(poll_calls.get(), expected_calls);
+        }
+
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "pending-long");
+        assert_eq!(values[0]["ready_after_ticks"], 51);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn multiple_pending_responses_resolve_independently() {
+        let root = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        let second_ready = Rc::new(Cell::new(false));
+        let second_ready_for_poll = Rc::clone(&second_ready);
+        let mut pending = PendingResponses::default();
+        pending.register(PendingResponse {
+            request_id: "pending-ready".to_string(),
+            session_id: "session-multi".to_string(),
+            attach_command: "read".to_string(),
+            poll: Box::new(|_| {
+                Some(Response::success(
+                    "pending-ready",
+                    serde_json::json!({"which": "ready"}),
+                ))
+            }),
+        });
+        pending.register(PendingResponse {
+            request_id: "pending-later".to_string(),
+            session_id: "session-multi".to_string(),
+            attach_command: "read".to_string(),
+            poll: Box::new(move |_| {
+                if second_ready_for_poll.get() {
+                    Some(Response::success(
+                        "pending-later",
+                        serde_json::json!({"which": "later"}),
+                    ))
+                } else {
+                    None
+                }
+            }),
+        });
+        let mut writer = Vec::new();
+
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "pending-ready");
+        assert!(!pending.is_empty());
+
+        second_ready.set(true);
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[1]["id"], "pending-later");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn shutdown_drops_pending_without_polling_or_writing() {
+        let root = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        let poll_calls = Rc::new(Cell::new(0usize));
+        let calls_for_poll = Rc::clone(&poll_calls);
+        let mut pending = PendingResponses::default();
+        pending.register(PendingResponse {
+            request_id: "pending-shutdown".to_string(),
+            session_id: "session-shutdown".to_string(),
+            attach_command: "read".to_string(),
+            poll: Box::new(move |_| {
+                calls_for_poll.set(calls_for_poll.get() + 1);
+                Some(Response::success(
+                    "pending-shutdown",
+                    serde_json::json!({"should_not_write": true}),
+                ))
+            }),
+        });
+        let mut writer = Vec::new();
+
+        pending.drain_on_shutdown();
+        assert!(pending.is_empty());
+        assert_eq!(poll_calls.get(), 0);
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            0
+        );
+        assert!(writer.is_empty());
+        assert_eq!(poll_calls.get(), 0);
+    }
 }
 
 #[cfg(test)]

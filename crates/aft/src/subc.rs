@@ -1955,15 +1955,10 @@ async fn handle_tool_call(
             log_ctx::with_session(Some(session_for_log.clone()), || {
                 let dispatch_with_finalize = |raw_req: RawRequest, app_ctx: &AppContext| {
                     let mut response = dispatch(raw_req, app_ctx);
-                    crate::response_finalize::attach_bg_completions(
+                    crate::response_finalize::finalize_response(
                         &mut response,
                         app_ctx,
                         &session_for_finalize,
-                        &bare_name_for_finalize,
-                    );
-                    crate::response_finalize::attach_status_bar(
-                        &mut response,
-                        app_ctx,
                         &bare_name_for_finalize,
                     );
                     response
