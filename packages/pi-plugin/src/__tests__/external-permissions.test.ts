@@ -225,7 +225,7 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
     );
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].command).toBe("organize_imports");
+    expect(calls[0]).toMatchObject({ command: "tool_call", params: { name: "aft_import" } });
   });
 
   test("restrict=true allows IN-ROOT paths untouched", async () => {
@@ -239,7 +239,9 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
       makeExtContext("/repo"),
     );
 
-    expect(calls.some((call) => call.command === "organize_imports")).toBe(true);
+    expect(
+      calls.some((call) => call.command === "tool_call" && call.params.name === "aft_import"),
+    ).toBe(true);
   });
 
   test("restrict=true blocks tilde paths that resolve outside the project", async () => {
@@ -257,6 +259,8 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
     ).rejects.toThrow(BLOCK_MESSAGE);
     // Sanity: the resolved home path really is outside /repo.
     expect(resolve(homedir(), "aft-pi-tilde/imports.ts").startsWith("/repo")).toBe(false);
-    expect(calls.some((call) => call.command === "organize_imports")).toBe(false);
+    expect(
+      calls.some((call) => call.command === "tool_call" && call.params.name === "aft_import"),
+    ).toBe(false);
   });
 });

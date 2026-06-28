@@ -13,7 +13,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
@@ -300,18 +300,21 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         await assertAstPathsPermission(extCtx, paths, ctx.config.restrict_to_project_root ?? false);
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const req: Record<string, unknown> = {
+        const rawArgs: Record<string, unknown> = {
           pattern: params.pattern,
           lang: params.lang,
         };
         // Use isEmptyParam so empty arrays sent by GPT-family models don't
         // get forwarded to Rust as "scope present" — let Rust default to whole
         // project_root instead of round-tripping a useless empty scope.
-        if (!isEmptyParam(paths)) req.paths = paths;
-        if (!isEmptyParam(params.globs)) req.globs = params.globs;
-        if (params.contextLines !== undefined) req.context = params.contextLines;
-        const response = await callBridge(bridge, "ast_search", req, extCtx);
-        return textResult((response.text as string | undefined) ?? JSON.stringify(response));
+        if (!isEmptyParam(paths)) rawArgs.paths = paths;
+        if (!isEmptyParam(params.globs)) rawArgs.globs = params.globs;
+        if (params.contextLines !== undefined) rawArgs.contextLines = params.contextLines;
+        const response = await callToolCall(bridge, "ast_search", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "ast_search failed");
+        }
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderAstCall("ast_grep_search", args, theme, context);
@@ -340,18 +343,21 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         await assertAstPathsPermission(extCtx, paths, ctx.config.restrict_to_project_root ?? false);
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const req: Record<string, unknown> = {
+        const rawArgs: Record<string, unknown> = {
           pattern: params.pattern,
           rewrite: params.rewrite,
           lang: params.lang,
         };
         // Use isEmptyParam — see ast_search above for rationale.
-        if (!isEmptyParam(paths)) req.paths = paths;
-        if (!isEmptyParam(params.globs)) req.globs = params.globs;
+        if (!isEmptyParam(paths)) rawArgs.paths = paths;
+        if (!isEmptyParam(params.globs)) rawArgs.globs = params.globs;
         // Coerce at the boundary: dryRun "true" must stay preview-only (coerceBoolean).
-        req.dry_run = coerceBoolean(params.dryRun);
-        const response = await callBridge(bridge, "ast_replace", req, extCtx);
-        return textResult((response.text as string | undefined) ?? JSON.stringify(response));
+        rawArgs.dryRun = coerceBoolean(params.dryRun);
+        const response = await callToolCall(bridge, "ast_replace", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "ast_replace failed");
+        }
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderAstCall("ast_grep_replace", args, theme, context);

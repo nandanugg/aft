@@ -1,5 +1,5 @@
 /**
- * Unit tests for aft_conflicts bridge dispatch.
+ * Unit tests for aft_conflicts tool_call dispatch.
  */
 
 /// <reference path="../bun-test.d.ts" />
@@ -9,7 +9,7 @@ import { registerConflictsTool } from "../tools/conflicts.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
 describe("aft_conflicts adapter", () => {
-  test("calls git_conflicts with an empty request and returns bridge text", async () => {
+  test("calls tool_call conflicts with an empty request and returns server text", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "No conflicts" }));
     registerConflictsTool(api, makePluginContext(bridge));
@@ -18,23 +18,14 @@ describe("aft_conflicts adapter", () => {
       content: Array<{ text: string }>;
     };
 
-    expect(calls[0]).toMatchObject({ command: "git_conflicts", params: {} });
+    expect(calls[0]).toMatchObject({
+      command: "tool_call",
+      params: { name: "conflicts", arguments: {} },
+    });
     expect(result.content[0].text).toBe("No conflicts");
   });
 
-  test("falls back to JSON text when bridge omits formatted text", async () => {
-    const { api, tools } = makeMockApi();
-    const { bridge } = makeMockBridge(() => ({ success: true, conflicts: [] }));
-    registerConflictsTool(api, makePluginContext(bridge));
-
-    const result = (await executeTool(tools.get("aft_conflicts")!, {})) as {
-      content: Array<{ text: string }>;
-    };
-
-    expect(result.content[0].text).toContain('"conflicts": []');
-  });
-
-  test("forwards path to git_conflicts when provided", async () => {
+  test("forwards path to tool_call conflicts when provided", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
     registerConflictsTool(api, makePluginContext(bridge));
@@ -42,8 +33,8 @@ describe("aft_conflicts adapter", () => {
     await executeTool(tools.get("aft_conflicts")!, { path: "/tmp/other-worktree" });
 
     expect(calls[0]).toMatchObject({
-      command: "git_conflicts",
-      params: { path: "/tmp/other-worktree" },
+      command: "tool_call",
+      params: { name: "conflicts", arguments: { path: "/tmp/other-worktree" } },
     });
   });
 
@@ -54,6 +45,9 @@ describe("aft_conflicts adapter", () => {
 
     await executeTool(tools.get("aft_conflicts")!, { path: "   " });
 
-    expect(calls[0]).toMatchObject({ command: "git_conflicts", params: {} });
+    expect(calls[0]).toMatchObject({
+      command: "tool_call",
+      params: { name: "conflicts", arguments: {} },
+    });
   });
 });

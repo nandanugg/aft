@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cleanupPiIsolatedEnv,
@@ -45,6 +47,53 @@ function resultText(event: Record<string, unknown>): string {
     }
   }
   return JSON.stringify(result ?? "");
+}
+
+async function setupMergeConflict(env: PiIsolatedEnv): Promise<void> {
+  const runGit = (args: string[]) =>
+    execFileSync("git", args, { cwd: env.workdir, stdio: "ignore" });
+  runGit(["init"]);
+  runGit(["config", "user.email", "pi@example.test"]);
+  runGit(["config", "user.name", "Pi Test"]);
+  await writeFile(join(env.workdir, "conflict.txt"), "base\n", "utf8");
+  runGit(["add", "conflict.txt"]);
+  runGit(["commit", "-m", "base"]);
+  runGit(["checkout", "-b", "feature"]);
+  await writeFile(join(env.workdir, "conflict.txt"), "feature\n", "utf8");
+  runGit(["commit", "-am", "feature"]);
+  runGit(["checkout", "master"]);
+  await writeFile(join(env.workdir, "conflict.txt"), "main\n", "utf8");
+  runGit(["commit", "-am", "main"]);
+  try {
+    runGit(["merge", "feature"]);
+  } catch {
+    // The merge is expected to stop with conflict markers for aft_conflicts.
+  }
+}
+
+async function waitForToolEnds(
+  client: RpcClient,
+  count: number,
+): Promise<Record<string, unknown>[]> {
+  const seen = new Set<string>();
+  const events: Record<string, unknown>[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const event = await client.waitForEvent((candidate) => {
+      if (candidate.type !== "tool_execution_end") return false;
+      const id = typeof candidate.toolCallId === "string" ? candidate.toolCallId : undefined;
+      return id === undefined || !seen.has(id);
+    }, 60_000);
+    if (typeof event.toolCallId === "string") seen.add(event.toolCallId);
+    events.push(event);
+  }
+  return events;
+}
+
+function eventsForTool(
+  events: Record<string, unknown>[],
+  toolName: string,
+): Record<string, unknown>[] {
+  return events.filter((event) => event.toolName === toolName);
 }
 
 async function withPiTool(
@@ -236,6 +285,198 @@ describe("AFT Pi tools (real Pi RPC)", () => {
     const text = resultText(toolEnd);
     expect(text).toContain("TODO");
     expect(text).not.toContain('"summary"');
+  }, 120_000);
+
+  test("remaining Pi tools use tool_call text and keep disk mutations", async () => {
+    const env = createPiIsolatedEnv();
+    const aimock = await startAimock();
+    let client: RpcClient | undefined;
+    try {
+      await enableAllToolSurface(env);
+      await setupMergeConflict(env);
+      await writeFile(
+        join(env.workdir, "ast-search.ts"),
+        "export function searched() {\n  console.log('search');\n}\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "ast-dry.ts"),
+        "export function dryRun() {\n  console.log('dry');\n}\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "ast-apply.ts"),
+        "export function applyRun() {\n  console.log('apply');\n}\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "import-add.ts"),
+        "export const value = join('a', 'b');\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "import-organize.ts"),
+        "import { b } from './b';\nimport { a } from './a';\nexport const value = a + b;\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "extract.ts"),
+        "export function calc(a: number, b: number): number {\n  const sum = a + b;\n  return sum * 2;\n}\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "move-symbol.ts"),
+        "export function movedValue(): string {\n  return 'moved';\n}\nexport function caller(): string {\n  return movedValue();\n}\n",
+        "utf8",
+      );
+      await writeFile(
+        join(env.workdir, "inline.ts"),
+        "function addOne(value: number): number {\n  return value + 1;\n}\nexport function run(): number {\n  return addOne(2);\n}\n",
+        "utf8",
+      );
+      await writeFile(join(env.workdir, "delete-me.txt"), "delete\n", "utf8");
+      await writeFile(join(env.workdir, "move-me.txt"), "move\n", "utf8");
+
+      const toolCalls = [
+        { name: "aft_conflicts", arguments: { path: "." } },
+        {
+          name: "ast_grep_search",
+          arguments: {
+            pattern: "console.log($MSG)",
+            lang: "typescript",
+            paths: ["ast-search.ts"],
+            contextLines: 1,
+          },
+        },
+        {
+          name: "ast_grep_replace",
+          arguments: {
+            pattern: "console.log($MSG)",
+            rewrite: "logger.info($MSG)",
+            lang: "typescript",
+            paths: ["ast-dry.ts"],
+            dryRun: true,
+          },
+        },
+        {
+          name: "ast_grep_replace",
+          arguments: {
+            pattern: "console.log($MSG)",
+            rewrite: "logger.info($MSG)",
+            lang: "typescript",
+            paths: ["ast-apply.ts"],
+            dryRun: false,
+          },
+        },
+        {
+          name: "aft_import",
+          arguments: {
+            op: "add",
+            filePath: "import-add.ts",
+            module: "node:path",
+            names: ["join"],
+            validate: "syntax",
+          },
+        },
+        {
+          name: "aft_import",
+          arguments: { op: "organize", filePath: "import-organize.ts", validate: "syntax" },
+        },
+        {
+          name: "aft_refactor",
+          arguments: {
+            op: "extract",
+            filePath: "extract.ts",
+            name: "doubleSum",
+            startLine: 2,
+            endLine: 3,
+          },
+        },
+        {
+          name: "aft_refactor",
+          arguments: {
+            op: "move",
+            filePath: "move-symbol.ts",
+            symbol: "movedValue",
+            destination: "moved-symbol-target.ts",
+          },
+        },
+        {
+          name: "aft_refactor",
+          arguments: { op: "inline", filePath: "inline.ts", symbol: "addOne", callSiteLine: 5 },
+        },
+        { name: "aft_delete", arguments: { files: ["delete-me.txt"] } },
+        {
+          name: "aft_move",
+          arguments: { filePath: "move-me.txt", destination: "moved/move-me.txt" },
+        },
+      ];
+      aimock.registerToolCallFixture({ predicate: () => true, toolCalls, followupText: "Done." });
+      const spawned = spawnPiRpc({
+        mockProviderURL: aimock.url,
+        aftPluginDir: resolvePiPluginDir(),
+        configDir: env.configDir,
+        workdir: env.workdir,
+      });
+      client = spawned.client;
+      expect(
+        (await client.sendCommand({ type: "prompt", message: "Run remaining AFT tools." })).success,
+      ).toBe(true);
+      const events = await waitForToolEnds(client, toolCalls.length);
+
+      for (const event of events) expect(event.isError).toBe(false);
+      const conflictText = resultText(eventsForTool(events, "aft_conflicts")[0]);
+      expect(conflictText).toContain("1 file, 1 conflict");
+      expect(conflictText).toContain("conflict.txt");
+
+      const astSearchText = resultText(eventsForTool(events, "ast_grep_search")[0]);
+      expect(astSearchText).toContain("Found 1 match(es) in 1 file(s)");
+      expect(astSearchText).toContain("ast-search.ts");
+      expect(astSearchText).not.toContain('"matches"');
+
+      const astReplaceTexts = eventsForTool(events, "ast_grep_replace").map(resultText);
+      expect(
+        astReplaceTexts.some((text) => text.includes("[DRY RUN] Would replace 1 match(es)")),
+      ).toBe(true);
+      expect(astReplaceTexts.some((text) => text.includes("Replaced 1 match(es)"))).toBe(true);
+      expect(await readFile(join(env.workdir, "ast-dry.ts"), "utf8")).toContain(
+        "console.log('dry')",
+      );
+      expect(await readFile(join(env.workdir, "ast-apply.ts"), "utf8")).toContain(
+        "logger.info('apply')",
+      );
+
+      const importTexts = eventsForTool(events, "aft_import").map(resultText);
+      expect(importTexts.some((text) => text.includes("added node:path"))).toBe(true);
+      expect(importTexts.some((text) => text.includes("organized"))).toBe(true);
+      expect(await readFile(join(env.workdir, "import-add.ts"), "utf8")).toContain("node:path");
+      expect(await readFile(join(env.workdir, "import-organize.ts"), "utf8")).toContain(
+        "import { a } from './a';",
+      );
+
+      const refactorTexts = eventsForTool(events, "aft_refactor").map(resultText);
+      expect(refactorTexts.some((text) => text.includes("extracted doubleSum"))).toBe(true);
+      expect(refactorTexts.some((text) => text.includes("moved symbol movedValue"))).toBe(true);
+      expect(refactorTexts.some((text) => text.includes("inlined addOne"))).toBe(true);
+      expect(await readFile(join(env.workdir, "extract.ts"), "utf8")).toContain(
+        "function doubleSum",
+      );
+      expect(existsSync(join(env.workdir, "moved-symbol-target.ts"))).toBe(true);
+      expect(await readFile(join(env.workdir, "inline.ts"), "utf8")).not.toContain("addOne(2)");
+
+      const deleteText = resultText(eventsForTool(events, "aft_delete")[0]);
+      expect(deleteText).toContain("Deleted");
+      expect(existsSync(join(env.workdir, "delete-me.txt"))).toBe(false);
+
+      const moveText = resultText(eventsForTool(events, "aft_move")[0]);
+      expect(moveText).toContain("Moved move-me.txt → moved/move-me.txt");
+      expect(existsSync(join(env.workdir, "move-me.txt"))).toBe(false);
+      expect(existsSync(join(env.workdir, "moved", "move-me.txt"))).toBe(true);
+    } finally {
+      await client?.close();
+      await aimock.close();
+      await cleanupPiIsolatedEnv(env);
+    }
   }, 120_000);
 
   test("aft_callgraph callers returns text and soft symbol_not_found stays non-error", async () => {

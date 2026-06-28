@@ -7,7 +7,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
@@ -173,25 +173,23 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
         restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
       });
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const commandMap: Record<string, string> = {
-        add: "add_import",
-        remove: "remove_import",
-        organize: "organize_imports",
-      };
-      const req: Record<string, unknown> = { file: filePath };
-      if (params.module !== undefined) req.module = params.module;
-      if (params.names !== undefined) req.names = params.names;
-      if (params.defaultImport !== undefined) req.default_import = params.defaultImport;
-      if (params.namespace !== undefined) req.namespace = params.namespace;
-      if (params.alias !== undefined) req.alias = params.alias;
-      if (params.modifiers !== undefined) req.modifiers = params.modifiers;
-      if (params.importKind !== undefined) req.import_kind = params.importKind;
-      if (params.removeName !== undefined) req.name = params.removeName;
-      if (params.typeOnly !== undefined) req.type_only = params.typeOnly;
-      if (params.validate !== undefined) req.validate = params.validate;
+      const rawArgs: Record<string, unknown> = { op: params.op, filePath };
+      if (params.module !== undefined) rawArgs.module = params.module;
+      if (params.names !== undefined) rawArgs.names = params.names;
+      if (params.defaultImport !== undefined) rawArgs.defaultImport = params.defaultImport;
+      if (params.namespace !== undefined) rawArgs.namespace = params.namespace;
+      if (params.alias !== undefined) rawArgs.alias = params.alias;
+      if (params.modifiers !== undefined) rawArgs.modifiers = params.modifiers;
+      if (params.importKind !== undefined) rawArgs.importKind = params.importKind;
+      if (params.removeName !== undefined) rawArgs.removeName = params.removeName;
+      if (params.typeOnly !== undefined) rawArgs.typeOnly = params.typeOnly;
+      if (params.validate !== undefined) rawArgs.validate = params.validate;
 
-      const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
-      return textResult(JSON.stringify(response, null, 2));
+      const response = await callToolCall(bridge, "aft_import", rawArgs, extCtx);
+      if (response.success === false) {
+        throw new Error(response.text || response.message || `${params.op} failed`);
+      }
+      return textResult(response.text, response);
     },
     renderCall(args, theme, context) {
       return renderImportCall(args, theme, context);

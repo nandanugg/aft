@@ -1,5 +1,5 @@
 /**
- * Unit tests for aft_refactor argument shaping.
+ * Unit tests for aft_refactor tool_call argument shaping.
  */
 
 /// <reference path="../bun-test.d.ts" />
@@ -9,9 +9,9 @@ import { registerRefactorTool } from "../tools/refactor.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
 describe("aft_refactor adapter", () => {
-  test("extract converts inclusive Pi endLine to Rust-exclusive end_line", async () => {
+  test("extract forwards inclusive Pi endLine for server translation", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
     registerRefactorTool(api, makePluginContext(bridge));
 
     await executeTool(tools.get("aft_refactor")!, {
@@ -22,18 +22,22 @@ describe("aft_refactor adapter", () => {
       endLine: 12,
     });
 
-    expect(calls[0].command).toBe("extract_function");
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      file: "src/app.ts",
-      name: "computeTotal",
-      start_line: 10,
-      end_line: 13,
+      name: "aft_refactor",
+      arguments: {
+        op: "extract",
+        filePath: "src/app.ts",
+        name: "computeTotal",
+        startLine: 10,
+        endLine: 12,
+      },
     });
   });
 
-  test("inline keeps callSiteLine and non-extract endLine unchanged", async () => {
+  test("inline forwards callSiteLine and non-extract endLine unchanged", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
     registerRefactorTool(api, makePluginContext(bridge));
 
     await executeTool(tools.get("aft_refactor")!, {
@@ -44,18 +48,22 @@ describe("aft_refactor adapter", () => {
       endLine: 50,
     });
 
-    expect(calls[0].command).toBe("inline_symbol");
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      file: "src/app.ts",
-      symbol: "helper",
-      call_site_line: 44,
-      end_line: 50,
+      name: "aft_refactor",
+      arguments: {
+        op: "inline",
+        filePath: "src/app.ts",
+        symbol: "helper",
+        callSiteLine: 44,
+        endLine: 50,
+      },
     });
   });
 
   test("move forwards symbol destination and disambiguating scope", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
     registerRefactorTool(api, makePluginContext(bridge));
 
     await executeTool(tools.get("aft_refactor")!, {
@@ -66,12 +74,16 @@ describe("aft_refactor adapter", () => {
       scope: "exports",
     });
 
-    expect(calls[0].command).toBe("move_symbol");
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      file: "src/app.ts",
-      symbol: "Service",
-      destination: "src/service.ts",
-      scope: "exports",
+      name: "aft_refactor",
+      arguments: {
+        op: "move",
+        filePath: "src/app.ts",
+        symbol: "Service",
+        destination: "src/service.ts",
+        scope: "exports",
+      },
     });
   });
 

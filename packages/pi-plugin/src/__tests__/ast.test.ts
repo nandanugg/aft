@@ -1,5 +1,5 @@
 /**
- * Unit tests for AST tool argument shaping.
+ * Unit tests for AST tool_call argument shaping.
  */
 
 /// <reference path="../bun-test.d.ts" />
@@ -9,7 +9,7 @@ import { registerAstTools } from "../tools/ast.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
 describe("AST tool adapters", () => {
-  test("ast_grep_search maps contextLines to the `context` key Rust reads, and preserves globs", async () => {
+  test("ast_grep_search forwards agent-facing contextLines and preserves globs", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "Found 0 matches" }));
     registerAstTools(api, makePluginContext(bridge), { astSearch: true, astReplace: true });
@@ -22,15 +22,16 @@ describe("AST tool adapters", () => {
       contextLines: 3,
     });
 
-    expect(calls[0].command).toBe("ast_search");
-    // Rust ast_search reads `context`, not `context_lines`; sending the wrong
-    // key silently dropped the requested context.
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toEqual({
-      pattern: "console.log($MSG)",
-      lang: "typescript",
-      paths: ["src"],
-      globs: ["**/*.ts", "!dist/**"],
-      context: 3,
+      name: "ast_search",
+      arguments: {
+        pattern: "console.log($MSG)",
+        lang: "typescript",
+        paths: ["src"],
+        globs: ["**/*.ts", "!dist/**"],
+        contextLines: 3,
+      },
     });
   });
 
@@ -45,18 +46,21 @@ describe("AST tool adapters", () => {
       lang: "typescript",
     });
 
-    expect(calls[0].command).toBe("ast_replace");
+    expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params).toMatchObject({
-      pattern: "console.log($MSG)",
-      rewrite: "logger.info($MSG)",
-      lang: "typescript",
-      dry_run: false,
+      name: "ast_replace",
+      arguments: {
+        pattern: "console.log($MSG)",
+        rewrite: "logger.info($MSG)",
+        lang: "typescript",
+        dryRun: false,
+      },
     });
   });
 
   test("ast_grep_replace preserves explicit dryRun previews", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true }));
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "preview" }));
     registerAstTools(api, makePluginContext(bridge), { astSearch: false, astReplace: true });
 
     await executeTool(tools.get("ast_grep_replace")!, {
@@ -69,9 +73,12 @@ describe("AST tool adapters", () => {
     });
 
     expect(calls[0].params).toMatchObject({
-      paths: ["lib"],
-      globs: ["**/*.js"],
-      dry_run: true,
+      name: "ast_replace",
+      arguments: {
+        paths: ["lib"],
+        globs: ["**/*.js"],
+        dryRun: true,
+      },
     });
   });
 
@@ -87,7 +94,7 @@ describe("AST tool adapters", () => {
       dryRun: "true" as unknown as boolean,
     });
 
-    expect(calls[0].command).toBe("ast_replace");
-    expect(calls[0].params.dry_run).toBe(true);
+    expect(calls[0].command).toBe("tool_call");
+    expect((calls[0].params.arguments as Record<string, unknown>).dryRun).toBe(true);
   });
 });

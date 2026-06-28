@@ -1,5 +1,5 @@
 /**
- * Unit tests for aft_delete/aft_move argument shaping.
+ * Unit tests for aft_delete/aft_move tool_call argument shaping.
  */
 
 /// <reference path="../bun-test.d.ts" />
@@ -19,6 +19,7 @@ describe("fs tool adapters", () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({
       success: true,
+      text: "Deleted 1/2 file(s)",
       complete: false,
       deleted: [{ file: "ok.ts", backup_id: "b-1" }],
       skipped_files: [{ file: "locked.ts", reason: "permission denied" }],
@@ -33,14 +34,17 @@ describe("fs tool adapters", () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].params).toEqual({
-      files: ["ok.ts", "locked.ts"],
-      recursive: false,
+      name: "aft_delete",
+      arguments: {
+        files: ["ok.ts", "locked.ts"],
+        recursive: false,
+      },
       session_id: "delete-session",
     });
     expect(result.content[0].text).toBe("Deleted 1/2 file(s)");
     expect(result.details).toMatchObject({
       complete: false,
-      deleted: ["ok.ts"],
+      deleted: [{ file: "ok.ts", backup_id: "b-1" }],
       skipped_files: [{ file: "locked.ts", reason: "permission denied" }],
     });
   });
@@ -49,6 +53,7 @@ describe("fs tool adapters", () => {
     const { api, tools } = makeMockApi();
     const { bridge } = makeMockBridge(() => ({
       success: true,
+      text: "Deleted 1/2 file(s)",
       complete: false,
       deleted: [],
       skipped_files: [{ file: "missing.ts", reason: "file_not_found" }],
@@ -73,9 +78,13 @@ describe("fs tool adapters", () => {
     );
   });
 
-  test("aft_move maps filePath to file and destination to destination", async () => {
+  test("aft_move forwards agent-typed filePath and destination", async () => {
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({ success: true, moved: true }));
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      text: "Moved src/old.ts → src/new.ts",
+      moved: true,
+    }));
     registerFsTools(api, makePluginContext(bridge), { delete: false, move: true });
 
     const result = (await executeTool(tools.get("aft_move")!, {
@@ -83,8 +92,11 @@ describe("fs tool adapters", () => {
       destination: "src/new.ts",
     })) as { content: Array<{ text: string }> };
 
-    expect(calls[0].command).toBe("move_file");
-    expect(calls[0].params).toMatchObject({ file: "src/old.ts", destination: "src/new.ts" });
+    expect(calls[0].command).toBe("tool_call");
+    expect(calls[0].params).toMatchObject({
+      name: "aft_move",
+      arguments: { filePath: "src/old.ts", destination: "src/new.ts" },
+    });
     expect(result.content[0].text).toBe("Moved src/old.ts → src/new.ts");
   });
 });

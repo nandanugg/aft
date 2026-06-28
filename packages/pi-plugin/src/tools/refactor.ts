@@ -9,7 +9,7 @@ import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
-  callBridge,
+  callToolCall,
   coerceOptionalInt,
   isEmptyParam,
   optionalInt,
@@ -128,11 +128,6 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       _onUpdate,
       extCtx,
     ) {
-      const commandMap: Record<string, string> = {
-        move: "move_symbol",
-        extract: "extract_function",
-        inline: "inline_symbol",
-      };
       // Per-op required-field validation using isEmptyParam so empty strings
       // ("") sent by GPT-family models trigger the proper "required" error
       // instead of being passed through to Rust as a valid empty value.
@@ -182,21 +177,21 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       }
 
       const bridge = bridgeFor(ctx, extCtx.cwd);
-      const req: Record<string, unknown> = { file: filePath };
+      const rawArgs: Record<string, unknown> = { op: params.op, filePath };
       // Use isEmptyParam everywhere so "" / [] / null don't slip through as
       // valid string params that Rust then has to deal with.
-      if (!isEmptyParam(params.symbol)) req.symbol = params.symbol;
-      if (destination !== undefined) req.destination = destination;
-      if (!isEmptyParam(params.scope)) req.scope = params.scope;
-      if (!isEmptyParam(params.name)) req.name = params.name;
-      if (startLine !== undefined) req.start_line = startLine;
-      // Agent uses inclusive end_line; Rust extract_function expects exclusive.
-      if (endLine !== undefined) {
-        req.end_line = params.op === "extract" ? endLine + 1 : endLine;
+      if (!isEmptyParam(params.symbol)) rawArgs.symbol = params.symbol;
+      if (destination !== undefined) rawArgs.destination = destination;
+      if (!isEmptyParam(params.scope)) rawArgs.scope = params.scope;
+      if (!isEmptyParam(params.name)) rawArgs.name = params.name;
+      if (startLine !== undefined) rawArgs.startLine = startLine;
+      if (endLine !== undefined) rawArgs.endLine = endLine;
+      if (callSiteLine !== undefined) rawArgs.callSiteLine = callSiteLine;
+      const response = await callToolCall(bridge, "aft_refactor", rawArgs, extCtx);
+      if (response.success === false) {
+        throw new Error(response.text || response.message || `${params.op} failed`);
       }
-      if (callSiteLine !== undefined) req.call_site_line = callSiteLine;
-      const response = await callBridge(bridge, commandMap[params.op], req, extCtx);
-      return textResult(JSON.stringify(response, null, 2));
+      return textResult(response.text, response);
     },
     renderCall(args, theme, context) {
       return renderRefactorCall(args, theme, context);

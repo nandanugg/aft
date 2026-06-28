@@ -7,7 +7,7 @@ import { coerceBoolean, coerceStringArray } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
@@ -43,6 +43,15 @@ const MoveParams = Type.Object({
 export interface FsSurface {
   delete: boolean;
   move: boolean;
+}
+
+function deletedPath(entry: unknown): string | undefined {
+  if (typeof entry === "string") return entry;
+  if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+    const file = (entry as { file?: unknown }).file;
+    if (typeof file === "string") return file;
+  }
+  return undefined;
 }
 
 /** Exported for renderer unit tests. */
@@ -89,7 +98,9 @@ export function renderFsResult(
       skipped_files?: Array<{ file: string; reason: string }>;
       complete?: boolean;
     };
-    const deletedPaths = data.deleted ?? files;
+    const deletedPaths = Array.isArray(data.deleted)
+      ? data.deleted.map(deletedPath).filter((file): file is string => file !== undefined)
+      : files;
     const skipped = data.skipped_files ?? [];
     const lines: string[] = [];
     for (const entry of deletedPaths) {
@@ -157,9 +168,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         const bridge = bridgeFor(ctx, extCtx.cwd);
         // Single batched call so every file shares one op_id; one
         // `aft_safety undo` then restores the whole delete atomically.
-        const response = await callBridge(
+        const response = await callToolCall(
           bridge,
-          "delete_file",
+          "aft_delete",
           {
             files,
             // Coerce at the boundary, like `files`: a stringified "true" from the
@@ -168,6 +179,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           },
           extCtx,
         );
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "delete failed");
+        }
         const deletedEntries = (response.deleted as Array<{ file: string }> | undefined) ?? [];
         const skipped =
           (response.skipped_files as Array<{ file: string; reason: string }> | undefined) ?? [];
@@ -180,16 +194,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
               skipped.map((entry) => `  ${entry.file}: ${entry.reason}`).join("\n"),
           );
         }
-        const summary =
-          deleted.length === 1 && skipped.length === 0
-            ? `Deleted ${deleted[0]}`
-            : `Deleted ${deleted.length}/${inputs.length} file(s)`;
-        return textResult(summary, {
-          success: true,
-          complete: skipped.length === 0,
-          deleted,
-          skipped_files: skipped,
-        });
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderFsCall("aft_delete", args, theme, context);
@@ -228,16 +233,19 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         }
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const response = await callBridge(
+        const response = await callToolCall(
           bridge,
-          "move_file",
+          "aft_move",
           {
-            file: filePath,
-            destination,
+            filePath: params.filePath,
+            destination: params.destination,
           },
           extCtx,
         );
-        return textResult(`Moved ${params.filePath} → ${params.destination}`, response);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "move failed");
+        }
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderFsCall("aft_move", args, theme, context);

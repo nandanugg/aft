@@ -5,7 +5,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   collectTextContent,
@@ -92,8 +92,11 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
         });
         reqParams.path = await resolvePathArg(extCtx.cwd, path);
       }
-      const response = await callBridge(bridge, "git_conflicts", reqParams, extCtx);
-      return textResult((response.text as string | undefined) ?? JSON.stringify(response, null, 2));
+      const response = await callToolCall(bridge, "conflicts", reqParams, extCtx);
+      if (response.success === false) {
+        throw new Error(response.text || response.message || "conflicts failed");
+      }
+      return textResult(response.text, response);
     },
     renderCall(_args, theme, context) {
       return renderConflictCall(theme, context);
