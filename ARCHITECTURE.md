@@ -5,10 +5,10 @@
 **Overall:** TypeScript plugin + Rust worker process over a session-scoped NDJSON bridge. A unified CLI (`packages/aft-cli/`) serves setup/doctor across all harnesses; shared transport, binary resolution, and ONNX helpers live in `packages/aft-bridge/`.
 
 **Key Characteristics:**
-- Use `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` to register harness tools and map them onto Rust commands.
+- Use `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` to register harness tools and map them onto the unified `tool_call` command.
 - Use `packages/aft-bridge/src/bridge.ts` and `packages/aft-bridge/src/pool.ts` as the shared transport layer, isolating one `aft` process per project root.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
-- Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular.
+- Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
 - Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
 
 ## Layers
@@ -42,23 +42,23 @@
 - Used by: End users via `npx @cortexkit/aft`
 
 **Tool definition layer (OpenCode):**
-- Purpose: Convert OpenCode tool arguments into protocol requests and permission checks.
+- Purpose: Convert OpenCode tool arguments into the unified `tool_call` protocol request and perform permission checks.
 - Location: `packages/opencode-plugin/src/tools/`
-- Contains: Hoisted tools (edit/write/apply_patch), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, LSP tools, search tools, semantic tools, inspect tools, permissions helpers
+- Contains: Hoisted tools (edit/write/apply_patch), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, LSP tools, search tools, semantic tools, inspect tools, permissions helpers, and the `callToolCall` transport wrapper (`packages/opencode-plugin/src/tools/_shared.ts`)
 - Depends on: `packages/aft-bridge/src/pool.ts`, `packages/opencode-plugin/src/shared/`, `packages/opencode-plugin/src/metadata-store.ts`
 - Used by: `packages/opencode-plugin/src/index.ts`
 
 **Tool definition layer (Pi):**
-- Purpose: Convert Pi tool arguments into protocol requests and permission checks.
+- Purpose: Convert Pi tool arguments into the unified `tool_call` protocol request and perform permission checks.
 - Location: `packages/pi-plugin/src/tools/`
-- Contains: Hoisted tools (read/write/edit/grep), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, inspect tools, semantic tools, render helpers, diff-format helper
+- Contains: Hoisted tools (read/write/edit/grep), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, inspect tools, semantic tools, render helpers, diff-format helper, and the `callToolCall` transport wrapper (`packages/pi-plugin/src/tools/_shared.ts`)
 - Depends on: `packages/aft-bridge/src/pool.ts`, `packages/pi-plugin/src/shared/`
 - Used by: `packages/pi-plugin/src/index.ts`
 
 **Protocol and command layer:**
-- Purpose: Accept NDJSON requests and route each command to a focused handler.
-- Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`
-- Contains: Request dispatch, response encoding, command handlers for read/write/edit/outline/zoom/bash/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
+- Purpose: Accept NDJSON requests, route tool calls via the unified `tool_call` command, and dispatch them to focused command handlers.
+- Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`
+- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting, and standalone command handlers for read/write/edit/outline/zoom/bash/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state
 - Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
@@ -72,7 +72,7 @@
 **State and diagnostics layer:**
 - Purpose: Hold per-process mutable state for backups, checkpoints, file watching, call graph cache, LSP state, database storage, bash background tasks, cache freshness tracking, and file-system locking.
 - Location: `crates/aft/src/context.rs`, `crates/aft/src/backup.rs`, `crates/aft/src/checkpoint.rs`, `crates/aft/src/lsp/`, `crates/aft/src/db/`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/bash_background/`, `crates/aft/src/callgraph_store/mod.rs`
-- Contains: `AppContext`, undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels
+- Contains: `AppContext` with symlink path verification checks (recursively following chain hops to reject escaping paths), undo history, backup policies and disk-locking handlers, named checkpoints, watcher receiver, LSP manager, diagnostics store, document store, persistent database tables (backups, bash tasks, compression events, state, callgraph edges and nodes), cache-freshness tracker, file-system lockfile, background task registry, PTY process pool, callgraph store background channels
 - Depends on: `notify`, LSP transport helpers, Rust `RefCell`, SQLite (via `db/` and `callgraph_store/`), `serde`
 - Used by: All command handlers through `AppContext`
 
@@ -81,14 +81,16 @@
 **Tool invocation flow:**
 
 1. Register tool definitions and config-driven surface selection -- `packages/opencode-plugin/src/index.ts` or `packages/pi-plugin/src/index.ts`
-2. Get a session bridge and send a command over NDJSON -- `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
-3. Dispatch the request to a Rust handler and return structured JSON -- `crates/aft/src/main.rs`, `crates/aft/src/commands/mod.rs`
+2. Get a session bridge and send a unified `tool_call` command carrying the bare tool name and arguments over NDJSON -- `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
+3. Dispatch the request to the `tool_call` handler in Rust, which translates it to the target command, executes the handler, formats/renders the agent-facing output text on the server, and returns the response -- `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, and individual command handlers under `crates/aft/src/commands/`
 
 **Edit pipeline:**
 
-1. Validate permissions and map tool arguments to protocol params -- `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents)
-2. Snapshot, mutate, diff, and validate content -- `crates/aft/src/edit.rs`
-3. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`
+1. Validate path and verify symlink safety (recursively follow components up to 40 hops to reject escaping paths) -- `crates/aft/src/context.rs`
+2. Translate tool arguments to command parameters -- `crates/aft/src/subc_translate.rs`
+3. Check edit permissions -- `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents)
+4. Snapshot, mutate, diff, and validate content -- `crates/aft/src/edit.rs`
+5. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`
 
 **Call-graph and navigation flow:**
 
@@ -138,12 +140,18 @@
 **Tool groups (OpenCode):**
 - Purpose: Group related OpenCode tool definitions by capability surface.
 - Location: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/imports.ts`, `packages/opencode-plugin/src/tools/structure.ts`, `packages/opencode-plugin/src/tools/navigation.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/safety.ts`, `packages/opencode-plugin/src/tools/conflicts.ts`, `packages/opencode-plugin/src/tools/lsp.ts`, `packages/opencode-plugin/src/tools/ast.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/bash_watch.ts`, `packages/opencode-plugin/src/tools/bash_write.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`, `packages/opencode-plugin/src/tools/semantic.ts`, `packages/opencode-plugin/src/tools/permissions.ts`, `packages/opencode-plugin/src/tools/hoisted-internals.ts`
-- Pattern: Thin TypeScript adapters over shared bridge transport
+- Pattern: Thin TypeScript adapters delegating to the unified `tool_call` transport
 
 **Tool groups (Pi):**
 - Purpose: Group related Pi tool definitions by capability surface.
 - Location: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/structure.ts`, `packages/pi-plugin/src/tools/navigate.ts`, `packages/pi-plugin/src/tools/refactor.ts`, `packages/pi-plugin/src/tools/safety.ts`, `packages/pi-plugin/src/tools/conflicts.ts`, `packages/pi-plugin/src/tools/ast.ts`, `packages/pi-plugin/src/tools/bash.ts`, `packages/pi-plugin/src/tools/semantic.ts`, `packages/pi-plugin/src/tools/inspect.ts`, `packages/pi-plugin/src/tools/fs.ts`, `packages/pi-plugin/src/tools/diff-format.ts`, `packages/pi-plugin/src/tools/render-helpers.ts`
-- Pattern: Thin TypeScript adapters over shared bridge transport with Pi-specific argument mapping
+- Pattern: Thin TypeScript adapters delegating to the unified `tool_call` transport with Pi-specific schema configuration
+
+**ToolCallCommand:**
+- Purpose: Route and execute client-facing agent tools via a single request.
+- Location: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/run_tool_call.rs`
+- Pattern: Unified request translator and response formatting coordinator
+- Contains: `subc_translate` mapping, `subc_format` text rendering, and dispatching to target command handlers
 
 **AppContext:**
 - Purpose: Centralize runtime state for commands inside the Rust worker.
@@ -212,6 +220,11 @@
 - Location: `crates/aft/src/main.rs`
 - Triggers: `packages/aft-bridge/src/bridge.ts` spawns the `aft` binary
 - Responsibilities: Read NDJSON requests from stdin, dispatch handlers, drain watcher and LSP events, compress background task output, and write JSON responses
+
+**Rust subc daemon entry point:**
+- Location: `crates/aft/src/main.rs`, `crates/aft/src/subc.rs`
+- Triggers: Spawned with the `--subc <connection-file>` argument
+- Responsibilities: Connect to the subc daemon over loopback TCP, authenticate using HMAC handshake, and process frames via tokio client loop routed through the per-actor executor
 
 **Rust binary CLI subcommands:**
 - Location: `crates/aft/src/cli/`

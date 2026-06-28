@@ -35,7 +35,7 @@ opencode-aft/
 **`crates/aft/`:**
 - Purpose: Keep the Rust execution engine, stdin/stdout protocol binary, and shared analysis logic together.
 - Contains: `src/` Rust modules, `tests/` integration suites, `tests/fixtures/` test fixtures, `tests/helpers/` test utilities, `tests/lsp/` LSP integration tests
-- Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/commands/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, `crates/aft/src/bash_background/`, `crates/aft/tests/integration/`
+- Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, `crates/aft/src/subc.rs`, `crates/aft/src/commands/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, `crates/aft/src/bash_background/`, `crates/aft/tests/integration/`
 
 **`crates/aft-tokenizer/`:**
 - Purpose: Ship a standalone tokenizer for Claude API token counting.
@@ -50,7 +50,7 @@ opencode-aft/
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
 - Contains: ~60 command-specific request parsing and response generation modules
-- Key files: `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
+- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
 
 **`crates/aft/src/compress/`:**
 - Purpose: Provide tiered output compression for hoisted bash commands.
@@ -100,7 +100,7 @@ opencode-aft/
 **`packages/opencode-plugin/src/tools/`:**
 - Purpose: Group OpenCode tool definitions by capability area.
 - Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, LSP, search, semantic, and inspect tools; permissions and internals helpers
-- Key files: `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`
+- Key files: `packages/opencode-plugin/src/tools/_shared.ts`, `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`
 
 **`packages/pi-plugin/`:**
 - Purpose: Ship the Pi coding-agent facing package that resolves the binary and registers tools.
@@ -110,7 +110,7 @@ opencode-aft/
 **`packages/pi-plugin/src/tools/`:**
 - Purpose: Group Pi tool definitions by capability area.
 - Contains: Thin adapters for hoisted, reading, import, structure, navigation, refactor, safety, bash, conflict, AST, semantic, and inspect tools; render helpers, diff-format helper
-- Key files: `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/fs.ts`
+- Key files: `packages/pi-plugin/src/tools/_shared.ts`, `packages/pi-plugin/src/tools/hoisted.ts`, `packages/pi-plugin/src/tools/reading.ts`, `packages/pi-plugin/src/tools/imports.ts`, `packages/pi-plugin/src/tools/fs.ts`
 
 **`packages/npm/`:**
 - Purpose: Publish one npm package per target platform so the plugin can resolve a bundled binary.
@@ -140,11 +140,11 @@ opencode-aft/
 
 ## Key File Locations
 
-**Entry Points:** `packages/opencode-plugin/src/index.ts` -- register OpenCode plugin tools; `packages/pi-plugin/src/index.ts` -- register Pi plugin tools; `packages/aft-cli/src/index.ts` -- unified CLI dispatcher; `packages/aft-bridge/src/index.ts` -- shared bridge module exports; `crates/aft/src/main.rs` -- start the Rust request loop; `crates/aft/src/cli/` -- warmup and storage-migration subcommands; `.github/workflows/release.yml` -- drive tagged release publishing.
+**Entry Points:** `packages/opencode-plugin/src/index.ts` -- register OpenCode plugin tools; `packages/pi-plugin/src/index.ts` -- register Pi plugin tools; `packages/aft-cli/src/index.ts` -- unified CLI dispatcher; `packages/aft-bridge/src/index.ts` -- shared bridge module exports; `crates/aft/src/main.rs` -- start the Rust request loop; `crates/aft/src/cli/` -- warmup and storage-migration subcommands; `crates/aft/src/subc.rs` -- handle subc loopback daemon connection and routing; `.github/workflows/release.yml` -- drive tagged release publishing.
 
 **Configuration:** `package.json` -- define Bun workspace scripts; `Cargo.toml` -- define the Rust workspace; `packages/opencode-plugin/src/config.ts` -- parse user and project AFT config for OpenCode; `packages/pi-plugin/src/config.ts` -- parse user and project AFT config for Pi; `crates/aft/src/config.rs` -- parse the shared Rust-side config (semantic backend, LSP servers, bash compression, etc.). User-level AFT settings reside in the unified CortexKit location `~/.config/cortexkit/aft.jsonc`, and project-level overrides reside in `<project_root>/.cortexkit/aft.jsonc`.
 
-**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/backup.rs` -- manage sessionized backup stores, policies, and stack-level disk locks; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
+**Core Logic:** `crates/aft/src/parser.rs` -- extract symbols and languages; `crates/aft/src/callgraph.rs` -- build navigation indexes; `crates/aft/src/backup.rs` -- manage sessionized backup stores, policies, and stack-level disk locks; `crates/aft/src/edit.rs` -- run shared edit and diff logic; `crates/aft/src/semantic_index.rs` -- dense-embedding semantic search index; `crates/aft/src/search_index.rs` -- trigram-based full-text search index; `crates/aft/src/compress/mod.rs` -- bash output compression dispatcher; `crates/aft/src/bash_background/` -- background task and PTY management; `crates/aft/src/imports/` -- language-aware import engines; `crates/aft/src/inspect/` -- codebase health scanners; `crates/aft/src/format.rs` -- formatter detection and execution; `crates/aft/src/run_tool_call.rs` -- execute tool calls with translation and formatting; `crates/aft/src/subc_translate.rs` -- translate tool arguments to internal command parameters; `crates/aft/src/subc_format.rs` -- format/render agent-facing text on the server; `packages/aft-bridge/src/bridge.ts` -- manage subprocess transport; `packages/aft-bridge/src/pool.ts` -- session-scoped bridge pool.
 
 **Tests:** `packages/opencode-plugin/src/__tests__/` -- plugin unit and e2e tests; `packages/pi-plugin/src/__tests__/` -- Pi plugin unit and e2e tests; `packages/aft-cli/src/__tests__/` -- CLI command tests; `packages/aft-bridge/src/__tests__/` -- bridge transport tests; `crates/aft/tests/integration/` -- Rust integration tests; `crates/aft/tests/semantic_test.rs` -- semantic index tests; `tests/docker/` -- Docker e2e; `tests/macos-e2e/` -- macOS e2e; `tests/windows-e2e/` -- Windows e2e; `tests/pi-rpc/` -- Pi RPC tests.
 
@@ -156,7 +156,11 @@ opencode-aft/
 
 ## Where to Add New Code
 
-**New hoisted OpenCode file tool:** `packages/opencode-plugin/src/tools/hoisted.ts` -- register the tool and map it onto a Rust command.
+**New hoisted OpenCode file tool:** `packages/opencode-plugin/src/tools/hoisted.ts` -- register the tool and map it onto the unified `tool_call` command.
+
+**New tool argument translation/mapping:** `crates/aft/src/subc_translate.rs` -- define how client-facing tool arguments are translated to internal command parameters.
+
+**New tool server-side text formatter:** `crates/aft/src/subc_format.rs` -- define how tool outputs are formatted/rendered to the agent.
 
 **New plugin tool group (OpenCode):** `packages/opencode-plugin/src/tools/[capability].ts` -- export a `Record<string, ToolDefinition>` and wire it into `packages/opencode-plugin/src/index.ts`.
 
