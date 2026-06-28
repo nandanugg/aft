@@ -122,6 +122,12 @@ fn known_tool_translate_errors_surface_as_invalid_request() {
             json!({"filePath": "src/main.ts", "url": "https://example.com/doc", "symbols": "run"}),
             "Provide exactly ONE of 'filePath' or 'url'",
         ),
+        (
+            "apply-patch-missing-patch-text",
+            "apply_patch",
+            json!({}),
+            "apply_patch: missing required param 'patchText'",
+        ),
     ] {
         let response = send_json(
             &mut aft,
@@ -249,6 +255,11 @@ fn parity_cases() -> Vec<ParityCase> {
             arguments: json!({"filePath": "src/edit.txt", "oldString": "old", "newString": "new"}),
         },
         ParityCase {
+            label: "apply_patch_update",
+            tool: "apply_patch",
+            arguments: json!({"patchText": "*** Begin Patch\n*** Update File: src/patch.txt\n@@\n-before\n+after\n*** End Patch"}),
+        },
+        ParityCase {
             label: "read_missing_file_error",
             tool: "read",
             arguments: json!({"filePath": "src/missing.txt"}),
@@ -292,6 +303,7 @@ fn create_fixture_project(root: &Path) {
     .expect("write read fixture");
     fs::write(root.join("src/search.txt"), "another needle\n").expect("write search fixture");
     fs::write(root.join("src/edit.txt"), "replace old value\n").expect("write edit fixture");
+    fs::write(root.join("src/patch.txt"), "before\n").expect("write patch fixture");
     fs::write(
         root.join("src/todos.rs"),
         "// TODO: keep the parity fixture visible to inspect\nfn main() {}\n",

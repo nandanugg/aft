@@ -15,7 +15,6 @@ import { coerceBoolean, coerceStringArray } from "@cortexkit/aft-bridge";
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
-import { applyUpdateChunks, type Hunk as PatchHunk, parsePatch } from "../patch-parser.js";
 import type { PluginContext } from "../types.js";
 import {
   callBridge,
@@ -106,42 +105,6 @@ function buildUnifiedDiff(fp: string, before: string, after: string): string {
     }
   }
   return diff;
-}
-
-/**
- * Count non-empty lines in a string. Used for unambiguous addition/deletion
- * counts when one side of a diff is empty (apply_patch's add/delete hunks).
- *
- * `split("\n")` on a string with a trailing newline produces a trailing
- * empty element which we drop, so the count matches "actual content lines"
- * rather than "split slots". For empty input the count is 0.
- */
-function lineCount(content: string): number {
-  if (content.length === 0) return 0;
-  const parts = content.split("\n");
-  // Drop the trailing empty element produced by a terminating "\n".
-  if (parts[parts.length - 1] === "") parts.pop();
-  return parts.length;
-}
-
-/**
- * Count additions and deletions between two file contents using the same
- * LCS path that powers buildUnifiedDiff. Used for apply_patch's *move*
- * case where the Rust write diff would compare against an empty target
- * (overcounting additions). For non-move updates we use the Rust counts
- * directly.
- */
-function countDiffLines(before: string, after: string): { additions: number; deletions: number } {
-  const beforeLines = before.split("\n");
-  const afterLines = after.split("\n");
-  const ops = diffLines(beforeLines, afterLines);
-  let additions = 0;
-  let deletions = 0;
-  for (const op of ops) {
-    if (op.tag === "ins") additions++;
-    else if (op.tag === "del") deletions++;
-  }
-  return { additions, deletions };
 }
 
 type DiffOp =
@@ -330,92 +293,6 @@ async function readCurrentFileForPreview(filePath: string): Promise<string> {
     }
     throw error;
   }
-}
-
-function virtualPatchContent(
-  virtualFiles: Map<string, string | null>,
-  filePath: string,
-): string | null | undefined {
-  return virtualFiles.has(filePath) ? (virtualFiles.get(filePath) ?? null) : undefined;
-}
-
-async function readPatchPreviewContent(
-  virtualFiles: Map<string, string | null>,
-  filePath: string,
-  action: "delete" | "update",
-  patchPath: string,
-): Promise<string> {
-  const virtualContent = virtualPatchContent(virtualFiles, filePath);
-  if (virtualContent !== undefined) {
-    if (virtualContent === null) {
-      throw new Error(`Failed to ${action} ${patchPath}: file not found: ${filePath}`);
-    }
-    return virtualContent;
-  }
-
-  try {
-    return await fs.promises.readFile(filePath, "utf-8");
-  } catch (error) {
-    throw new Error(`Failed to ${action} ${patchPath}: ${formatError(error)}`);
-  }
-}
-
-async function buildApplyPatchPreview(
-  hunks: PatchHunk[],
-  projectRoot: string,
-): Promise<{ filepath: string; diff: string }> {
-  const virtualFiles = new Map<string, string | null>();
-  const patches: string[] = [];
-  let firstFilePath = "";
-
-  for (const hunk of hunks) {
-    const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
-    if (!firstFilePath) firstFilePath = filePath;
-
-    switch (hunk.type) {
-      case "add": {
-        const virtualContent = virtualPatchContent(virtualFiles, filePath);
-        const exists =
-          virtualContent !== undefined ? virtualContent !== null : fs.existsSync(filePath);
-        if (exists) {
-          throw new Error(
-            `Failed to create ${hunk.path}: file already exists. Use *** Update File: to modify, or *** Delete File: first if you want to replace it entirely.`,
-          );
-        }
-        const after = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
-        patches.push(buildUnifiedDiff(filePath, "", after));
-        virtualFiles.set(filePath, after);
-        break;
-      }
-
-      case "delete": {
-        const before = await readPatchPreviewContent(virtualFiles, filePath, "delete", hunk.path);
-        patches.push(buildUnifiedDiff(filePath, before, ""));
-        virtualFiles.set(filePath, null);
-        break;
-      }
-
-      case "update": {
-        const before = await readPatchPreviewContent(virtualFiles, filePath, "update", hunk.path);
-        let after: string;
-        try {
-          after = applyUpdateChunks(before, filePath, hunk.chunks);
-        } catch (error) {
-          throw new Error(`Failed to update ${hunk.path}: ${formatError(error)}`);
-        }
-
-        const targetPath = hunk.move_path
-          ? resolvePathFromProjectRoot(projectRoot, hunk.move_path)
-          : filePath;
-        patches.push(buildUnifiedDiff(targetPath, before, after));
-        if (hunk.move_path) virtualFiles.set(filePath, null);
-        virtualFiles.set(targetPath, after);
-        break;
-      }
-    }
-  }
-
-  return { filepath: firstFilePath || projectRoot, diff: patches.join("\n") };
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +733,7 @@ function applyPatchDescription(ctx: PluginContext): string {
   const backupBehavior =
     ctx.config.backup?.enabled === false
       ? "- Backup capture is disabled by user config; applied file changes are not recorded in the undo stack."
-      : "- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. A pre-patch checkpoint is created automatically — use `aft_safety` undo if you need to revert.\n- Files are backed up before modification";
+      : "- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. Use `aft_safety` undo if you need to revert the applied changes.\n- Files are backed up before modification";
   return `Use the \`apply_patch\` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
 
 *** Begin Patch
@@ -898,7 +775,21 @@ ${backupBehavior}
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with \`+\` even when creating a new file
 
-Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` or a per-call \`diagnostics: true\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
+Edits return as soon as the write completes unless \`lsp.diagnostics_on_edit\` requests legacy sync-wait behavior. Call \`aft_inspect\` afterward to check diagnostics across a batch of edits.`;
+}
+
+function applyPatchErrorMessage(response: Record<string, unknown>, fallback: string): string {
+  for (const key of ["text", "output", "message"] as const) {
+    const value = response[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return fallback;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
 }
 
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
@@ -909,558 +800,61 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
     },
     execute: async (args, context): Promise<ToolResult> => {
       const patchText = args.patchText as string;
-      const diagnostics = diagnosticsOnEditDefault(ctx);
       if (!patchText) throw new Error("'patchText' is required");
 
-      // Parse the patch
-      let hunks: PatchHunk[];
-      try {
-        hunks = parsePatch(patchText);
-      } catch (e) {
-        throw new Error(`Patch parse error: ${e instanceof Error ? e.message : e}`);
+      const preview = await callToolCall(
+        ctx,
+        context,
+        "apply_patch",
+        { patchText },
+        { preview: true },
+      );
+      if (preview.success === false) {
+        throw new Error(applyPatchErrorMessage(preview, "apply_patch preview failed"));
       }
 
-      if (hunks.length === 0) {
-        throw new Error("Empty patch: no file operations found");
+      const askedExternalPaths = new Set<string>();
+      for (const filePath of stringArray(preview.affected_paths)) {
+        if (askedExternalPaths.has(filePath)) continue;
+        askedExternalPaths.add(filePath);
+        const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
+        if (denial) return permissionDeniedResponse(denial);
       }
 
-      const projectRoot = await resolveProjectRoot(ctx, context);
-
-      // Resolve every path this patch touches — SOURCES (h.path) and
-      // DESTINATIONS (h.move_path for move hunks). Move destinations have to
-      // be tracked because the old code only checkpointed sources; a partial
-      // move that succeeded at the destination but failed at source deletion
-      // left orphan files behind that rollback never cleaned up.
-      const affectedAbs = new Set<string>();
-      // Snapshot initial existence for every touched path BEFORE applying any
-      // hunk. A patch can delete an existing file and then add the same path
-      // back; that add target is not "new" for checkpoint purposes because
-      // aft_safety must be able to restore the original pre-patch contents.
-      const initiallyExistsAbs = new Map<string, boolean>();
-      const rememberAffectedPath = (abs: string) => {
-        affectedAbs.add(abs);
-        if (!initiallyExistsAbs.has(abs)) {
-          initiallyExistsAbs.set(abs, fs.existsSync(abs));
-        }
-      };
-
-      for (const h of hunks) {
-        const srcAbs = resolvePathFromProjectRoot(projectRoot, h.path);
-        rememberAffectedPath(srcAbs);
-        if (h.type === "update" && h.move_path) {
-          rememberAffectedPath(resolvePathFromProjectRoot(projectRoot, h.move_path));
-        }
-      }
-
-      // Files that did NOT exist before this patch — add targets plus move
-      // destinations whose path was empty at patch start. On rollback we
-      // delete these instead of restoring content that was never there.
-      const newlyCreatedAbs = new Set<string>();
-      for (const h of hunks) {
-        const srcAbs = resolvePathFromProjectRoot(projectRoot, h.path);
-        if (h.type === "add" && initiallyExistsAbs.get(srcAbs) === false) {
-          newlyCreatedAbs.add(srcAbs);
-        }
-        if (h.type === "update" && h.move_path) {
-          const dstAbs = resolvePathFromProjectRoot(projectRoot, h.move_path);
-          if (initiallyExistsAbs.get(dstAbs) === false) {
-            newlyCreatedAbs.add(dstAbs);
-          }
-        }
-      }
-
-      const relPaths = Array.from(affectedAbs).map((abs) => path.relative(projectRoot, abs));
-      const multiFileWritePaths = Array.from(affectedAbs);
-
-      // External-directory check first (mirrors opencode-native patch.ts:298).
-      {
-        const asked = new Set<string>();
-        for (const filePath of multiFileWritePaths) {
-          if (asked.has(filePath)) continue;
-          asked.add(filePath);
-          const denial = await assertExternalDirectoryPermission(ctx, context, filePath);
-          if (denial) return permissionDeniedResponse(denial);
-        }
-      }
-
-      const preview = await buildApplyPatchPreview(hunks, projectRoot);
-      const denial = await askEditPermission(context, relPaths, {
-        filepath: preview.filepath,
-        diff: preview.diff,
+      const affectedRelPaths = stringArray(preview.affected_rel_paths);
+      const denial = await askEditPermission(context, affectedRelPaths, {
+        diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
+        filepath: typeof preview.filepath === "string" ? preview.filepath : affectedRelPaths[0],
       });
       if (denial) return permissionDeniedResponse(denial);
 
-      // Pre-patch checkpoint covers files that exist pre-patch (so the
-      // agent can `aft_safety` undo if they want to abort after seeing a
-      // partial result). Newly-created targets are deleted to revert.
-      // Checkpoint failure is non-fatal — agent can still inspect partial
-      // results and proceed.
-      const checkpointPaths = Array.from(affectedAbs).filter((abs) => !newlyCreatedAbs.has(abs));
-      const checkpointName = `apply_patch_${Date.now()}`;
-      let checkpointCreated = false;
-      if (checkpointPaths.length > 0) {
-        try {
-          await callBridge(ctx, context, "checkpoint", {
-            name: checkpointName,
-            files: checkpointPaths,
-          });
-          checkpointCreated = true;
-        } catch {
-          // Checkpoint failure: agent loses the easy `aft_safety` undo
-          // path but the patch still attempts each hunk independently.
-        }
+      const response = await callToolCall(ctx, context, "apply_patch", { patchText });
+      if (response.success === false) {
+        throw new Error(applyPatchErrorMessage(response, "apply_patch failed"));
       }
 
-      // Process each hunk, track per-file diffs for metadata.
-      // additions/deletions come from the Rust-side `similar`-crate diff
-      // (returned via `include_diff: true` on the write call) — same source
-      // as the edit/write tools, which produce correct counts. Avoid
-      // recomputing via TS-side LCS to keep one source of truth (issue: the
-      // `apply_patch` UI was reporting +N/-N≈filesize counts because the
-      // local count was diverging from the Rust truth).
-      //
-      // PER-FILE COMMIT MODEL (BUG-6a, dogfooding fix): each hunk commits
-      // independently. A failure on one file no longer rolls back the
-      // others. The pre-patch checkpoint is still created so the agent can
-      // use `aft_safety` to revert successful files manually if they want
-      // to abort the whole patch after seeing a partial result.
-      //
-      // Why this changed: an agent submitted a 3-file patch where 2 files
-      // patched cleanly and the 3rd hit a fuzzy-match drift. The old
-      // atomic-rollback discarded the 2 successes, so the agent had to
-      // re-issue the same patch with the failing file removed — exactly
-      // the per-file commit semantics, just done by hand. The ergonomic
-      // fix is to give them per-file commit out of the box.
-      const results: string[] = [];
-      const failures: Array<{ index: number; path: string }> = [];
-      const appliedHunkResults: Array<{
-        index: number;
-        hunk: PatchHunk;
-        filePath: string;
-        displayPath: string;
-        movePath?: string;
-        before: string;
-        after: string;
-        additions: number;
-        deletions: number;
-      }> = [];
-
-      for (const [hunkIndex, hunk] of hunks.entries()) {
-        const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
-
-        switch (hunk.type) {
-          case "add": {
-            // *** Add File: <path> means CREATE; refuse to overwrite an existing
-            // file. The unified `write` bridge command silently overwrites by
-            // design (it's the back-end for both `write` and `apply_patch`'s
-            // create-or-overwrite flow), so the existence check has to happen
-            // here, in the apply_patch wrapper. Without it, an Add hunk against
-            // a path that already exists would clobber the file's contents and
-            // the agent would see a misleading "Created <path>" success.
-            if (fs.existsSync(filePath)) {
-              const msg = `Failed to create ${hunk.path}: file already exists. Use *** Update File: to modify, or *** Delete File: first if you want to replace it entirely.`;
-              results.push(msg);
-              failures.push({ index: hunkIndex, path: hunk.path });
-              break;
-            }
-            try {
-              const content = hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`;
-              const writeResult = await callBridge(ctx, context, "write", {
-                file: filePath,
-                content,
-                create_dirs: true,
-                diagnostics,
-                include_diff_content: true,
-                multi_file_write_paths: multiFileWritePaths,
-              });
-              // callBridge returns `{ success: false }` as data, not a throw,
-              // so without this check a failed write would be falsely recorded
-              // as `Created` and the hunk would never reach `failures`.
-              if (writeResult.success === false) {
-                throw new Error((writeResult.message as string | undefined) ?? "write failed");
-              }
-              // Rust reverts a write that fails syntax validation and returns
-              // rolled_back:true with success:true. The file did NOT change, so
-              // this hunk must count as a failure, not a green "Created".
-              if (writeResult.rolled_back === true) {
-                throw new Error("produced invalid syntax (rolled back)");
-              }
-              const wrDiff = writeResult.diff as
-                | { before?: string; after?: string; additions?: number; deletions?: number }
-                | undefined;
-              appliedHunkResults.push({
-                index: hunkIndex,
-                hunk,
-                filePath,
-                displayPath: filePath,
-                before: "",
-                after: content,
-                // For a brand-new file, additions = total lines, deletions = 0.
-                // Prefer Rust counts; fall back to a content line count if the
-                // bridge didn't include a diff (e.g. older binary).
-                additions: wrDiff?.additions ?? lineCount(content),
-                deletions: wrDiff?.deletions ?? 0,
-              });
-              results.push(`Created ${hunk.path}`);
-            } catch (e) {
-              const msg = `Failed to create ${hunk.path}: ${e instanceof Error ? e.message : e}`;
-              results.push(msg);
-              failures.push({ index: hunkIndex, path: hunk.path });
-              // The write may have left a partial file on disk for an `add`
-              // hunk. Best-effort cleanup so we don't leave orphan partials.
-              // (Failures here are tolerated: the agent will see the
-              // creation failure in `results` either way.)
-              const filePath = resolvePathFromProjectRoot(projectRoot, hunk.path);
-              if (fs.existsSync(filePath)) {
-                try {
-                  fs.rmSync(filePath, { force: true });
-                } catch {
-                  // ignore — surfaced through the parent failure already
-                }
-              }
-            }
-            break;
-          }
-
-          case "delete": {
-            try {
-              const before = await fs.promises.readFile(filePath, "utf-8").catch(() => "");
-              const deleteResult = await callBridge(ctx, context, "delete_file", {
-                file: filePath,
-              });
-              if (deleteResult.success === false) {
-                throw new Error((deleteResult.message as string | undefined) ?? "delete failed");
-              }
-              // delete_file doesn't return a diff. The counts are unambiguous:
-              // every prior line is a deletion; nothing is added.
-              appliedHunkResults.push({
-                index: hunkIndex,
-                hunk,
-                filePath,
-                displayPath: filePath,
-                before,
-                after: "",
-                additions: 0,
-                deletions: lineCount(before),
-              });
-              results.push(`Deleted ${hunk.path}`);
-            } catch (e) {
-              results.push(`Failed to delete ${hunk.path}: ${e instanceof Error ? e.message : e}`);
-              failures.push({ index: hunkIndex, path: hunk.path });
-            }
-            break;
-          }
-
-          case "update": {
-            try {
-              // Read original, apply chunks, write back
-              const original = await fs.promises.readFile(filePath, "utf-8");
-              const newContent = applyUpdateChunks(original, filePath, hunk.chunks);
-
-              const targetPath = hunk.move_path
-                ? resolvePathFromProjectRoot(projectRoot, hunk.move_path)
-                : filePath;
-
-              const writeResult = await callBridge(ctx, context, "write", {
-                file: targetPath,
-                content: newContent,
-                create_dirs: true,
-                diagnostics,
-                include_diff_content: true,
-                multi_file_write_paths: multiFileWritePaths,
-              });
-              // CRITICAL for move hunks: the destination write returns
-              // `{ success: false }` as data, not a throw. Without this check a
-              // failed destination write would be treated as success and the
-              // code below would proceed to DELETE THE SOURCE — losing the file
-              // entirely. Throwing here routes to the catch → `failures` and
-              // leaves the source intact.
-              if (writeResult.success === false) {
-                throw new Error((writeResult.message as string | undefined) ?? "write failed");
-              }
-              // Same hazard as success:false for move hunks: a destination write
-              // that fails syntax validation returns rolled_back:true (the file
-              // is unchanged). Treating it as success would mark the hunk applied
-              // and, for a move, proceed to DELETE THE SOURCE — losing the file.
-              // Throw → routes to the catch → `failures`, source intact.
-              if (writeResult.rolled_back === true) {
-                throw new Error("produced invalid syntax (rolled back)");
-              }
-
-              // Collect diagnostics from this file
-              const diags = writeResult.lsp_diagnostics as
-                | Array<Record<string, unknown>>
-                | undefined;
-              if (diags && diags.length > 0) {
-                const errors = diags.filter((d) => d.severity === "error");
-                if (errors.length > 0) {
-                  const relPath = path.relative(projectRoot, targetPath);
-                  const diagLines = errors.map((d) => `  Line ${d.line}: ${d.message}`).join("\n");
-                  results.push(`\nLSP errors detected in ${relPath}, please fix:\n${diagLines}`);
-                }
-              }
-
-              // Track per-file diff for metadata. For a regular update the
-              // Rust write diff compares disk-before vs new content, which
-              // matches what we want. For a *move*, write goes to a fresh
-              // target (no prior content), so Rust would report the whole
-              // file as additions; we recompute via TS-side LCS instead.
-              // For non-move updates we still recompute as a fallback when
-              // the bridge didn't include a diff (older binary or a test
-              // mock without diff support).
-              const wrDiff = writeResult.diff as
-                | { before?: string; after?: string; additions?: number; deletions?: number }
-                | undefined;
-              const isMove = Boolean(hunk.move_path);
-              const { additions, deletions } =
-                isMove || wrDiff?.additions === undefined || wrDiff.deletions === undefined
-                  ? countDiffLines(original, newContent)
-                  : {
-                      additions: wrDiff.additions,
-                      deletions: wrDiff.deletions,
-                    };
-              const appliedHunkResult = {
-                index: hunkIndex,
-                hunk,
-                filePath,
-                displayPath: targetPath,
-                ...(hunk.move_path ? { movePath: targetPath } : {}),
-                before: original,
-                after: newContent,
-                additions,
-                deletions,
-              };
-
-              if (hunk.move_path) {
-                try {
-                  const deleteResult = await callBridge(ctx, context, "delete_file", {
-                    file: filePath,
-                  });
-                  if (deleteResult.success === false) {
-                    throw new Error(
-                      (deleteResult.message as string | undefined) ?? "delete failed",
-                    );
-                  }
-                } catch (deleteError) {
-                  try {
-                    if (!checkpointCreated) {
-                      throw new Error("pre-patch checkpoint was not created");
-                    }
-                    const rollbackResult = await callBridge(ctx, context, "restore_checkpoint", {
-                      name: checkpointName,
-                    });
-                    if (rollbackResult.success === false) {
-                      throw new Error(
-                        (rollbackResult.message as string | undefined) ??
-                          "checkpoint restore failed",
-                      );
-                    }
-                    if (newlyCreatedAbs.has(targetPath) && fs.existsSync(targetPath)) {
-                      const cleanupResult = await callBridge(ctx, context, "delete_file", {
-                        file: targetPath,
-                      });
-                      if (cleanupResult.success === false) {
-                        throw new Error(
-                          (cleanupResult.message as string | undefined) ??
-                            "new destination cleanup failed",
-                        );
-                      }
-                    }
-                  } catch (rollbackError) {
-                    throw new Error(
-                      `success: false; code: move_partial_failure; files: [${filePath}, ${targetPath}]; wrote destination ${targetPath}, but failed to delete source ${filePath} (${formatError(deleteError)}) and failed to restore pre-patch checkpoint ${checkpointName} (${formatError(rollbackError)}). Both copies may exist or destination content may be changed: ${filePath}, ${targetPath}`,
-                    );
-                  }
-                  throw new Error(
-                    `source delete failed after writing move destination; restored pre-patch checkpoint ${checkpointName}: ${formatError(deleteError)}`,
-                  );
-                }
-                appliedHunkResults.push(appliedHunkResult);
-                results.push(`Updated and moved ${hunk.path} → ${hunk.move_path}`);
-              } else {
-                appliedHunkResults.push(appliedHunkResult);
-                results.push(`Updated ${hunk.path}`);
-              }
-            } catch (e) {
-              results.push(`Failed to update ${hunk.path}: ${e instanceof Error ? e.message : e}`);
-              failures.push({ index: hunkIndex, path: hunk.path });
-              break;
-            }
-            break;
-          }
-        }
+      const metadata =
+        response.metadata &&
+        typeof response.metadata === "object" &&
+        !Array.isArray(response.metadata)
+          ? (response.metadata as Record<string, unknown>)
+          : {};
+      const result: {
+        output: string;
+        title?: string;
+        metadata: { diff: unknown; files: unknown };
+      } = {
+        output:
+          typeof response.text === "string" ? response.text : applyPatchErrorMessage(response, ""),
+        metadata: {
+          diff: typeof metadata.diff === "string" ? metadata.diff : "",
+          files: Array.isArray(metadata.files) ? metadata.files : [],
+        },
+      };
+      if (typeof response.title === "string" && response.title.length > 0) {
+        result.title = response.title;
       }
-
-      // PER-FILE COMMIT (BUG-6a): no atomic rollback. The pre-patch
-      // checkpoint stays available so the agent can `aft_safety` revert
-      // successful files manually if they want to abort the whole patch
-      // after seeing a partial outcome.
-      //
-      // Each hunk type self-recovers cleanly on failure:
-      //   - add: the partial file (if any) is deleted in the catch block
-      //          above so we don't leave orphan partials
-      //   - update: applyUpdateChunks throws BEFORE write when fuzzy match
-      //             can't find the lines, so the original file is intact
-      //             on disk. write failures are also pre-commit at the
-      //             bridge level (bridge does its own backup).
-      //   - delete: failed delete leaves the file in place — no cleanup
-      //             needed
-      //
-      // Surface a clear failure summary at the end so the agent can see
-      // which hunks failed and decide whether to retry just those, without
-      // scanning the per-hunk lines.
-      if (failures.length > 0) {
-        const partial = failures.length < hunks.length;
-        const failedList = failures.map((failure) => failure.path).join(", ");
-        const summary = partial
-          ? `Patch partially applied — ${hunks.length - failures.length} of ${hunks.length} hunk(s) succeeded. Failed: ${failedList}. Successful changes are kept; use \`aft_safety\` to revert if you want to abort.`
-          : `Patch failed — none of the ${hunks.length} hunk(s) applied: ${failedList}.`;
-        results.push(summary);
-        // Total-failure case: throw so OpenCode marks the tool call as errored
-        // in the UI (state.status = "error") and the agent's retry loop sees
-        // a real failure. Returning the failure summary as a normal string
-        // makes OpenCode classify the call as completed/successful — the
-        // agent only sees the failure in the output text, and the UI shows
-        // a green check next to a red error message. This matches OpenCode's
-        // native apply_patch which uses Effect.fail() on every error path
-        // (packages/opencode/src/tool/apply_patch.ts).
-        //
-        // Partial successes still return the string: real changes landed on
-        // disk, the agent needs to see exactly which hunks worked, and the
-        // tool genuinely did do work. Treating it as an error would obscure
-        // the partial outcome.
-        if (!partial) {
-          throw new Error(results.join("\n"));
-        }
-      }
-
-      // UI metadata returned directly on the result (matches opencode built-in
-      // apply_patch shape). Replaces the old metadata-store + after-hook merge
-      // that intermittently lost diffs under duplicate plugin loads (#96).
-      {
-        // Build one UI row per reported file path, but keep success/failure
-        // accounting per hunk. Same-path multi-hunk patches (for example
-        // delete+add replacement) should render the net before→after diff, not
-        // whichever per-hunk diff happened to be last for that path. Failures
-        // are tracked by hunk index above, so a later failed hunk on the same
-        // path cannot erase an earlier successful hunk's metadata.
-        const diffByReportKey = new Map<
-          string,
-          {
-            filePath: string;
-            displayPath: string;
-            movePath?: string;
-            lastHunk: PatchHunk;
-            before: string;
-            after: string;
-            additions: number;
-            deletions: number;
-            hunkCount: number;
-          }
-        >();
-
-        for (const applied of appliedHunkResults) {
-          // Non-move operations with the same source path are one logical file
-          // replacement and should be collapsed. Move hunks keep source and
-          // destination in the key so a later add back at the source path is not
-          // folded into the move row.
-          const reportKey = applied.movePath
-            ? `${applied.filePath}\0${applied.displayPath}`
-            : applied.filePath;
-          const existing = diffByReportKey.get(reportKey);
-          if (!existing) {
-            diffByReportKey.set(reportKey, {
-              filePath: applied.filePath,
-              displayPath: applied.displayPath,
-              ...(applied.movePath ? { movePath: applied.movePath } : {}),
-              lastHunk: applied.hunk,
-              before: applied.before,
-              after: applied.after,
-              additions: applied.additions,
-              deletions: applied.deletions,
-              hunkCount: 1,
-            });
-            continue;
-          }
-
-          existing.displayPath = applied.displayPath;
-          existing.movePath = applied.movePath ?? existing.movePath;
-          existing.lastHunk = applied.hunk;
-          existing.after = applied.after;
-          existing.hunkCount += 1;
-          const netCounts = countDiffLines(existing.before, existing.after);
-          existing.additions = netCounts.additions;
-          existing.deletions = netCounts.deletions;
-        }
-
-        // Build per-file metadata. OpenCode's apply_patch shape (see
-        // packages/opencode/src/tool/apply_patch.ts:188) per file:
-        //   { filePath, relativePath, type, patch, additions, deletions, movePath? }
-        // `type` is normalised to "move" when an update hunk has a move target,
-        // and to "update" for multi-hunk same-path replacements with a net
-        // before→after diff.
-        //
-        // additions/deletions come from per-hunk Rust-side counts when there is
-        // only one successful hunk for a report row. Collapsed same-path rows
-        // use net before→after counts so metadata matches the displayed patch.
-        const files = Array.from(diffByReportKey.values()).map((entry) => {
-          const relPath = path.relative(projectRoot, entry.displayPath);
-          const patch = buildUnifiedDiff(entry.displayPath, entry.before, entry.after);
-
-          let uiType: "add" | "update" | "delete" | "move";
-          if (entry.movePath) {
-            uiType = "move";
-          } else if (entry.hunkCount === 1) {
-            uiType = entry.lastHunk.type;
-          } else if (entry.before.length === 0 && entry.after.length > 0) {
-            uiType = "add";
-          } else if (entry.before.length > 0 && entry.after.length === 0) {
-            uiType = "delete";
-          } else {
-            uiType = "update";
-          }
-
-          return {
-            filePath: entry.filePath,
-            relativePath: relPath,
-            type: uiType,
-            patch,
-            additions: entry.additions,
-            deletions: entry.deletions,
-            ...(entry.movePath ? { movePath: entry.movePath } : {}),
-          };
-        });
-
-        // Build title matching built-in: "Success. Updated the following files:\nM path/to/file.ts"
-        // On PARTIAL failure (some hunks failed but others landed), don't claim
-        // "Success" — say so and list only what actually applied.
-        const fileList = files
-          .map((f) => {
-            const prefix = f.type === "add" ? "A" : f.type === "delete" ? "D" : "M";
-            return `${prefix} ${f.relativePath}`;
-          })
-          .join("\n");
-        const title =
-          failures.length > 0
-            ? `Partially applied (${hunks.length - failures.length} of ${hunks.length}). Updated:\n${fileList}`
-            : `Success. Updated the following files:\n${fileList}`;
-
-        // Aggregate unified diff for the top-level metadata.diff field
-        // (OpenCode's renderer also uses this for some views).
-        const diffText = files
-          .map((f) => f.patch)
-          .filter(Boolean)
-          .join("\n");
-
-        return {
-          output: results.join("\n"),
-          title,
-          metadata: {
-            diff: diffText,
-            files,
-          },
-        };
-      }
+      return result;
     },
   };
 }
@@ -1667,10 +1061,6 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
   }
 
   return tools;
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**

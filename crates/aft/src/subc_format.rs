@@ -221,6 +221,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "read"
             | "write"
             | "edit"
+            | "apply_patch"
             | "grep"
             | "glob"
             | "search"
@@ -269,6 +270,7 @@ pub fn format_response_with_context(
     match bare_name {
         "edit" => format_edit_response(data),
         "write" => format_write_response(data),
+        "apply_patch" => format_apply_patch(data),
         "read" => format_read(data, ctx.agent_specified_range),
         "grep" => format_grep(data),
         "glob" => data["text"].as_str().unwrap_or_default().to_string(),
@@ -324,6 +326,46 @@ fn import_module_name(response: &serde_json::Map<String, Value>, ctx: &FormatCon
 fn import_file_name(response: &serde_json::Map<String, Value>, ctx: &FormatContext) -> String {
     import_string_field(response, "file")
         .or_else(|| ctx.import_file_arg.clone())
+        .unwrap_or_default()
+}
+
+fn format_apply_patch(data: &Value) -> String {
+    if let Some(output) = data
+        .get("output")
+        .and_then(Value::as_str)
+        .filter(|output| !output.is_empty())
+    {
+        return output.to_string();
+    }
+
+    data.get("metadata")
+        .and_then(|metadata| metadata.get("files"))
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| {
+                    let kind = file.get("type").and_then(Value::as_str).unwrap_or("update");
+                    let rel = file
+                        .get("relativePath")
+                        .or_else(|| file.get("filePath"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("(file)");
+                    match kind {
+                        "add" => Some(format!("Created {rel}")),
+                        "delete" => Some(format!("Deleted {rel}")),
+                        "move" => {
+                            let move_path =
+                                file.get("movePath").and_then(Value::as_str).unwrap_or(rel);
+                            Some(format!("Moved {rel} → {move_path}"))
+                        }
+                        "update" => Some(format!("Updated {rel}")),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default()
 }
 

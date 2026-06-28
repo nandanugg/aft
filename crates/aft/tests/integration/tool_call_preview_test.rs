@@ -35,6 +35,9 @@ fn tool_call_top_level_preview_does_not_mutate_edit_or_write_modes() {
     let write_overwrite_path = root.join("src/write-overwrite.txt");
     fs::write(&write_overwrite_path, "before write\n").expect("write overwrite fixture");
 
+    let apply_patch_path = root.join("src/apply-patch.txt");
+    fs::write(&apply_patch_path, "before patch\n").expect("write apply_patch fixture");
+
     let mut aft = AftProcess::spawn();
     let configure = aft.configure(root);
     assert_eq!(
@@ -104,6 +107,15 @@ fn tool_call_top_level_preview_does_not_mutate_edit_or_write_modes() {
         json!({"filePath": "src/write-overwrite.txt", "content": "after write\n"}),
         &write_overwrite_path,
         Some("before write\n"),
+    );
+
+    assert_preview_does_not_mutate(
+        &mut aft,
+        "apply_patch update",
+        "apply_patch",
+        json!({"patchText": "*** Begin Patch\n*** Update File: src/apply-patch.txt\n@@\n-before patch\n+after patch\n*** End Patch"}),
+        &apply_patch_path,
+        Some("before patch\n"),
     );
 
     let status = aft.shutdown();
@@ -211,10 +223,17 @@ fn assert_preview_does_not_mutate(
         !preview_diff.is_empty(),
         "preview {label} returned an empty preview_diff"
     );
-    assert!(
-        response["diff"].is_object(),
-        "preview {label} missing structured diff: {response:#}"
-    );
+    if tool == "apply_patch" {
+        assert!(
+            response["affected_paths"].is_array(),
+            "preview {label} missing affected_paths: {response:#}"
+        );
+    } else {
+        assert!(
+            response["diff"].is_object(),
+            "preview {label} missing structured diff: {response:#}"
+        );
+    }
 
     match expected_content {
         Some(content) => assert_eq!(

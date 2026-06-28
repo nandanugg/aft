@@ -187,6 +187,7 @@ pub fn subc_translate_with_context(
         "read" => translate_read(agent_args, project_root),
         "write" => translate_write(agent_args, project_root, ctx),
         "edit" => translate_edit(agent_args, project_root, ctx),
+        "apply_patch" => translate_apply_patch(agent_args),
         "grep" => translate_grep(agent_args, project_root),
         "glob" => translate_glob(agent_args),
         "search" => translate_search(agent_args),
@@ -511,6 +512,25 @@ fn translate_edit(
     Err(invalid_request(
         "edit: no edit mode resolved from arguments.",
     ))
+}
+
+fn translate_apply_patch(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let patch_text = map_in
+        .get("patchText")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("apply_patch: missing required param 'patchText'"))?;
+
+    let mut out = Map::new();
+    out.insert(
+        "patch_text".to_string(),
+        Value::String(patch_text.to_string()),
+    );
+    Ok(Translated {
+        command: "apply_patch".into(),
+        args: out,
+    })
 }
 
 fn translate_grep(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {

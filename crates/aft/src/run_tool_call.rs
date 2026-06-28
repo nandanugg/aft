@@ -77,6 +77,9 @@ pub fn run_tool_call(
     };
 
     let mut map = translated_args;
+    if ctx.preview {
+        map.insert("preview".to_string(), json!(true));
+    }
     map.insert("id".to_string(), json!(ctx.request_id.clone()));
     map.insert("command".to_string(), json!(command));
     map.insert("session_id".to_string(), json!(ctx.session_id.clone()));

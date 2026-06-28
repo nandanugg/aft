@@ -14,7 +14,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { BridgePool } from "@cortexkit/aft-bridge";
+import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { astTools } from "../packages/opencode-plugin/src/tools/ast.ts";
 import { conflictTools } from "../packages/opencode-plugin/src/tools/conflicts.ts";
@@ -41,6 +41,7 @@ type BareToolName =
   | "read"
   | "write"
   | "edit"
+  | "apply_patch"
   | "grep"
   | "glob"
   | "search"
@@ -197,6 +198,19 @@ function translateAftMoveToolCall(rawArgs: Record<string, unknown>): BridgeCall 
   };
 }
 
+function translateApplyPatchToolCall(
+  rawArgs: Record<string, unknown>,
+  options?: ToolCallOptions,
+): BridgeCall {
+  return {
+    command: "apply_patch",
+    params: {
+      patch_text: rawArgs.patchText,
+      ...(options?.preview === true ? { preview: true } : {}),
+    },
+  };
+}
+
 function makeCtx(
   calls: BridgeCall[],
   responseForCall: (command: string, params: Record<string, unknown>) => Record<string, unknown>,
@@ -215,7 +229,13 @@ function makeCtx(
             _sessionId: string | undefined,
             name: string,
             rawArgs: Record<string, unknown> = {},
+            options?: ToolCallOptions,
           ) => {
+            if (name === "apply_patch") {
+              const translated = translateApplyPatchToolCall(rawArgs, options);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
             if (name === "aft_import") {
               const translated = translateAftImportToolCall(rawArgs);
               calls.push(translated);
@@ -268,6 +288,7 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     read: createReadTool(ctx),
     write: hoisted.write,
     edit: hoisted.edit,
+    apply_patch: hoisted.apply_patch,
     grep: grepTools.grep ?? grepTools.aft_grep,
     glob: grepTools.glob ?? grepTools.aft_glob,
     search: semanticTools(ctx).aft_search,
@@ -286,6 +307,18 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
 }
 
 function successForTranslate(command: string, params: Record<string, unknown>): Record<string, unknown> {
+  if (command === "apply_patch" && params.preview === true) {
+    return {
+      id: "preview",
+      success: true,
+      preview: true,
+      preview_diff: `Index: ${PROJECT_ROOT}/src/main.ts\n--- ${PROJECT_ROOT}/src/main.ts\n+++ ${PROJECT_ROOT}/src/main.ts\n`,
+      affected_paths: [`${PROJECT_ROOT}/src/main.ts`],
+      affected_rel_paths: ["src/main.ts"],
+      filepath: "src/main.ts",
+      text: "",
+    };
+  }
   if (params.preview === true) {
     return { id: "preview", success: true, diff: { before: "", after: "" } };
   }
@@ -409,6 +442,18 @@ async function captureFormatCase(caseDef: FormatCase): Promise<void> {
     const multiTargetResponses = zoomMultiTargetResponses(caseDef.native_response_json);
     let multiTargetIndex = 0;
     const ctx = makeCtx(calls, (command, params) => {
+      if (command === "apply_patch" && params.preview === true) {
+        return {
+          id: "preview",
+          success: true,
+          preview: true,
+          preview_diff: `Index: ${PROJECT_ROOT}/src/main.ts\n--- ${PROJECT_ROOT}/src/main.ts\n+++ ${PROJECT_ROOT}/src/main.ts\n`,
+          affected_paths: [`${PROJECT_ROOT}/src/main.ts`],
+          affected_rel_paths: ["src/main.ts"],
+          filepath: "src/main.ts",
+          text: "",
+        };
+      }
       if (params.preview === true) {
         return { id: "preview", success: true, diff: { before: "old\n", after: "new\n" } };
       }
@@ -459,6 +504,8 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "edit_batch", tool_name: "edit", agent_args: { filePath: "src/main.ts", edits: [{ oldString: "value", newString: "answer", startLine: 1, endLine: 1 }] } },
   { name: "edit_symbol", tool_name: "edit", agent_args: { filePath: "src/main.ts", symbol: "value", content: "const value = 2;" } },
   { name: "edit_replace_occurrence_zero", tool_name: "edit", agent_args: { filePath: "src/main.ts", oldString: "value", newString: "answer", occurrence: 0 } },
+  { name: "apply_patch_translate", tool_name: "apply_patch", agent_args: { patchText: "*** Begin Patch\n*** Update File: src/main.ts\n@@\n-const value = 1;\n+const value = 2;\n*** End Patch" } },
+  { name: "apply_patch_missing_patchText", tool_name: "apply_patch", expected_error: "apply_patch: missing required param 'patchText'", agent_args: {} },
   { name: "grep_include_braces", tool_name: "grep", agent_args: { pattern: "value", include: "*.ts,**/*.{vue,tsx}" } },
   { name: "grep_multi_path_existing_and_missing", tool_name: "grep", agent_args: { pattern: "value", path: "src docs missing-dir" } },
   { name: "glob_tool_match_translate", tool_name: "glob", agent_args: { pattern: "**/*.ts" } },
@@ -530,6 +577,44 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "write_rolled_back", tool_name: "write", agent_args: { filePath: "src/main.ts", content: "{" }, native_response_json: { id: "1", success: true, rolled_back: true } },
   { name: "edit_no_op_lsp", tool_name: "edit", agent_args: { filePath: "src/main.ts", oldString: "value", newString: "value" }, native_response_json: { id: "1", success: true, replacements: 1, no_op: true, diff: { additions: 0, deletions: 0 }, format_skip_reasons: ["unsupported_language", "timeout", "error", "timeout"], lsp_diagnostics: [{ severity: "warning", line: 1, message: "warn" }, { severity: "error", line: 2, message: "bad" }], lsp_pending_servers: ["typescript"] } },
   { name: "edit_glob_summary", tool_name: "edit", agent_args: { filePath: "src/**/*.ts", oldString: "value", newString: "answer", replaceAll: true }, native_response_json: { id: "1", success: true, total_files: 2, total_replacements: 3 } },
+  {
+    name: "apply_patch_format_success",
+    tool_name: "apply_patch",
+    agent_args: { patchText: "*** Begin Patch\n*** Update File: src/main.ts\n@@\n-const value = 1;\n+const value = 2;\n*** End Patch" },
+    native_response_json: {
+      id: "1",
+      success: true,
+      output: "Updated src/main.ts",
+      title: "Applied 1 hunks",
+      complete: true,
+      partial: false,
+      all_failed: false,
+      failures: [],
+      metadata: {
+        diff: `Index: ${PROJECT_ROOT}/src/main.ts\n--- ${PROJECT_ROOT}/src/main.ts\n+++ ${PROJECT_ROOT}/src/main.ts\n@@ -1,1 +1,1 @@\n-const value = 1;\n+const value = 2;\n`,
+        files: [{ filePath: `${PROJECT_ROOT}/src/main.ts`, relativePath: "src/main.ts", type: "update", patch: `Index: ${PROJECT_ROOT}/src/main.ts\n--- ${PROJECT_ROOT}/src/main.ts\n+++ ${PROJECT_ROOT}/src/main.ts\n@@ -1,1 +1,1 @@\n-const value = 1;\n+const value = 2;\n`, additions: 1, deletions: 1 }],
+      },
+    },
+  },
+  {
+    name: "apply_patch_format_partial",
+    tool_name: "apply_patch",
+    agent_args: { patchText: "*** Begin Patch\n*** Add File: src/new.ts\n+export {};\n*** Add File: src/existing.ts\n+nope\n*** End Patch" },
+    native_response_json: {
+      id: "1",
+      success: true,
+      output: "Created src/new.ts\nFailed to create src/existing.ts: file already exists\nPatch partially applied — 1 of 2 hunk(s) succeeded. Failed: src/existing.ts.",
+      title: "Applied 1 of 2 hunks",
+      complete: false,
+      partial: true,
+      all_failed: false,
+      failures: [{ path: "src/existing.ts", reason: "file already exists" }],
+      metadata: {
+        diff: `Index: ${PROJECT_ROOT}/src/new.ts\n--- ${PROJECT_ROOT}/src/new.ts\n+++ ${PROJECT_ROOT}/src/new.ts\n@@ -0,0 +1,1 @@\n+export {};\n`,
+        files: [{ filePath: `${PROJECT_ROOT}/src/new.ts`, relativePath: "src/new.ts", type: "add", patch: `Index: ${PROJECT_ROOT}/src/new.ts\n--- ${PROJECT_ROOT}/src/new.ts\n+++ ${PROJECT_ROOT}/src/new.ts\n@@ -0,0 +1,1 @@\n+export {};\n`, additions: 1, deletions: 0 }],
+      },
+    },
+  },
   { name: "grep_text", tool_name: "grep", agent_args: { pattern: "value" }, native_response_json: { id: "1", success: true, text: "src/main.ts:1: const value = 1;" } },
   { name: "grep_matches_fallback", tool_name: "grep", agent_args: { pattern: "value" }, native_response_json: { id: "1", success: true, matches: [{ file: "src/main.ts", line: 1, line_text: "const value = 1;" }], total_matches: 1, files_with_matches: 1 } },
   { name: "grep_empty_fallback", tool_name: "grep", agent_args: { pattern: "missing" }, native_response_json: { id: "1", success: true, matches: [], total_matches: 0, files_with_matches: 0 } },

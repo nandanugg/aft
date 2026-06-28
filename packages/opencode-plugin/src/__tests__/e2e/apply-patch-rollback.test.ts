@@ -1,11 +1,11 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { callBridge } from "../../tools/_shared.js";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk, toolResultText } from "../test-helpers";
@@ -20,6 +20,8 @@ import {
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
+
+type AskInput = Record<string, unknown>;
 
 function createMockClient(): any {
   return {
@@ -37,20 +39,30 @@ function createPluginContext(pool: BridgePool, storageDir: string): PluginContex
   };
 }
 
-function createSdkContext(directory: string): ToolContext {
+function createSdkContext(directory: string, ask: ToolContext["ask"] = noopAsk): ToolContext {
   return {
-    sessionID: "apply-patch-rollback-e2e",
+    sessionID: `apply-patch-cutover-e2e-${Math.random()}`,
     messageID: "apply-patch-message",
     agent: "test",
     directory,
     worktree: directory,
     abort: new AbortController().signal,
     metadata: () => {},
-    ask: noopAsk,
+    ask,
   };
 }
 
-maybeDescribe("e2e apply_patch rollback behavior", () => {
+function recordingAsk(
+  calls: AskInput[],
+  onAsk?: (input: AskInput) => void | Promise<void>,
+): ToolContext["ask"] {
+  return (async (input: AskInput) => {
+    calls.push(input);
+    await onAsk?.(input);
+  }) as unknown as ToolContext["ask"];
+}
+
+maybeDescribe("e2e apply_patch server-side cutover", () => {
   let preparedBinary: PreparedBinary = initialBinary;
   const harnesses: E2EHarness[] = [];
   const pools: BridgePool[] = [];
@@ -64,9 +76,8 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
     await cleanupHarnesses(harnesses);
   });
 
-  async function toolHarness(): Promise<{
+  async function toolHarness(ask?: ToolContext["ask"]): Promise<{
     h: E2EHarness;
-    ctx: PluginContext;
     tools: ReturnType<typeof hoistedTools>;
     sdkCtx: ToolContext;
   }> {
@@ -81,176 +92,144 @@ maybeDescribe("e2e apply_patch rollback behavior", () => {
     const ctx = createPluginContext(pool, join(h.tempDir, ".storage"));
     return {
       h,
-      ctx,
       tools: hoistedTools(ctx),
-      sdkCtx: createSdkContext(h.tempDir),
+      sdkCtx: createSdkContext(h.tempDir, ask),
     };
   }
 
-  test("successful two-file patch updates both files", async () => {
+  test("successful add+update patch changes disk and returns server summary", async () => {
     const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("one.txt"), "alpha\n", "utf8");
-    await writeFile(h.path("two.txt"), "bravo\n", "utf8");
+    await writeFile(h.path("existing.txt"), "before\n", "utf8");
 
     const output = await tools.apply_patch.execute(
       {
         patchText: `*** Begin Patch
-*** Update File: one.txt
-@@
--alpha
-+alpha changed
-*** Update File: two.txt
-@@
--bravo
-+bravo changed
-*** End Patch`,
-      },
-      sdkCtx,
-    );
-
-    expect(toolResultText(output)).toContain("Updated one.txt");
-    expect(toolResultText(output)).toContain("Updated two.txt");
-    expect(await readTextFile(h.path("one.txt"))).toBe("alpha changed\n");
-    expect(await readTextFile(h.path("two.txt"))).toBe("bravo changed\n");
-  });
-
-  test("move hunk success removes source and writes destination", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("from.txt"), "move me\n", "utf8");
-
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
-*** Update File: from.txt
-*** Move to: nested/to.txt
-@@
--move me
-+move me please
-*** End Patch`,
-      },
-      sdkCtx,
-    );
-
-    expect(toolResultText(output)).toContain("Updated and moved from.txt → nested/to.txt");
-    await expect(readTextFile(h.path("from.txt"))).rejects.toThrow();
-    expect(await readTextFile(h.path("nested", "to.txt"))).toBe("move me please\n");
-  });
-
-  test("move source-delete failure restores source and removes new destination", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await mkdir(h.path("locked"), { recursive: true });
-    await writeFile(h.path("locked", "from.txt"), "original\n", "utf8");
-    await chmod(h.path("locked"), 0o555);
-
-    try {
-      // Total-failure (single hunk that fully fails) now throws so OpenCode
-      // marks the tool call as errored in the UI. Capture the thrown error
-      // to verify both the failure summary and the rollback messaging are
-      // preserved in the error message.
-      let caught: unknown;
-      try {
-        await tools.apply_patch.execute(
-          {
-            patchText: `*** Begin Patch
-*** Update File: locked/from.txt
-*** Move to: moved/to.txt
-@@
--original
-+changed
-*** End Patch`,
-          },
-          sdkCtx,
-        );
-      } catch (e) {
-        caught = e;
-      }
-      expect(caught).toBeInstanceOf(Error);
-      const message = (caught as Error).message;
-      expect(message).toContain("Failed to update locked/from.txt");
-      expect(message).toContain("source delete failed after writing move destination");
-      expect(message).toContain("Patch failed");
-      expect(await readTextFile(h.path("locked", "from.txt"))).toBe("original\n");
-      await expect(readTextFile(h.path("moved", "to.txt"))).rejects.toThrow();
-    } finally {
-      await chmod(h.path("locked"), 0o755).catch(() => {});
-    }
-  });
-
-  test("add hunk to existing path fails during preview without applying earlier hunks", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("kept.txt"), "before\n", "utf8");
-    await writeFile(h.path("exists.txt"), "already here\n", "utf8");
-
-    let caught: unknown;
-    try {
-      await tools.apply_patch.execute(
-        {
-          patchText: `*** Begin Patch
-*** Update File: kept.txt
+*** Add File: created.txt
++created
+*** Update File: existing.txt
 @@
 -before
 +after
-*** Add File: exists.txt
-+new content
+*** End Patch`,
+      },
+      sdkCtx,
+    );
+
+    expect(toolResultText(output)).toContain("Created created.txt");
+    expect(toolResultText(output)).toContain("Updated existing.txt");
+    expect(await readTextFile(h.path("created.txt"))).toBe("created\n");
+    expect(await readTextFile(h.path("existing.txt"))).toBe("after\n");
+  });
+
+  test("preview then denied edit permission leaves disk unchanged", async () => {
+    const ask = (async (input: AskInput) => {
+      if (input.permission === "edit") throw new Error("Denied by test");
+    }) as unknown as ToolContext["ask"];
+    const { h, tools, sdkCtx } = await toolHarness(ask);
+    await writeFile(h.path("existing.txt"), "before\n", "utf8");
+
+    const output = await tools.apply_patch.execute(
+      {
+        patchText: `*** Begin Patch
+*** Add File: created.txt
++created
+*** Update File: existing.txt
+@@
+-before
++after
+*** End Patch`,
+      },
+      sdkCtx,
+    );
+
+    expect(toolResultText(output)).toContain("permission_denied");
+    expect(await readTextFile(h.path("existing.txt"))).toBe("before\n");
+    expect(existsSync(h.path("created.txt"))).toBe(false);
+  });
+
+  test("total failure after preview throws the server error", async () => {
+    let mutatedAfterPreview = false;
+    let targetPath = "";
+    const ask = recordingAsk([], async (input) => {
+      if (input.permission === "edit" && !mutatedAfterPreview) {
+        mutatedAfterPreview = true;
+        await writeFile(targetPath, "drift\n", "utf8");
+      }
+    });
+    const { h, tools, sdkCtx } = await toolHarness(ask);
+    targetPath = h.path("target.txt");
+    await writeFile(h.path("target.txt"), "before\n", "utf8");
+
+    await expect(
+      tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
+*** Update File: target.txt
+@@
+-before
++after
+*** End Patch`,
+        },
+        sdkCtx,
+      ),
+    ).rejects.toThrow("Patch failed");
+    expect(await readTextFile(h.path("target.txt"))).toBe("drift\n");
+  });
+
+  test("partial failure returns summary and keeps successful hunks", async () => {
+    let projectRoot = "";
+    const ask = recordingAsk([], async (input) => {
+      if (input.permission === "edit") {
+        await writeFile(join(projectRoot, "second.txt"), "race\n");
+      }
+    });
+    const { h, tools, sdkCtx } = await toolHarness(ask);
+    projectRoot = h.tempDir;
+
+    const output = await tools.apply_patch.execute(
+      {
+        patchText: `*** Begin Patch
+*** Add File: first.txt
++first
+*** Add File: second.txt
++second
+*** End Patch`,
+      },
+      sdkCtx,
+    );
+
+    const text = toolResultText(output);
+    expect(text).toContain("Created first.txt");
+    expect(text).toContain("Failed to create second.txt");
+    expect(text).toContain("Patch partially applied");
+    expect(await readTextFile(h.path("first.txt"))).toBe("first\n");
+    expect(await readTextFile(h.path("second.txt"))).toBe("race\n");
+  });
+
+  test("external-directory and edit permissions are both requested", async () => {
+    const asks: AskInput[] = [];
+    const ask = recordingAsk(asks);
+    const { h, tools, sdkCtx } = await toolHarness(ask);
+    const externalDir = join(dirname(h.tempDir), `aft-apply-patch-external-${Date.now()}`);
+    const externalFile = join(externalDir, "outside.txt");
+    await mkdir(externalDir, { recursive: true });
+
+    try {
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
+*** Add File: ${externalFile}
++outside
 *** End Patch`,
         },
         sdkCtx,
       );
-    } catch (e) {
-      caught = e;
+
+      expect(toolResultText(output)).toContain(`Created ${externalFile}`);
+      expect(await readFile(externalFile, "utf8")).toBe("outside\n");
+      expect(asks.map((call) => call.permission)).toEqual(["external_directory", "edit"]);
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
     }
-
-    expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toContain("Failed to create exists.txt");
-    expect(await readTextFile(h.path("kept.txt"))).toBe("before\n");
-    expect(await readTextFile(h.path("exists.txt"))).toBe("already here\n");
-  });
-
-  test("delete then add of an existing path remains restorable from partial checkpoint", async () => {
-    const { h, ctx, tools, sdkCtx } = await toolHarness();
-    const existing = h.path("existing.ts");
-    const lockedDir = h.path("locked");
-    await writeFile(existing, 'export const value = "original";\n', "utf8");
-    await mkdir(lockedDir, { recursive: true });
-    await writeFile(h.path("locked", "fail.ts"), "export const locked = true;\n", "utf8");
-
-    const output = await (async () => {
-      await chmod(lockedDir, 0o555);
-      try {
-        return await tools.apply_patch.execute(
-          {
-            patchText: `*** Begin Patch
-*** Delete File: existing.ts
-*** Add File: existing.ts
-+export const value = "replacement";
-*** Delete File: locked/fail.ts
-*** End Patch`,
-          },
-          sdkCtx,
-        );
-      } finally {
-        await chmod(lockedDir, 0o755).catch(() => {});
-      }
-    })();
-
-    const text = toolResultText(output);
-    expect(text).toContain("Deleted existing.ts");
-    expect(text).toContain("Created existing.ts");
-    expect(text).toContain("Failed to delete locked/fail.ts");
-    expect(text).toContain("Patch partially applied");
-    expect(await readTextFile(existing)).toBe('export const value = "replacement";\n');
-
-    const list = await callBridge(ctx, sdkCtx, "list_checkpoints");
-    expect(list.success).toBe(true);
-    const checkpointName = (list.checkpoints as Array<Record<string, unknown>>)
-      .map((checkpoint) => checkpoint.name)
-      .filter((name): name is string => typeof name === "string" && name.startsWith("apply_patch_"))
-      .sort()
-      .at(-1);
-    expect(checkpointName).toBeDefined();
-
-    const restore = await callBridge(ctx, sdkCtx, "restore_checkpoint", { name: checkpointName });
-    expect(restore.success).toBe(true);
-    expect(await readTextFile(existing)).toBe('export const value = "original";\n');
   });
 });

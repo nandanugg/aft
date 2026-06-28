@@ -1,4 +1,4 @@
-//! Dormant Rust leaf for the `apply_patch` command.
+//! Rust implementation of the `apply_patch` command.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -957,8 +957,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     )
 }
 
-/// Handle a raw `apply_patch` request. This leaf is registered for direct NDJSON
-/// testing but is intentionally not wired into translate/format/plugin paths yet.
+/// Handle a raw `apply_patch` request.
 pub fn handle_apply_patch(req: &RawRequest, ctx: &AppContext) -> Response {
     let params = command_params(req);
     let patch_text = match params.get("patch_text").and_then(Value::as_str) {

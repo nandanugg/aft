@@ -321,7 +321,7 @@ EOF
       ),
     ).rejects.toThrow("timed out");
 
-    await expect(readTextFile(h.path("timeout.ts"))).rejects.toThrow();
+    expect(await readTextFile(h.path("timeout.ts"))).toBe("export    const   slow   = 1;\n");
   }, 25_000);
 
   test("patch with formatter generic error", async () => {
