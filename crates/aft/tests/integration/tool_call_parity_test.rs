@@ -290,6 +290,11 @@ fn parity_cases() -> Vec<ParityCase> {
                 "callgraph": true
             }),
         },
+        ParityCase {
+            label: "safety_list_empty",
+            tool: "aft_safety",
+            arguments: json!({"op": "list"}),
+        },
     ]
 }
 

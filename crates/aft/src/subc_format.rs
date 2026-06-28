@@ -34,6 +34,9 @@ pub struct FormatContext {
     pub refactor_file_arg: Option<String>,
     pub move_file_arg: Option<String>,
     pub move_dest_arg: Option<String>,
+    pub safety_op: Option<String>,
+    pub safety_file_arg: Option<String>,
+    pub safety_name_arg: Option<String>,
 }
 
 impl Default for FormatContext {
@@ -55,6 +58,9 @@ impl Default for FormatContext {
             refactor_file_arg: None,
             move_file_arg: None,
             move_dest_arg: None,
+            safety_op: None,
+            safety_file_arg: None,
+            safety_name_arg: None,
         }
     }
 }
@@ -80,6 +86,9 @@ impl FormatContext {
             refactor_file_arg: refactor_string_arg_for_call(bare_name, arguments, "filePath"),
             move_file_arg: move_string_arg_for_call(bare_name, arguments, "filePath"),
             move_dest_arg: move_string_arg_for_call(bare_name, arguments, "destination"),
+            safety_op: safety_string_arg_for_call(bare_name, arguments, "op"),
+            safety_file_arg: safety_string_arg_for_call(bare_name, arguments, "filePath"),
+            safety_name_arg: safety_string_arg_for_call(bare_name, arguments, "name"),
         }
     }
 }
@@ -198,6 +207,17 @@ fn move_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Op
         .map(str::to_string)
 }
 
+fn safety_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> Option<String> {
+    if bare_name != "aft_safety" {
+        return None;
+    }
+    arguments
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn coerce_boolean(value: &Value) -> bool {
     match value {
         Value::Bool(value) => *value,
@@ -236,6 +256,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "aft_move"
             | "aft_import"
             | "aft_refactor"
+            | "aft_safety"
     )
 }
 
@@ -291,6 +312,7 @@ pub fn format_response_with_context(
         "aft_move" => format_move(data, ctx),
         "aft_import" => format_import(data, ctx),
         "aft_refactor" => format_refactor(data, ctx),
+        "aft_safety" => format_safety(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }
@@ -604,6 +626,227 @@ fn format_refactor(data: &Value, ctx: &FormatContext) -> String {
         }
         _ => "No refactor result.".to_string(),
     }
+}
+
+fn format_safety(data: &Value, ctx: &FormatContext) -> String {
+    let Some(response) = data.as_object() else {
+        return "No safety result.".to_string();
+    };
+
+    match ctx.safety_op.as_deref() {
+        Some("undo") => {
+            if response.get("operation").and_then(Value::as_bool) == Some(true) {
+                let op_id = import_string_field(response, "op_id")
+                    .unwrap_or_else(|| "(operation)".to_string());
+                let files = import_number_field(response, "restored_count").unwrap_or_else(|| {
+                    response
+                        .get("restored")
+                        .and_then(Value::as_array)
+                        .map(|items| items.len().to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                });
+                [
+                    format!("restored operation {op_id}"),
+                    format!("files {files}"),
+                ]
+                .join("\n")
+            } else {
+                let file = import_string_field(response, "path")
+                    .or_else(|| ctx.safety_file_arg.clone())
+                    .unwrap_or_else(|| "(file)".to_string());
+                let backup =
+                    import_string_field(response, "backup_id").unwrap_or_else(|| "—".to_string());
+                [
+                    format!("restored {}", shorten_path(&file)),
+                    format!("backup {backup}"),
+                ]
+                .join("\n")
+            }
+        }
+        Some("history") => {
+            let file = import_string_field(response, "file")
+                .or_else(|| ctx.safety_file_arg.clone())
+                .unwrap_or_else(|| "(file)".to_string());
+            let entries = records_field(response, "entries");
+            let mut lines = vec![shorten_path(&file)];
+            if entries.is_empty() {
+                lines.push("No history entries.".to_string());
+            } else {
+                lines.push(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| {
+                            let backup_id = entry
+                                .get("backup_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("entry-{}", index + 1));
+                            let timestamp = entry
+                                .get("timestamp")
+                                .and_then(format_timestamp)
+                                .unwrap_or_else(|| "unknown time".to_string());
+                            let description = entry
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let mut line = format!("{}. {backup_id} {timestamp}", index + 1);
+                            if !description.is_empty() {
+                                line.push_str("\n   ");
+                                line.push_str(description);
+                            }
+                            line
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+            lines.join("\n")
+        }
+        Some("checkpoint") => {
+            let name = import_string_field(response, "name")
+                .or_else(|| ctx.safety_name_arg.clone())
+                .unwrap_or_else(|| "(checkpoint)".to_string());
+            let files =
+                import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
+            let skipped = records_field(response, "skipped");
+            let skipped_text = if skipped.is_empty() {
+                "No skipped files.".to_string()
+            } else {
+                let details = skipped
+                    .iter()
+                    .map(|entry| {
+                        let file = entry
+                            .get("file")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(file)");
+                        let error = entry
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error");
+                        format!("  ↳ {}: {error}", shorten_path(file))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("skipped\n{details}")
+            };
+            [
+                format!("checkpoint created {name}"),
+                format!("files {files}"),
+                skipped_text,
+            ]
+            .join("\n")
+        }
+        Some("restore") => {
+            let name = import_string_field(response, "name")
+                .or_else(|| ctx.safety_name_arg.clone())
+                .unwrap_or_else(|| "(checkpoint)".to_string());
+            let files =
+                import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
+            [
+                format!("checkpoint restored {name}"),
+                format!("files {files}"),
+            ]
+            .join("\n")
+        }
+        Some("list") => {
+            let checkpoints = records_field(response, "checkpoints");
+            let mut lines = vec![format!("{} checkpoint(s)", checkpoints.len())];
+            if checkpoints.is_empty() {
+                lines.push("No checkpoints saved.".to_string());
+            } else {
+                lines.push(
+                    checkpoints
+                        .iter()
+                        .enumerate()
+                        .map(|(index, checkpoint)| {
+                            let name = checkpoint
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("checkpoint-{}", index + 1));
+                            let file_count = checkpoint
+                                .get("file_count")
+                                .and_then(import_number_value)
+                                .unwrap_or_else(|| "0".to_string());
+                            let created = checkpoint
+                                .get("created_at")
+                                .and_then(format_timestamp)
+                                .unwrap_or_else(|| "unknown time".to_string());
+                            format!("{}. {name} {file_count} file(s) · {created}", index + 1)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+            lines.join("\n")
+        }
+        _ => "No safety result.".to_string(),
+    }
+}
+
+fn format_timestamp(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+    let number = value.as_f64()?;
+    if !number.is_finite() {
+        return None;
+    }
+    let millis = if number > 1_000_000_000_000.0 {
+        number
+    } else {
+        number * 1000.0
+    };
+    const JS_DATE_MAX_MILLIS: f64 = 8_640_000_000_000_000.0;
+    if !millis.is_finite()
+        || millis.abs() > JS_DATE_MAX_MILLIS
+        || millis < i64::MIN as f64
+        || millis > i64::MAX as f64
+    {
+        return Some(value_to_plain_string(value));
+    }
+    Some(format_unix_millis_utc(millis.trunc() as i64))
+}
+
+fn format_unix_millis_utc(millis: i64) -> String {
+    let seconds = div_floor_i64(millis, 1000);
+    let millisecond = millis.rem_euclid(1000);
+    let days = div_floor_i64(seconds, 86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    if millisecond == 0 {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}Z")
+    } else {
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millisecond:03}Z")
+    }
+}
+
+fn div_floor_i64(value: i64, divisor: i64) -> i64 {
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+    if remainder != 0 && ((remainder > 0) != (divisor > 0)) {
+        quotient - 1
+    } else {
+        quotient
+    }
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 // Mirrors per-tool OpenCode wrapper error handling in packages/opencode-plugin/src/tools/*.ts.

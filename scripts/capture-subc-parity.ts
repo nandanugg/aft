@@ -24,6 +24,7 @@ import { importTools } from "../packages/opencode-plugin/src/tools/imports.ts";
 import { navigationTools } from "../packages/opencode-plugin/src/tools/navigation.ts";
 import { readingTools } from "../packages/opencode-plugin/src/tools/reading.ts";
 import { refactoringTools } from "../packages/opencode-plugin/src/tools/refactoring.ts";
+import { safetyTools } from "../packages/opencode-plugin/src/tools/safety.ts";
 import { searchTools } from "../packages/opencode-plugin/src/tools/search.ts";
 import { semanticTools } from "../packages/opencode-plugin/src/tools/semantic.ts";
 import type { PluginContext } from "../packages/opencode-plugin/src/types.ts";
@@ -55,7 +56,8 @@ type BareToolName =
   | "aft_delete"
   | "aft_move"
   | "aft_import"
-  | "aft_refactor";
+  | "aft_refactor"
+  | "aft_safety";
 
 interface BridgeCall {
   command: string;
@@ -175,6 +177,34 @@ function translateAftRefactorToolCall(rawArgs: Record<string, unknown>): BridgeC
   return { command, params };
 }
 
+function translateAftSafetyToolCall(rawArgs: Record<string, unknown>): BridgeCall {
+  const op = rawArgs.op;
+  const command =
+    op === "undo"
+      ? "undo"
+      : op === "history"
+        ? "edit_history"
+        : op === "checkpoint"
+          ? "checkpoint"
+          : op === "restore"
+            ? "restore_checkpoint"
+            : "list_checkpoints";
+  const params: Record<string, unknown> = {};
+  if (rawArgs.name !== undefined) params.name = rawArgs.name;
+  const files = Array.isArray(rawArgs.files) && rawArgs.files.length > 0 ? rawArgs.files : undefined;
+  if (op === "checkpoint") {
+    if (files) {
+      params.files = files;
+    } else if (rawArgs.filePath !== undefined) {
+      params.files = [rawArgs.filePath];
+    }
+  } else {
+    if (rawArgs.filePath !== undefined) params.file = rawArgs.filePath;
+    if (files) params.files = files;
+  }
+  return { command, params };
+}
+
 function resolveProjectPath(raw: unknown): string {
   const value = String(raw ?? "");
   return isAbsolute(value) ? value : resolve(PROJECT_ROOT, value);
@@ -246,6 +276,11 @@ function makeCtx(
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
+            if (name === "aft_safety") {
+              const translated = translateAftSafetyToolCall(rawArgs);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
             if (name === "aft_delete") {
               const translated = translateAftDeleteToolCall(rawArgs);
               calls.push(translated);
@@ -303,6 +338,7 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     aft_move: hoisted.aft_move,
     aft_import: importTools(ctx).aft_import,
     aft_refactor: refactoringTools(ctx).aft_refactor,
+    aft_safety: safetyTools(ctx).aft_safety,
   };
 }
 
@@ -542,6 +578,14 @@ const TRANSLATE_CASES: TranslateCase[] = [
     input_agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, lsp_hints: { symbols: [{ name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 4, kind: "function" }] } },
     lsp_symbols: [{ name: "run", kind: 12, location: { uri: `file://${PROJECT_ROOT}/src/main.ts`, range: { start: { line: 4 } } } }],
   },
+  { name: "aft_safety_undo_file", tool_name: "aft_safety", agent_args: { op: "undo", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "aft_safety_history_file", tool_name: "aft_safety", agent_args: { op: "history", filePath: `${PROJECT_ROOT}/src/main.ts` } },
+  { name: "aft_safety_checkpoint_files", tool_name: "aft_safety", agent_args: { op: "checkpoint", name: "before-edit", files: [`${PROJECT_ROOT}/src/main.ts`, "docs/guide.md"] } },
+  { name: "aft_safety_checkpoint_filePath", tool_name: "aft_safety", agent_args: { op: "checkpoint", name: "single-file", filePath: "src/main.ts" } },
+  { name: "aft_safety_restore_name", tool_name: "aft_safety", agent_args: { op: "restore", name: "before-edit" } },
+  { name: "aft_safety_list", tool_name: "aft_safety", agent_args: { op: "list" } },
+  { name: "aft_safety_missing_filePath_for_history", tool_name: "aft_safety", expected_error: "'filePath' is required for 'history' op", agent_args: { op: "history" } },
+  { name: "aft_safety_missing_name_for_checkpoint", tool_name: "aft_safety", expected_error: "'name' is required for 'checkpoint' op", agent_args: { op: "checkpoint" } },
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },

@@ -240,11 +240,11 @@ describe("Tool round-trips", () => {
     expect(content).toContain("Goodbye");
 
     // Undo the edit
-    const undoResult = JSON.parse(
+    const undoResult = toolResultText(
       await undoTools.aft_safety.execute({ op: "undo", filePath }, sdkCtx),
     );
-    expect(undoResult.success).toBe(true);
-    expect(undoResult.backup_id).toBeDefined();
+    expect(undoResult).toContain("restored");
+    expect(undoResult.trim().startsWith("{")).toBe(false);
 
     // Verify file was restored
     content = await readFile(filePath, "utf-8");

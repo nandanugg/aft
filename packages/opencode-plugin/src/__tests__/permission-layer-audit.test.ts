@@ -82,7 +82,8 @@ function createHarness(
         params: rawArgs,
         ...(options?.preview ? { options: { preview: true } } : {}),
       });
-      return await sendImpl(name, rawArgs, options);
+      const response = await sendImpl(name, rawArgs, options);
+      return { text: "ok", ...response };
     },
   };
   const pool = { getBridge: () => bridge } as unknown as BridgePool;
@@ -632,9 +633,9 @@ describe("permission audit regressions", () => {
       sdkCtx,
     )) as string;
 
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls[0]?.command).toBe("checkpoint");
+    expect(calls[0]?.command).toBe("aft_safety");
   });
 
   test("aft_safety checkpoint preflight warms session root before resolving relative files", async () => {
@@ -650,6 +651,14 @@ describe("permission audit regressions", () => {
       send: async (command: string, params: Record<string, unknown> = {}) => {
         calls.push({ command, params });
         return { success: true, name: "snap" };
+      },
+      toolCall: async (
+        _sessionID: string | undefined,
+        name: string,
+        rawArgs: Record<string, unknown> = {},
+      ) => {
+        calls.push({ command: name, params: rawArgs });
+        return { success: true, name: "snap", text: "ok" };
       },
     };
     const pool = {
@@ -678,11 +687,11 @@ describe("permission audit regressions", () => {
 
     const expectedApprovedPath = path.resolve(project, "../outside.ts");
     const externalAsk = askCalls.find((call) => call.permission === "external_directory");
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(externalAsk?.metadata?.filepath).toBe(expectedApprovedPath);
     expect(calls[0]).toMatchObject({
-      command: "checkpoint",
-      params: { files: ["../outside.ts"] },
+      command: "aft_safety",
+      params: { op: "checkpoint", name: "snap", files: ["../outside.ts"] },
     });
     expect(bridgeRoots[0]).toBe(project);
   });
@@ -721,9 +730,9 @@ describe("permission audit regressions", () => {
       sdkCtx,
     )) as string;
 
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
   });
 
   test("aft_safety undo without filePath previews, asks edit, then calls bridge without file param", async () => {
@@ -745,12 +754,12 @@ describe("permission audit regressions", () => {
 
     const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
 
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
     expect(askCalls[0]?.patterns).toEqual(["inside.ts"]);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
     expect(calls[0]?.params).not.toHaveProperty("file");
-    expect(calls[1]?.params).not.toHaveProperty("file");
+    expect(calls[1]?.params).not.toHaveProperty("filePath");
   });
 
   test("aft_safety undo without filePath stops before undo when edit permission is denied", async () => {
@@ -786,8 +795,8 @@ describe("permission audit regressions", () => {
 
     expect(calls[0]?.command).toBe("undo_preview");
     expect(calls[0]?.params).toMatchObject({ file: "inside.ts" });
-    expect(calls[1]?.command).toBe("undo");
-    expect(calls[1]?.params).toMatchObject({ file: "inside.ts" });
+    expect(calls[1]?.command).toBe("aft_safety");
+    expect(calls[1]?.params).toMatchObject({ op: "undo", filePath: "inside.ts" });
   });
 
   test("aft_safety undo preflights external paths returned by preview", async () => {
@@ -803,9 +812,9 @@ describe("permission audit regressions", () => {
 
     const raw = (await tools.aft_safety.execute({ op: "undo" }, sdkCtx)) as string;
 
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
   });
 
   test("aft_safety undo preview internal paths do not ask external_directory", async () => {
@@ -821,7 +830,7 @@ describe("permission audit regressions", () => {
     await tools.aft_safety.execute({ op: "undo" }, sdkCtx);
 
     expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
-    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "undo"]);
+    expect(calls.map((call) => call.command)).toEqual(["undo_preview", "aft_safety"]);
   });
 
   test("aft_safety restore preflights external checkpoint paths", async () => {
@@ -837,9 +846,9 @@ describe("permission audit regressions", () => {
 
     const raw = (await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx)) as string;
 
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "aft_safety"]);
   });
 
   test("aft_safety restore internal checkpoint paths do not ask external_directory", async () => {
@@ -855,7 +864,7 @@ describe("permission audit regressions", () => {
     await tools.aft_safety.execute({ op: "restore", name: "snap" }, sdkCtx);
 
     expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
-    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "restore_checkpoint"]);
+    expect(calls.map((call) => call.command)).toEqual(["checkpoint_paths", "aft_safety"]);
   });
 
   test("aft_safety checkpoint checks a single external filePath", async () => {
@@ -870,10 +879,10 @@ describe("permission audit regressions", () => {
       sdkCtx,
     )) as string;
 
-    expect(JSON.parse(raw).success).toBe(true);
+    expect(raw).toBe("ok");
     expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-    expect(calls[0]?.command).toBe("checkpoint");
-    expect(calls[0]?.params).toMatchObject({ files: [externalFile] });
+    expect(calls[0]?.command).toBe("aft_safety");
+    expect(calls[0]?.params).toMatchObject({ op: "checkpoint", filePath: externalFile });
   });
 
   test("ast_grep_search denies external paths before bridge execution", async () => {

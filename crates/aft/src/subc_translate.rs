@@ -202,6 +202,7 @@ pub fn subc_translate_with_context(
         "aft_move" => translate_move(agent_args, project_root),
         "aft_import" => translate_import(agent_args),
         "aft_refactor" => translate_refactor(agent_args),
+        "aft_safety" => translate_safety(agent_args),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
@@ -845,6 +846,61 @@ fn translate_refactor(args: &Value) -> Result<Translated, TranslateError> {
     }
 
     insert_present_renamed(&mut out, &map_in, "lsp_hints", "lsp_hints");
+
+    Ok(Translated {
+        command: command.into(),
+        args: out,
+    })
+}
+
+fn translate_safety(args: &Value) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let op = map_in
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_request("aft_safety: missing required param 'op'"))?;
+    let command = match op {
+        "undo" => "undo",
+        "history" => "edit_history",
+        "checkpoint" => "checkpoint",
+        "restore" => "restore_checkpoint",
+        "list" => "list_checkpoints",
+        other => {
+            return Err(invalid_request(format!(
+                "aft_safety: invalid op {other:?}; expected 'undo', 'history', 'checkpoint', 'restore', or 'list'"
+            )));
+        }
+    };
+
+    if op == "history" && map_in.get("filePath").and_then(Value::as_str).is_none() {
+        return Err(invalid_request("'filePath' is required for 'history' op"));
+    }
+    if matches!(op, "checkpoint" | "restore")
+        && map_in.get("name").and_then(Value::as_str).is_none()
+    {
+        return Err(invalid_request(format!("'name' is required for '{op}' op")));
+    }
+
+    let mut out = Map::new();
+    insert_present_renamed(&mut out, &map_in, "name", "name");
+    let files = map_in
+        .get("files")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .cloned();
+
+    if op == "checkpoint" {
+        if let Some(files) = files {
+            out.insert("files".to_string(), Value::Array(files));
+        } else if let Some(file_path) = map_in.get("filePath") {
+            out.insert("files".to_string(), Value::Array(vec![file_path.clone()]));
+        }
+    } else {
+        insert_present_renamed(&mut out, &map_in, "filePath", "file");
+        if let Some(files) = files {
+            out.insert("files".to_string(), Value::Array(files));
+        }
+    }
 
     Ok(Translated {
         command: command.into(),

@@ -1,0 +1,6 @@
+{
+  "args": {
+    "name": "before-edit"
+  },
+  "command": "restore_checkpoint"
+}

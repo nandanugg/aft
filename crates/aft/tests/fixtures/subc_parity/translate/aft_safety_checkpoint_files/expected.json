@@ -1,0 +1,10 @@
+{
+  "args": {
+    "files": [
+      "<PROJECT_ROOT>/src/main.ts",
+      "docs/guide.md"
+    ],
+    "name": "before-edit"
+  },
+  "command": "checkpoint"
+}

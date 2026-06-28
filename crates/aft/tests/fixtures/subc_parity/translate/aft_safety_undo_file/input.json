@@ -1,0 +1,8 @@
+{
+  "agent_args": {
+    "filePath": "<PROJECT_ROOT>/src/main.ts",
+    "op": "undo"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "aft_safety"
+}

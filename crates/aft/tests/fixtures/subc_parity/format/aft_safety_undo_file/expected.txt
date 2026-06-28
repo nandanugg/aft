@@ -1,0 +1,2 @@
+restored <PROJECT_ROOT>/src/main.ts
+backup backup-123

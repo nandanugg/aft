@@ -3,7 +3,7 @@ import { coerceStringArray } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
-import { callBridge, expandTilde, resolveProjectRoot } from "./_shared.js";
+import { callBridge, callToolCall, expandTilde, resolveProjectRoot } from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
@@ -162,42 +162,22 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
 
-        const commandMap: Record<string, string> = {
-          undo: "undo",
-          history: "edit_history",
-          checkpoint: "checkpoint",
-          restore: "restore_checkpoint",
-          list: "list_checkpoints",
-        };
-        const params: Record<string, unknown> = {};
-        if (args.name !== undefined) params.name = args.name;
+        const rawArgs: Record<string, unknown> = { op };
+        if (args.name !== undefined) rawArgs.name = args.name;
         // Expand ~ on every path so Rust (which treats ~ literally) gets the real
         // target instead of creating/looking up a literal `~` path. Relative
         // paths are left for Rust to resolve against the project root.
         const payloadFiles = coerceStringArray(args.files).map(expandTilde);
         const filePathArg =
           typeof args.filePath === "string" ? expandTilde(args.filePath) : undefined;
-        if (op === "checkpoint") {
-          // For checkpoint, Rust only knows `files`. If the agent passes
-          // `filePath` (a reasonable mistake — the tool schema exposes both),
-          // auto-promote it into a single-entry `files` list rather than
-          // silently dropping it and falling back to the whole tracked-file
-          // set.
-          if (payloadFiles.length > 0) {
-            params.files = payloadFiles;
-          } else if (filePathArg !== undefined) {
-            params.files = [filePathArg];
-          }
-        } else {
-          // undo / history / restore / list all take `file` as-is.
-          if (filePathArg !== undefined) params.file = filePathArg;
-          if (payloadFiles.length > 0) params.files = payloadFiles;
-        }
-        const response = await callBridge(ctx, context, commandMap[op], params);
+        if (filePathArg !== undefined) rawArgs.filePath = filePathArg;
+        if (payloadFiles.length > 0) rawArgs.files = payloadFiles;
+
+        const response = await callToolCall(ctx, context, "aft_safety", rawArgs);
         if (response.success === false) {
           throw new Error((response.message as string) || `${op} failed`);
         }
-        return JSON.stringify(response);
+        return response.text;
       },
     },
   };
