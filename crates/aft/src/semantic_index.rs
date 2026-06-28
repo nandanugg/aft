@@ -3725,7 +3725,16 @@ mod tests {
             .expect("nonblocking listener");
         let addr = listener.local_addr().expect("local addr");
         let handle = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            // The deadline is only a hang-backstop for the case where the client
+            // makes FEWER than `attempts` connections. It MUST comfortably exceed
+            // the client's full retry budget (3 attempts: 3x250ms read-timeouts +
+            // 500ms + 1000ms backoffs ~= 2.25s) so the last connect is always
+            // accepted — otherwise the 3rd connect lands after a too-short
+            // deadline, the server thread is already gone, and the client gets a
+            // connect error ("request failed") instead of the body-read error the
+            // test asserts. Under loaded CI (esp. Windows) thread scheduling
+            // drifts the connects later, so this needs generous headroom.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut accepted = 0usize;
             while accepted < attempts && std::time::Instant::now() < deadline {
                 match listener.accept() {
