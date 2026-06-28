@@ -17,7 +17,6 @@ import {
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
-import { disposePtyTerminal, getOrCreatePtyTerminal, readPtyBytes } from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
@@ -321,7 +320,7 @@ export async function waitForBashStatus(
       lastData = data;
       const terminal = isTerminalStatus(data.status);
       if (waitFor) {
-        const scan = await readNewTaskOutput(runtime, taskId, data, spillCursor);
+        const scan = await readNewTaskOutput(data, spillCursor);
         if (scan) {
           spillCursor = scan.nextCursor;
           if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
@@ -379,31 +378,15 @@ export async function waitForBashStatus(
     }
   } finally {
     if (!sawTerminal) unmarkTaskWaiting(runtime.sessionID, taskId);
-    await disposePtyTerminal(watchPtyCacheKey(runtime, taskId));
   }
 }
 
 async function readNewTaskOutput(
-  runtime: ToolContext,
-  taskId: string,
   data: Record<string, unknown>,
   cursor: OutputCursor,
 ): Promise<{ text: string; baseOffset: number; nextCursor: OutputCursor } | undefined> {
   const outputPath = data.output_path as string | undefined;
-  if (data.mode === "pty") {
-    if (!outputPath) return undefined;
-    const state = await getOrCreatePtyTerminal(watchPtyCacheKey(runtime, taskId), outputPath);
-    const baseOffset = state.offset;
-    const bytes = await readPtyBytes(state);
-    if (bytes.length === 0) return undefined;
-    return {
-      text: bytes.toString("utf8"),
-      baseOffset,
-      nextCursor: { output: state.offset, stderr: 0, combined: state.offset },
-    };
-  }
-
-  const stderrPath = data.stderr_path as string | undefined;
+  const stderrPath = data.mode === "pty" ? undefined : (data.stderr_path as string | undefined);
   if (!outputPath && !stderrPath) return undefined;
   const stdoutBytes = outputPath
     ? await readFileBytesFrom(outputPath, cursor.output)
@@ -554,10 +537,4 @@ export function __trimWaitScanBufferForTests(
 
 function withWaited(data: Record<string, unknown>, waited: BashStatusWaited): BashStatusWithWait {
   return { ...data, waited };
-}
-function ptyCacheKey(runtime: ToolContext, taskId: string): string {
-  return `${projectRootFor(runtime)}::${runtime.sessionID ?? "__default__"}::${taskId}`;
-}
-function watchPtyCacheKey(runtime: ToolContext, taskId: string): string {
-  return `${ptyCacheKey(runtime, taskId)}::watch`;
 }

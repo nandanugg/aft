@@ -86,6 +86,7 @@ pub mod patch;
 pub mod path_identity;
 pub mod pattern_compile;
 pub mod protocol;
+pub mod pty_render;
 pub mod query_shape;
 pub mod response_finalize;
 pub mod run_tool_call;

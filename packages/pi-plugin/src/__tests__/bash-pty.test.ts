@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { __ptyCacheSizeForTests, __resetPtyCacheForTests } from "../shared/pty-cache.js";
 import { registerBashTool } from "../tools/bash.js";
 import type { PluginContext } from "../types.js";
 
@@ -25,7 +24,6 @@ interface MockToolDef {
 const tempDirs: string[] = [];
 
 afterEach(async () => {
-  __resetPtyCacheForTests();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -177,14 +175,15 @@ describe("Pi bash PTY layer", () => {
     expect(calls[0][1].output_mode).toBe("raw");
   });
 
-  test("bash_status output_mode screen returns rendered screen", async () => {
-    const outputPath = await spill("\u001b[2J\u001b[Hhello\u001b[10;5Hthere");
+  test("bash_status output_mode screen returns server-rendered screen", async () => {
+    const outputPath = await spill("raw bytes are not rendered in screen mode");
     const tools = new Map<string, MockToolDef>();
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
       status: "running",
       mode: "pty",
       output_path: outputPath,
+      pty_screen: "hello\n    there",
     }));
     registerBashTool(api(tools), pluginCtx);
     const result = await tools
@@ -194,33 +193,27 @@ describe("Pi bash PTY layer", () => {
       });
     expect(text(result)).toContain("hello");
     expect(text(result)).toContain("there");
+    expect(text(result)).not.toContain("raw bytes are not rendered");
   });
 
-  test("bash_status output_mode screen uses custom dimensions", async () => {
-    const outputPath = await spill("\u001b[2J\u001b[Hleft\u001b[1;100Hwide");
+  test("bash_status output_mode both combines server screen with raw bytes", async () => {
+    const outputPath = await spill("raw\u001b[31m-bytes");
     const tools = new Map<string, MockToolDef>();
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
       status: "running",
       mode: "pty",
       output_path: outputPath,
-      pty_rows: 50,
-      pty_cols: 120,
+      pty_screen: "left\nwide",
     }));
     registerBashTool(api(tools), pluginCtx);
     const result = await tools
       .get("bash_status")!
-      .execute(
-        "call",
-        { task_id: "bash-wide-screen", output_mode: "screen" },
-        undefined,
-        undefined,
-        {
-          cwd: process.cwd(),
-        },
-      );
-    expect(text(result)).toContain("left");
-    expect(text(result)).toContain("wide");
+      .execute("call", { task_id: "bash-both", output_mode: "both" }, undefined, undefined, {
+        cwd: process.cwd(),
+      });
+    expect(text(result)).toContain(String.raw`"screen": "left\nwide"`);
+    expect(text(result)).toContain(String.raw`"raw": "raw\u001b[31m-bytes"`);
   });
 
   test("bash_status preserves full coordinated non-PTY preview", async () => {
@@ -271,7 +264,7 @@ describe("Pi bash PTY layer", () => {
     expect(text(result)).not.toContain("COMPRESSED PIPE PREVIEW");
   });
 
-  test("bash_status cache reuses terminal across calls", async () => {
+  test("bash_status raw rereads the full PTY output file", async () => {
     const outputPath = await spill("first");
     const tools = new Map<string, MockToolDef>();
     const { ctx: pluginCtx } = ctx(() => ({
@@ -284,7 +277,7 @@ describe("Pi bash PTY layer", () => {
     const status = tools.get("bash_status")!;
     await status.execute(
       "call",
-      { task_id: "bash-cache", output_mode: "raw" },
+      { task_id: "bash-raw-reread", output_mode: "raw" },
       undefined,
       undefined,
       {
@@ -294,14 +287,12 @@ describe("Pi bash PTY layer", () => {
     await appendFile(outputPath, "second");
     const second = await status.execute(
       "call",
-      { task_id: "bash-cache", output_mode: "raw" },
+      { task_id: "bash-raw-reread", output_mode: "raw" },
       undefined,
       undefined,
       { cwd: process.cwd() },
     );
-    expect(text(second)).toContain("second");
-    expect(text(second)).not.toContain("firstsecond");
-    expect(__ptyCacheSizeForTests()).toBe(1);
+    expect(text(second)).toContain("firstsecond");
   });
 
   test("bash_watch PTY scan is independent from bash_status cursor", async () => {
@@ -332,10 +323,9 @@ describe("Pi bash PTY layer", () => {
       );
 
     expect(text(result)).toContain('matched "ready" at offset 0');
-    expect(__ptyCacheSizeForTests()).toBe(1);
   });
 
-  test("bash_watch PTY scan cache disposes on timeout", async () => {
+  test("bash_watch PTY scan times out without a match", async () => {
     const outputPath = await spill("not yet\n");
     const tools = new Map<string, MockToolDef>();
     const { ctx: pluginCtx } = ctx(() => ({
@@ -346,7 +336,7 @@ describe("Pi bash PTY layer", () => {
     }));
     registerBashTool(api(tools), pluginCtx);
 
-    await tools
+    const result = await tools
       .get("bash_watch")!
       .execute(
         "call",
@@ -356,12 +346,10 @@ describe("Pi bash PTY layer", () => {
         { cwd: process.cwd() },
       );
 
-    // One cache entry remains for the rendered bash_watch result. The
-    // independent ::watch scan terminal must not leak as a second entry.
-    expect(__ptyCacheSizeForTests()).toBe(1);
+    expect(text(result)).toContain("timeout reached without match");
   });
 
-  test("bash_watch PTY scan cache disposes on terminal status", async () => {
+  test("bash_watch PTY terminal status renders server screen", async () => {
     const outputPath = await spill("done\n");
     const tools = new Map<string, MockToolDef>();
     const { ctx: pluginCtx } = ctx(() => ({
@@ -370,6 +358,7 @@ describe("Pi bash PTY layer", () => {
       exit_code: 0,
       mode: "pty",
       output_path: outputPath,
+      pty_screen: "done",
     }));
     registerBashTool(api(tools), pluginCtx);
 
@@ -384,10 +373,9 @@ describe("Pi bash PTY layer", () => {
       );
 
     expect(text(result)).toContain("done");
-    expect(__ptyCacheSizeForTests()).toBe(0);
   });
 
-  test("bash_status cache disposes on terminal status", async () => {
+  test("bash_status terminal PTY screen uses server-rendered text", async () => {
     const outputPath = await spill("done");
     const tools = new Map<string, MockToolDef>();
     const { ctx: pluginCtx } = ctx(() => ({
@@ -396,6 +384,7 @@ describe("Pi bash PTY layer", () => {
       exit_code: 0,
       mode: "pty",
       output_path: outputPath,
+      pty_screen: "done",
     }));
     registerBashTool(api(tools), pluginCtx);
     const result = await tools
@@ -404,6 +393,5 @@ describe("Pi bash PTY layer", () => {
         cwd: process.cwd(),
       });
     expect(text(result)).toContain("done");
-    expect(__ptyCacheSizeForTests()).toBe(0);
   });
 });

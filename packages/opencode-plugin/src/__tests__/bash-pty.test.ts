@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { __ptyCacheSizeForTests, __resetPtyCacheForTests } from "../shared/pty-cache.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { createBashStatusTool, createBashTool } from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
@@ -16,7 +15,6 @@ import { noopAsk, toolResultText } from "./test-helpers";
 const tempDirs: string[] = [];
 
 afterEach(async () => {
-  __resetPtyCacheForTests();
   _resetSubagentCacheForTest();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -129,13 +127,14 @@ describe("OpenCode bash PTY layer", () => {
     expect(calls[0].params.output_mode).toBe("raw");
   });
 
-  test("Test 25: bash_status outputMode screen returns rendered screen", async () => {
-    const outputPath = await spill("\u001b[2J\u001b[Hhello\u001b[10;5Hthere");
+  test("Test 25: bash_status outputMode screen returns server-rendered screen", async () => {
+    const outputPath = await spill("raw bytes are not rendered in screen mode");
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
       status: "running",
       mode: "pty",
       output_path: outputPath,
+      pty_screen: "hello\n    there",
     }));
     const result = await createBashStatusTool(pluginCtx).execute(
       { taskId: "bash-screen", outputMode: "screen" },
@@ -143,24 +142,24 @@ describe("OpenCode bash PTY layer", () => {
     );
     expect(result).toContain("hello");
     expect(result).toContain("there");
+    expect(result).not.toContain("raw bytes are not rendered");
   });
 
-  test("Test 25b: bash_status renders custom PTY dimensions", async () => {
-    const outputPath = await spill("\u001b[2J\u001b[Hleft\u001b[1;100Hwide");
+  test("Test 25b: bash_status outputMode both combines server screen with raw bytes", async () => {
+    const outputPath = await spill("raw\u001b[31m-bytes");
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
       status: "running",
       mode: "pty",
       output_path: outputPath,
-      pty_rows: 50,
-      pty_cols: 120,
+      pty_screen: "left\nwide",
     }));
     const result = await createBashStatusTool(pluginCtx).execute(
-      { taskId: "bash-wide-screen", outputMode: "screen" },
+      { taskId: "bash-both", outputMode: "both" },
       runtime(),
     );
-    expect(result).toContain("left");
-    expect(result).toContain("wide");
+    expect(result).toContain(String.raw`"screen": "left\nwide"`);
+    expect(result).toContain(String.raw`"raw": "raw\u001b[31m-bytes"`);
   });
 
   test("bash_status preserves full coordinated non-PTY preview", async () => {
@@ -201,7 +200,7 @@ describe("OpenCode bash PTY layer", () => {
     expect(result).not.toContain("COMPRESSED PIPE PREVIEW");
   });
 
-  test("Test 26: bash_status cache reuses terminal across calls", async () => {
+  test("Test 26: bash_status raw rereads the full PTY output file", async () => {
     const outputPath = await spill("first");
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
@@ -210,12 +209,13 @@ describe("OpenCode bash PTY layer", () => {
       output_path: outputPath,
     }));
     const status = createBashStatusTool(pluginCtx);
-    await status.execute({ taskId: "bash-cache", outputMode: "raw" }, runtime());
+    await status.execute({ taskId: "bash-raw-reread", outputMode: "raw" }, runtime());
     await appendFile(outputPath, "second");
-    const second = await status.execute({ taskId: "bash-cache", outputMode: "raw" }, runtime());
-    expect(second).toContain("second");
-    expect(second).not.toContain("firstsecond");
-    expect(__ptyCacheSizeForTests()).toBe(1);
+    const second = await status.execute(
+      { taskId: "bash-raw-reread", outputMode: "raw" },
+      runtime(),
+    );
+    expect(second).toContain("firstsecond");
   });
 
   test("Test 26b: bash_watch pattern matches PTY bytes", async () => {
@@ -232,7 +232,6 @@ describe("OpenCode bash PTY layer", () => {
     );
     expect(result).toContain('matched "ready on pty" at offset 8');
     expect(result).toContain("ready on pty");
-    expect(__ptyCacheSizeForTests()).toBe(0);
   });
 
   test("Test 26c: bash_watch PTY scan is independent from bash_status cursor", async () => {
@@ -257,20 +256,21 @@ describe("OpenCode bash PTY layer", () => {
     expect(result).toContain('matched "ready" at offset 0');
   });
 
-  test("Test 27: bash_status cache disposes on terminal status", async () => {
-    const outputPath = await spill("done");
+  test("Test 27: bash_status terminal PTY screen uses server-rendered text", async () => {
+    const outputPath = await spill("raw terminal bytes");
     const { ctx: pluginCtx } = ctx(() => ({
       success: true,
       status: "completed",
       exit_code: 0,
       mode: "pty",
       output_path: outputPath,
+      pty_screen: "done",
     }));
     const result = await createBashStatusTool(pluginCtx).execute(
       { taskId: "bash-done", outputMode: "screen" },
       runtime(),
     );
     expect(result).toContain("done");
-    expect(__ptyCacheSizeForTests()).toBe(0);
+    expect(result).not.toContain("raw terminal bytes");
   });
 });

@@ -1,0 +1,2 @@
+hello from vim test
+hello2

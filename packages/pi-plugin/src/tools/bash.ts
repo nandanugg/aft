@@ -30,12 +30,6 @@ import {
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
-import {
-  disposePtyTerminal,
-  getOrCreatePtyTerminal,
-  readPtyBytes,
-  renderScreen,
-} from "../shared/pty-cache.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -257,6 +251,7 @@ interface BashStatusDetails {
   output_path?: string;
   pty_rows?: number;
   pty_cols?: number;
+  pty_screen?: string;
   waited?: BashStatusWaited;
 }
 
@@ -835,7 +830,6 @@ export function createBashKillTool(ctx: PluginContext) {
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
-      await disposePtyTerminal(ptyCacheKey(extCtx, params.task_id));
       const details = data as unknown as BashKillDetails & { kill_signaled?: boolean };
       if (details.kill_signaled === true) {
         return bashKillResult(`Task ${params.task_id}: kill_signaled`, details);
@@ -965,7 +959,7 @@ async function waitForBashStatus(
       const terminal = isTerminalStatus(data.status);
 
       if (waitFor) {
-        const scan = await readNewTaskOutput(extCtx, taskId, data, spillCursor);
+        const scan = await readNewTaskOutput(data, spillCursor);
         if (scan) {
           spillCursor = scan.nextCursor;
           if (scanText.length === 0) scanBaseOffset = scan.baseOffset;
@@ -1026,39 +1020,15 @@ async function waitForBashStatus(
     }
   } finally {
     if (waitForExit && !sawTerminal) unmarkTaskWaiting(sessionId, taskId);
-    if (waitFor) {
-      await disposePtyTerminal(watchPtyCacheKey(extCtx, taskId));
-    }
   }
 }
 
 async function readNewTaskOutput(
-  extCtx: ExtensionContext,
-  taskId: string,
   data: Record<string, unknown>,
   cursor: OutputCursor,
 ): Promise<{ text: string; baseOffset: number; nextCursor: OutputCursor } | undefined> {
   const outputPath = data.output_path as string | undefined;
-  if (data.mode === "pty") {
-    if (!outputPath) return undefined;
-    const { rows, cols } = ptyDimensions(data);
-    const state = await getOrCreatePtyTerminal(
-      watchPtyCacheKey(extCtx, taskId),
-      outputPath,
-      rows,
-      cols,
-    );
-    const baseOffset = state.offset;
-    const bytes = await readPtyBytes(state);
-    if (bytes.length === 0) return undefined;
-    return {
-      text: bytes.toString("utf8"),
-      baseOffset,
-      nextCursor: { output: state.offset, stderr: 0, combined: state.offset },
-    };
-  }
-
-  const stderrPath = data.stderr_path as string | undefined;
+  const stderrPath = data.mode === "pty" ? undefined : (data.stderr_path as string | undefined);
   if (!outputPath && !stderrPath) return undefined;
   const stdoutBytes = outputPath
     ? await readFileBytesFrom(outputPath, cursor.output)
@@ -1265,56 +1235,38 @@ A completion reminder will be delivered automatically; don't poll.`;
 }
 
 async function formatPtyStatus(
-  extCtx: ExtensionContext,
+  _extCtx: ExtensionContext,
   taskId: string,
   details: BashStatusDetails,
   requestedOutputMode: string | undefined,
 ): Promise<string> {
   if (!details.output_path) return "\n[PTY output path unavailable]";
-  const key = ptyCacheKey(extCtx, taskId);
-  const { rows, cols } = ptyDimensions(details);
-  const state = await getOrCreatePtyTerminal(key, details.output_path, rows, cols);
-  const raw = await readPtyBytes(state);
   const outputMode = requestedOutputMode ?? "screen";
+  const raw =
+    outputMode === "raw" || outputMode === "both"
+      ? await fs.readFile(details.output_path)
+      : undefined;
   let suffix = "";
   if (outputMode === "raw") {
     suffix =
-      raw.length > 0
+      raw && raw.length > 0
         ? `
 ${raw.toString("utf8")}`
         : "";
   } else if (outputMode === "both") {
     suffix = `
-${JSON.stringify({ screen: renderScreen(state, rows, cols), raw: raw.toString("utf8") }, null, 2)}`;
+${JSON.stringify({ screen: details.pty_screen ?? "", raw: raw?.toString("utf8") ?? "" }, null, 2)}`;
   } else {
-    const screen = renderScreen(state, rows, cols);
-    suffix = screen
+    suffix = details.pty_screen
       ? `
-${screen}`
+${details.pty_screen}`
       : "";
   }
   if (!isTerminalStatus(details.status)) {
-    suffix += `\nPTY task is still running. Use bash_status({ task_id: "${taskId}", output_mode: "screen" }) to inspect, bash_write({ task_id: "${taskId}", input: "..." }) to send keystrokes.`;
-  } else {
-    await disposePtyTerminal(key);
+    suffix += `
+PTY task is still running. Use bash_status({ task_id: "${taskId}", output_mode: "screen" }) to inspect, bash_write({ task_id: "${taskId}", input: "..." }) to send keystrokes.`;
   }
   return suffix;
-}
-
-function ptyDimensions(data: { pty_rows?: unknown; pty_cols?: unknown }): {
-  rows: number;
-  cols: number;
-} {
-  const rows = typeof data.pty_rows === "number" ? data.pty_rows : 24;
-  const cols = typeof data.pty_cols === "number" ? data.pty_cols : 80;
-  return { rows, cols };
-}
-
-function ptyCacheKey(extCtx: ExtensionContext, taskId: string): string {
-  return `${extCtx.cwd}::${resolveSessionId(extCtx) ?? "__default__"}::${taskId}`;
-}
-function watchPtyCacheKey(extCtx: ExtensionContext, taskId: string): string {
-  return `${ptyCacheKey(extCtx, taskId)}::watch`;
 }
 
 function renderBashCall(

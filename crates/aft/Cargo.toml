@@ -117,6 +117,7 @@ htmd = "0.5.4"
 subc-protocol = "0.5"
 subc-transport = "0.2.2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
+vt100 = "0.16"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

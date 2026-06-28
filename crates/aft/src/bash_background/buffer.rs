@@ -164,9 +164,9 @@ impl BgBuffer {
                     (Err(_), Err(_)) => TokenCountInput::Skipped,
                 }
             }
-            // PTY completions intentionally skip token accounting. The combined
-            // stream can include terminal control sequences that the plugin
-            // renders via xterm-headless instead of the text compressor.
+            // PTY output skips token accounting because the raw terminal stream
+            // can contain control sequences produced by terminal emulation rather
+            // than the original command text.
             Self::Pty { .. } => TokenCountInput::Skipped,
         }
     }

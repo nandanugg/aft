@@ -24,7 +24,6 @@
   },
   "dependencies": {
     "@cortexkit/aft-bridge": "0.42.0",
-    "@xterm/headless": "^5.5.0",
     "comment-json": "^5.0.0",
     "diff": "^8.0.4",
     "typebox": "1.1.38",

@@ -110,6 +110,8 @@ pub struct BgTaskSnapshot {
     pub pty_rows: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pty_cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pty_screen: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3533,6 +3535,7 @@ impl BgTask {
                 .map(|path| path.display().to_string()),
             pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
             pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
+            pty_screen: None,
         }
     }
 

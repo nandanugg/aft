@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import {
   type BridgeRequestOptions,
   coerceBoolean,
@@ -13,12 +14,6 @@ import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
 import { resolveBashConfig } from "../config.js";
 import { sessionLog } from "../logger.js";
-import {
-  disposePtyTerminal,
-  getOrCreatePtyTerminal,
-  readPtyBytes,
-  renderScreen,
-} from "../shared/pty-cache.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
@@ -495,7 +490,6 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
-      await disposePtyTerminal(ptyCacheKey(context, args.taskId as string));
       if (data.kill_signaled === true) {
         return `Task ${args.taskId}: kill_signaled`;
       }
@@ -552,43 +546,38 @@ async function formatBashStatusText(
 }
 
 async function formatPtyStatus(
-  runtime: ToolContext,
+  _runtime: ToolContext,
   taskId: string,
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
 ): Promise<string> {
   const outputPath = data.output_path as string | undefined;
   if (!outputPath) return "\n[PTY output path unavailable]";
-  const key = ptyCacheKey(runtime, taskId);
-  const { rows, cols } = ptyDimensions(data);
-  const state = await getOrCreatePtyTerminal(key, outputPath, rows, cols);
-  const raw = await readPtyBytes(state);
   const outputMode = requestedOutputMode ?? "screen";
+  const raw =
+    outputMode === "raw" || outputMode === "both" ? await fs.readFile(outputPath) : undefined;
   let suffix = "";
   if (outputMode === "raw") {
-    suffix = raw.length > 0 ? `\n${raw.toString("utf8")}` : "";
+    suffix =
+      raw && raw.length > 0
+        ? `
+${raw.toString("utf8")}`
+        : "";
   } else if (outputMode === "both") {
-    suffix = `\n${JSON.stringify({ screen: renderScreen(state, rows, cols), raw: raw.toString("utf8") }, null, 2)}`;
+    suffix = `
+${JSON.stringify({ screen: String(data.pty_screen ?? ""), raw: raw?.toString("utf8") ?? "" }, null, 2)}`;
   } else {
-    const screen = renderScreen(state, rows, cols);
-    suffix = screen ? `\n${screen}` : "";
+    const screen = data.pty_screen as string | undefined;
+    suffix = screen
+      ? `
+${screen}`
+      : "";
   }
   if (data.status === "running") {
-    suffix += `\nPTY task is still running. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to inspect, bash_write({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
-  } else if (isTerminalStatus(data.status)) {
-    await disposePtyTerminal(key);
+    suffix += `
+PTY task is still running. Use bash_status({ taskId: "${taskId}", outputMode: "screen" }) to inspect, bash_write({ taskId: "${taskId}", input: "..." }) to send keystrokes.`;
   }
   return suffix;
-}
-
-function ptyDimensions(data: Record<string, unknown>): { rows: number; cols: number } {
-  const rows = typeof data.pty_rows === "number" ? data.pty_rows : 24;
-  const cols = typeof data.pty_cols === "number" ? data.pty_cols : 80;
-  return { rows, cols };
-}
-
-function ptyCacheKey(runtime: ToolContext, taskId: string): string {
-  return `${projectRootFor(runtime)}::${runtime.sessionID ?? "__default__"}::${taskId}`;
 }
 
 function preview(output: string): string {

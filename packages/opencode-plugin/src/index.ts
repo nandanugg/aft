@@ -55,7 +55,6 @@ import {
 } from "./notifications.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { sendIgnoredMessage } from "./shared/ignored-message.js";
-import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import {
   drainNotifications,
   isTuiConnected,
@@ -637,7 +636,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     } catch {
       // best-effort
     }
-    await disposeAllPtyTerminals();
     await pool.shutdown();
   });
   rpcServer.handle("status", async (params) => {

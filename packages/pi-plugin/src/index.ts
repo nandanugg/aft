@@ -80,7 +80,6 @@ import { statusBarBlockForSession } from "./status-bar-inject.js";
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
-import { disposeAllPtyTerminals } from "./shared/pty-cache.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { resolveSessionId } from "./tools/_shared.js";
@@ -918,7 +917,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      await disposeAllPtyTerminals();
       await pool.shutdown();
     } catch (err) {
       warn(`Error during process shutdown: ${err instanceof Error ? err.message : String(err)}`);
@@ -929,7 +927,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   pi.on("session_shutdown", async () => {
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
-      await disposeAllPtyTerminals();
       await pool.shutdown();
       log("Bridge pool shut down");
     } catch (err) {
