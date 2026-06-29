@@ -443,6 +443,23 @@ const SidebarContent = (props: {
           current.sessionID === sid &&
           current.snapshot.cache_role !== "not_initialized";
         if (shouldSuppressUninitializedDowngrade(snapshot.cache_role, haveGoodForContext)) return;
+        // Equality gate: at idle the 1.5s poll returns the same snapshot every
+        // tick. Minting a new status object would run SolidJS reactivity and
+        // schedule a host frame for no visible change. Skip the update when the
+        // freshly-fetched snapshot is byte-identical to what we already show for
+        // this exact context. JSON.stringify is a sound content comparison here:
+        // the snapshot is a plain object coerced from the status RPC's JSON, so
+        // equal serialization means equal data (any changed field reorders/edits
+        // the string and re-renders). Distinct from the server-side per-poll
+        // dir_size cost (tracked separately) — this only elides the render.
+        if (
+          current !== null &&
+          current.directory === directory &&
+          current.sessionID === sid &&
+          JSON.stringify(current.snapshot) === JSON.stringify(snapshot)
+        ) {
+          return;
+        }
         setStatus({ directory, sessionID: sid, snapshot });
         requestRender();
       }
