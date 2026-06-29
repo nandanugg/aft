@@ -204,6 +204,19 @@ struct RouteIdentity {
     session: String,
 }
 
+#[derive(Clone, Copy)]
+struct BgSub {
+    corr: u64,
+    ver: u8,
+    flags: Flags,
+}
+
+struct MaintenanceCompletion {
+    root_id: ProjectRootId,
+    response: Response,
+    empty_bg_sessions: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReplayKey {
     root: ProjectRootId,
@@ -309,6 +322,37 @@ fn insert_route_channel(
         .insert(channel);
 }
 
+fn remove_bg_subscription_index(
+    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    channel: RouteChannel,
+    identity: Option<&RouteIdentity>,
+) {
+    if let Some(identity) = identity {
+        let key = (identity.root.clone(), identity.session.clone());
+        if bg_sub_by_session.get(&key).copied() == Some(channel) {
+            bg_sub_by_session.remove(&key);
+        }
+    } else {
+        bg_sub_by_session.retain(|_, mapped_channel| *mapped_channel != channel);
+    }
+}
+
+fn end_bg_subscription(
+    writer_tx: &mpsc::Sender<Frame>,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    channel: RouteChannel,
+    identity: Option<&RouteIdentity>,
+) {
+    if let Some(sub) = bg_subs.get(&channel).copied() {
+        let _ = try_send_bg_stream_end(writer_tx, channel, &sub);
+        bg_subs.remove(&channel);
+        bg_wake_pending.remove(&channel);
+        remove_bg_subscription_index(bg_sub_by_session, channel, identity);
+    }
+}
+
 fn remember_session_identity(
     session_identity: &mut HashMap<(ProjectRootId, String), String>,
     identity: &RouteIdentity,
@@ -359,6 +403,16 @@ fn frame_is_reliable(frame: &PushFrame) -> bool {
 fn completed_task_id(frame: &PushFrame) -> Option<&str> {
     match frame {
         PushFrame::BashCompleted(completed) => Some(completed.task_id.as_str()),
+        _ => None,
+    }
+}
+
+fn completed_bg_session_key(
+    root: &ProjectRootId,
+    frame: &PushFrame,
+) -> Option<(ProjectRootId, String)> {
+    match frame {
+        PushFrame::BashCompleted(completed) => Some((root.clone(), completed.session_id.clone())),
         _ => None,
     }
 }
@@ -512,6 +566,77 @@ fn try_send_push_frame(
         }
     };
     try_send_push_body(writer_tx, channel, &body)
+}
+
+fn try_send_bg_stream_frame(
+    writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    sub: &BgSub,
+    ty: FrameType,
+    body: Vec<u8>,
+) -> PushSendOutcome {
+    let Ok(route_channel) = u16::try_from(channel) else {
+        log::warn!("subc attach: invalid route channel {channel} for bg_events stream");
+        return PushSendOutcome::PermanentFailure;
+    };
+    let frame =
+        match Frame::build_with_version(sub.ver, ty, sub.flags, route_channel, sub.corr, body) {
+            Ok(frame) => frame,
+            Err(error) => {
+                log::warn!("subc attach: failed to build bg_events stream frame: {error}");
+                return PushSendOutcome::PermanentFailure;
+            }
+        };
+    match writer_tx.try_send(frame) {
+        Ok(()) => PushSendOutcome::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => PushSendOutcome::Backpressure,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            log::warn!("subc attach: writer closed while sending bg_events stream frame");
+            PushSendOutcome::PermanentFailure
+        }
+    }
+}
+
+fn try_send_bg_stream_data(
+    writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    sub: &BgSub,
+) -> PushSendOutcome {
+    let body = match serde_json::to_vec(&json!({ "op": "bg_events" })) {
+        Ok(body) => body,
+        Err(error) => {
+            log::warn!("subc attach: failed to serialize bg_events stream payload: {error}");
+            return PushSendOutcome::PermanentFailure;
+        }
+    };
+    try_send_bg_stream_frame(writer_tx, channel, sub, FrameType::StreamData, body)
+}
+
+fn try_send_bg_stream_end(
+    writer_tx: &mpsc::Sender<Frame>,
+    channel: RouteChannel,
+    sub: &BgSub,
+) -> PushSendOutcome {
+    try_send_bg_stream_frame(writer_tx, channel, sub, FrameType::StreamEnd, Vec::new())
+}
+
+fn emit_bg_event_wakes(
+    writer_tx: &mpsc::Sender<Frame>,
+    bg_subs: &HashMap<RouteChannel, BgSub>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+) {
+    let pending_channels: Vec<RouteChannel> = bg_wake_pending.iter().copied().collect();
+    let mut stale_channels = Vec::new();
+    for channel in pending_channels {
+        if let Some(sub) = bg_subs.get(&channel) {
+            let _ = try_send_bg_stream_data(writer_tx, channel, sub);
+        } else {
+            stale_channels.push(channel);
+        }
+    }
+    for channel in stale_channels {
+        bg_wake_pending.remove(&channel);
+    }
 }
 
 fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
@@ -803,7 +928,8 @@ fn process_reliable_push_frame(
     completed_tasks: &mut CompletedTaskIds,
     root: ProjectRootId,
     frame: PushFrame,
-) {
+) -> Option<(ProjectRootId, String)> {
+    let completed_bg_session = completed_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
     }
@@ -817,6 +943,7 @@ fn process_reliable_push_frame(
         &root,
         &frame,
     );
+    completed_bg_session
 }
 
 fn process_lossy_push_frame(
@@ -1039,7 +1166,7 @@ where
     let reader_task = spawn_reader_task(read, reader_tx);
     let shutdown = Arc::new(Notify::new());
     let mut drain_interval = tokio::time::interval(Duration::from_millis(250));
-    let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<(ProjectRootId, Response)>(256);
+    let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) = mpsc::channel::<BashDeferredCompletion>(256);
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
@@ -1052,6 +1179,9 @@ where
     };
     let connection_cancel = PersistentCancelSignal::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
+    let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
+    let mut bg_sub_by_session: HashMap<(ProjectRootId, String), RouteChannel> = HashMap::new();
+    let mut bg_wake_pending: HashSet<RouteChannel> = HashSet::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), String> = HashMap::new();
     let mut push_buffer: HashMap<ReplayKey, VecDeque<PushFrame>> = HashMap::new();
@@ -1100,6 +1230,14 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel);
+                        end_bg_subscription(
+                            &writer_tx,
+                            &mut bg_subs,
+                            &mut bg_sub_by_session,
+                            &mut bg_wake_pending,
+                            channel,
+                            routes.get(&channel),
+                        );
                         if let Some(cancel) = route_bash_cancels.remove(&channel) {
                             cancel.token.cancel();
                         }
@@ -1183,6 +1321,9 @@ where
                             &bash_deferred_tx,
                             &bash_poll_touch_tx,
                             &mut route_bash_cancels,
+                            &mut bg_subs,
+                            &mut bg_sub_by_session,
+                            &mut bg_wake_pending,
                             dispatch,
                             allow_native_passthrough,
                         )
@@ -1191,9 +1332,22 @@ where
                             break Err(error);
                         }
                     }
-                    // Cancel/Push/etc. are not yet handled: in-flight tool-call
-                    // cancellation is not implemented, so these frame types are
-                    // ignored rather than acted on.
+                    FrameType::Cancel => {
+                        let channel = route_key(frame.header.channel);
+                        if bg_subs.contains_key(&channel) {
+                            end_bg_subscription(
+                                &writer_tx,
+                                &mut bg_subs,
+                                &mut bg_sub_by_session,
+                                &mut bg_wake_pending,
+                                channel,
+                                routes.get(&channel),
+                            );
+                        }
+                    }
+                    // Push/etc. are not handled on ingress. In-flight tool-call
+                    // cancellation is not implemented, so non-bg_events Cancels
+                    // and unrelated frame types are ignored rather than acted on.
                     _ => {}
                 }
             }
@@ -1207,7 +1361,7 @@ where
                 }
 
                 for (root, frame) in batch {
-                    process_reliable_push_frame(
+                    if let Some((root, session)) = process_reliable_push_frame(
                         &writer_tx,
                         &routes,
                         &root_channels,
@@ -1217,7 +1371,11 @@ where
                         &mut completed_tasks,
                         root,
                         frame,
-                    );
+                    ) {
+                        if let Some(channel) = bg_sub_by_session.get(&(root, session)).copied() {
+                            bg_wake_pending.insert(channel);
+                        }
+                    }
                 }
             }
             Some((root_id, frame)) = lossy_rx.recv() => {
@@ -1225,7 +1383,7 @@ where
                 // completions first so a following stale BashLongRunning frame can
                 // be suppressed even if select! happened to wake on the lossy lane.
                 while let Ok((reliable_root, reliable_frame)) = reliable_rx.try_recv() {
-                    process_reliable_push_frame(
+                    if let Some((root, session)) = process_reliable_push_frame(
                         &writer_tx,
                         &routes,
                         &root_channels,
@@ -1235,7 +1393,11 @@ where
                         &mut completed_tasks,
                         reliable_root,
                         reliable_frame,
-                    );
+                    ) {
+                        if let Some(channel) = bg_sub_by_session.get(&(root, session)).copied() {
+                            bg_wake_pending.insert(channel);
+                        }
+                    }
                 }
 
                 // Drain the currently queued burst in one loop turn so lossy
@@ -1294,15 +1456,25 @@ where
                     meta.touch();
                 }
             }
-            Some((root_id, response)) = maintenance_rx.recv() => {
+            Some(completion) = maintenance_rx.recv() => {
+                let root_id = completion.root_id;
+                let response = completion.response;
                 if let Some(meta) = live_roots.get_mut(&root_id) {
                     meta.maintenance_pending = false;
+                }
+                for session in completion.empty_bg_sessions {
+                    let key = (root_id.clone(), session);
+                    if let Some(channel) = bg_sub_by_session.get(&key).copied() {
+                        bg_wake_pending.remove(&channel);
+                    }
                 }
                 if response_is_internal_error(&response) {
                     signal_fatal_teardown(&writer_tx, None, PROTOCOL_VERSION, 0, &shutdown).await;
                 }
             }
             _ = drain_interval.tick() => {
+                emit_bg_event_wakes(&writer_tx, &bg_subs, &mut bg_wake_pending);
+
                 let retried = drain_retry_buffers_for_bound_routes(
                     &writer_tx,
                     &routes,
@@ -1326,7 +1498,22 @@ where
                     })
                     .collect();
                 for root_id in due_roots {
-                    submit_maintenance_drain(&executor, root_id, &maintenance_tx);
+                    let bg_sessions_to_check: Vec<String> = bg_sub_by_session
+                        .iter()
+                        .filter_map(|((root, session), _)| {
+                            if root == &root_id {
+                                Some(session.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    submit_maintenance_drain(
+                        &executor,
+                        root_id,
+                        bg_sessions_to_check,
+                        &maintenance_tx,
+                    );
                 }
             }
         }
@@ -1981,6 +2168,9 @@ async fn handle_tool_call(
     bash_deferred_tx: &mpsc::Sender<BashDeferredCompletion>,
     bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
     route_bash_cancels: &mut HashMap<RouteChannel, RouteBashCancel>,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
     dispatch: DispatchFn,
     allow_native_passthrough: bool,
 ) -> Result<(), SubcError> {
@@ -2010,6 +2200,28 @@ async fn handle_tool_call(
     };
     if let Some(meta) = live_roots.get_mut(&identity.root) {
         meta.touch();
+    }
+
+    let is_bg_events_subscribe = serde_json::from_slice::<BgEventsProbe>(&frame.body)
+        .ok()
+        .and_then(|probe| probe.op)
+        .as_deref()
+        == Some("bg_events");
+    if is_bg_events_subscribe {
+        if let Some(old_sub) = bg_subs.get(&route_id).copied() {
+            let _ = try_send_bg_stream_end(tx, route_id, &old_sub);
+        }
+        bg_subs.insert(
+            route_id,
+            BgSub {
+                corr: frame.header.corr,
+                ver: frame.header.ver,
+                flags: frame.header.flags,
+            },
+        );
+        bg_sub_by_session.insert((identity.root, identity.session), route_id);
+        bg_wake_pending.insert(route_id);
+        return Ok(());
     }
 
     let call = serde_json::from_slice::<ToolCallRequest>(&frame.body).map_err(SubcError::Json)?;
@@ -2856,7 +3068,8 @@ async fn handle_bash_deferred_completion(
 fn submit_maintenance_drain(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
-    completion_tx: &mpsc::Sender<(ProjectRootId, Response)>,
+    bg_sessions_to_check: Vec<String>,
+    completion_tx: &mpsc::Sender<MaintenanceCompletion>,
 ) {
     let request_id = format!(
         "subc-maintenance-drain-{}",
@@ -2864,6 +3077,7 @@ fn submit_maintenance_drain(
     );
     let response_id = request_id.clone();
     let completion_root_id = root_id.clone();
+    let (empty_bg_sessions_tx, empty_bg_sessions_rx) = oneshot::channel::<Vec<String>>();
     let rx = executor.submit_async(
         root_id,
         Lane::Mutating,
@@ -2877,13 +3091,28 @@ fn submit_maintenance_drain(
             runtime_drain::drain_inspect_events(ctx);
             runtime_drain::drain_watcher_events(ctx);
             runtime_drain::drain_lsp_events(ctx);
+            let empty_bg_sessions = bg_sessions_to_check
+                .into_iter()
+                .filter(|session| {
+                    !ctx.bash_background()
+                        .has_completions_for_session(Some(session.as_str()))
+                })
+                .collect();
+            let _ = empty_bg_sessions_tx.send(empty_bg_sessions);
             Response::success(response_id, json!({ "drained": true }))
         }),
     );
     let completion_tx = completion_tx.clone();
     tokio::spawn(async move {
         let response = await_executor_response(rx, request_id).await;
-        let _ = completion_tx.send((completion_root_id, response)).await;
+        let empty_bg_sessions = empty_bg_sessions_rx.await.unwrap_or_default();
+        let _ = completion_tx
+            .send(MaintenanceCompletion {
+                root_id: completion_root_id,
+                response,
+                empty_bg_sessions,
+            })
+            .await;
     });
 }
 
@@ -3129,6 +3358,11 @@ fn command_lane(command: &str) -> Lane {
 
         _ => Lane::Mutating,
     }
+}
+
+#[derive(Deserialize)]
+struct BgEventsProbe {
+    op: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

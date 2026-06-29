@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -886,6 +886,8 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         },
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
         "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
@@ -1377,6 +1379,16 @@ fn subc_bridge_session_scoped_bg_completion_and_push_isolation() {
         "subc_bridge_session_scoped_bg_completion_and_push_isolation",
         Duration::from_secs(60),
         drive_session_scoped_bg_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bg_events_idle_completion_wake_lane() {
+    run_subc_bridge_test(
+        "subc_bridge_bg_events_idle_completion_wake_lane",
+        Duration::from_secs(90),
+        drive_bg_events_daemon,
         |_, _, _| {},
     );
 }
@@ -3026,6 +3038,186 @@ async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_bg_events_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_route_bind_with_session(&mut stream, 7, 70, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 70).await;
+
+    send_bg_events_subscribe(&mut stream, 7, 700).await;
+    send_tool_call(&mut stream, 1, 701, "echo", json!({ "case": "fast" })).await;
+    let route_usable = read_tool_response_allowing_bg_events(
+        &mut stream,
+        701,
+        7,
+        700,
+        "route usable while bg_events is subscribed",
+    )
+    .await;
+    assert_eq!(route_usable["success"].as_bool(), Some(true));
+
+    drain_bg_events_for(
+        &mut stream,
+        7,
+        700,
+        Duration::from_millis(800),
+        "optimistic bg_events subscribe seed",
+    )
+    .await;
+
+    let burst_specs = [
+        (710, "sleep 2; printf 'bg-events-a\n'"),
+        (711, "sleep 2; printf 'bg-events-b\n'"),
+        (712, "sleep 2; printf 'bg-events-c\n'"),
+    ];
+    for (corr, command) in burst_specs {
+        send_bash_background(&mut stream, corr, command).await;
+    }
+    let (start_responses, mut early_bg_events) = collect_tool_responses_allowing_bg_events(
+        &mut stream,
+        HashSet::from([710, 711, 712]),
+        7,
+        700,
+        "bg_events burst bash start responses",
+    )
+    .await;
+    let task_ids: Vec<String> = [710, 711, 712]
+        .into_iter()
+        .map(|corr| {
+            let response = start_responses.get(&corr).expect("bash start response");
+            assert!(
+                response["success"].as_bool().unwrap_or(false),
+                "background bash should start: {response:?}"
+            );
+            response["task_id"]
+                .as_str()
+                .expect("background task_id")
+                .to_string()
+        })
+        .collect();
+
+    if early_bg_events.is_empty() {
+        early_bg_events.push(
+            wait_for_bg_event(
+                &mut stream,
+                7,
+                700,
+                Duration::from_secs(30),
+                "completion wake",
+            )
+            .await,
+        );
+    }
+    assert_bg_events_are_coalesced(&early_bg_events);
+    if early_bg_events.len() == 1 {
+        let elapsed = early_bg_events[0].elapsed();
+        if elapsed < Duration::from_millis(150) {
+            assert_no_bg_event_for(
+                &mut stream,
+                7,
+                700,
+                Duration::from_millis(150).saturating_sub(elapsed),
+                "second bg_events nudge in the same tick",
+            )
+            .await;
+        }
+    }
+
+    wait_for_bg_event(
+        &mut stream,
+        7,
+        700,
+        Duration::from_secs(2),
+        "re-armed bg_events wake before ack",
+    )
+    .await;
+
+    let drained = drain_bg_completions_until(&mut stream, 1, 7300, &task_ids, 7, 700).await;
+    let drained_ids: HashSet<String> = drained["bg_completions"]
+        .as_array()
+        .expect("drained bg_completions")
+        .iter()
+        .filter_map(|completion| {
+            completion
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    for task_id in &task_ids {
+        assert!(
+            drained_ids.contains(task_id),
+            "drain response should include {task_id}: {drained:?}"
+        );
+    }
+
+    send_tool_call(
+        &mut stream,
+        1,
+        7400,
+        "bash_ack_completions",
+        json!({ "task_ids": task_ids }),
+    )
+    .await;
+    let ack = read_tool_response_allowing_bg_events(
+        &mut stream,
+        7400,
+        7,
+        700,
+        "bg completion ack response",
+    )
+    .await;
+    assert_eq!(ack["success"].as_bool(), Some(true));
+
+    drain_bg_events_for(
+        &mut stream,
+        7,
+        700,
+        Duration::from_millis(1200),
+        "bg_events clear grace after ack",
+    )
+    .await;
+    assert_no_bg_event_for(
+        &mut stream,
+        7,
+        700,
+        Duration::from_millis(700),
+        "bg_events quiet after ack clear",
+    )
+    .await;
+
+    send_bg_events_cancel(&mut stream, 7, 700).await;
+    expect_bg_events_stream_end(&mut stream, 7, 700).await;
+
+    send_bash_background(
+        &mut stream,
+        7500,
+        "sleep 1; printf 'bg-events-after-cancel\n'",
+    )
+    .await;
+    let after_cancel_start =
+        read_tool_response_rejecting_bg_events(&mut stream, 7500, 7, 700, "post-cancel bash start")
+            .await;
+    let after_cancel_task = after_cancel_start["task_id"]
+        .as_str()
+        .expect("post-cancel task_id")
+        .to_string();
+    wait_for_bash_completion_without_bg_event(&mut stream, 1, 7501, &after_cancel_task, 7, 700)
+        .await;
+    assert_no_bg_event_for(
+        &mut stream,
+        7,
+        700,
+        Duration::from_millis(700),
+        "bg_events quiet after cancel",
+    )
+    .await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_detached_session_replay_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream,
@@ -3642,6 +3834,53 @@ async fn send_tool_call(
     .await;
 }
 
+async fn send_bash_background(stream: &mut tokio::net::TcpStream, corr: u64, command: &str) {
+    send_tool_call(
+        stream,
+        1,
+        corr,
+        "bash",
+        json!({
+            "params": {
+                "command": command,
+                "background": true,
+                "timeout": 10_000,
+            },
+        }),
+    )
+    .await;
+}
+
+async fn send_bg_events_subscribe(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            corr,
+            serde_json::to_vec(&json!({ "op": "bg_events" })).expect("bg_events body"),
+        )
+        .expect("bg_events subscribe frame"),
+    )
+    .await;
+}
+
+async fn send_bg_events_cancel(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Cancel,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            corr,
+            Vec::new(),
+        )
+        .expect("bg_events cancel frame"),
+    )
+    .await;
+}
+
 async fn send_frame(stream: &mut tokio::net::TcpStream, frame: Frame) {
     write_frame(stream, &frame).await.expect("write frame");
 }
@@ -3706,6 +3945,313 @@ async fn assert_no_response_frame_within(
             frame.header
         );
     }
+}
+
+async fn read_any_frame_until(
+    stream: &mut tokio::net::TcpStream,
+    deadline: Instant,
+    label: &str,
+) -> Option<Frame> {
+    let now = Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(now);
+    match tokio::time::timeout(remaining, read_frame(stream)).await {
+        Ok(Ok(Some(frame))) => Some(frame),
+        Ok(Ok(None)) => panic!("EOF waiting for {label}"),
+        Ok(Err(error)) => panic!("read frame for {label}: {error}"),
+        Err(_) => None,
+    }
+}
+
+fn is_expected_bg_event_stream_data(frame: &Frame, channel: u16, corr: u64) -> bool {
+    if frame.header.ty != FrameType::StreamData {
+        return false;
+    }
+    assert_eq!(
+        frame.header.channel, channel,
+        "unexpected StreamData channel"
+    );
+    assert_eq!(frame.header.corr, corr, "unexpected StreamData corr");
+    let body: Value = serde_json::from_slice(&frame.body).expect("bg_events StreamData body");
+    assert_eq!(body.get("op").and_then(Value::as_str), Some("bg_events"));
+    true
+}
+
+fn assert_no_bg_events_terminal(frame: &Frame, channel: u16, corr: u64, label: &str) {
+    if frame.header.channel == channel
+        && frame.header.corr == corr
+        && matches!(
+            frame.header.ty,
+            FrameType::Response | FrameType::Error | FrameType::StreamEnd
+        )
+    {
+        panic!(
+            "bg_events subscribe ended while waiting for {label}: {:?}",
+            frame.header
+        );
+    }
+}
+
+async fn read_tool_response_allowing_bg_events(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    bg_channel: u16,
+    bg_corr: u64,
+    label: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = read_any_frame_until(stream, deadline, label)
+            .await
+            .unwrap_or_else(|| panic!("timed out waiting for {label}"));
+        if is_expected_bg_event_stream_data(&frame, bg_channel, bg_corr) {
+            continue;
+        }
+        assert_no_bg_events_terminal(&frame, bg_channel, bg_corr, label);
+        match frame.header.ty {
+            FrameType::Push => {}
+            FrameType::Response if frame.header.corr == corr => return tool_response_json(&frame),
+            other => panic!("unexpected frame while waiting for {label}: {other:?}"),
+        }
+    }
+}
+
+async fn read_tool_response_rejecting_bg_events(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    bg_channel: u16,
+    bg_corr: u64,
+    label: &str,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = read_any_frame_until(stream, deadline, label)
+            .await
+            .unwrap_or_else(|| panic!("timed out waiting for {label}"));
+        if is_expected_bg_event_stream_data(&frame, bg_channel, bg_corr) {
+            panic!("unexpected bg_events StreamData while waiting for {label}");
+        }
+        assert_no_bg_events_terminal(&frame, bg_channel, bg_corr, label);
+        match frame.header.ty {
+            FrameType::Push => {}
+            FrameType::Response if frame.header.corr == corr => return tool_response_json(&frame),
+            other => panic!("unexpected frame while waiting for {label}: {other:?}"),
+        }
+    }
+}
+
+async fn collect_tool_responses_allowing_bg_events(
+    stream: &mut tokio::net::TcpStream,
+    expected_corrs: HashSet<u64>,
+    bg_channel: u16,
+    bg_corr: u64,
+    label: &str,
+) -> (HashMap<u64, Value>, Vec<Instant>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut responses = HashMap::new();
+    let mut bg_event_times = Vec::new();
+    while responses.len() < expected_corrs.len() {
+        let frame = read_any_frame_until(stream, deadline, label)
+            .await
+            .unwrap_or_else(|| panic!("timed out waiting for {label}"));
+        if is_expected_bg_event_stream_data(&frame, bg_channel, bg_corr) {
+            bg_event_times.push(Instant::now());
+            continue;
+        }
+        assert_no_bg_events_terminal(&frame, bg_channel, bg_corr, label);
+        match frame.header.ty {
+            FrameType::Push => {}
+            FrameType::Response if expected_corrs.contains(&frame.header.corr) => {
+                responses.insert(frame.header.corr, tool_response_json(&frame));
+            }
+            other => panic!("unexpected frame while waiting for {label}: {other:?}"),
+        }
+    }
+    (responses, bg_event_times)
+}
+
+fn assert_bg_events_are_coalesced(event_times: &[Instant]) {
+    for pair in event_times.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= Duration::from_millis(150),
+            "bg_events StreamData frames should be coalesced per tick: {event_times:?}"
+        );
+    }
+}
+
+async fn wait_for_bg_event(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    timeout: Duration,
+    label: &str,
+) -> Instant {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let frame = read_any_frame_until(stream, deadline, label)
+            .await
+            .unwrap_or_else(|| panic!("timed out waiting for {label}"));
+        if is_expected_bg_event_stream_data(&frame, channel, corr) {
+            return Instant::now();
+        }
+        assert_no_bg_events_terminal(&frame, channel, corr, label);
+        match frame.header.ty {
+            FrameType::Push => {}
+            other => panic!("unexpected frame while waiting for {label}: {other:?}"),
+        }
+    }
+}
+
+async fn assert_no_bg_event_for(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    duration: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + duration;
+    while let Some(frame) = read_any_frame_until(stream, deadline, label).await {
+        if is_expected_bg_event_stream_data(&frame, channel, corr) {
+            panic!("unexpected bg_events StreamData while waiting for {label}");
+        }
+        assert_no_bg_events_terminal(&frame, channel, corr, label);
+        match frame.header.ty {
+            FrameType::Push => {}
+            other => panic!("unexpected frame while waiting for {label}: {other:?}"),
+        }
+    }
+}
+
+async fn drain_bg_events_for(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    duration: Duration,
+    label: &str,
+) -> usize {
+    let deadline = Instant::now() + duration;
+    let mut count = 0;
+    while let Some(frame) = read_any_frame_until(stream, deadline, label).await {
+        if is_expected_bg_event_stream_data(&frame, channel, corr) {
+            count += 1;
+            continue;
+        }
+        assert_no_bg_events_terminal(&frame, channel, corr, label);
+        match frame.header.ty {
+            FrameType::Push => {}
+            other => panic!("unexpected frame while draining {label}: {other:?}"),
+        }
+    }
+    count
+}
+
+async fn expect_bg_events_stream_end(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = read_any_frame_until(stream, deadline, "bg_events StreamEnd")
+            .await
+            .unwrap_or_else(|| panic!("timed out waiting for bg_events StreamEnd"));
+        match frame.header.ty {
+            FrameType::StreamEnd
+                if frame.header.channel == channel && frame.header.corr == corr =>
+            {
+                assert!(frame.body.is_empty(), "StreamEnd body should be empty");
+                return;
+            }
+            FrameType::Push => {}
+            FrameType::StreamData
+                if frame.header.channel == channel && frame.header.corr == corr =>
+            {
+                panic!("unexpected bg_events StreamData before StreamEnd")
+            }
+            other => panic!("unexpected frame while waiting for bg_events StreamEnd: {other:?}"),
+        }
+    }
+}
+
+async fn drain_bg_completions_until(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    first_corr: u64,
+    expected_task_ids: &[String],
+    bg_channel: u16,
+    bg_corr: u64,
+) -> Value {
+    let expected: HashSet<String> = expected_task_ids.iter().cloned().collect();
+    let mut last_response = Value::Null;
+    for attempt in 0_u64..300 {
+        let corr = first_corr + attempt;
+        send_tool_call(stream, channel, corr, "bash_drain_completions", json!({})).await;
+        let response = read_tool_response_allowing_bg_events(
+            stream,
+            corr,
+            bg_channel,
+            bg_corr,
+            "drain bg completions",
+        )
+        .await;
+        let seen: HashSet<String> = response["bg_completions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|completion| {
+                completion
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        if expected.is_subset(&seen) {
+            return response;
+        }
+        last_response = response;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "bg completions never contained expected task ids: {expected:?}; last response: {last_response:?}"
+    );
+}
+
+async fn wait_for_bash_completion_without_bg_event(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    first_corr: u64,
+    task_id: &str,
+    bg_channel: u16,
+    bg_corr: u64,
+) {
+    for attempt in 0_u64..120 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let corr = first_corr + attempt;
+        send_tool_call(
+            stream,
+            channel,
+            corr,
+            "bash_status",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let response = read_tool_response_rejecting_bg_events(
+            stream,
+            corr,
+            bg_channel,
+            bg_corr,
+            "post-cancel bash status",
+        )
+        .await;
+        assert_no_finalizer_fields(&response);
+        if response["success"].as_bool() == Some(true)
+            && response
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(is_terminal_status)
+        {
+            return;
+        }
+    }
+    panic!("background bash task did not complete after bg_events cancel: {task_id}");
 }
 
 fn tool_result_body(frame: &Frame) -> Value {
