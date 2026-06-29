@@ -560,6 +560,20 @@ function buildSchema(): Record<string, unknown> {
           "Shared NDJSON bridge transport tuning (OpenCode and Pi). User-scoped only — project configs cannot set this block (bridge safety and per-machine transport budget).",
       },
 
+      subc: {
+        type: "object",
+        properties: {
+          connection_file: {
+            type: "string",
+            description:
+              "Absolute path to the Subconscious (subc) daemon connection file. When present (non-empty), the plugin talks to AFT as a daemon-supervised module over subc instead of spawning the aft binary; absent/empty means standalone NDJSON (the default). macOS default: ~/.local/share/cortexkit/run/subc-connection.json.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module.",
+      },
+
       auto_update: {
         type: "boolean",
         default: true,

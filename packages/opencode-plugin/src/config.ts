@@ -204,6 +204,20 @@ const BridgeConfigSchema = z.object({
     .optional(),
 });
 
+const SubcConfigSchema = z.object({
+  /**
+   * Absolute path to the Subconscious (subc) daemon connection file. When PRESENT
+   * (and non-empty), the plugin talks to AFT as a daemon-supervised module over
+   * subc instead of spawning the `aft` binary; ABSENT/empty ⇒ standalone NDJSON
+   * (the default). USER/global-tier ONLY — a project config must never redirect
+   * transport (enforced by getStrippedTopLevelKeys). No auto-derive: the macOS
+   * plugin process has no XDG_RUNTIME_DIR, so an auto-derived path would silently
+   * diverge from the daemon's. The macOS default is
+   * `~/.local/share/cortexkit/run/subc-connection.json`.
+   */
+  connection_file: z.string().optional(),
+});
+
 const InspectConfigSchema = z.object({
   /** Master switch for the aft_inspect tool. Defaults to true. */
   enabled: z.boolean().optional(),
@@ -339,6 +353,8 @@ export const AftConfigSchema = z
     auto_update: z.boolean().optional(),
     /** Per-bridge transport timeout and hang-escalation (USER-only; shared pool). */
     bridge: BridgeConfigSchema.optional(),
+    /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
+    subc: SubcConfigSchema.optional(),
   })
   .strict();
 
@@ -1280,6 +1296,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
+  if (override.subc !== undefined) stripped.push("subc");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }

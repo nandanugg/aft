@@ -339,6 +339,29 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring auto_update from project config");
   });
 
+  test("project config cannot redirect transport via subc (user-tier only)", () => {
+    const fixture = createConfigFixture();
+    // User selects subc; a hostile project tries to point transport elsewhere.
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ subc: { connection_file: "/run/user/subc.json" } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ subc: { connection_file: "/tmp/evil-subc.json" } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as { subc?: { connection_file?: string } };
+    // User's connection file preserved; project's attempt ignored.
+    expect(config.subc?.connection_file).toBe("/run/user/subc.json");
+    expect(result.stderr).toContain("Ignoring subc from project config");
+  });
+
   // v0.27.2 bash graduation: nested `experimental.bash.*` legacy values are
   // migrated to the top-level `bash` block during load, and the resulting
   // in-memory config exposes them under `bash.*`. The user's on-disk file

@@ -50,6 +50,17 @@ export interface BridgeConfig {
   hang_threshold?: number;
 }
 
+export interface SubcConfig {
+  /**
+   * Absolute path to the Subconscious (subc) daemon connection file. PRESENT
+   * (non-empty) ⇒ talk to AFT as a daemon-supervised module over subc; ABSENT ⇒
+   * standalone NDJSON (default). USER/global-tier ONLY (a project must not
+   * redirect transport). No auto-derive. macOS default:
+   * `~/.local/share/cortexkit/run/subc-connection.json`.
+   */
+  connection_file?: string;
+}
+
 export interface SemanticConfig {
   backend?: SemanticBackend;
   model?: string;
@@ -206,6 +217,7 @@ export interface AftConfig {
   url_fetch_allow_private?: boolean;
   semantic?: SemanticConfig;
   bridge?: BridgeConfig;
+  subc?: SubcConfig;
 }
 
 /**
@@ -462,6 +474,10 @@ const BridgeConfigSchema = z.object({
     .optional(),
 });
 
+const SubcConfigSchema = z.object({
+  connection_file: z.string().optional(),
+});
+
 const InspectConfigSchema = z.object({
   enabled: z.boolean().optional(),
   tier2_idle_minutes: z.number().min(0).optional(),
@@ -531,6 +547,7 @@ export const AftConfigSchema = z
     url_fetch_allow_private: z.boolean().optional(),
     semantic: SemanticConfigSchema.optional(),
     bridge: BridgeConfigSchema.optional(),
+    subc: SubcConfigSchema.optional(),
   })
   .strict();
 
@@ -1181,6 +1198,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
+  if (override.subc !== undefined) stripped.push("subc");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }
