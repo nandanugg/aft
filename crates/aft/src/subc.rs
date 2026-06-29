@@ -2889,6 +2889,28 @@ async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: St
         .unwrap_or_else(|_| Response::error(request_id, "internal_error", "executor dropped"))
 }
 
+/// Flatten a tool-call `Response` + server-rendered `text` into the SAME flat
+/// object the standalone NDJSON `tool_call` command puts on the wire:
+/// `{id, success, ...data, text}` (Response flattens `data` to the top level —
+/// protocol.rs — and `response_with_text` merges `text` in). Mirrors
+/// `commands::tool_call::response_with_text` exactly, including its non-object
+/// `data` fallback (data replaced by `{text}`), so the subc `structuredContent`
+/// is byte-identical to the standalone response body. Built field-by-field
+/// rather than via `serde_json::to_value(response)` because `#[serde(flatten)]`
+/// of a non-object `data` would error.
+fn flat_tool_response(response: &crate::protocol::Response, text: &str) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), Value::String(response.id.clone()));
+    obj.insert("success".to_string(), Value::Bool(response.success));
+    if let Some(data) = response.data.as_object() {
+        for (key, value) in data {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+    obj.insert("text".to_string(), Value::String(text.to_string()));
+    Value::Object(obj)
+}
+
 fn build_tool_response_frame(
     ver: u8,
     route_channel: u16,
@@ -2897,11 +2919,22 @@ fn build_tool_response_frame(
     result: &ToolCallResult,
 ) -> Result<Frame, SubcError> {
     let is_error = !result.response.success;
-    let result = json!({
+    // `content`/`isError` is the MCP-native surface a GENERIC host reads (and a
+    // generic host ignores `structuredContent`, per the MCP spec). The
+    // FIRST-PARTY AFT plugin instead reads `structuredContent`, which carries
+    // the full flat standalone shape ({id, success, ...data, text}) so every
+    // structured sidecar the plugin drives UI from — status_bar, bg_completions
+    // (in-band drain), preview_diff, code, message, attachments — survives the
+    // route. subc relays the body byte-for-byte, so this reaches the plugin
+    // unchanged. SubcTransport.toolCall re-lifts `structuredContent` straight to
+    // the flat ToolCallResult, so nothing downstream of the transport differs
+    // from the NDJSON path.
+    let payload = json!({
         "content": [{ "type": "text", "text": result.text.as_str() }],
         "isError": is_error,
+        "structuredContent": flat_tool_response(&result.response, &result.text),
     });
-    let body = serde_json::to_vec(&result).map_err(SubcError::Json)?;
+    let body = serde_json::to_vec(&payload).map_err(SubcError::Json)?;
 
     Frame::build_with_version(ver, FrameType::Response, flags, route_channel, corr, body)
         .map_err(SubcError::FrameBuild)
@@ -4056,6 +4089,83 @@ mod tests {
     fn subc_agent_lanes_classify_new_read_tools() {
         assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
         assert_eq!(command_lane("conflicts"), Lane::PureRead);
+    }
+
+    #[test]
+    fn tool_response_frame_carries_flat_standalone_shape_in_structured_content() {
+        use crate::protocol::Response;
+
+        // A response with sidecars the FIRST-PARTY plugin drives UI from
+        // (status_bar, bg_completions, code) plus a normal result field.
+        let response = Response::success(
+            "req-7",
+            json!({
+                "complete": true,
+                "matches": 3,
+                "status_bar": { "errors": 0, "warnings": 1 },
+                "bg_completions": [{ "task_id": "bash-abc" }],
+            }),
+        );
+        let result = ToolCallResult {
+            text: "rendered text".to_string(),
+            response,
+        };
+
+        // The flat shape must equal the standalone NDJSON `tool_call` body:
+        // {id, success, ...data, text}. Build the standalone expectation the
+        // same way commands::tool_call::response_with_text does.
+        let expected_flat = json!({
+            "id": "req-7",
+            "success": true,
+            "complete": true,
+            "matches": 3,
+            "status_bar": { "errors": 0, "warnings": 1 },
+            "bg_completions": [{ "task_id": "bash-abc" }],
+            "text": "rendered text",
+        });
+        assert_eq!(
+            flat_tool_response(&result.response, &result.text),
+            expected_flat,
+            "structuredContent must be byte-identical to the standalone flat response"
+        );
+
+        // The frame body carries the MCP surface for generic hosts AND the flat
+        // sidecar shape under structuredContent for the first-party plugin.
+        let frame =
+            build_tool_response_frame(PROTOCOL_VERSION, 1, 42, control_flags(), &result).unwrap();
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["isError"], json!(false));
+        assert_eq!(body["content"][0]["type"], json!("text"));
+        assert_eq!(body["content"][0]["text"], json!("rendered text"));
+        assert_eq!(body["structuredContent"], expected_flat);
+
+        // A failed response flips isError and still carries the flat shape
+        // (with success:false + code) for the plugin's error path.
+        let err = Response::error_with_data(
+            "req-8",
+            "ambiguous_match",
+            "too many matches",
+            json!({ "candidates": ["a", "b"] }),
+        );
+        let err_result = ToolCallResult {
+            text: "error text".to_string(),
+            response: err,
+        };
+        let err_frame =
+            build_tool_response_frame(PROTOCOL_VERSION, 1, 43, control_flags(), &err_result)
+                .unwrap();
+        let err_body: Value = serde_json::from_slice(&err_frame.body).unwrap();
+        assert_eq!(err_body["isError"], json!(true));
+        assert_eq!(err_body["structuredContent"]["success"], json!(false));
+        assert_eq!(
+            err_body["structuredContent"]["code"],
+            json!("ambiguous_match")
+        );
+        assert_eq!(
+            err_body["structuredContent"]["candidates"],
+            json!(["a", "b"])
+        );
+        assert_eq!(err_body["structuredContent"]["text"], json!("error text"));
     }
 }
 
