@@ -4,7 +4,12 @@ import { error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
-import type { ToolCallArguments, ToolCallOptions, ToolCallResult } from "./transport.js";
+import type {
+  AftTransportPool,
+  ToolCallArguments,
+  ToolCallOptions,
+  ToolCallResult,
+} from "./transport.js";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // evict idle bridges after 30 minutes
 const DEFAULT_MAX_POOL_SIZE = 8;
@@ -121,7 +126,7 @@ export interface PoolOptions extends BridgeOptions {
  * latency of a single request pipeline; the trade-off is acceptable because
  * it removes the real RAM multiplier.
  */
-export class BridgePool {
+export class BridgePool implements AftTransportPool {
   /** Project-root → bridge. Key is a normalized canonical path. */
   private readonly bridges = new Map<string, PoolEntry>();
   private readonly staleBridges = new Set<BinaryBridge>();

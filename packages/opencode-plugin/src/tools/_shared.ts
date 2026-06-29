@@ -19,7 +19,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type {
-  BinaryBridge,
+  AftProjectTransport,
   BridgeRequestOptions,
   ToolCallOptions,
   ToolCallResult,
@@ -198,7 +198,7 @@ export async function resolvePathArg(
  * eagerly warms the cache before calling this so the cache is hot for
  * subsequent calls in the same session.
  */
-export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): BinaryBridge {
+export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectTransport {
   return ctx.pool.getBridge(projectRootFor(runtime));
 }
 
@@ -243,7 +243,7 @@ export async function callBridge(
     ...options,
   };
   markBridgeStart();
-  let response: Awaited<ReturnType<BinaryBridge["send"]>>;
+  let response: Awaited<ReturnType<AftProjectTransport["send"]>>;
   try {
     response = await bridgeFor(ctx, runtime).send(
       command,
@@ -284,7 +284,7 @@ export async function callToolCall(
     ...options,
   };
   markBridgeStart();
-  let response: Awaited<ReturnType<BinaryBridge["toolCall"]>>;
+  let response: Awaited<ReturnType<AftProjectTransport["toolCall"]>>;
   try {
     response = await bridgeFor(ctx, runtime).toolCall(
       runtime.sessionID,

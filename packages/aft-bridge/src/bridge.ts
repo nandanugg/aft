@@ -8,7 +8,12 @@ import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
-import type { ToolCallArguments, ToolCallOptions, ToolCallResult } from "./transport.js";
+import type {
+  AftProjectTransport,
+  ToolCallArguments,
+  ToolCallOptions,
+  ToolCallResult,
+} from "./transport.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
@@ -333,7 +338,7 @@ interface SendOptions extends BridgeRequestOptions {
  * stdin/stdout. Lazy-spawns on first `send()` call. Handles crash detection
  * with exponential backoff auto-restart.
  */
-export class BinaryBridge {
+export class BinaryBridge implements AftProjectTransport {
   private static readonly RESTART_RESET_MS = 5 * 60 * 1000;
   /** How many recent stderr lines to keep for crash diagnostics. */
   private static readonly STDERR_TAIL_MAX = 20;

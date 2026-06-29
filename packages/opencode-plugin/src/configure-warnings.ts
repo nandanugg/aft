@@ -20,7 +20,7 @@
  * from this file directly.
  */
 
-import { type BinaryBridge, formatDroppedKeyWarnings } from "@cortexkit/aft-bridge";
+import { type AftProjectTransport, formatDroppedKeyWarnings } from "@cortexkit/aft-bridge";
 
 import {
   type ConfigLoadError,
@@ -36,7 +36,7 @@ const pendingConfigParseWarnings = new Map<string, ConfigureWarning[]>();
 type PendingSessionWarnings = {
   warnings: ConfigureWarning[];
   client: unknown;
-  bridge: Pick<BinaryBridge, "send">;
+  bridge: Pick<AftProjectTransport, "send">;
   storageDir: string;
   pluginVersion: string;
   projectRoot: string;
@@ -129,7 +129,7 @@ export function enqueueConfigureWarningsForSession(context: {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
-  bridge: Pick<BinaryBridge, "send">;
+  bridge: Pick<AftProjectTransport, "send">;
   warnings: unknown[];
   configDroppedKeys?: unknown;
   fallbackClient: unknown;
@@ -203,7 +203,7 @@ export async function handleConfigureWarningsForSession(context: {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
-  bridge: Pick<BinaryBridge, "send">;
+  bridge: Pick<AftProjectTransport, "send">;
   warnings: unknown[];
   configDroppedKeys?: unknown;
   fallbackClient: unknown;

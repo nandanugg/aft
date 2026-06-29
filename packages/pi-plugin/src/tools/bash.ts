@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import {
-  type BinaryBridge,
+  type AftProjectTransport,
   type BridgeRequestOptions,
   coerceBoolean,
   isBridgeTransportTimeout,
@@ -278,7 +278,7 @@ interface RenderContextLike {
 }
 
 async function callBashBridge(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   command: string,
   params: Record<string, unknown> = {},
   extCtx?: ExtensionContext,
@@ -650,7 +650,7 @@ export function createBashWatchTool(ctx: PluginContext) {
  * already handles exit notifications, so just return the conversion message.
  */
 async function convertToAsyncWatchOnAbort(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   extCtx: ExtensionContext,
   taskId: string,
   waitFor: BashWaitPattern | undefined,
@@ -806,7 +806,7 @@ type BashWaitPattern = { kind: "substring"; value: string } | { kind: "regex"; s
 type OutputCursor = { output: number; stderr: number; combined: number };
 
 async function bashStatusSnapshot(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   extCtx: ExtensionContext,
   taskId: string,
   outputMode: string | undefined,
@@ -823,7 +823,7 @@ async function bashStatusSnapshot(
 
 async function waitForBashStatus(
   ctx: PluginContext,
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   extCtx: ExtensionContext,
   taskId: string,
   outputMode: string | undefined,
@@ -1015,7 +1015,7 @@ function isRegexWaitObject(value: unknown): value is { regex: string } {
 type WaitMatch = { text: string; byteOffset: number };
 
 async function validateWaitRegex(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   extCtx: ExtensionContext,
   pattern: Extract<BashWaitPattern, { kind: "regex" }>,
 ): Promise<void> {
@@ -1023,7 +1023,7 @@ async function validateWaitRegex(
 }
 
 async function findWaitMatch(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   extCtx: ExtensionContext,
   text: string,
   pattern: BashWaitPattern,
@@ -1038,7 +1038,7 @@ async function findWaitMatch(
 }
 
 async function matchRegexWithBridge(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   extCtx: ExtensionContext,
   pattern: string,
   text: string,

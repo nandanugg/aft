@@ -288,7 +288,7 @@ async function handleConfigureWarningsForSession(context: {
   projectRoot: string;
   sessionId?: string | null;
   client?: unknown;
-  bridge: Pick<import("@cortexkit/aft-bridge").BinaryBridge, "send">;
+  bridge: Pick<import("@cortexkit/aft-bridge").AftProjectTransport, "send">;
   warnings: unknown[];
   configDroppedKeys?: unknown;
   storageDir: string;

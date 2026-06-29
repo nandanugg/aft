@@ -148,8 +148,10 @@ export {
 export type { ReadFooterOptions } from "./tool-format.js";
 export { formatBridgeErrorMessage, formatReadFooter } from "./tool-format.js";
 export type {
+  AftProjectTransport,
   AftTransport,
   AftTransportOptions,
+  AftTransportPool,
   ToolCallArguments,
   ToolCallOptions,
   ToolCallResult,

@@ -1,4 +1,6 @@
-import type { BridgeRequestOptions } from "./bridge.js";
+import type { BridgeRequestOptions, StatusSnapshot } from "./bridge.js";
+import type { BridgeToolCallRuntime } from "./pool.js";
+import type { StatusBarCounts } from "./status-bar.js";
 
 export type ToolCallArguments = Record<string, unknown>;
 
@@ -25,6 +27,41 @@ export interface AftTransportOptions extends BridgeRequestOptions {
 export interface ToolCallOptions extends AftTransportOptions {
   /** Server-owned dry-run flag placed at the top level of the tool_call request. */
   preview?: boolean;
+}
+
+// A single project's transport (today: one BinaryBridge per project root).
+export interface AftProjectTransport {
+  send(
+    command: string,
+    params?: Record<string, unknown>,
+    options?: AftTransportOptions,
+  ): Promise<Record<string, unknown>>;
+  toolCall(
+    sessionId: string | undefined,
+    name: string,
+    rawArgs?: ToolCallArguments,
+    options?: ToolCallOptions,
+  ): Promise<ToolCallResult>;
+  getCwd(): string;
+  getStatusBar(): StatusBarCounts | undefined;
+  getCachedStatus(): StatusSnapshot | null;
+  cacheStatusSnapshot(snapshot: StatusSnapshot): void;
+}
+
+// The pool of project transports (today: BridgePool).
+export interface AftTransportPool {
+  getBridge(projectRoot: string): AftProjectTransport;
+  getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null;
+  toolCall(
+    projectRoot: string,
+    runtime: BridgeToolCallRuntime,
+    name: string,
+    rawArgs?: ToolCallArguments,
+    options?: ToolCallOptions,
+  ): Promise<ToolCallResult>;
+  setConfigureOverride(key: string, value: unknown): void;
+  replaceBinary(path: string): Promise<string>;
+  shutdown(): Promise<void>;
 }
 
 export interface AftTransport<ToolCallContext = string | undefined> {

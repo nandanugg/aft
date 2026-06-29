@@ -1,4 +1,4 @@
-import type { BridgePool } from "@cortexkit/aft-bridge";
+import type { AftTransportPool } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { AftConfig } from "./config.js";
 
@@ -15,7 +15,7 @@ interface ShellEnvPluginHost {
  * Bundles the binary bridge, the OpenCode SDK client, and plugin config.
  */
 export interface PluginContext {
-  pool: BridgePool;
+  pool: AftTransportPool;
   client: PluginInput["client"];
   plugin?: ShellEnvPluginHost;
   config: AftConfig;

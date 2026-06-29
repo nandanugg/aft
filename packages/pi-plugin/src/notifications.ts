@@ -1,5 +1,5 @@
 import {
-  type BinaryBridge,
+  type AftProjectTransport,
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
@@ -26,7 +26,7 @@ export interface ConfigureWarning {
 export interface ConfigureWarningOptions {
   client: unknown;
   sessionId: string;
-  bridge: Pick<BinaryBridge, "send">;
+  bridge: Pick<AftProjectTransport, "send">;
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
@@ -69,9 +69,9 @@ function sendIgnoredMessage(client: unknown, sessionId: string, text: string): b
  * value) — only a genuine read failure is `null`.
  */
 async function readWarnedTools(
-  bridge: Pick<BinaryBridge, "send">,
+  bridge: Pick<AftProjectTransport, "send">,
 ): Promise<Record<string, unknown> | null> {
-  let resp: Awaited<ReturnType<Pick<BinaryBridge, "send">["send"]>>;
+  let resp: Awaited<ReturnType<Pick<AftProjectTransport, "send">["send"]>>;
   try {
     resp = await bridge.send("db_get_state", { key: "warned_tools" });
   } catch {
@@ -98,7 +98,7 @@ async function readWarnedTools(
  *     configured call delivers once.
  */
 async function warnedStatus(
-  bridge: Pick<BinaryBridge, "send">,
+  bridge: Pick<AftProjectTransport, "send">,
   key: string,
 ): Promise<"warned" | "fresh" | "unknown"> {
   const warned = await readWarnedTools(bridge);
@@ -106,7 +106,10 @@ async function warnedStatus(
   return warned[key] === true || typeof warned[key] === "string" ? "warned" : "fresh";
 }
 
-async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
+async function recordWarning(
+  bridge: Pick<AftProjectTransport, "send">,
+  key: string,
+): Promise<void> {
   const warned = await readWarnedTools(bridge);
   if (warned === null) return;
   warned[key] = true;

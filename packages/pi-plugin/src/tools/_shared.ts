@@ -3,7 +3,7 @@
  */
 
 import type {
-  BinaryBridge,
+  AftProjectTransport,
   BridgeRequestOptions,
   ToolCallOptions,
   ToolCallResult,
@@ -32,7 +32,7 @@ export {
 } from "@cortexkit/aft-bridge";
 
 /** Get the session bridge for the current working directory. */
-export function bridgeFor(ctx: PluginContext, cwd: string): BinaryBridge {
+export function bridgeFor(ctx: PluginContext, cwd: string): AftProjectTransport {
   return ctx.pool.getBridge(cwd);
 }
 
@@ -75,7 +75,7 @@ export class BridgeError extends Error {
  * scopes backups/undo per Pi session rather than per extension instance.
  */
 export async function callBridge(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   command: string,
   params: Record<string, unknown> = {},
   extCtx?: ExtensionContext,
@@ -113,7 +113,7 @@ export async function callBridge(
  * response plus the text summary the model will receive.
  */
 export async function callToolCall(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   name: string,
   rawArgs: Record<string, unknown> = {},
   extCtx?: ExtensionContext,

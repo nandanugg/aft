@@ -1,4 +1,4 @@
-import type { BridgePool } from "@cortexkit/aft-bridge";
+import type { AftTransportPool } from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
 
 /**
@@ -11,7 +11,7 @@ import type { AftConfig } from "./config.js";
  * state in AFT.
  */
 export interface PluginContext {
-  pool: BridgePool;
+  pool: AftTransportPool;
   config: AftConfig;
   /** Absolute path to AFT's data storage dir (e.g. ~/.local/share/cortexkit/aft). */
   storageDir: string;

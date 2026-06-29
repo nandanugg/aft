@@ -18,7 +18,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import {
-  type BinaryBridge,
+  type AftProjectTransport,
   markAnnouncementSeen,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
@@ -400,7 +400,7 @@ export interface ConfigureWarning {
 export interface ConfigureWarningOptions {
   client: unknown;
   sessionId: string;
-  bridge: Pick<BinaryBridge, "send">;
+  bridge: Pick<AftProjectTransport, "send">;
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
@@ -572,9 +572,9 @@ function persistAnnouncedVersion(storageDir: string | undefined, version: string
  * re-delivered every time.
  */
 async function readWarnedTools(
-  bridge: Pick<BinaryBridge, "send">,
+  bridge: Pick<AftProjectTransport, "send">,
 ): Promise<Record<string, unknown> | null> {
-  let resp: Awaited<ReturnType<Pick<BinaryBridge, "send">["send"]>>;
+  let resp: Awaited<ReturnType<Pick<AftProjectTransport, "send">["send"]>>;
   try {
     resp = await bridge.send("db_get_state", { key: "warned_tools" });
   } catch {
@@ -610,7 +610,7 @@ async function readWarnedTools(
  *     delivering would risk spamming). The next configured call retries.
  */
 async function warnedStatus(
-  bridge: Pick<BinaryBridge, "send">,
+  bridge: Pick<AftProjectTransport, "send">,
   key: string,
 ): Promise<"warned" | "fresh" | "unknown"> {
   const warned = await readWarnedTools(bridge);
@@ -618,7 +618,10 @@ async function warnedStatus(
   return warned[key] === true || typeof warned[key] === "string" ? "warned" : "fresh";
 }
 
-async function recordWarning(bridge: Pick<BinaryBridge, "send">, key: string): Promise<void> {
+async function recordWarning(
+  bridge: Pick<AftProjectTransport, "send">,
+  key: string,
+): Promise<void> {
   // Read-modify-write. If the read failed (null), do NOT write — a blind
   // `{}` write would clobber previously-recorded keys and re-open the
   // re-fire window. We only reach here after a "fresh" status, which means
