@@ -95,10 +95,30 @@ type SessionBgState = {
    */
   consumedTaskIds: Set<string>;
   consumedTaskOrder: string[];
+  /**
+   * Task IDs whose delivery is IN FLIGHT (removed from pendingCompletions /
+   * pattern queues, prompt not yet resolved). Ingest skips these so a subc forced
+   * drain in the removal→delivery window cannot re-accept and double-schedule an
+   * already-departing completion. Bounded by the in-flight wake batch (cleared on
+   * delivery success → moves to awaitingAck, or on delivery failure → re-pended).
+   */
+  deliveringTaskIds: Set<string>;
+  /**
+   * Task IDs DELIVERED to the agent but whose `bash_ack_completions` has not yet
+   * confirmed (so the Rust registry still holds them and, over subc, re-nudges).
+   * Ingest skips these for fresh delivery AND a forced drain RE-ACKs them (the
+   * self-terminating close of the re-nudge loop, C-#3). Maps task_id → insertedAt
+   * for TTL pruning. Normally cleared within one ack round-trip; only lingers if
+   * ack permanently fails (transport down).
+   */
+  deliveredAwaitingAckTaskIds: Map<string, number>;
   lastSeenAt: number;
 };
 
 const CONSUMED_TASKIDS_CAP = 256;
+/** Cap + TTL for deliveredAwaitingAckTaskIds (defensive; entries normally clear in ms). */
+const DELIVERED_AWAITING_ACK_CAP = 1024;
+const DELIVERED_AWAITING_ACK_TTL_MS = 5 * 60 * 1000;
 
 export const sessionBgStates: Map<string, SessionBgState> = new Map();
 
@@ -170,9 +190,17 @@ export async function markBgCompletionDelivered(
   drainContext: DrainContext,
   taskId: string,
 ): Promise<void> {
-  await ackCompletions(drainContext, [
+  // C-#1 site 5: an inline bash_watch wait already delivered this task's result
+  // in its tool output. Mark it awaiting-ack so a forced drain racing this ack
+  // re-acks rather than re-delivering, then confirm/keep on the ack result. (Do
+  // NOT route this through consumedTaskIds — that set is also used pre-delivery
+  // by markTaskWaiting, so re-acking all of it would be wrong.)
+  const state = stateFor(drainContext.sessionID);
+  markDeliveredAwaitingAck(state, [taskId]);
+  const acked = await ackCompletions(drainContext, [
     { task_id: taskId, status: "unknown", exit_code: null, command: "" },
   ]);
+  if (acked) confirmAcked(state, [taskId]);
 }
 
 /**
@@ -336,6 +364,12 @@ export function ingestBgCompletions(
       queuePendingPatternMatch(state, completionToExitPattern(completion, true));
       continue;
     }
+    // C-#1: skip a task whose delivery is in flight / awaiting ack — a late push
+    // for an already-departing completion would otherwise re-queue a duplicate.
+    if (isDeliveringOrAwaitingAck(state, completion.task_id)) {
+      state.outstandingTaskIds.delete(completion.task_id);
+      continue;
+    }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
       bufferUnknownCompletion(state, completion);
       continue;
@@ -431,7 +465,13 @@ export async function appendInTurnBgCompletions(
   state.retryDelayMs = null;
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
-  await ackCompletions(drainContext, completionAcks);
+  // C-#1 site 4: this path delivers via the tool-result piggyback (already
+  // written to output.output above — delivery cannot fail here), so mark the
+  // ack-target ids awaiting-ack directly, then confirm/keep on the ack result.
+  const inTurnAckIds = completionAcks.map((completion) => completion.task_id);
+  markDeliveredAwaitingAck(state, inTurnAckIds);
+  const inTurnAcked = await ackCompletions(drainContext, completionAcks);
+  if (inTurnAcked) confirmAcked(state, inTurnAckIds);
   // Cancel any pending debounced wake — its captured pendingCompletions /
   // pendingLongRunning are now drained, and firing the timer anyway would
   // build an empty-body system-reminder ("[BACKGROUND BASH STILL RUNNING]"
@@ -625,7 +665,14 @@ async function triggerWakeIfPending(
 
       const client = getInProcessClient();
       const deliveryID = await sendPrompt(client);
-      await ackCompletions(drainContext, deliveredCompletions, deliveryID);
+      // C-#1 site 2: delivery SUCCEEDED — move from in-flight to awaiting-ack
+      // BEFORE acking, so a forced drain racing the ack round-trip still skips
+      // these (and re-acks instead of re-delivering). On ack success, stop
+      // tracking; on ack failure, KEEP them awaiting-ack so a later forced drain
+      // re-acks them (C-#3 self-terminating close).
+      markDeliveredAwaitingAck(state, taskIDs);
+      const acked = await ackCompletions(drainContext, deliveredCompletions, deliveryID);
+      if (acked) confirmAcked(state, taskIDs);
     },
     (err, hardStopped) => {
       sessionWarn(
@@ -722,7 +769,26 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
       return;
     }
     state.forcedDrainCompleted = true;
+    // C-#3: any drained completion still in deliveredAwaitingAckTaskIds was
+    // delivered to the agent but its ack never confirmed (so the module kept
+    // re-nudging and re-surfacing it here). Re-ack it now so the Rust registry
+    // drops it and the nudges stop — the self-terminating close of the loop.
+    // ingestDrainedBgCompletions skips these for fresh delivery, so this never
+    // double-delivers; it only retries the ack.
+    const reackTaskIds = collectAwaitingAckTaskIds(state, response.bg_completions);
     ingestDrainedBgCompletions(sessionID, response.bg_completions);
+    if (reackTaskIds.length > 0) {
+      const reacked = await ackCompletions(
+        { ctx, directory, sessionID },
+        reackTaskIds.map((task_id) => ({
+          task_id,
+          status: "unknown",
+          exit_code: null,
+          command: "",
+        })),
+      );
+      if (reacked) confirmAcked(state, reackTaskIds);
+    }
   } catch (err) {
     sessionWarn(
       sessionID,
@@ -735,9 +801,9 @@ async function ackCompletions(
   { ctx, directory, sessionID }: DrainContext,
   completions: readonly BgCompletion[],
   deliveryID?: string,
-): Promise<void> {
+): Promise<boolean> {
   const taskIds = [...new Set(completions.map((completion) => completion.task_id))];
-  if (taskIds.length === 0) return;
+  if (taskIds.length === 0) return true;
   try {
     const bridge = ctx.pool.getActiveBridgeForRoot(directory) ?? ctx.pool.getBridge(directory);
     const response = await bridge.send("bash_ack_completions", {
@@ -749,7 +815,7 @@ async function ackCompletions(
         sessionID,
         `${LOG_PREFIX} ack failed: ${String(response.message ?? "unknown error")}`,
       );
-      return;
+      return false;
     }
     // Trace #6 of 7: bash_ack_completions succeeded on the Rust side.
     // Closes the wake chain: scheduled → fire → start → ok → ack_ok.
@@ -761,11 +827,13 @@ async function ackCompletions(
       delivery_id: deliveryID ?? null,
       task_ids: taskIds,
     });
+    return true;
   } catch (err) {
     sessionWarn(
       sessionID,
       `${LOG_PREFIX} ack failed: ${err instanceof Error ? err.message : String(err)}`,
     );
+    return false;
   }
 }
 
@@ -903,6 +971,12 @@ function scheduleWake(
     state.pendingLongRunning = [];
     state.pendingPatternMatches = [];
     const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
+    // C-#1 site 1: mark ALL ack-target ids (completions + ack-on-delivery pattern
+    // matches, not just `pending`) as delivery-in-flight at the same synchronous
+    // tick they leave the queues, BEFORE the sendWake await. Ingest skips them so
+    // a forced drain in the delivery window can't re-accept them.
+    const ackTargetIds = completionAcks.map((completion) => completion.task_id);
+    markDelivering(state, ackTargetIds);
     void sendWake(reminder, completionAcks)
       .then(() => {
         state.retryDelayMs = null;
@@ -910,6 +984,11 @@ function scheduleWake(
         state.wakeHardStopped = false;
       })
       .catch((err) => {
+        // C-#1 site 3: delivery failed BEFORE departing (sendWake only rejects on
+        // getInProcessClient/sendPrompt throw, which is before the awaiting-ack
+        // move — ackCompletions never throws). Clear the in-flight marks so the
+        // re-prepended tasks are redeliverable on the retry.
+        clearDelivering(state, ackTargetIds);
         state.pendingCompletions = [...pending, ...state.pendingCompletions];
         state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
         state.pendingPatternMatches = [...pendingPatternMatches, ...state.pendingPatternMatches];
@@ -952,6 +1031,8 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       wakeDeferredTaskIds: new Set(),
       consumedTaskIds: new Set(),
       consumedTaskOrder: [],
+      deliveringTaskIds: new Set(),
+      deliveredAwaitingAckTaskIds: new Map(),
       lastSeenAt: now,
     };
     sessionBgStates.set(key, state);
@@ -979,6 +1060,11 @@ function ingestDrainedBgCompletions(
     // Suppress completions for tasks already consumed inline by a
     // bash_status wait (same dedupe as ingestBgCompletions push path).
     if (state.consumedTaskIds.has(completion.task_id)) continue;
+    // C-#1: a completion mid-delivery (in flight) or delivered-but-not-yet-acked
+    // must NOT be re-accepted as a fresh delivery, or a forced drain in that
+    // window double-delivers it. The drainCompletions caller separately re-acks
+    // the awaiting-ack ones (C-#3) so the module's re-nudge loop terminates.
+    if (isDeliveringOrAwaitingAck(state, completion.task_id)) continue;
     if (
       !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
       !accepted.some((pending) => pending.task_id === completion.task_id)
@@ -1052,6 +1138,68 @@ function completionAcksForDelivery(
     ackedTaskIds.add(match.task_id);
   }
   return acks;
+}
+
+/**
+ * True if `taskId` has a delivery in flight or delivered-awaiting-ack — i.e. it
+ * has already left a deliverable queue and will be acked, so a fresh ingest
+ * (push or forced drain) must NOT re-accept it (audit C-#1 double-deliver guard).
+ */
+function isDeliveringOrAwaitingAck(state: SessionBgState, taskId: string): boolean {
+  return state.deliveringTaskIds.has(taskId) || state.deliveredAwaitingAckTaskIds.has(taskId);
+}
+
+/** Mark ack-target task ids as delivery-in-flight (at queue-removal, before await). */
+function markDelivering(state: SessionBgState, taskIds: readonly string[]): void {
+  for (const id of taskIds) state.deliveringTaskIds.add(id);
+}
+
+/** Delivery succeeded: move from in-flight to delivered-awaiting-ack (before ack). */
+function markDeliveredAwaitingAck(state: SessionBgState, taskIds: readonly string[]): void {
+  const now = Date.now();
+  for (const id of taskIds) {
+    state.deliveringTaskIds.delete(id);
+    state.deliveredAwaitingAckTaskIds.set(id, now);
+  }
+  pruneDeliveredAwaitingAck(state, now);
+}
+
+/** Delivery failed before it departed: return ids to redeliverable (clear in-flight). */
+function clearDelivering(state: SessionBgState, taskIds: readonly string[]): void {
+  for (const id of taskIds) state.deliveringTaskIds.delete(id);
+}
+
+/** Ack confirmed (Rust dropped them): stop tracking — they will never re-nudge. */
+function confirmAcked(state: SessionBgState, taskIds: readonly string[]): void {
+  for (const id of taskIds) state.deliveredAwaitingAckTaskIds.delete(id);
+}
+
+/**
+ * Of the just-drained completions, which task ids are delivered-awaiting-ack —
+ * i.e. were already delivered and need a RE-ACK (not a redelivery) so the module
+ * stops re-nudging (C-#3). Read-only; the caller acks then confirms.
+ */
+function collectAwaitingAckTaskIds(state: SessionBgState, completions: unknown): string[] {
+  if (!Array.isArray(completions)) return [];
+  const ids: string[] = [];
+  for (const completion of completions) {
+    if (!isBgCompletion(completion)) continue;
+    if (state.deliveredAwaitingAckTaskIds.has(completion.task_id)) ids.push(completion.task_id);
+  }
+  return ids;
+}
+
+/** TTL + cap prune so a permanently-failing ack can't grow the set unbounded. */
+function pruneDeliveredAwaitingAck(state: SessionBgState, now: number): void {
+  const cutoff = now - DELIVERED_AWAITING_ACK_TTL_MS;
+  for (const [id, at] of state.deliveredAwaitingAckTaskIds) {
+    if (at < cutoff) state.deliveredAwaitingAckTaskIds.delete(id);
+  }
+  while (state.deliveredAwaitingAckTaskIds.size > DELIVERED_AWAITING_ACK_CAP) {
+    const oldest = state.deliveredAwaitingAckTaskIds.keys().next().value;
+    if (oldest === undefined) break;
+    state.deliveredAwaitingAckTaskIds.delete(oldest);
+  }
 }
 
 function isBgCompletion(value: unknown): value is BgCompletion {

@@ -46,6 +46,7 @@ import {
   formatSystemReminder,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
+  handleSubcBgEventsNudge,
   ingestBgCompletions,
   markBgCompletionDelivered,
   markExplicitControl,
@@ -949,6 +950,109 @@ describe("OpenCode background notifications", () => {
     expect(meta?.task_ids).toEqual(["task-1"]);
     expect(meta?.attempt).toBe(1);
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
+  });
+});
+
+describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("a forced drain DURING in-flight delivery does not double-deliver", async () => {
+    // Set up: a tracked completion is pending. A wake fires and its promptAsync
+    // is held open (delivery in flight). While it's in flight, a subc bg_events
+    // nudge force-drains — the module still holds the completion (not yet acked),
+    // so the drain returns it. The fix must NOT schedule a second delivery.
+    trackBgTask("s1", "task-1");
+    let releasePrompt!: () => void;
+    const promptGate = new Promise<void>((r) => {
+      releasePrompt = r;
+    });
+    const promptAsync = mock(async () => {
+      await promptGate; // hold delivery open
+    });
+    const client = makeClient(promptAsync);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+
+    // First delivery: a push schedules the wake; let the debounce timer fire so
+    // promptAsync is invoked and parks on the gate (delivery in flight).
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    await handleIdleBgCompletions(drainCtx);
+    await waitForMockCallCount(promptAsync, 1);
+
+    // While the first delivery is parked, a subc nudge force-drains.
+    await handleSubcBgEventsNudge(drainCtx);
+    // Give any (erroneous) second wake a chance to schedule + fire.
+    await sleep(300);
+
+    // The completion was in flight, so the forced drain must NOT have queued it
+    // again — exactly ONE promptAsync delivery total.
+    releasePrompt();
+    await sleep(50);
+    expect(promptAsync.mock.calls.length).toBe(1);
+  });
+
+  test("a forced drain RE-ACKS a delivered-but-unacked completion (C-#3 close)", async () => {
+    // Delivery succeeds but the FIRST ack fails. The completion stays
+    // awaiting-ack; the module re-nudges. The next forced drain must re-ack it
+    // (not re-deliver), so the loop terminates.
+    trackBgTask("s1", "task-1");
+    let ackCalls = 0;
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") {
+        return { success: true, bg_completions: [completion("task-1", "npm test")] };
+      }
+      // first ack fails, subsequent acks succeed
+      ackCalls += 1;
+      return ackCalls === 1
+        ? { success: false, message: "ack transport down" }
+        : { success: true, acked_task_ids: ["task-1"] };
+    });
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+    const client = makeClient(promptAsync);
+    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+
+    // First delivery: push → wake → promptAsync ok → ack FAILS.
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    await handleIdleBgCompletions(drainCtx);
+    await waitForMockCallCount(promptAsync, 1);
+    await sleep(50);
+    // Still awaiting ack (first ack failed).
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(true);
+
+    // Module re-nudges → forced drain returns the still-held completion.
+    await handleSubcBgEventsNudge(drainCtx);
+    await sleep(50);
+
+    // It was RE-ACKED (not re-delivered): still one promptAsync, and the
+    // awaiting-ack entry is now cleared (the re-ack succeeded).
+    expect(promptAsync.mock.calls.length).toBe(1);
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
+  });
+
+  test("delivery FAILURE re-pends the completion (redeliverable, not stuck in-flight)", async () => {
+    trackBgTask("s1", "task-1");
+    const promptAsync = mock(async () => {
+      throw new Error("promptAsync rejected");
+    });
+    const client = makeClient(promptAsync);
+    const send = mock(async () => ({ success: true, acked_task_ids: [] }));
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    await handleIdleBgCompletions(drainCtx);
+    await waitForMockCallCount(promptAsync, 1);
+    await sleep(50);
+
+    const state = sessionBgStates.get("s1");
+    // Delivery failed before departing → cleared from in-flight, back in pending.
+    expect(state?.deliveringTaskIds.has("task-1")).toBe(false);
+    expect(state?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
+    expect(state?.pendingCompletions.some((c) => c.task_id === "task-1")).toBe(true);
   });
 });
 

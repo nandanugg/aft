@@ -8,6 +8,7 @@ import {
   consumeBgCompletion,
   formatSystemReminder,
   handlePushedBgCompletion,
+  handleSubcBgEventsNudge,
   handleTurnEndBgCompletions,
   ingestBgCompletions,
   markBgCompletionDelivered,
@@ -628,6 +629,87 @@ describe("Pi background notifications", () => {
     );
 
     expect(content).toBeUndefined();
+  });
+});
+
+describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("a forced drain during the ack window does not double-deliver", async () => {
+    // Pi delivery (sendUserMessage) is synchronous; the in-flight window is the
+    // ack round-trip. Hold the ack open, fire a subc nudge force-drain in that
+    // window, and assert the completion is NOT delivered twice.
+    trackBgTask("s1", "task-1");
+    let releaseAck!: () => void;
+    const ackGate = new Promise<void>((r) => {
+      releaseAck = r;
+    });
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") {
+        return { success: true, bg_completions: [completion("task-1", "npm test")] };
+      }
+      await ackGate; // hold the ack open (delivery already happened)
+      return { success: true, acked_task_ids: ["task-1"] };
+    });
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    };
+
+    // First delivery: push → wake → sendUserMessage (sync) → ack parks on gate.
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    await handleTurnEndBgCompletions(drainCtx);
+    await waitForMockCallCount(sendUserMessage, 1);
+
+    // While ack is parked, a subc nudge force-drains (module still holds task-1).
+    // Don't await it: its C-#3 re-ack parks on the SAME gate. The double-deliver
+    // decision (ingest dedup) happens synchronously before that await, so the
+    // assertion below is valid while the nudge is parked.
+    const nudge = handleSubcBgEventsNudge(drainCtx);
+    await sleep(300);
+    // Still exactly one delivery — the in-flight task was skipped, not re-delivered.
+    expect(sendUserMessage.mock.calls.length).toBe(1);
+
+    releaseAck();
+    await nudge;
+    await sleep(50);
+    expect(sendUserMessage.mock.calls.length).toBe(1);
+  });
+
+  test("a forced drain re-acks a delivered-but-unacked completion (C-#3 close)", async () => {
+    trackBgTask("s1", "task-1");
+    let ackCalls = 0;
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") {
+        return { success: true, bg_completions: [completion("task-1", "npm test")] };
+      }
+      ackCalls += 1;
+      return ackCalls === 1
+        ? { success: false, message: "ack transport down" }
+        : { success: true, acked_task_ids: ["task-1"] };
+    });
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    };
+
+    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
+    await handleTurnEndBgCompletions(drainCtx);
+    await waitForMockCallCount(sendUserMessage, 1);
+    await sleep(50);
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(true);
+
+    await handleSubcBgEventsNudge(drainCtx);
+    await sleep(50);
+
+    expect(sendUserMessage.mock.calls.length).toBe(1); // re-acked, not re-delivered
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
   });
 });
 
