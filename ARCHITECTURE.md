@@ -2,11 +2,11 @@
 
 ## Pattern Overview
 
-**Overall:** TypeScript plugin + Rust worker process over a session-scoped NDJSON bridge. A unified CLI (`packages/aft-cli/`) serves setup/doctor across all harnesses; shared transport, binary resolution, and ONNX helpers live in `packages/aft-bridge/`.
+**Overall:** TypeScript plugin + Rust worker process communicating over either a session-scoped NDJSON bridge (standalone mode) or the Subconscious (subc) daemon transport. A unified CLI (`packages/aft-cli/`) serves setup/doctor across all harnesses; shared transport, binary resolution, and ONNX helpers live in `packages/aft-bridge/`.
 
 **Key Characteristics:**
 - Use `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` to register harness tools and map them onto the unified `tool_call` command.
-- Use `packages/aft-bridge/src/bridge.ts` and `packages/aft-bridge/src/pool.ts` as the shared transport layer, isolating one `aft` process per project root.
+- Use `packages/aft-bridge/src/transport-factory.ts` to instantiate either `BridgePool` (standalone NDJSON bridge, isolating one `aft` process per project root) or `SubcTransportPool` (daemon-backed transport) satisfying the shared `AftTransportPool` interface.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
 - Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, and `crates/aft/src/lsp/` as shared engines behind multiple commands.
@@ -28,10 +28,10 @@
 - Used by: Pi coding agent through `@cortexkit/aft-pi`
 
 **Shared bridge layer:**
-- Purpose: Resolve or download the binary, start worker processes, manage ONNX runtime, format output, and forward requests. All harness adapters share this layer.
-- Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/zoom-format.ts`
-- Contains: Session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger
-- Depends on: Node child-process APIs, GitHub releases, `onnxruntime-node`
+- Purpose: Resolve or download the binary, start worker processes, manage ONNX runtime, format output, select and manage the transport pool, and forward requests. All harness adapters share this layer.
+- Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/subc-transport.ts`, `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/zoom-format.ts`
+- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, route caching per session-identity, background event subscriptions with independent reconnects, session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger
+- Depends on: Node child-process APIs, GitHub releases, `onnxruntime-node`, `@cortexkit/subc-client`
 - Used by: `packages/opencode-plugin/src/index.ts`, `packages/pi-plugin/src/index.ts`
 
 **Unified CLI layer:**
@@ -81,8 +81,10 @@
 **Tool invocation flow:**
 
 1. Register tool definitions and config-driven surface selection -- `packages/opencode-plugin/src/index.ts` or `packages/pi-plugin/src/index.ts`
-2. Get a session bridge and send a unified `tool_call` command carrying the bare tool name and arguments over NDJSON -- `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
-3. Dispatch the request to the `tool_call` handler in Rust, which translates it to the target command (via `crates/aft/src/subc_translate.rs`) and executes it. For deferred tasks like foreground bash orchestration, the request is registered in the main-loop pending registry (`crates/aft/src/main.rs`). The execution outcome is processed through the server-side text formatter (`crates/aft/src/subc_format.rs`) and a pending response finalizer seam (`crates/aft/src/response_finalize.rs`) which attaches background completions and status bar updates before returning the response envelope.
+2. Resolve the active transport pool:
+   - For standalone mode (default): send a unified `tool_call` command carrying the bare tool name and arguments over NDJSON -- `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/bridge.ts`
+   - For subc mode (when `subc.connection_file` is set): send `{name, arguments}` as a data-plane request over a tool-provider route channel opened and cached per session identity (`BindIdentity`) -- `packages/aft-bridge/src/subc-transport.ts`
+3. Dispatch the request to the target command or executor. Under standalone mode, dispatch through the Rust stdin NDJSON loop. Under subc mode, process frames via the TCP loopback client loop. Local `configure` commands are satisfied locally on bind. Native plumbing tools (`bash_drain_completions`, `bash_ack_completions`) bypass the tool manifest check but reinject the BIND session ID to keep sessions isolated. The execution outcome is processed through the server-side text formatter (`crates/aft/src/subc_format.rs`) and a pending response finalizer seam (`crates/aft/src/response_finalize.rs`). Subc relays `structuredContent` carrying the full flat response shape, which is re-lifted into `ToolCallResult` at the transport boundary to maintain parity with standalone mode.
 
 **Edit pipeline:**
 
@@ -119,6 +121,13 @@
 3. Execute foreground, background, or PTY modes. Foreground bash executions are orchestrated with a wait window (defaulting to 15s, clamped to config) and deferred to background tasks if they exceed the budget, polling state and optionally rendering PTY screens with vt100 parsing -- `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_status.rs`, `crates/aft/src/pty_render.rs`, `crates/aft/src/bash_background/`
 4. Compress output through the tiered compressor -- `crates/aft/src/compress/`
 
+**Background completion wake flow:**
+
+1. Maintain background subscriptions for completions. Under standalone mode, completion notifications push directly over the bridge process stdout channel. Under subc mode, the plugin maintains a persistent `BgSubscription` over a dedicated second route channel -- `packages/aft-bridge/src/subc-transport.ts`.
+2. When a background task completes, Rust marks the session's background channel wake-pending and emits a coalesced, lossy `{op: "bg_events"}` wake nudge at most once per 250ms tick -- `crates/aft/src/subc.rs`.
+3. The plugin receives the nudge via `onBgEventsNudge` and triggers an unconditional forced-drain (`handleSubcBgEventsNudge`) to fetch, deliver, and ack the completions -- `packages/opencode-plugin/src/bg-notifications.ts`, `packages/pi-plugin/src/bg-notifications.ts`.
+4. If a subc background subscription channel drops, `BgSubscription` drives its own independent reconnect loop to resubscribe without waiting for new tool traffic, retrieving any completions queued while disconnected.
+
 **Binary resolution flow:**
 
 1. Check cache, npm platform package, PATH, and cargo install locations -- `packages/aft-bridge/src/resolver.ts`
@@ -136,6 +145,21 @@
 - Purpose: Scope bridges per OpenCode/Pi session and preserve isolated undo history.
 - Location: `packages/aft-bridge/src/pool.ts`
 - Pattern: Session-keyed object pool with LRU eviction
+
+**AftTransportPool / AftProjectTransport / AftTransport:**
+- Purpose: Abstract transport details (standalone NDJSON vs daemon-backed subc) behind a unified, session-closed client-facing interface.
+- Location: `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`
+- Pattern: Factory-created abstraction layer.
+
+**SubcTransportPool:**
+- Purpose: Provide route cache and connection management over the authenticated subc client.
+- Location: `packages/aft-bridge/src/subc-transport.ts`
+- Pattern: Cache tool-provider and background event routes per session identity (`BindIdentity`), handling lazy subscriptions and independent reconnects.
+
+**BgSubscription:**
+- Purpose: Consume the daemon's held-open `bg_events` wake lane.
+- Location: `packages/aft-bridge/src/subc-transport.ts`
+- Pattern: Resubscribe itself independently on stream drop or error without waiting for tool traffic, driving unconditional forced-drains.
 
 **Tool groups (OpenCode):**
 - Purpose: Group related OpenCode tool definitions by capability surface.

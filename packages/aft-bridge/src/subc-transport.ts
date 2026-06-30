@@ -67,6 +67,24 @@ export interface SubcClientLike {
 const AFT_MODULE_ID = "aft";
 
 /**
+ * A run of consecutive NON-transient transport throws (timeout / route GOODBYE)
+ * on the SAME client is presumed a dead half-open connection (local writes
+ * succeed, no response ever arrives), so the client is dropped after this many.
+ * A single throw does not drop the client (a slow tool can legitimately time out
+ * once); the counter resets on any successful request. Tool-level errors never
+ * count — they return `success:false`, they do not throw. (Audit B-#4.)
+ */
+const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
+
+/**
+ * A bg subscription that stayed up at least this long before dropping is treated
+ * as "stable", so its reconnect backoff resets to zero. A subscription that fails
+ * faster than this is escalating-broken and must keep backing off toward the cap
+ * (otherwise a permanently-failing route resubscribes in a 100ms hot loop). (B-#2.)
+ */
+const BG_STABLE_MS = 5_000;
+
+/**
  * Session fallback when a tool runtime carries no session id, mirroring the Rust
  * `DEFAULT_SESSION_ID` (`protocol.rs`). Keeps undo/checkpoint/bash namespacing
  * identical to the standalone path for session-less calls.
@@ -133,14 +151,14 @@ function identityKey(identity: BindIdentity): string {
  */
 class BgSubscription {
   private stopped = false;
+  /** The live subscription handle, read by stop() to wake the loop's `await closed`. */
   private current: SubcSubscriptionLike | null = null;
-  private currentClient: SubcClientLike | null = null;
-  private currentChannel: number | null = null;
   private readonly loop: Promise<void>;
 
   constructor(
     private readonly identity: BindIdentity,
     private readonly acquireClient: () => Promise<SubcClientLike>,
+    private readonly dropClient: (client: SubcClientLike) => void,
     private readonly onNudge: () => void,
     private readonly sleep: (ms: number) => Promise<void>,
   ) {
@@ -149,24 +167,17 @@ class BgSubscription {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    // Wake a live `await sub.closed` so the loop unwinds via its StreamEnd path,
+    // where the `finally` is the SOLE owner of closeRouteChannel (so the channel
+    // is closed exactly once, never double-closed by stop() + the loop). If the
+    // loop is between routeOpen and subscribe, its post-subscribe `stopped`
+    // re-check (or the pre-subscribe check) closes/returns instead.
     const sub = this.current;
-    const client = this.currentClient;
-    const channel = this.currentChannel;
-    this.current = null;
-    this.currentClient = null;
-    this.currentChannel = null;
     if (sub) {
       try {
         sub.unsubscribe();
       } catch {
         // best-effort; the socket may already be gone
-      }
-    }
-    if (client && channel !== null) {
-      try {
-        await client.closeRouteChannel(channel);
-      } catch {
-        // best-effort; a dropped connection releases the route daemon-side
       }
     }
     await this.loop.catch(() => undefined);
@@ -193,41 +204,58 @@ class BgSubscription {
           { kind: "tool_provider", module_id: AFT_MODULE_ID },
           this.identity,
         );
-      } catch {
+      } catch (err) {
+        // routeOpen failed. If it signals a dead CONNECTION, drop the shared
+        // client so the next `acquireClient` reconnects fresh — the idle-stranding
+        // fix (B-#1): `acquireClient` returns the cached client, so without this an
+        // idle bg loop would resubscribe forever onto the same dead socket.
+        if (isConsumerReconnectTransient(err)) this.dropClient(client);
         await this.backoff(attempt++);
         continue;
       }
       if (this.stopped) {
-        void client.closeRouteChannel(channel).catch(() => undefined);
+        safeCloseRoute(client, channel);
         return;
       }
 
-      const sub = client.subscribe(channel, { op: "bg_events" }, () => {
-        if (!this.stopped) this.onNudge();
-      });
-      this.current = sub;
-      this.currentClient = client;
-      this.currentChannel = channel;
-      attempt = 0; // a successful (re)subscribe resets backoff
-
-      // Immediate forced-drain replay: a completion that landed while we were
-      // disconnected is recovered now (resubscribe == the outbox replay trigger).
-      if (!this.stopped) this.onNudge();
-
+      // Channel lifetime: the `finally` guarantees closeRouteChannel on EVERY exit
+      // path from here (StreamEnd return, drop+resubscribe, stopped) so the
+      // dedicated route never leaks (B-#2).
+      const subscribedAt = Date.now();
       try {
+        const sub = client.subscribe(channel, { op: "bg_events" }, () => {
+          if (!this.stopped) this.onNudge();
+        });
+        this.current = sub;
+        // stop() may have fired between the pre-subscribe check and here; self-
+        // unsubscribe so the await below resolves immediately (avoids a stop()
+        // that hangs awaiting a subscription nobody woke).
+        if (this.stopped) sub.unsubscribe();
+
+        // Immediate forced-drain replay: a completion that landed while we were
+        // disconnected is recovered now (resubscribe == the outbox replay trigger).
+        if (!this.stopped) this.onNudge();
+
         await sub.closed;
         // StreamEnd = an intentional close (our unsubscribe or module teardown).
         // Do NOT resubscribe.
         return;
-      } catch {
+      } catch (err) {
         // Dropped (socket death / route GOODBYE / Error). Resubscribe — this is
         // the independent reconnect driver that fixes idle-stranding.
-        this.current = null;
-        this.currentClient = null;
-        this.currentChannel = null;
         if (this.stopped) return;
-        await this.backoff(attempt++);
+        // A dead-connection drop must replace the client (B-#1); a route-only
+        // GOODBYE keeps the client and just re-opens a fresh route.
+        if (isConsumerReconnectTransient(err)) this.dropClient(client);
+        // Reset backoff ONLY if the subscription was stable before dropping;
+        // otherwise a permanently-failing route would resubscribe in a 100ms hot
+        // loop and never reach the cap (B-#2).
+        if (Date.now() - subscribedAt >= BG_STABLE_MS) attempt = 0;
+      } finally {
+        this.current = null;
+        safeCloseRoute(client, channel);
       }
+      await this.backoff(attempt++);
     }
   }
 
@@ -242,23 +270,72 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Fire-and-forget route close that can never throw — neither synchronously (a
+ * client that rejects/throws when closing a route on an already-dead socket) nor
+ * via an unhandled rejection. Used on every best-effort teardown path.
+ */
+function safeCloseRoute(client: SubcClientLike, channel: number): void {
+  try {
+    void client.closeRouteChannel(channel).catch(() => undefined);
+  } catch {
+    // synchronous throw (e.g. closing a route on an already-closed client) — ignore
+  }
+}
+
+/**
+ * Per-identity tool-route state. Installed BEFORE the `routeOpen` await so two
+ * concurrent first calls for the same identity share ONE open (singleflight)
+ * instead of each minting a channel and leaking the loser (audit B-#3). `closed`
+ * tombstones the entry when `closeSession`/`shutdown` races an in-flight open: the
+ * resolving open observes it and closes the just-opened channel instead of caching
+ * a route for a torn-down session.
+ */
+interface RouteEntry {
+  /** In-flight routeOpen; non-null until it settles. Concurrent callers await it. */
+  opening: Promise<number> | null;
+  /** Resolved channel once open; null while still opening. */
+  channel: number | null;
+  /** Tombstone: a teardown raced the open — the resolving open must self-close. */
+  closed: boolean;
+}
+
+/**
+ * A route open that resolved AFTER its session was torn down (closeSession /
+ * shutdown / client swap). The caller's request can't proceed, but this is an
+ * intentional teardown — NOT a transport fault — so it must not drop the client
+ * or count toward the half-open-socket failure budget (B-#3/B-#4).
+ */
+class RouteTornDownError extends Error {}
+
+/**
  * Re-lift the route reply into the flat {@link ToolCallResult} shape the standalone
  * `BinaryBridge.toolCall` returns. The Rust module wraps the full flat response
  * (`{id, success, …data, text}`) under `structuredContent` (S1 envelope), alongside
  * the MCP `{content, isError}` a generic host reads. The first-party plugin reads
  * `structuredContent`, so re-lifting it makes everything downstream (status_bar,
- * bg_completions, preview_diff, code, …) byte-identical to NDJSON. If the reply is
- * not the expected envelope (defensive — should not happen for a tool response),
- * fall back to treating the reply itself as the flat shape.
+ * bg_completions, preview_diff, code, …) byte-identical to NDJSON.
+ *
+ * Every AFT tool reply over subc carries this envelope with a boolean `success`
+ * and string `text`. A reply missing the envelope, or whose lifted shape lacks a
+ * boolean `success`, is a PROTOCOL VIOLATION — never a tool result — and is thrown
+ * rather than coerced. Coercing it (the old `{success:false,text:""}` /
+ * raw-record fallback) could let a malformed reply with `success === undefined`
+ * read downstream as a successful tool result (audit B-#7). Surfacing it loudly is
+ * the honest contract: a broken wire shape is a failure, not a silent empty pass.
  */
 function reliftReply(reply: unknown): Record<string, unknown> {
-  if (isRecord(reply) && isRecord(reply.structuredContent)) {
-    return reply.structuredContent;
+  if (!isRecord(reply) || !isRecord(reply.structuredContent)) {
+    throw new Error(
+      "subc tool reply is missing the structuredContent envelope (protocol violation)",
+    );
   }
-  if (isRecord(reply)) {
-    return reply;
+  const flat = reply.structuredContent;
+  if (typeof flat.success !== "boolean" || typeof flat.text !== "string") {
+    throw new Error(
+      "subc tool reply structuredContent lacks a boolean `success` / string `text` (protocol violation)",
+    );
   }
-  return { success: false, text: "" };
+  return flat;
 }
 
 /**
@@ -388,8 +465,15 @@ export class SubcTransportPool implements AftTransportPool {
   private client: SubcClientLike | null = null;
   /** Single-flight guard so concurrent first calls share one connect. */
   private connecting: Promise<SubcClientLike> | null = null;
-  /** Cached route channels by identity key. */
-  private readonly routes = new Map<string, number>();
+  /** Cached tool-route state by identity key (singleflight + tombstone, B-#3). */
+  private readonly routes = new Map<string, RouteEntry>();
+  /**
+   * Consecutive NON-transient transport throws on the current client with no
+   * success in between. Resets to 0 on any successful request. Trips a client drop
+   * at {@link MAX_CONSECUTIVE_TRANSPORT_FAILURES} to recover a half-open socket
+   * whose timeouts never classify transient (B-#4).
+   */
+  private transportFailures = 0;
   /** One bg_events subscription per identity key (idempotent: never duplicated). */
   private readonly bgSubs = new Map<string, BgSubscription>();
   /** Per-root transport facades returned by getBridge/getActiveBridgeForRoot. */
@@ -456,13 +540,26 @@ export class SubcTransportPool implements AftTransportPool {
     onProgress?: RequestOptions["onProgress"],
   ): Promise<unknown> {
     const client = await this.ensureClient();
-    const channel = await this.routeChannel(client, identity);
+    let channel: number;
+    try {
+      channel = await this.routeChannel(client, identity);
+    } catch (err) {
+      // A teardown that raced the open is not a transport fault — surface it
+      // without dropping the client or charging the failure budget (B-#3).
+      if (err instanceof RouteTornDownError) throw err;
+      // routeOpen itself failed. Classify like a request failure: a dead
+      // connection drops the client so the next call reconnects (B-#4); the
+      // routeChannel catch already removed the stale entry.
+      if (isConsumerReconnectTransient(err)) this.dropClient(client);
+      throw err;
+    }
     try {
       const reply = await client.request(channel, body, { timeoutMs, onProgress });
       // Lazy-open the dedicated bg_events subscription on first successful route
       // use for this identity (Oracle Q4: a bg bash task requires a prior tool
       // call, so by the time any completion can land the session is subscribed).
       // Idempotent — only opens once per identity.
+      this.transportFailures = 0; // a real response proves the connection is live
       this.ensureBgSubscription(identity);
       return reply;
     } catch (err) {
@@ -484,6 +581,14 @@ export class SubcTransportPool implements AftTransportPool {
       // failed call is surfaced to the agent, mutation-safe by construction.
       this.routes.delete(identityKey(identity));
       if (isConsumerReconnectTransient(err)) {
+        this.transportFailures = 0;
+        this.dropClient(client);
+      } else if (++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
+        // A run of non-transient throws (timeouts / route GOODBYEs) with no
+        // success between them is a half-open socket: local writes succeed but no
+        // response ever returns, so isConsumerReconnectTransient never fires and
+        // the client would otherwise be kept forever (B-#4). Force a reconnect.
+        this.transportFailures = 0;
         this.dropClient(client);
       }
       throw err;
@@ -501,8 +606,19 @@ export class SubcTransportPool implements AftTransportPool {
       handshakeTimeoutMs: this.handshakeTimeoutMs,
     })
       .then((client) => {
-        this.client = client;
         this.connecting = null;
+        // shutdown() may have fired while this connect was in flight. Don't
+        // install a live client after teardown — close it and fail the call
+        // (B-#5: otherwise a socket leaks open past shutdown()).
+        if (this.shuttingDown) {
+          try {
+            client.close();
+          } catch {
+            // best-effort
+          }
+          throw new SubcCallError("terminal", "subc transport is shutting down");
+        }
+        this.client = client;
         return client;
       })
       .catch((err) => {
@@ -514,14 +630,36 @@ export class SubcTransportPool implements AftTransportPool {
 
   private async routeChannel(client: SubcClientLike, identity: BindIdentity): Promise<number> {
     const key = identityKey(identity);
-    const cached = this.routes.get(key);
-    if (cached !== undefined) return cached;
-    const channel = await client.routeOpen(
-      { kind: "tool_provider", module_id: AFT_MODULE_ID },
-      identity,
-    );
-    this.routes.set(key, channel);
-    return channel;
+    const existing = this.routes.get(key);
+    if (existing?.channel != null) return existing.channel;
+    if (existing?.opening) return existing.opening;
+
+    // Singleflight: install the entry BEFORE awaiting so a concurrent caller for
+    // the same identity awaits this same open instead of minting a second channel.
+    const entry: RouteEntry = { opening: null, channel: null, closed: false };
+    const opening = client
+      .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity)
+      .then((channel) => {
+        // A teardown (closeSession/shutdown) or a client swap raced this open.
+        // Don't cache a route for a torn-down session / stale client; release the
+        // freshly-minted channel so it doesn't leak daemon-side.
+        if (entry.closed || this.client !== client) {
+          safeCloseRoute(client, channel);
+          this.routes.delete(key);
+          throw new RouteTornDownError("subc route opened after teardown");
+        }
+        entry.channel = channel;
+        entry.opening = null;
+        return channel;
+      })
+      .catch((err) => {
+        // Failed open: drop the entry so the next call retries cleanly.
+        if (this.routes.get(key) === entry) this.routes.delete(key);
+        throw err;
+      });
+    entry.opening = opening;
+    this.routes.set(key, entry);
+    return opening;
   }
 
   /**
@@ -538,6 +676,7 @@ export class SubcTransportPool implements AftTransportPool {
     const sub = new BgSubscription(
       identity,
       () => this.ensureClient(),
+      (client) => this.dropClient(client),
       onNudge,
       this.bgBackoffSleep,
     );
@@ -602,13 +741,19 @@ export class SubcTransportPool implements AftTransportPool {
       this.bgSubs.delete(key);
       await sub.stop();
     }
-    const channel = this.routes.get(key);
-    if (channel !== undefined && this.client) {
+    const entry = this.routes.get(key);
+    if (entry) {
+      // Tombstone first so an in-flight routeOpen for this identity self-closes
+      // instead of installing a route for a just-closed session (B-#3 race).
+      entry.closed = true;
+      const channel = entry.channel;
       this.routes.delete(key);
-      try {
-        await this.client.closeRouteChannel(channel);
-      } catch {
-        // best-effort; a dropped connection releases the route daemon-side
+      if (channel != null && this.client) {
+        try {
+          await this.client.closeRouteChannel(channel);
+        } catch {
+          // best-effort; a dropped connection releases the route daemon-side
+        }
       }
     }
   }

@@ -34,9 +34,14 @@ class FakeSubscription {
     this.onEvent(new TextEncoder().encode(JSON.stringify({ op: "bg_events" })));
   }
 
-  /** Simulate a socket drop / route GOODBYE — the loop should resubscribe. */
+  /** Simulate a socket drop / route GOODBYE (non-transient) — resubscribe, keep client. */
   drop(): void {
     this.rejectClosed(new Error("subscription dropped"));
+  }
+
+  /** Simulate a dead-CONNECTION drop (transient) — resubscribe AND drop the client. */
+  dropTransient(): void {
+    this.rejectClosed(new SocketClosedError("subc socket closed"));
   }
 
   /** Simulate an intentional StreamEnd — the loop should NOT resubscribe. */
@@ -58,11 +63,21 @@ class FakeClient implements SubcClientLike {
   closedRoutes: number[] = [];
   closed = 0;
   private nextChannel = 1;
+  /** When set, routeOpen awaits this gate before resolving (race control). */
+  routeOpenGate: Promise<void> | null = null;
+  /** When set, the NEXT routeOpen rejects with this error then clears it. */
+  routeOpenError: Error | null = null;
 
   constructor(private readonly onRequest: (channel: number, body: unknown) => Promise<unknown>) {}
 
   async routeOpen(_target: RouteTarget, identity: BindIdentity): Promise<number> {
     this.routeOpens.push(identity);
+    if (this.routeOpenError) {
+      const err = this.routeOpenError;
+      this.routeOpenError = null;
+      throw err;
+    }
+    if (this.routeOpenGate) await this.routeOpenGate;
     return this.nextChannel++;
   }
 
@@ -309,6 +324,166 @@ describe("SubcTransport Rd reconnect", () => {
   });
 });
 
+describe("SubcTransport reply envelope (B-#7)", () => {
+  test("a reply missing the structuredContent envelope throws (protocol violation)", async () => {
+    // No structuredContent → must NOT be coerced to a silent {success:false}.
+    const client = new FakeClient(async () => ({ content: [], isError: false }));
+    const { pool } = poolWith(client);
+    await expect(pool.getBridge("/work/proj").toolCall("s", "read", {})).rejects.toThrow(
+      /structuredContent envelope/,
+    );
+  });
+
+  test("a structuredContent without boolean success throws (cannot read as success)", async () => {
+    const client = new FakeClient(async () => ({
+      content: [],
+      isError: false,
+      structuredContent: { text: "x" }, // success is undefined
+    }));
+    const { pool } = poolWith(client);
+    await expect(pool.getBridge("/work/proj").toolCall("s", "read", {})).rejects.toThrow(
+      /boolean `success`/,
+    );
+  });
+});
+
+describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
+  test("singleflight: concurrent first calls for one identity share ONE routeOpen", async () => {
+    let release!: () => void;
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    client.routeOpenGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const { pool } = poolWith(client);
+    const t = pool.getBridge("/work/proj");
+
+    const a = t.toolCall("sess-1", "read", {});
+    const b = t.toolCall("sess-1", "grep", {});
+    release();
+    await Promise.all([a, b]);
+
+    // Only ONE routeOpen despite two concurrent first calls (no leaked channel).
+    expect(client.routeOpens.length).toBe(1);
+    expect(client.requests[0]?.channel).toBe(client.requests[1]?.channel);
+  });
+
+  test("tombstone: closeSession during an in-flight routeOpen self-closes the route", async () => {
+    let release!: () => void;
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    client.routeOpenGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const { pool } = poolWith(client);
+    const t = pool.getBridge("/work/proj");
+
+    const call = t.toolCall("sess-1", "read", {}).catch((e) => e);
+    await tick(); // let routeOpen start (now gated)
+    const close = pool.closeSession("/work/proj", "sess-1");
+    release();
+    const [err] = await Promise.all([call, close]);
+
+    // The racing open resolved AFTER teardown → channel closed, not cached, call failed.
+    expect(err).toBeInstanceOf(Error);
+    expect(client.closedRoutes.length).toBe(1);
+  });
+
+  test("a transient routeOpen failure drops the client so the next call reconnects", async () => {
+    let madeClients = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        const c = new FakeClient(async () => envelope({ id: "r", success: true, text: "ok" }));
+        if (madeClients === 1) c.routeOpenError = new SocketClosedError("dead");
+        return c;
+      },
+    });
+    const t = pool.getBridge("/work/proj");
+
+    await expect(t.toolCall("s", "read", {})).rejects.toBeInstanceOf(SocketClosedError);
+    const res = await t.toolCall("s", "read", {});
+    expect(res.text).toBe("ok");
+    expect(madeClients).toBe(2); // dead client dropped on the routeOpen failure
+  });
+
+  test("half-open backstop: 3 consecutive non-transient throws force a reconnect", async () => {
+    let madeClients = 0;
+    let calls = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        return new FakeClient(async () => {
+          calls += 1;
+          if (calls <= 3) throw new SubcError("timed out");
+          return envelope({ id: "r", success: true, text: "recovered" });
+        });
+      },
+    });
+    const t = pool.getBridge("/work/proj");
+
+    // Three non-transient timeouts: client kept for the first two, dropped on the third.
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    expect(madeClients).toBe(1); // not yet reconnected mid-run
+    const res = await t.toolCall("s", "edit", {});
+    expect(res.text).toBe("recovered");
+    expect(madeClients).toBe(2); // 3rd failure tripped the reconnect
+  });
+
+  test("a success between failures resets the half-open counter", async () => {
+    let madeClients = 0;
+    let calls = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        return new FakeClient(async () => {
+          calls += 1;
+          // fail, fail, succeed, fail, fail — never 3 in a row → never reconnects.
+          if (calls === 3) return envelope({ id: "r", success: true, text: "ok" });
+          throw new SubcError("timed out");
+        });
+      },
+    });
+    const t = pool.getBridge("/work/proj");
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    await t.toolCall("s", "edit", {}); // success resets the counter
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    expect(madeClients).toBe(1); // run was 2-1-2, never 3 consecutive → no reconnect
+  });
+
+  test("shutdown during an in-flight connect closes the late client (no leak)", async () => {
+    let release!: (c: FakeClient) => void;
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: () =>
+        new Promise<SubcClientLike>((r) => {
+          release = r as (c: FakeClient) => void;
+        }),
+    });
+
+    const call = pool
+      .getBridge("/work/proj")
+      .toolCall("s", "read", {})
+      .catch((e) => e);
+    await tick(); // connect now in flight
+    await pool.shutdown();
+    release(client); // connect resolves AFTER shutdown
+    await call;
+
+    expect(client.closed).toBe(1); // the late client was closed, not installed
+  });
+});
+
 describe("SubcTransport.send", () => {
   test("configure is satisfied locally and never hits the wire", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
@@ -416,6 +591,56 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     // The resubscribe fired another forced-drain replay (recovers a completion
     // that landed while disconnected).
     expect(nudges.length).toBe(2);
+  });
+
+  test("B-#1: a TRANSIENT subscription drop replaces the dead client before resubscribe", async () => {
+    // Two clients from the factory; the bg loop must drop the dead one and
+    // reconnect, not resubscribe forever onto the same dead socket (idle-stranding).
+    const clients: FakeClient[] = [];
+    let madeClients = 0;
+    const nudges: { root: string; session: string }[] = [];
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        const c = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+        clients.push(c);
+        return c;
+      },
+      onBgEventsNudge: (root, session) => nudges.push({ root, session }),
+      bgBackoffSleep: async () => undefined,
+    });
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+    expect(madeClients).toBe(1);
+
+    // Dead-connection drop (transient): the bg loop must drop client #1 and
+    // reconnect via a fresh client #2, then resubscribe there.
+    clients[0]?.subscriptions[0]?.dropTransient();
+    await tick();
+    await tick();
+
+    expect(madeClients).toBe(2); // reconnected, not stranded on the dead client
+    expect(clients[1]?.subscriptions.length).toBe(1); // resubscribed on the new client
+  });
+
+  test("B-#2: the dedicated bg route is closed on the drop→resubscribe path (no leak)", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool } = bgPool(client);
+
+    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await tick();
+    const firstBgChannel = client.subscriptions[0]?.channel;
+
+    client.subscriptions[0]?.drop(); // non-transient: keep client, re-open route
+    await tick();
+    await tick();
+
+    // The first bg route was closed (finally), and a new one opened.
+    expect(client.closedRoutes).toContain(firstBgChannel);
+    expect(client.subscriptions.length).toBe(2);
   });
 
   test("StreamEnd (intentional close) does NOT resubscribe", async () => {
