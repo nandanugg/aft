@@ -564,11 +564,19 @@ export class SubcTransportPool implements AftTransportPool {
       // request-correlated progress frame (a wire/SDK change), not just this
       // passthrough. (Audit B-#6: verified latent gap, not a live bug.)
       const reply = await client.request(channel, body, { timeoutMs, onProgress });
-      // Lazy-open the dedicated bg_events subscription on first successful route
-      // use for this identity (Oracle Q4: a bg bash task requires a prior tool
-      // call, so by the time any completion can land the session is subscribed).
-      // Idempotent — only opens once per identity.
-      this.transportFailures = 0; // a real response proves the connection is live
+      // The half-open failure budget is GENERATION-SPECIFIC: only a success on the
+      // CURRENT client proves THAT client live, so reset it only when `client` is
+      // still current. A late success from a client already replaced (dropped by a
+      // concurrent request's transient failure, or shutdown) must not reset the NEW
+      // client's budget (R3 #2). `client === this.client` is the generation
+      // identity (each connect mints a distinct object).
+      if (this.client === client) this.transportFailures = 0;
+      // ensureBgSubscription is generation-INDEPENDENT — idempotent per identity and
+      // it drives its OWN client via ensureClient(), not this stale `client`. Open
+      // it on ANY success so even a stale-but-successful request still guarantees
+      // the bg_events subscription exists (against the live client). Oracle Q4: a bg
+      // bash task requires a prior tool call, so by the time any completion lands
+      // the session is subscribed.
       this.ensureBgSubscription(identity);
       return reply;
     } catch (err) {
@@ -588,17 +596,26 @@ export class SubcTransportPool implements AftTransportPool {
       // the client is dead; a genuinely dead client surfaces on the NEXT call as a
       // transient socket error and is dropped then). NEVER auto-retry here — the
       // failed call is surfaced to the agent, mutation-safe by construction.
-      this.routes.delete(identityKey(identity));
-      if (isConsumerReconnectTransient(err)) {
-        this.transportFailures = 0;
-        this.dropClient(client);
-      } else if (++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
-        // A run of non-transient throws (timeouts / route GOODBYEs) with no
-        // success between them is a half-open socket: local writes succeed but no
-        // response ever returns, so isConsumerReconnectTransient never fires and
-        // the client would otherwise be kept forever (B-#4). Force a reconnect.
-        this.transportFailures = 0;
-        this.dropClient(client);
+      // A failure from a STALE client generation (already replaced by a
+      // concurrent drop / shutdown) must not mutate the NEW client's pool state:
+      // not its route cache (would delete a successor's entry — R3 #1) and not
+      // its half-open failure budget (a stale increment could false-trip the new
+      // client, a stale reset could mask real half-open detection — R3 #2). Only
+      // act when `client` is still current. `dropClient` is itself generation-
+      // guarded, but the bare routes.delete + counter mutations were not.
+      if (this.client === client) {
+        this.routes.delete(identityKey(identity));
+        if (isConsumerReconnectTransient(err)) {
+          this.transportFailures = 0;
+          this.dropClient(client);
+        } else if (++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES) {
+          // A run of non-transient throws (timeouts / route GOODBYEs) with no
+          // success between them is a half-open socket: local writes succeed but
+          // no response ever returns, so isConsumerReconnectTransient never fires
+          // and the client would otherwise be kept forever (B-#4). Force reconnect.
+          this.transportFailures = 0;
+          this.dropClient(client);
+        }
       }
       throw err;
     }

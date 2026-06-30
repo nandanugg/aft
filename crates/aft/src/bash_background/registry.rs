@@ -3941,18 +3941,25 @@ fn spawn_detached_child(
 }
 
 fn random_slug() -> String {
-    let mut bytes = [0u8; 4];
+    // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
+    // at `generate_unique_task_id`. The width is load-bearing for the subc
+    // delivery dedup: a plugin can retain a delivered task id awaiting ack that
+    // Rust has already dropped (a lost ack response), and Rust's uniqueness check
+    // cannot see that plugin-side set — so id reuse must be made negligible by
+    // entropy alone. 32-bit was reusable within a long session and could let a new
+    // task collide with such a stale id and be silently skipped (audit R3 #3).
+    let mut bytes = [0u8; 8];
     // getrandom is a transitive dependency; use it directly for OS entropy.
     getrandom::fill(&mut bytes).unwrap_or_else(|_| {
-        // Extremely unlikely fallback: time + pid mix.
+        // Extremely unlikely fallback: time + pid mix across all 8 bytes.
         let t = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let p = std::process::id();
-        bytes.copy_from_slice(&(t ^ p).to_le_bytes());
+        let p = u64::from(std::process::id());
+        bytes.copy_from_slice(&(t ^ p.rotate_left(32)).to_le_bytes());
     });
-    // `bash-` + 8 lowercase hex chars — compact, OS-entropy backed.
+    // `bash-` + 16 lowercase hex chars — compact, OS-entropy backed.
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("bash-{hex}")
 }

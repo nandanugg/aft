@@ -462,6 +462,59 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
     expect(madeClients).toBe(2);
   });
 
+  test("R3: a late failure from a REPLACED client does not corrupt the new client's state", async () => {
+    // R1 is in flight on client A (held). A second request transient-fails and
+    // drops A; a third installs client B. Then R1 fails LATE on the dead A — its
+    // catch must NOT touch B's route cache / failure budget (stale generation).
+    let releaseR1!: () => void;
+    const r1Gate = new Promise<void>((r) => {
+      releaseR1 = r;
+    });
+    const clients: FakeClient[] = [];
+    let madeClients = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        const idx = madeClients;
+        let calls = 0;
+        const c = new FakeClient(async () => {
+          calls += 1;
+          if (idx === 1) {
+            if (calls === 1) {
+              await r1Gate; // R1 held, then fails late, non-transiently
+              throw new SubcError("R1 late timeout");
+            }
+            throw new SocketClosedError("A dead"); // R2 transient → drops A
+          }
+          return envelope({ id: "r", success: true, text: "B-ok" }); // client B
+        });
+        clients.push(c);
+        return c;
+      },
+    });
+    const t = pool.getBridge("/work/proj");
+
+    const r1 = t.toolCall("s", "read", {}).catch((e) => e); // in flight on A
+    await tick();
+    await expect(t.toolCall("s", "read", {})).rejects.toBeInstanceOf(SocketClosedError); // drops A
+    const r3 = await t.toolCall("s", "read", {}); // installs + uses B
+    expect(r3.text).toBe("B-ok");
+    expect(madeClients).toBe(2);
+    const bRouteOpensAfterR3 = clients[1]?.routeOpens.length;
+
+    // R1 fails LATE on the dead client A — must be a no-op against B's state.
+    releaseR1();
+    await r1;
+
+    const r4 = await t.toolCall("s", "read", {});
+    expect(r4.text).toBe("B-ok");
+    expect(madeClients).toBe(2); // R1's stale failure did NOT drop/replace B
+    // B's cached route survived (no extra routeOpen): R1 didn't delete it.
+    expect(clients[1]?.routeOpens.length).toBe(bRouteOpensAfterR3);
+  });
+
   test("a transient routeOpen failure drops the client so the next call reconnects", async () => {
     let madeClients = 0;
     const pool = new SubcTransportPool({
