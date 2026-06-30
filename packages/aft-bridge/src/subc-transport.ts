@@ -554,6 +554,15 @@ export class SubcTransportPool implements AftTransportPool {
       throw err;
     }
     try {
+      // `onProgress` is forwarded for parity with the standalone bridge, but it
+      // is DORMANT today: no production path emits a live bash progress chunk
+      // (`ctx.emit_progress` has only test callers; foreground bash uses the
+      // deferred-response model and returns its full output in one reply, on
+      // both transports). If live bash streaming is ever added, note that the
+      // module emits route Push frames at corr=0 which the SDK's per-request
+      // `onProgress` does NOT demux — streaming over subc would need a
+      // request-correlated progress frame (a wire/SDK change), not just this
+      // passthrough. (Audit B-#6: verified latent gap, not a live bug.)
       const reply = await client.request(channel, body, { timeoutMs, onProgress });
       // Lazy-open the dedicated bg_events subscription on first successful route
       // use for this identity (Oracle Q4: a bg bash task requires a prior tool
