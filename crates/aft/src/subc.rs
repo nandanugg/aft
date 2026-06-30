@@ -214,7 +214,7 @@ struct BgSub {
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
     response: Response,
-    empty_bg_sessions: Vec<String>,
+    empty_bg_sessions: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -636,6 +636,38 @@ fn emit_bg_event_wakes(
     }
     for channel in stale_channels {
         bg_wake_pending.remove(&channel);
+    }
+}
+
+/// Always bump the epoch for (root, session) when arming a wake on `channel`,
+/// even if the channel was already present in the pending set. This ensures
+/// that later maintenance logic holding an older epoch value cannot suppress a
+/// wake that was armed after the maintenance snapshot was taken.
+fn arm_bg_wake(
+    root: ProjectRootId,
+    session: String,
+    channel: RouteChannel,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+) {
+    *bg_wake_epoch.entry((root, session)).or_default() += 1;
+    bg_wake_pending.insert(channel);
+}
+
+fn clear_stale_bg_wakes_for_empty_sessions(
+    root_id: &ProjectRootId,
+    empty_bg_sessions: &[(String, u64)],
+    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
+) {
+    for (session, epoch_at_submit) in empty_bg_sessions {
+        let key = (root_id.clone(), session.clone());
+        if bg_wake_epoch.get(&key).copied() == Some(*epoch_at_submit) {
+            if let Some(channel) = bg_sub_by_session.get(&key).copied() {
+                bg_wake_pending.remove(&channel);
+            }
+        }
     }
 }
 
@@ -1182,6 +1214,7 @@ where
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: HashMap<(ProjectRootId, String), RouteChannel> = HashMap::new();
     let mut bg_wake_pending: HashSet<RouteChannel> = HashSet::new();
+    let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), String> = HashMap::new();
     let mut push_buffer: HashMap<ReplayKey, VecDeque<PushFrame>> = HashMap::new();
@@ -1324,6 +1357,7 @@ where
                             &mut bg_subs,
                             &mut bg_sub_by_session,
                             &mut bg_wake_pending,
+                            &mut bg_wake_epoch,
                             dispatch,
                             allow_native_passthrough,
                         )
@@ -1372,8 +1406,17 @@ where
                         root,
                         frame,
                     ) {
-                        if let Some(channel) = bg_sub_by_session.get(&(root, session)).copied() {
-                            bg_wake_pending.insert(channel);
+                        if let Some(channel) = bg_sub_by_session
+                            .get(&(root.clone(), session.clone()))
+                            .copied()
+                        {
+                            arm_bg_wake(
+                                root,
+                                session,
+                                channel,
+                                &mut bg_wake_pending,
+                                &mut bg_wake_epoch,
+                            );
                         }
                     }
                 }
@@ -1394,8 +1437,17 @@ where
                         reliable_root,
                         reliable_frame,
                     ) {
-                        if let Some(channel) = bg_sub_by_session.get(&(root, session)).copied() {
-                            bg_wake_pending.insert(channel);
+                        if let Some(channel) = bg_sub_by_session
+                            .get(&(root.clone(), session.clone()))
+                            .copied()
+                        {
+                            arm_bg_wake(
+                                root,
+                                session,
+                                channel,
+                                &mut bg_wake_pending,
+                                &mut bg_wake_epoch,
+                            );
                         }
                     }
                 }
@@ -1462,13 +1514,14 @@ where
                 if let Some(meta) = live_roots.get_mut(&root_id) {
                     meta.maintenance_pending = false;
                 }
-                for session in completion.empty_bg_sessions {
-                    let key = (root_id.clone(), session);
-                    if let Some(channel) = bg_sub_by_session.get(&key).copied() {
-                        bg_wake_pending.remove(&channel);
-                    }
-                }
-                if response_is_internal_error(&response) {
+                clear_stale_bg_wakes_for_empty_sessions(
+                    &root_id,
+                    &completion.empty_bg_sessions,
+                    &bg_sub_by_session,
+                    &mut bg_wake_pending,
+                    &bg_wake_epoch,
+                );
+                if response_is_fatal_panic(&response) {
                     signal_fatal_teardown(&writer_tx, None, PROTOCOL_VERSION, 0, &shutdown).await;
                 }
             }
@@ -1498,11 +1551,17 @@ where
                     })
                     .collect();
                 for root_id in due_roots {
-                    let bg_sessions_to_check: Vec<String> = bg_sub_by_session
+                    let bg_sessions_to_check: Vec<(String, u64)> = bg_sub_by_session
                         .iter()
                         .filter_map(|((root, session), _)| {
                             if root == &root_id {
-                                Some(session.clone())
+                                Some((
+                                    session.clone(),
+                                    bg_wake_epoch
+                                        .get(&(root_id.clone(), session.clone()))
+                                        .copied()
+                                        .unwrap_or(0),
+                                ))
                             } else {
                                 None
                             }
@@ -1685,7 +1744,7 @@ async fn handle_route_bind_completion(
             inserted_new_actor,
         );
         let message = response_message(response, fallback);
-        let fatal = response_is_internal_error(response);
+        let fatal = response_is_fatal_panic(response);
         send_route_bind_error_parts(
             tx,
             completion.ver,
@@ -2171,6 +2230,7 @@ async fn handle_tool_call(
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
     bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
     allow_native_passthrough: bool,
 ) -> Result<(), SubcError> {
@@ -2219,8 +2279,14 @@ async fn handle_tool_call(
                 flags: frame.header.flags,
             },
         );
-        bg_sub_by_session.insert((identity.root, identity.session), route_id);
-        bg_wake_pending.insert(route_id);
+        bg_sub_by_session.insert((identity.root.clone(), identity.session.clone()), route_id);
+        arm_bg_wake(
+            identity.root,
+            identity.session,
+            route_id,
+            bg_wake_pending,
+            bg_wake_epoch,
+        );
         return Ok(());
     }
 
@@ -2378,7 +2444,7 @@ async fn handle_tool_call(
             )
         });
         let result = ToolCallResult { text, response };
-        let fatal = is_mutating && response_is_internal_error(&result.response);
+        let fatal = is_mutating && response_is_fatal_panic(&result.response);
         match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
             Ok(response_frame) => {
                 let _ = completion_tx.send(response_frame).await;
@@ -2581,7 +2647,7 @@ fn submit_deferred_bash(
                     params: Value::Object(translated.args),
                 };
                 let response = dispatch(raw_req, ctx);
-                let spawn_fatal = response_is_internal_error(&response);
+                let spawn_fatal = response_is_fatal_panic(&response);
                 if !response.success {
                     return finish_bash_spawn_immediate(
                         response,
@@ -2734,7 +2800,7 @@ fn submit_deferred_bash(
                 .await;
             }
             Err(_) => {
-                let spawn_fatal = response_is_internal_error(&spawn_response);
+                let spawn_fatal = response_is_fatal_panic(&spawn_response);
                 let result = bash_result_from_response(spawn_response, &format_context);
                 send_bash_deferred_completion(
                     &completion_tx,
@@ -3068,7 +3134,7 @@ async fn handle_bash_deferred_completion(
 fn submit_maintenance_drain(
     executor: &Arc<Executor>,
     root_id: ProjectRootId,
-    bg_sessions_to_check: Vec<String>,
+    bg_sessions_to_check: Vec<(String, u64)>,
     completion_tx: &mpsc::Sender<MaintenanceCompletion>,
 ) {
     let request_id = format!(
@@ -3077,7 +3143,7 @@ fn submit_maintenance_drain(
     );
     let response_id = request_id.clone();
     let completion_root_id = root_id.clone();
-    let (empty_bg_sessions_tx, empty_bg_sessions_rx) = oneshot::channel::<Vec<String>>();
+    let (empty_bg_sessions_tx, empty_bg_sessions_rx) = oneshot::channel::<Vec<(String, u64)>>();
     let rx = executor.submit_async(
         root_id,
         Lane::Mutating,
@@ -3093,7 +3159,7 @@ fn submit_maintenance_drain(
             runtime_drain::drain_lsp_events(ctx);
             let empty_bg_sessions = bg_sessions_to_check
                 .into_iter()
-                .filter(|session| {
+                .filter(|(session, _)| {
                     !ctx.bash_background()
                         .has_completions_for_session(Some(session.as_str()))
                 })
@@ -3234,8 +3300,8 @@ fn response_message(response: &Response, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn response_is_internal_error(response: &Response) -> bool {
-    !response.success && response.data.get("code").and_then(Value::as_str) == Some("internal_error")
+fn response_is_fatal_panic(response: &Response) -> bool {
+    !response.success && response.data.get("code").and_then(Value::as_str) == Some("actor_fatal")
 }
 
 fn is_subc_agent_core_tool(name: &str) -> bool {
@@ -4172,6 +4238,106 @@ mod tests {
             &completed_tasks,
             &long_running_frame("other-task", 200)
         ));
+    }
+
+    #[test]
+    fn arm_bg_wake_bumps_epoch_even_when_channel_is_already_pending() {
+        let (_root_dir, root) = test_root("subc-bg-wake-epoch-root");
+        let session = "session-1".to_string();
+        let key = (root.clone(), session.clone());
+        let channel = route_key(7);
+        let mut bg_wake_pending = HashSet::from([channel]);
+        let mut bg_wake_epoch = HashMap::from([(key.clone(), 41_u64)]);
+
+        arm_bg_wake(
+            root,
+            session,
+            channel,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+        );
+
+        assert_eq!(bg_wake_pending, HashSet::from([channel]));
+        assert_eq!(bg_wake_epoch.get(&key).copied(), Some(42));
+    }
+
+    #[test]
+    fn stale_maintenance_epoch_does_not_clear_newer_bg_wake() {
+        let (_root_dir, root) = test_root("subc-bg-wake-stale-root");
+        let session = "session-1".to_string();
+        let key = (root.clone(), session.clone());
+        let channel = route_key(8);
+        let mut bg_sub_by_session = HashMap::new();
+        bg_sub_by_session.insert(key.clone(), channel);
+        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_epoch = HashMap::new();
+
+        arm_bg_wake(
+            root.clone(),
+            session.clone(),
+            channel,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+        );
+        let epoch_at_submit = bg_wake_epoch[&key];
+        arm_bg_wake(
+            root.clone(),
+            session.clone(),
+            channel,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+        );
+
+        clear_stale_bg_wakes_for_empty_sessions(
+            &root,
+            &[(session, epoch_at_submit)],
+            &bg_sub_by_session,
+            &mut bg_wake_pending,
+            &bg_wake_epoch,
+        );
+
+        assert!(bg_wake_pending.contains(&channel));
+        assert_eq!(bg_wake_epoch.get(&key).copied(), Some(epoch_at_submit + 1));
+    }
+
+    #[test]
+    fn matching_maintenance_epoch_clears_genuinely_stale_bg_wake() {
+        let (_root_dir, root) = test_root("subc-bg-wake-clear-root");
+        let session = "session-1".to_string();
+        let key = (root.clone(), session.clone());
+        let channel = route_key(9);
+        let mut bg_sub_by_session = HashMap::new();
+        bg_sub_by_session.insert(key.clone(), channel);
+        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_epoch = HashMap::new();
+
+        arm_bg_wake(
+            root.clone(),
+            session.clone(),
+            channel,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+        );
+        let epoch_at_submit = bg_wake_epoch[&key];
+
+        clear_stale_bg_wakes_for_empty_sessions(
+            &root,
+            &[(session, epoch_at_submit)],
+            &bg_sub_by_session,
+            &mut bg_wake_pending,
+            &bg_wake_epoch,
+        );
+
+        assert!(!bg_wake_pending.contains(&channel));
+    }
+
+    #[test]
+    fn response_is_fatal_panic_only_matches_panic_exclusive_code() {
+        let tool_error = Response::error("request-1", "internal_error", "ordinary tool error");
+        let panic_error = Response::error("request-2", "actor_fatal", "mutating panic");
+
+        assert!(!response_is_fatal_panic(&tool_error));
+        assert!(response_is_fatal_panic(&panic_error));
     }
 
     #[tokio::test]

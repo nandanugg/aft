@@ -433,7 +433,7 @@ fn worker_panic_completes_keeps_capacity_and_marks_mutating_actor_fatal() {
             .data
             .get("code")
             .and_then(|value| value.as_str()),
-        Some("internal_error")
+        Some("actor_fatal")
     );
     assert!(panic_response
         .data

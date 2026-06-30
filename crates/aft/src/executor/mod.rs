@@ -513,7 +513,7 @@ fn panic_response(
     let panic_message = panic_payload_message(payload);
     Response::error(
         request_id,
-        "internal_error",
+        "actor_fatal",
         format!("command '{command}' panicked: {panic_message}"),
     )
 }

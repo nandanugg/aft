@@ -919,6 +919,12 @@ fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         }
         "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
         "semantic_search" => state.heavy(req.id),
+        "subc_test_mutating_internal_error" => Response::error(
+            req.id,
+            "internal_error",
+            "intentional mutating internal error",
+        ),
+        "subc_test_mutating_panic" => panic!("intentional mutating panic"),
         "subc_test_echo_session" => {
             let session = req.session().to_string();
             Response::success(req.id, json!({ "transport_session": session }))
@@ -1455,6 +1461,26 @@ fn subc_bridge_new_manifest_tools_route_in_production() {
 }
 
 #[test]
+fn subc_bridge_mutating_internal_error_is_not_fatal_teardown() {
+    run_subc_bridge_test(
+        "subc_bridge_mutating_internal_error_is_not_fatal_teardown",
+        Duration::from_secs(30),
+        drive_mutating_internal_error_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_mutating_panic_triggers_fatal_teardown() {
+    run_subc_bridge_test(
+        "subc_bridge_mutating_panic_triggers_fatal_teardown",
+        Duration::from_secs(30),
+        drive_mutating_panic_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
     run_subc_bridge_test(
         "subc_bridge_bash_fast_foreground_returns_terminal_response",
@@ -1840,6 +1866,62 @@ async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
             .expect("goodbye frame"),
     )
     .await;
+}
+
+async fn drive_mutating_internal_error_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_routes_1_and_4(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        100,
+        "subc_test_mutating_internal_error",
+        json!({}),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "mutating internal_error response").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 100);
+    assert!(tool_result_is_error(&frame));
+    let response = tool_response_json(&frame);
+    assert_eq!(response["code"].as_str(), Some("internal_error"));
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(500),
+        "fatal teardown after non-panic internal_error",
+    )
+    .await;
+    send_tool_call(&mut stream, 4, 101, "echo", json!({ "case": "fast" })).await;
+    let alive = read_frame_timeout(&mut stream, "post-internal-error response").await;
+    assert_eq!(alive.header.channel, 4);
+    assert_eq!(alive.header.corr, 101);
+    assert_eq!(tool_response_json(&alive)["success"].as_bool(), Some(true));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_mutating_panic_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(&mut stream, 1, 102, "subc_test_mutating_panic", json!({})).await;
+    let frame = read_frame_timeout(&mut stream, "mutating panic response").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 102);
+    assert!(tool_result_is_error(&frame));
+    let response = tool_response_json(&frame);
+    assert_eq!(response["code"].as_str(), Some("actor_fatal"));
+
+    let route_goodbye = read_any_frame_timeout(&mut stream, "fatal route goodbye").await;
+    assert_eq!(route_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(route_goodbye.header.channel, 1);
+    assert_eq!(route_goodbye.header.corr, 102);
+
+    let connection_goodbye = read_any_frame_timeout(&mut stream, "fatal connection goodbye").await;
+    assert_eq!(connection_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(connection_goodbye.header.channel, 0);
 }
 
 async fn drive_bash_fast_foreground_daemon(input: FakeDaemonInput) {
