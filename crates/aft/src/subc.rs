@@ -160,7 +160,7 @@ struct BashDeferredCompletion {
     root: ProjectRootId,
     request_id: String,
     result: Option<ToolCallResult>,
-    spawn_fatal: bool,
+    fatal: bool,
 }
 
 #[derive(Debug)]
@@ -2433,7 +2433,6 @@ async fn handle_tool_call(
     let corr = frame.header.corr;
     let flags = frame.header.flags;
     let ver = frame.header.ver;
-    let is_mutating = lane == Lane::Mutating;
     tokio::spawn(async move {
         let response = await_executor_response(rx, request_id.clone()).await;
         let text = text_rx.await.unwrap_or_else(|_| {
@@ -2444,7 +2443,7 @@ async fn handle_tool_call(
             )
         });
         let result = ToolCallResult { text, response };
-        let fatal = is_mutating && response_is_fatal_panic(&result.response);
+        let fatal = response_is_fatal_panic(&result.response);
         match build_tool_response_frame(ver, route_channel, corr, flags, &result) {
             Ok(response_frame) => {
                 let _ = completion_tx.send(response_frame).await;
@@ -2476,9 +2475,7 @@ struct BashTranslatedSettings {
 }
 
 enum BashSpawnControl {
-    Immediate {
-        spawn_fatal: bool,
-    },
+    Immediate,
     Foreground {
         task_id: String,
         session_id: String,
@@ -2544,7 +2541,6 @@ fn bash_background_launch_response(request_id: &str, task_id: &str, is_pty: bool
 
 fn finish_bash_spawn_immediate(
     response: Response,
-    spawn_fatal: bool,
     ctx: &AppContext,
     session_id: &str,
     format_context: &crate::subc_format::FormatContext,
@@ -2557,7 +2553,7 @@ fn finish_bash_spawn_immediate(
         let _ = tx.send(text);
     }
     if let Some(tx) = control_tx.take() {
-        let _ = tx.send(BashSpawnControl::Immediate { spawn_fatal });
+        let _ = tx.send(BashSpawnControl::Immediate);
     }
     response
 }
@@ -2629,7 +2625,6 @@ fn submit_deferred_bash(
                         );
                         return finish_bash_spawn_immediate(
                             response,
-                            false,
                             ctx,
                             &session_for_spawn,
                             &format_context_for_spawn,
@@ -2647,11 +2642,9 @@ fn submit_deferred_bash(
                     params: Value::Object(translated.args),
                 };
                 let response = dispatch(raw_req, ctx);
-                let spawn_fatal = response_is_fatal_panic(&response);
                 if !response.success {
                     return finish_bash_spawn_immediate(
                         response,
-                        spawn_fatal,
                         ctx,
                         &session_for_spawn,
                         &format_context_for_spawn,
@@ -2668,7 +2661,6 @@ fn submit_deferred_bash(
                 else {
                     return finish_bash_spawn_immediate(
                         response,
-                        false,
                         ctx,
                         &session_for_spawn,
                         &format_context_for_spawn,
@@ -2679,7 +2671,6 @@ fn submit_deferred_bash(
                 if response.data.get("status").and_then(Value::as_str) != Some("running") {
                     return finish_bash_spawn_immediate(
                         response,
-                        false,
                         ctx,
                         &session_for_spawn,
                         &format_context_for_spawn,
@@ -2699,7 +2690,6 @@ fn submit_deferred_bash(
                         bash_background_launch_response(&request_id_for_spawn, &task_id, is_pty);
                     return finish_bash_spawn_immediate(
                         response,
-                        false,
                         ctx,
                         &session_for_spawn,
                         &format_context_for_spawn,
@@ -2741,7 +2731,7 @@ fn submit_deferred_bash(
         let spawn_response = await_executor_response(spawn_rx, request_id.clone()).await;
         let spawn_control = spawn_control_rx.await;
         match spawn_control {
-            Ok(BashSpawnControl::Immediate { spawn_fatal }) => {
+            Ok(BashSpawnControl::Immediate) => {
                 let text = spawn_text_rx.await.unwrap_or_else(|_| {
                     crate::subc_format::format_response_with_context(
                         "bash",
@@ -2753,6 +2743,7 @@ fn submit_deferred_bash(
                     text,
                     response: spawn_response,
                 };
+                let fatal = response_is_fatal_panic(&result.response);
                 send_bash_deferred_completion(
                     &completion_tx,
                     route_channel,
@@ -2762,7 +2753,7 @@ fn submit_deferred_bash(
                     root_for_task,
                     request_id,
                     Some(result),
-                    spawn_fatal,
+                    fatal,
                 )
                 .await;
             }
@@ -2800,8 +2791,8 @@ fn submit_deferred_bash(
                 .await;
             }
             Err(_) => {
-                let spawn_fatal = response_is_fatal_panic(&spawn_response);
                 let result = bash_result_from_response(spawn_response, &format_context);
+                let fatal = response_is_fatal_panic(&result.response);
                 send_bash_deferred_completion(
                     &completion_tx,
                     route_channel,
@@ -2811,7 +2802,7 @@ fn submit_deferred_bash(
                     root_for_task,
                     request_id,
                     Some(result),
-                    spawn_fatal,
+                    fatal,
                 )
                 .await;
             }
@@ -2952,6 +2943,7 @@ async fn run_deferred_bash_wait(
                             text,
                             response: poll_response,
                         };
+                        let fatal = response_is_fatal_panic(&result.response);
                         send_bash_deferred_completion(
                             &completion_tx,
                             route_channel,
@@ -2961,7 +2953,7 @@ async fn run_deferred_bash_wait(
                             root,
                             request_id,
                             Some(result),
-                            false,
+                            fatal,
                         )
                         .await;
                         break;
@@ -2978,6 +2970,7 @@ async fn run_deferred_bash_wait(
                             format_context.clone(),
                         )
                         .await;
+                        let fatal = response_is_fatal_panic(&result.response);
                         send_bash_deferred_completion(
                             &completion_tx,
                             route_channel,
@@ -2987,7 +2980,7 @@ async fn run_deferred_bash_wait(
                             root,
                             request_id,
                             Some(result),
-                            false,
+                            fatal,
                         )
                         .await;
                         break;
@@ -3020,24 +3013,28 @@ async fn submit_bash_promote(
         request_id.clone(),
         Box::new(move |ctx| {
             log_ctx::with_session(Some(session_for_promote.clone()), || {
-                let response =
-                    if std::env::var_os("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR").is_some() {
-                        Response::error(
-                            &request_id_for_promote,
-                            "execution_failed",
-                            "forced subc bash promote failure",
-                        )
-                    } else {
-                        crate::commands::bash_orchestrate::promote_bash(
-                            ctx,
-                            &task_id_for_promote,
-                            &session_for_promote,
-                            ctx.config().project_root.as_deref(),
-                            timeout,
-                            wait_window_ms,
-                            &request_id_for_promote,
-                        )
-                    };
+                let response = if let Some(value) =
+                    std::env::var_os("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR")
+                {
+                    if value.to_string_lossy() == "panic" {
+                        panic!("forced subc bash promote panic");
+                    }
+                    Response::error(
+                        &request_id_for_promote,
+                        "execution_failed",
+                        "forced subc bash promote failure",
+                    )
+                } else {
+                    crate::commands::bash_orchestrate::promote_bash(
+                        ctx,
+                        &task_id_for_promote,
+                        &session_for_promote,
+                        ctx.config().project_root.as_deref(),
+                        timeout,
+                        wait_window_ms,
+                        &request_id_for_promote,
+                    )
+                };
                 let result = finalized_bash_result(
                     response,
                     ctx,
@@ -3067,7 +3064,7 @@ async fn send_bash_deferred_completion(
     root: ProjectRootId,
     request_id: String,
     result: Option<ToolCallResult>,
-    spawn_fatal: bool,
+    fatal: bool,
 ) {
     let _ = completion_tx
         .send(BashDeferredCompletion {
@@ -3078,7 +3075,7 @@ async fn send_bash_deferred_completion(
             root,
             request_id,
             result,
-            spawn_fatal,
+            fatal,
         })
         .await;
 }
@@ -3126,7 +3123,7 @@ async fn handle_bash_deferred_completion(
         );
     }
 
-    if done.spawn_fatal {
+    if done.fatal {
         signal_fatal_teardown(tx, Some(done.channel), done.ver, done.corr, shutdown).await;
     }
     Ok(())

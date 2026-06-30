@@ -47,6 +47,7 @@ struct FakeDaemonInput {
     callgraph_root: std::path::PathBuf,
     callgraph_file: std::path::PathBuf,
     state: Arc<BridgeState>,
+    executor: Arc<Executor>,
 }
 
 struct FakeDaemonSession {
@@ -59,6 +60,7 @@ struct FakeDaemonSession {
     callgraph_root: std::path::PathBuf,
     callgraph_file: std::path::PathBuf,
     state: Arc<BridgeState>,
+    executor: Arc<Executor>,
 }
 
 struct SubcBridgeTestRoots {
@@ -178,6 +180,13 @@ fn set_test_force_bash_promote_error() -> EnvVarGuard {
     let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
     let previous = std::env::var_os(key);
     std::env::set_var(key, "1");
+    EnvVarGuard { key, previous }
+}
+
+fn set_test_force_bash_promote_panic() -> EnvVarGuard {
+    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, "panic");
     EnvVarGuard { key, previous }
 }
 
@@ -1068,10 +1077,10 @@ where
     run_subc_bridge_test_with_env(name, watchdog, Vec::new, driver, after);
 }
 
-/// Like [`run_subc_bridge_test`] but installs process-global test env vars
-/// (foreground wait window, forced promote error) AFTER acquiring the serial
-/// guard, so the returned [`EnvVarGuard`]s live entirely inside the
-/// single-test critical section. Setting these env guards in the test body
+/// Like [`run_subc_bridge_test`], but installs the process-global test env vars
+/// that control foreground wait windows and forced promote errors or panics AFTER
+/// acquiring the serial guard, so the returned [`EnvVarGuard`]s live entirely
+/// inside the single-test critical section. Setting these env guards in the test body
 /// (before this fn takes the lock) races other bash tests under parallel CI:
 /// two tests can clobber each other's process-global wait window in the gap
 /// between guard creation and lock acquisition, which intermittently flipped
@@ -1125,6 +1134,23 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let roots = SubcBridgeTestRoots::new();
     let conn_path = roots.conn_dir.path().join("subc-connection.json");
 
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(roots.storage.path().to_path_buf()),
+            ..Config::default()
+        },
+    ));
+    let executor = Arc::new(Executor::with_config(ExecutorConfig {
+        pool_size: 4,
+        read_cap: 3,
+        actor_cap: 3,
+        heavy_permits: 2,
+        drr_quantum: 1,
+    }));
+    let executor_for_daemon = Arc::clone(&executor);
+    let executor_for_check = Arc::clone(&executor);
+
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
         .set_nonblocking(true)
@@ -1174,6 +1200,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     callgraph_root: callgraph_root_path,
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
+                    executor: executor_for_daemon,
                 }),
             )
             .await
@@ -1181,22 +1208,6 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
         });
     });
 
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        Config {
-            storage_dir: Some(roots.storage.path().to_path_buf()),
-            ..Config::default()
-        },
-    ));
-    let executor = Arc::new(Executor::with_config(ExecutorConfig {
-        pool_size: 4,
-        read_cap: 3,
-        actor_cap: 3,
-        heavy_permits: 2,
-        drr_quantum: 1,
-    }));
-
-    let executor_for_check = Arc::clone(&executor);
     // Inject a hermetic (nonexistent) user config path so the W5 local read
     // never touches a real ~/.config/cortexkit/aft.jsonc on the dev/CI machine.
     let user_config_path = roots.storage.path().join("nonexistent-user-aft.jsonc");
@@ -1481,6 +1492,16 @@ fn subc_bridge_mutating_panic_triggers_fatal_teardown() {
 }
 
 #[test]
+fn subc_bridge_pure_read_actor_fatal_response_triggers_fatal_teardown() {
+    run_subc_bridge_test(
+        "subc_bridge_pure_read_actor_fatal_response_triggers_fatal_teardown",
+        Duration::from_secs(30),
+        drive_pure_read_actor_fatal_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
     run_subc_bridge_test(
         "subc_bridge_bash_fast_foreground_returns_terminal_response",
@@ -1566,6 +1587,22 @@ fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
             ]
         },
         drive_bash_promote_failure_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_promote_panic_triggers_fatal_teardown",
+        Duration::from_secs(45),
+        || {
+            vec![
+                set_test_foreground_wait_ms(200),
+                set_test_force_bash_promote_panic(),
+            ]
+        },
+        drive_bash_promote_panic_daemon,
         |_, _, _| {},
     );
 }
@@ -1800,6 +1837,7 @@ async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
         callgraph_root,
         callgraph_file,
         state,
+        executor,
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
     authenticate_server(
@@ -1845,6 +1883,7 @@ async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
         callgraph_root,
         callgraph_file,
         state,
+        executor,
     }
 }
 
@@ -1920,6 +1959,54 @@ async fn drive_mutating_panic_daemon(input: FakeDaemonInput) {
     assert_eq!(route_goodbye.header.corr, 102);
 
     let connection_goodbye = read_any_frame_timeout(&mut stream, "fatal connection goodbye").await;
+    assert_eq!(connection_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(connection_goodbye.header.channel, 0);
+}
+
+async fn drive_pure_read_actor_fatal_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let fatal_response = executor.submit(
+        root_id.clone(),
+        Lane::Mutating,
+        "subc-test-mark-fatal".to_string(),
+        Box::new(|_| panic!("intentional direct mutating panic")),
+    );
+    let fatal_response = fatal_response
+        .recv_timeout(Duration::from_secs(30))
+        .expect("direct mutating panic response");
+    assert_eq!(fatal_response.data["code"].as_str(), Some("actor_fatal"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !executor.actor_is_fatal(&root_id) {
+        assert!(
+            Instant::now() < deadline,
+            "direct mutating panic should mark the actor fatal"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    send_tool_call(&mut stream, 1, 103, "echo", json!({ "case": "fast" })).await;
+    let frame = read_frame_timeout(&mut stream, "pure-read actor_fatal response").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 103);
+    assert!(tool_result_is_error(&frame));
+    let response = tool_response_json(&frame);
+    assert_eq!(response["code"].as_str(), Some("actor_fatal"));
+
+    let route_goodbye = read_any_frame_timeout(&mut stream, "pure-read fatal route goodbye").await;
+    assert_eq!(route_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(route_goodbye.header.channel, 1);
+    assert_eq!(route_goodbye.header.corr, 103);
+
+    let connection_goodbye =
+        read_any_frame_timeout(&mut stream, "pure-read fatal connection goodbye").await;
     assert_eq!(connection_goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(connection_goodbye.header.channel, 0);
 }
@@ -2265,6 +2352,44 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
     assert_eq!(alive.header.corr, 115);
     assert_eq!(tool_response_json(&alive)["success"].as_bool(), Some(true));
     send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_promote_panic_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        116,
+        "bash",
+        json!({
+            "command": "sleep 2; printf 'promote-panic-done\\n'",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "promote panic bash response").await;
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 116);
+    assert!(tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(
+        text.contains("forced subc bash promote panic"),
+        "expected promote panic text, got {text:?}"
+    );
+
+    let route_goodbye = read_any_frame_timeout(&mut stream, "promote panic route goodbye").await;
+    assert_eq!(route_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(route_goodbye.header.channel, 1);
+    assert_eq!(route_goodbye.header.corr, 116);
+
+    let connection_goodbye =
+        read_any_frame_timeout(&mut stream, "promote panic connection goodbye").await;
+    assert_eq!(connection_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(connection_goodbye.header.channel, 0);
 }
 
 async fn drive_core_routing_daemon(input: FakeDaemonInput) {
