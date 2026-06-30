@@ -228,7 +228,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     );
 
     expect(result.output).toContain("promoted to background");
-    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{8}$/);
+    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expectNoClientPollOrPromote(bridgeCalls);
   });
 
@@ -241,7 +241,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     });
 
     expect(result.output).toContain("Background task started:");
-    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{8}$/);
+    expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expectNoClientPollOrPromote(bridgeCalls);
   });
 

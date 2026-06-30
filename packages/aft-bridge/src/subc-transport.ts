@@ -540,17 +540,32 @@ export class SubcTransportPool implements AftTransportPool {
     onProgress?: RequestOptions["onProgress"],
   ): Promise<unknown> {
     const client = await this.ensureClient();
+    // Capture the immutable identity context for this request ONCE, up front. Every
+    // late side-effect below is gated on the specific axis of the resource it
+    // touches, so a callback that resolves after a teardown / client swap / session
+    // close can never corrupt a SUCCESSOR's state. Two axes (3 audit rounds each
+    // found a site that guarded the wrong one — now closed by construction):
+    //   - CLIENT generation → the half-open failure budget (`client === this.client`)
+    //   - ROUTE entry token  → the route cache delete AND the bg-sub reopen
+    //       (`this.routes.get(key) === entry`). closeSession() deletes the route
+    //       entry, so a stale callback whose session was closed mid-flight sees the
+    //       token mismatch and skips — no separate close-epoch needed (R4 #1/#2).
+    const key = identityKey(identity);
+    const entryStillCurrent = (entry: RouteEntry): boolean => this.routes.get(key) === entry;
+
     let channel: number;
+    let entry: RouteEntry;
     try {
-      channel = await this.routeChannel(client, identity);
+      ({ channel, entry } = await this.routeChannel(client, identity));
     } catch (err) {
       // A teardown that raced the open is not a transport fault — surface it
       // without dropping the client or charging the failure budget (B-#3).
       if (err instanceof RouteTornDownError) throw err;
       // routeOpen itself failed. Classify like a request failure: a dead
       // connection drops the client so the next call reconnects (B-#4); the
-      // routeChannel catch already removed the stale entry.
-      if (isConsumerReconnectTransient(err)) this.dropClient(client);
+      // routeChannel catch already removed the stale entry. Gate on the client
+      // axis so a stale open-failure can't drop the current client.
+      if (isConsumerReconnectTransient(err) && this.client === client) this.dropClient(client);
       throw err;
     }
     try {
@@ -564,20 +579,19 @@ export class SubcTransportPool implements AftTransportPool {
       // request-correlated progress frame (a wire/SDK change), not just this
       // passthrough. (Audit B-#6: verified latent gap, not a live bug.)
       const reply = await client.request(channel, body, { timeoutMs, onProgress });
-      // The half-open failure budget is GENERATION-SPECIFIC: only a success on the
-      // CURRENT client proves THAT client live, so reset it only when `client` is
-      // still current. A late success from a client already replaced (dropped by a
-      // concurrent request's transient failure, or shutdown) must not reset the NEW
-      // client's budget (R3 #2). `client === this.client` is the generation
-      // identity (each connect mints a distinct object).
+      // CLIENT axis: the half-open failure budget belongs to the current client, so
+      // only a success on THAT client resets it. A late success from a client
+      // already replaced (concurrent transient drop / shutdown) must not reset the
+      // new client's budget (R3 #2).
       if (this.client === client) this.transportFailures = 0;
-      // ensureBgSubscription is generation-INDEPENDENT — idempotent per identity and
-      // it drives its OWN client via ensureClient(), not this stale `client`. Open
-      // it on ANY success so even a stale-but-successful request still guarantees
-      // the bg_events subscription exists (against the live client). Oracle Q4: a bg
-      // bash task requires a prior tool call, so by the time any completion lands
-      // the session is subscribed.
-      this.ensureBgSubscription(identity);
+      // ROUTE axis: open the bg_events subscription on success — but NOT if this
+      // request's route was torn down while it was in flight. ensureBgSubscription
+      // is client-generation-independent (it drives its own client via
+      // ensureClient), so a stale-client success may still reach here; what must
+      // gate it is the route entry token. closeSession() deletes the entry, so a
+      // late success on a closed session sees the mismatch and does NOT resurrect a
+      // subscription for a session the user closed (R4 #1 — zombie route + nudges).
+      if (entryStillCurrent(entry)) this.ensureBgSubscription(identity);
       return reply;
     } catch (err) {
       // The raw `request()` path does NOT classify failures into SubcCallError
@@ -596,15 +610,18 @@ export class SubcTransportPool implements AftTransportPool {
       // the client is dead; a genuinely dead client surfaces on the NEXT call as a
       // transient socket error and is dropped then). NEVER auto-retry here — the
       // failed call is surfaced to the agent, mutation-safe by construction.
-      // A failure from a STALE client generation (already replaced by a
-      // concurrent drop / shutdown) must not mutate the NEW client's pool state:
-      // not its route cache (would delete a successor's entry — R3 #1) and not
-      // its half-open failure budget (a stale increment could false-trip the new
-      // client, a stale reset could mask real half-open detection — R3 #2). Only
-      // act when `client` is still current. `dropClient` is itself generation-
-      // guarded, but the bare routes.delete + counter mutations were not.
+      // ROUTE axis: a failed request makes ITS route suspect → drop it so the next
+      // call re-opens. Gate on the ENTRY TOKEN, not the client: a stale failure
+      // must drop only the route THIS request used, never a successor's route under
+      // the same key (which a concurrent re-open may have installed on the SAME
+      // still-current client — R4 #2; the `this.client === client` guard alone does
+      // not catch that). `dropClient` below also clears `routes`, so a transient
+      // drop doesn't need this delete, but a non-transient one (client kept) does.
+      if (this.routes.get(key) === entry) this.routes.delete(key);
+      // CLIENT axis: only touch the current client's failure budget / drop the
+      // current client. A failure from an already-replaced client must not
+      // false-trip or reset the new client's half-open budget (R3 #2).
       if (this.client === client) {
-        this.routes.delete(identityKey(identity));
         if (isConsumerReconnectTransient(err)) {
           this.transportFailures = 0;
           this.dropClient(client);
@@ -656,11 +673,22 @@ export class SubcTransportPool implements AftTransportPool {
     return this.connecting;
   }
 
-  private async routeChannel(client: SubcClientLike, identity: BindIdentity): Promise<number> {
+  /**
+   * Resolve the route channel for `identity`, returning BOTH the channel and the
+   * `RouteEntry` token that owns it. Callers capture the token so a LATE callback
+   * (success or failure that resolves after a teardown / successor re-open) can
+   * gate its route-scoped side-effects on `this.routes.get(key) === entry` — i.e.
+   * only act on the route THIS request actually used, never a successor's. This is
+   * the route axis of the stale-generation guard (the client axis is `client`).
+   */
+  private async routeChannel(
+    client: SubcClientLike,
+    identity: BindIdentity,
+  ): Promise<{ channel: number; entry: RouteEntry }> {
     const key = identityKey(identity);
     const existing = this.routes.get(key);
-    if (existing?.channel != null) return existing.channel;
-    if (existing?.opening) return existing.opening;
+    if (existing?.channel != null) return { channel: existing.channel, entry: existing };
+    if (existing?.opening) return { channel: await existing.opening, entry: existing };
 
     // Singleflight: install the entry BEFORE awaiting so a concurrent caller for
     // the same identity awaits this same open instead of minting a second channel.
@@ -691,7 +719,7 @@ export class SubcTransportPool implements AftTransportPool {
       });
     entry.opening = opening;
     this.routes.set(key, entry);
-    return opening;
+    return { channel: await opening, entry };
   }
 
   /**
@@ -774,24 +802,28 @@ export class SubcTransportPool implements AftTransportPool {
       session: session && session.length > 0 ? session : DEFAULT_SESSION_ID,
     };
     const key = identityKey(identity);
+    // Do ALL synchronous state teardown FIRST, before any await. Once we yield (to
+    // sub.stop() / closeRouteChannel()), an in-flight request's late callback can
+    // run; it gates the bg-sub reopen on `routes.get(key) === entry`, so the route
+    // entry MUST already be gone by then or the late success would resurrect the
+    // subscription we're tearing down (R4 #1). Tombstoning + deleting the entry
+    // up-front makes both the late-success gate and the in-flight routeOpen
+    // self-close (B-#3) observe the close synchronously.
     const sub = this.bgSubs.get(key);
-    if (sub) {
-      this.bgSubs.delete(key);
-      await sub.stop();
-    }
+    this.bgSubs.delete(key);
     const entry = this.routes.get(key);
+    const channel = entry?.channel ?? null;
     if (entry) {
-      // Tombstone first so an in-flight routeOpen for this identity self-closes
-      // instead of installing a route for a just-closed session (B-#3 race).
       entry.closed = true;
-      const channel = entry.channel;
       this.routes.delete(key);
-      if (channel != null && this.client) {
-        try {
-          await this.client.closeRouteChannel(channel);
-        } catch {
-          // best-effort; a dropped connection releases the route daemon-side
-        }
+    }
+    // Now the (awaiting) best-effort transport teardown.
+    if (sub) await sub.stop();
+    if (channel != null && this.client) {
+      try {
+        await this.client.closeRouteChannel(channel);
+      } catch {
+        // best-effort; a dropped connection releases the route daemon-side
       }
     }
   }

@@ -348,6 +348,45 @@ describe("SubcTransport reply envelope (B-#7)", () => {
 });
 
 describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
+  test("R4 #2: a stale non-transient failure does not delete a SUCCESSOR route on the same client", async () => {
+    // R1 opens route E (channel 1) and is held. closeSession deletes E. R2 opens a
+    // SUCCESSOR E2 (channel 2) on the SAME still-current client. R1 then fails LATE
+    // with a non-transient error (client kept). Its catch must delete only ITS OWN
+    // entry E — not the successor E2 (the client guard alone passes here; the entry
+    // token is what protects E2).
+    let releaseR1!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseR1 = r;
+    });
+    let calls = 0;
+    const client = new FakeClient(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await gate;
+        throw new SubcError("R1 late timeout"); // non-transient → client KEPT
+      }
+      return envelope({ id: "r", success: true, text: "ok" });
+    });
+    const { pool } = poolWith(client); // no bg sub → routeOpens count is just tool routes
+    const t = pool.getBridge("/work/proj");
+
+    const r1 = t.toolCall("sess-1", "read", {}).catch((e) => e); // opens E (ch 1), held
+    await tick();
+    await pool.closeSession("/work/proj", "sess-1"); // deletes E, closes ch 1
+    const r2 = await t.toolCall("sess-1", "read", {}); // opens successor E2 (ch 2)
+    expect(r2.text).toBe("ok");
+    const opensAfterR2 = client.routeOpens.length; // 2 (E + E2)
+
+    // R1 fails LATE — must NOT delete E2.
+    releaseR1();
+    await r1;
+
+    // E2 survives: a follow-up reuses it with NO new routeOpen.
+    const r3 = await t.toolCall("sess-1", "read", {});
+    expect(r3.text).toBe("ok");
+    expect(client.routeOpens.length).toBe(opensAfterR2); // E2 was not deleted
+  });
+
   test("singleflight: concurrent first calls for one identity share ONE routeOpen", async () => {
     let release!: () => void;
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
@@ -699,6 +738,39 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     await tick();
 
     expect(client.subscriptions.length).toBe(1); // never re-subscribed for the same session
+  });
+
+  test("R4 #1: a late success after closeSession does NOT resurrect the bg subscription", async () => {
+    // A tool call is in flight; closeSession tears down the session mid-flight; the
+    // request then succeeds LATE. Its success path must NOT re-open a bg_events
+    // subscription for the just-closed session (zombie route + nudges + leak).
+    let releaseReq!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseReq = r;
+    });
+    let calls = 0;
+    const client = new FakeClient(async () => {
+      calls += 1;
+      if (calls === 1) await gate; // first tool call held in flight
+      return envelope({ id: "r", success: true, text: "" });
+    });
+    const { pool } = bgPool(client);
+    const t = pool.getBridge("/work/proj");
+
+    const inflight = t.toolCall("sess-1", "read", {}); // held on `gate`
+    await tick();
+    expect(client.subscriptions.length).toBe(0); // not subscribed yet (reply pending)
+
+    // Close the session WHILE the request is in flight.
+    await pool.closeSession("/work/proj", "sess-1");
+
+    // Now let the held request succeed LATE.
+    releaseReq();
+    await inflight;
+    await tick();
+
+    // The late success must NOT have created a subscription for the closed session.
+    expect(client.subscriptions.length).toBe(0);
   });
 
   test("INDEPENDENT reconnect: a dropped subscription resubscribes + re-drains with NO tool call (idle-stranding fix)", async () => {

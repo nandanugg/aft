@@ -228,7 +228,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     );
 
     expect(result.output).toContain("promoted to background");
-    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{8}$/);
+    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{16}$/);
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
   });
 
@@ -241,7 +241,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     });
 
     expect(result.output).toContain("Background task started:");
-    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{8}$/);
+    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{16}$/);
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
   });
 

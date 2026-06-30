@@ -836,7 +836,8 @@ fn background_task_ids_use_short_bash_slug_format() {
 
     let task_id = spawn_bg(&mut aft, "slug-format", "true");
 
-    // Format: "bash-" + exactly 8 lowercase hex characters (4 OS-entropy bytes)
+    // Format: "bash-" + exactly 16 lowercase hex characters (8 OS-entropy bytes /
+    // 64-bit — the width is load-bearing for subc delivery dedup, see random_slug).
     assert!(
         task_id.starts_with("bash-"),
         "task_id must start with `bash-` prefix; got `{task_id}`"
@@ -844,8 +845,8 @@ fn background_task_ids_use_short_bash_slug_format() {
     let suffix = &task_id["bash-".len()..];
     assert_eq!(
         suffix.len(),
-        8,
-        "task_id suffix must be exactly 8 hex chars; got `{suffix}` (len={})",
+        16,
+        "task_id suffix must be exactly 16 hex chars; got `{suffix}` (len={})",
         suffix.len()
     );
     assert!(

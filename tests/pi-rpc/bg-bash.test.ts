@@ -10,7 +10,7 @@ import {
   startAimock,
 } from "./helpers";
 
-const BASH_TASK_ID = /^bash-[a-f0-9]{8}$/;
+const BASH_TASK_ID = /^bash-[a-f0-9]{16}$/;
 
 function resultText(event: Record<string, unknown>): string {
   return JSON.stringify(event.result ?? "");
