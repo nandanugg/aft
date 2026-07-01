@@ -60,6 +60,7 @@ import {
   drainNotifications,
   isTuiConnected,
   pushNotification,
+  pushStatusChange,
 } from "./shared/rpc-notifications.js";
 import { AftRpcServer } from "./shared/rpc-server.js";
 import {
@@ -593,6 +594,37 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     storageDir: configOverrides.storage_dir as string,
   };
 
+  type StatusSubscribableBridge = {
+    subscribeStatus(listener: (snapshot: Record<string, unknown>) => void): () => void;
+  };
+  const statusSubscribedBridges = new WeakSet<object>();
+  const statusUnsubscribes = new Set<() => void>();
+  const subscribeBridgeStatus = (bridge: unknown): void => {
+    if (!bridge || typeof bridge !== "object") return;
+    if (statusSubscribedBridges.has(bridge)) return;
+    const maybe = bridge as Partial<StatusSubscribableBridge>;
+    if (typeof maybe.subscribeStatus !== "function") return;
+    statusSubscribedBridges.add(bridge);
+    const unsubscribe = maybe.subscribeStatus((snapshot) => {
+      const session = snapshot.session as Record<string, unknown> | undefined;
+      const sessionId = typeof session?.id === "string" ? session.id : undefined;
+      pushStatusChange(sessionId);
+    });
+    statusUnsubscribes.add(unsubscribe);
+  };
+  const originalGetBridge = pool.getBridge.bind(pool);
+  pool.getBridge = (projectRoot) => {
+    const bridge = originalGetBridge(projectRoot);
+    subscribeBridgeStatus(bridge);
+    return bridge;
+  };
+  const originalToolCall = pool.toolCall.bind(pool);
+  pool.toolCall = async (projectRoot, runtime, name, rawArgs, options) => {
+    const result = await originalToolCall(projectRoot, runtime, name, rawArgs, options);
+    subscribeBridgeStatus(pool.getActiveBridgeForRoot(projectRoot));
+    return result;
+  };
+
   // Settle the ONNX runtime download promise (started above) and patch the
   // resolved path into the pool's configure overrides. Bridges spawned AFTER
   // this resolves will pass `_ort_dylib_dir` through configure and pick up
@@ -649,6 +681,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   registerShutdownCleanup(async () => {
     autoUpdateAbort.abort();
     clearInspectTier2Idle();
+    for (const unsubscribe of statusUnsubscribes) {
+      try {
+        unsubscribe();
+      } catch {
+        // Ignore unsubscribe errors during shutdown; sockets and other connections are already closing.
+      }
+    }
+    statusUnsubscribes.clear();
     await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
     try {
       rpcServer.stop();

@@ -14,6 +14,14 @@ import {
   formatSemanticRefreshing,
 } from "../shared/status";
 import {
+  createDebouncedStatusRefresh,
+  refreshAftTuiSocketScope,
+  type SocketNotification,
+  startAftTuiSocket,
+  stopAftTuiSocket,
+  subscribeStatusInvalidations,
+} from "./notification-socket";
+import {
   createAftSidebarSlot,
   formatCompressionSidebarRows,
   isSnapshotForContext,
@@ -50,52 +58,13 @@ function getSessionId(api: TuiPluginApi): string | null {
   return null;
 }
 
-interface TuiMessage {
-  id: number;
-  type: string;
-  payload: Record<string, unknown>;
-  sessionId?: string;
-}
-
-const lastReceivedNotificationIdBySession = new Map<string, number>();
-
-/** Poll for pending server → TUI notifications via RPC. */
-async function consumeTuiMessages(client: AftRpcClient, sessionId: string): Promise<TuiMessage[]> {
-  try {
-    const result = await client.call<{ messages?: TuiMessage[] }>("consume-notifications", {
-      lastReceivedId: lastReceivedNotificationIdBySession.get(sessionId) ?? 0,
-      sessionId,
-    });
-    return (result.messages ?? []).map((message) => ({
-      id: message.id,
-      type: message.type,
-      payload: message.payload,
-      sessionId: message.sessionId,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-function markTuiMessagesReceived(sessionId: string, messages: TuiMessage[]): void {
-  const previous = lastReceivedNotificationIdBySession.get(sessionId) ?? 0;
-  const next = messages.reduce((max, message) => Math.max(max, message.id), previous);
-  if (next > previous) lastReceivedNotificationIdBySession.set(sessionId, next);
-}
-
 // ---------------------------------------------------------------------------
-// StatusDialog — themed, two-column JSX dialog. Modeled on the magic-context
-// /ctx-status pattern (packages/plugin/src/tui/index.tsx in that repo):
-// custom JSX rendered via `api.ui.dialog.replace(() => <StatusDialog .../>)`
-// instead of feeding a padded monospace string into DialogAlert. The
-// difference matters because OpenCode renders DialogAlert text in a
-// proportional font with no column alignment; only TUI flex primitives
-// (<box flexDirection="row" flexBasis={0}>) actually produce visible
-// columns. This component owns its own RPC polling so it can re-render
-// reactively as the status snapshot changes, with no parent re-mount.
+// StatusDialog — themed, two-column JSX dialog. OpenCode renders DialogAlert
+// text in a proportional font with no column alignment, so the status view uses
+// TUI flex primitives instead of a padded monospace string. The component
+// subscribes to server-pushed invalidations so it can re-render as the status
+// snapshot changes, with no parent re-mount.
 // ---------------------------------------------------------------------------
-
-const POLL_INTERVAL_MS = 1500;
 
 function formatCountShort(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
@@ -187,20 +156,19 @@ const StatusDialog = (props: StatusDialogProps) => {
   const theme = createMemo(() => (props.api as any).theme.current as TuiThemeCurrent);
   const t = () => theme();
 
-  // Reactive status signal — the dialog re-renders on every status
-  // transition without remounting. The RPC polling is local to the dialog
-  // and stops when it unmounts.
+  // Reactive status signal — the dialog re-renders on pushed status
+  // invalidations without remounting.
   const [status, setStatus] = createSignal<AftStatusSnapshot | null>(props.initial);
   const [error, setError] = createSignal<string | null>(props.initialError);
 
-  let pollGeneration = 0;
-  let pollController: AbortController | null = null;
-  const pollStatus = async () => {
-    if (pollController) return;
+  let refreshGeneration = 0;
+  let refreshController: AbortController | null = null;
+  const refreshStatus = async () => {
+    if (refreshController) return;
 
     const controller = new AbortController();
-    const requestGeneration = ++pollGeneration;
-    pollController = controller;
+    const requestGeneration = ++refreshGeneration;
+    refreshController = controller;
 
     try {
       const response = await props.client.call(
@@ -208,12 +176,13 @@ const StatusDialog = (props: StatusDialogProps) => {
         { sessionID: props.sessionID },
         { signal: controller.signal, accept: statusAcceptGate(props.directory) },
       );
-      if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
+      if (controller.signal.aborted || requestGeneration !== refreshGeneration) return;
       if ((response as Record<string, unknown>).success !== false) {
         const snapshot = coerceAftStatus(response as Record<string, unknown>);
         // Stale-while-revalidate: don't downgrade a good snapshot to a transient
-        // `not_initialized` (bridge mid-respawn / session-dir key miss) — it
-        // arrives as success:true and would blank the dialog until the next poll.
+        // `not_initialized` (for example, while the bridge process respawns or
+        // a session directory lookup briefly misses) — it arrives as success:true
+        // and would blank the dialog until the next refresh.
         const current = status();
         if (
           shouldSuppressUninitializedDowngrade(
@@ -227,22 +196,25 @@ const StatusDialog = (props: StatusDialogProps) => {
         setError(null);
       }
     } catch {
-      if (controller.signal.aborted || requestGeneration !== pollGeneration) return;
+      if (controller.signal.aborted || requestGeneration !== refreshGeneration) return;
       // transient — keep showing last good snapshot
     } finally {
-      if (pollController === controller) pollController = null;
+      if (refreshController === controller) refreshController = null;
     }
   };
 
-  const timer = setInterval(() => {
-    void pollStatus();
-  }, POLL_INTERVAL_MS);
+  const statusDebouncer = createDebouncedStatusRefresh(refreshStatus, 200);
+  const unsubscribeStatusInvalidations = subscribeStatusInvalidations((event) => {
+    if (event.sessionId && event.sessionId !== props.sessionID) return;
+    statusDebouncer.schedule();
+  });
   onCleanup(() => {
-    clearInterval(timer);
-    pollGeneration++;
-    if (pollController) {
-      pollController.abort();
-      pollController = null;
+    unsubscribeStatusInvalidations();
+    statusDebouncer.dispose();
+    refreshGeneration++;
+    if (refreshController) {
+      refreshController.abort();
+      refreshController = null;
     }
   });
 
@@ -588,7 +560,7 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
   const client = getRpcClient(directory);
 
   // Prime the dialog with one initial fetch so we don't show a blank
-  // skeleton — the component then takes over polling.
+  // skeleton — the component then listens for pushed invalidations.
   let initial: AftStatusSnapshot | null = null;
   let initialError: string | null = null;
   try {
@@ -606,20 +578,15 @@ async function showStatusDialog(api: TuiPluginApi): Promise<void> {
     initialError = "AFT is starting up. Status will refresh automatically...";
   }
 
-  // The host's DialogProvider already wraps every replace()'d element in its own
-  // <Dialog> frame (absolute, centered, zIndex 3000) and binds Esc/Ctrl-C to pop
-  // the stack. Rendering our own <api.ui.Dialog> inside it was a frame-inside-a-
-  // frame: the inner absolute box anchored within the already-narrowed parent and
-  // rendered shifted down-right off the screen edge, unthemed, with key focus on
-  // the wrong layer. Pass the bare component — the host frames it — exactly like
-  // the DialogAlert/DialogConfirm paths and magic-context's status dialog do.
-  //
-  // Also: do NOT pass an onClose that calls dialog.clear(). The host invokes the
-  // entry's onClose on Esc AND clear() re-invokes every entry's onClose, so a
-  // clear()-based onClose recursed infinitely on close. The host pops the stack
-  // itself, and StatusDialog stops its own polling via onCleanup when unmounted,
-  // so no custom onClose is needed. `replace` resets size to "medium", so request
-  // "large" AFTER it.
+  // The dialog host already wraps every replace()'d element in its own centered
+  // frame and binds Esc/Ctrl-C to close it. Rendering our own dialog frame inside
+  // that host frame would misplace the content and focus; pass the bare component
+  // so the host frames it once.
+  // Do not pass an onClose that calls dialog.clear(). The dialog system calls
+  // every entry's onClose on Esc, and clear() would re-trigger them, causing
+  // infinite recursion. The host itself pops the dialog; StatusDialog cleans up
+  // its own subscriptions in onCleanup. `replace` resets size to "medium", so
+  // request "large" after the call.
   api.ui.dialog.replace(() => (
     <StatusDialog
       api={api}
@@ -774,54 +741,39 @@ const tui: TuiPlugin = async (api) => {
   // See https://github.com/cortexkit/aft/issues/33.
   registerStatusCommand(api);
 
-  // Poll for server → TUI dialog requests. The server owns the slash command,
-  // and this poller is how it asks the TUI process to show native UI.
-  let pollInFlight = false;
-  const messagePoller = setInterval(() => {
-    // Scope the drain to the TUI's active session so notifications tagged for a
-    // different session (served by the same RPC process) are not consumed here.
-    // Do not poll on non-session routes: a session-scoped action fetched while
-    // sessionless could otherwise be acked without being shown.
-    if (pollInFlight) return;
-
+  // Receive server → TUI dialog requests and status invalidations over one
+  // persistent WebSocket. This avoids repeated loopback HTTP connection setup,
+  // which caused idle CPU usage.
+  const handleNotification = async (message: SocketNotification): Promise<boolean> => {
     const requestedSessionId = getSessionId(api);
-    if (!requestedSessionId) return;
+    if (!requestedSessionId) return false;
+    if (message.sessionId && message.sessionId !== requestedSessionId) return false;
+    if (message.type !== "action") return false;
+    if (message.payload?.action !== "show-status-dialog") return false;
+    await showStatusDialog(api);
+    return true;
+  };
 
-    const directory = api.state.path.directory ?? "";
-    if (!directory) return;
+  startAftTuiSocket({
+    getDirectory: () => api.state.path.directory ?? "",
+    getSessionId: () => getSessionId(api),
+    onNotification: handleNotification,
+  });
 
-    pollInFlight = true;
-    const client = getRpcClient(directory);
-    void consumeTuiMessages(client, requestedSessionId)
-      .then(async (messages) => {
-        // If the user switched routes while the RPC was in flight, drop this
-        // batch without advancing the cursor; the next poll for the active
-        // session will fetch the right notifications.
-        if (getSessionId(api) !== requestedSessionId) return;
-
-        const orderedMessages = [...messages].sort((a, b) => a.id - b.id);
-        for (const message of orderedMessages) {
-          if (getSessionId(api) !== requestedSessionId) return;
-          if (message.sessionId && message.sessionId !== requestedSessionId) continue;
-          if (message.type !== "action") continue;
-          if (message.payload?.action !== "show-status-dialog") continue;
-          await showStatusDialog(api);
-        }
-
-        if (getSessionId(api) !== requestedSessionId) return;
-        markTuiMessagesReceived(requestedSessionId, orderedMessages);
-      })
-      .catch(() => {
-        // Intentional: message polling should never crash the TUI.
-      })
-      .finally(() => {
-        pollInFlight = false;
-      });
-  }, 500);
+  const socketScopeUnsubs = [
+    api.event?.on?.("message.updated", () => refreshAftTuiSocketScope()),
+    api.event?.on?.("session.updated", () => refreshAftTuiSocketScope()),
+  ].filter(Boolean);
 
   api.lifecycle?.onDispose?.(() => {
-    clearInterval(messagePoller);
-    lastReceivedNotificationIdBySession.clear();
+    stopAftTuiSocket();
+    for (const unsub of socketScopeUnsubs) {
+      try {
+        unsub();
+      } catch {
+        // Ignore unsubscribe errors during cleanup; socket shutdown is handled separately.
+      }
+    }
     for (const client of rpcClients.values()) client.reset();
     rpcClients.clear();
   });

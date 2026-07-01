@@ -1,9 +1,9 @@
 /**
  * In-memory notification queue for server → TUI push.
  *
- * Also tracks whether a TUI client is actively connected (polling).
- * The server plugin cannot use `process.env.OPENCODE_CLIENT` to detect TUI
- * because the server runs in a separate process from the TUI client.
+ * The queue is the durable at-least-once buffer; live WebSocket sinks are only
+ * a low-latency delivery path. A notification is pruned only after the TUI acks
+ * it with the highest id it handled.
  */
 
 export interface RpcNotification {
@@ -13,33 +13,80 @@ export interface RpcNotification {
   sessionId?: string;
 }
 
+export interface NotificationSink {
+  /** The TUI session that the sink's socket authenticated for. */
+  sessionId?: string;
+  /** Deliver one queued notification over the live socket. */
+  send: (notification: RpcNotification) => void;
+}
+
+export interface StatusChangeSink {
+  /** The TUI session that the sink's socket authenticated for. */
+  sessionId?: string;
+  /** Deliver a lightweight status invalidation over the live socket. */
+  send: (event: RpcStatusChange) => void;
+}
+
+export interface RpcStatusChange {
+  sessionId?: string;
+}
+
 let queue: RpcNotification[] = [];
 let nextNotificationId = 1;
-// Timestamp of last drain — used to detect if a TUI is actively polling.
-// The TUI polls every 500ms; we consider it connected if it polled within
-// the last 3 seconds (6× the poll interval, tolerates transient delays).
-//
-// PER-SESSION: a single server process can serve MANY sessions (e.g. a TUI on
-// session A plus an OpenCode Desktop opened on session B for the same project,
-// whose newer RPC server this TUI's port discovery then selects). The TUI
-// poller drains with ITS active session id, so a session is "TUI-connected"
-// only if a TUI recently drained FOR THAT session. A process-global timestamp
-// would make session B's producers (`/aft-status`, configure warnings, etc.)
-// take the TUI-dialog path because session A's TUI is polling — queuing a
-// B-scoped dialog action that A's poller correctly refuses to show, so B's
-// notice is lost (it also suppressed B's non-TUI fallback). Tracking drains per
-// session routes each producer to the right delivery path.
-const lastDrainAtBySession = new Map<string, number>();
-let lastDrainAtAny = 0;
-const TUI_CONNECTED_WINDOW_MS = 3_000;
+const notificationSinks = new Set<NotificationSink>();
+const statusChangeSinks = new Set<StatusChangeSink>();
 
-/** Push a notification for the TUI to pick up via polling. */
+/** Register a live TUI notification sink. Returns an unregister function. */
+export function registerNotificationSink(sink: NotificationSink): () => void {
+  notificationSinks.add(sink);
+  return () => {
+    notificationSinks.delete(sink);
+  };
+}
+
+/** Register a live TUI status-invalidation sink. Returns an unregister function. */
+export function registerStatusChangeSink(sink: StatusChangeSink): () => void {
+  statusChangeSinks.add(sink);
+  return () => {
+    statusChangeSinks.delete(sink);
+  };
+}
+
+function notificationMatchesSink(
+  notification: RpcNotification,
+  sink: { sessionId?: string },
+): boolean {
+  return (
+    notification.sessionId === undefined ||
+    sink.sessionId === undefined ||
+    notification.sessionId === sink.sessionId
+  );
+}
+
+function statusChangeMatchesSink(event: RpcStatusChange, sink: { sessionId?: string }): boolean {
+  return (
+    event.sessionId === undefined ||
+    sink.sessionId === undefined ||
+    event.sessionId === sink.sessionId
+  );
+}
+
+/** Push a notification for the TUI. Fans out to live sinks and keeps the queue. */
 export function pushNotification(
   type: string,
   payload: Record<string, unknown>,
   sessionId?: string,
 ): void {
-  queue.push({ id: nextNotificationId++, type, payload, sessionId });
+  const notification: RpcNotification = { id: nextNotificationId++, type, payload, sessionId };
+  queue.push(notification);
+  for (const sink of notificationSinks) {
+    if (!notificationMatchesSink(notification, sink)) continue;
+    try {
+      sink.send(notification);
+    } catch {
+      // A dead socket must not block other sinks; the queue replays on reconnect.
+    }
+  }
   // Cap queue size to prevent unbounded growth if a TUI is not draining.
   // Session-fair eviction: a naive `slice(-50)` drops the globally-oldest
   // items, so a noisy session could evict ANOTHER session's single unseen
@@ -64,8 +111,20 @@ export function pushNotification(
   }
 }
 
+/** Push a lightweight status invalidation to matching live TUI sockets. */
+export function pushStatusChange(sessionId?: string): void {
+  const event: RpcStatusChange = sessionId ? { sessionId } : {};
+  for (const sink of statusChangeSinks) {
+    if (!statusChangeMatchesSink(event, sink)) continue;
+    try {
+      sink.send(event);
+    } catch {
+      // A dead socket must not block other status listeners.
+    }
+  }
+}
+
 /** Return pending notifications after acking the client's last received id.
- *  Updates lastDrainAt so isTuiConnected() reflects recent activity.
  *
  *  Session scoping: when `sessionId` is provided, only notifications tagged for
  *  that session (or session-less/global ones) are returned and pruned — a
@@ -81,11 +140,9 @@ export function pushNotification(
  *
  *  Delivery is at-least-once (non-destructive return + prune-on-ack): a returned
  *  notification stays queued until a later call acks it via a higher
- *  `lastReceivedId`, so a lost poll response re-delivers on the next poll. */
+ *  `lastReceivedId`, so a dropped WS socket re-delivers the backlog on reconnect
+ *  (the client sends its `lastReceivedId` in the hello). */
 export function drainNotifications(lastReceivedId = 0, sessionId?: string): RpcNotification[] {
-  const now = Date.now();
-  lastDrainAtAny = now;
-  if (sessionId !== undefined) lastDrainAtBySession.set(sessionId, now);
   const matchesClient = (notification: RpcNotification): boolean =>
     sessionId === undefined ||
     notification.sessionId === undefined ||
@@ -102,20 +159,19 @@ export function drainNotifications(lastReceivedId = 0, sessionId?: string): RpcN
   );
 }
 
-/** Whether a TUI client is actively polling for notifications.
- *  Returns true only if a TUI has drained within the last 3 seconds.
- *
- *  Pass `sessionId` (preferred) to ask whether a TUI is polling FOR THAT
- *  SESSION — this is what producers (`/aft-status`, configure warnings, etc.)
- *  must use to decide dialog-vs-message, so a TUI on a different session in the
- *  same process does not misroute their delivery. Omit it only for legacy/global
- *  callers that genuinely have no session context; they fall back to "any
- *  session recently drained" (the pre-per-session behavior). */
+/** Whether a TUI client is connected via a live notification socket. */
 export function isTuiConnected(sessionId?: string): boolean {
-  const now = Date.now();
-  if (sessionId !== undefined) {
-    const at = lastDrainAtBySession.get(sessionId) ?? 0;
-    return at > 0 && now - at < TUI_CONNECTED_WINDOW_MS;
+  if (notificationSinks.size === 0) return false;
+  if (sessionId === undefined) return true;
+  for (const sink of notificationSinks) {
+    if (sink.sessionId === undefined || sink.sessionId === sessionId) return true;
   }
-  return lastDrainAtAny > 0 && now - lastDrainAtAny < TUI_CONNECTED_WINDOW_MS;
+  return false;
+}
+
+export function __resetRpcNotificationsForTest(): void {
+  queue = [];
+  nextNotificationId = 1;
+  notificationSinks.clear();
+  statusChangeSinks.clear();
 }

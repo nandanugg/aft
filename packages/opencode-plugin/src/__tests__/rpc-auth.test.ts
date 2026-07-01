@@ -14,6 +14,11 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AftRpcClient } from "../shared/rpc-client.js";
+import {
+  __resetRpcNotificationsForTest,
+  drainNotifications,
+  pushNotification,
+} from "../shared/rpc-notifications.js";
 import { AftRpcServer } from "../shared/rpc-server.js";
 import {
   isPidAlive,
@@ -43,6 +48,7 @@ function makeFixture() {
 }
 
 afterEach(() => {
+  __resetRpcNotificationsForTest();
   for (const root of tempRoots) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -80,6 +86,61 @@ describe("AFT RPC auth", () => {
         value: 1,
       });
       expect(result).toEqual({ ok: true, params: { value: 1 } });
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("websocket hello authenticates with the port-file token and replays backlog", async () => {
+    const fixture = makeFixture();
+    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    server.handle("noop", async () => ({ ok: true }));
+
+    try {
+      const port = await server.start();
+      const instancePortFile = resolveInstancePortFile(fixture.storageDir, fixture.directory);
+      const portFile = JSON.parse(readFileSync(instancePortFile, "utf-8")) as {
+        token: string;
+      };
+      pushNotification("queued", { ok: true }, "ses_ws");
+
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const messages: unknown[] = [];
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("websocket hello timed out")), 2000);
+        ws.addEventListener("open", () => {
+          ws.send(
+            JSON.stringify({
+              type: "hello",
+              token: portFile.token,
+              sessionId: "ses_ws",
+              lastReceivedId: 0,
+            }),
+          );
+        });
+        ws.addEventListener("message", (event) => {
+          const msg = JSON.parse(String(event.data));
+          messages.push(msg);
+          if (msg.type === "notification") {
+            ws.send(JSON.stringify({ type: "ack", lastReceivedId: msg.notification.id }));
+          }
+          if (msg.type === "hello-ack") {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+        ws.addEventListener("error", () => {
+          clearTimeout(timeout);
+          reject(new Error("websocket connection failed"));
+        });
+      });
+      ws.close();
+
+      expect(messages).toContainEqual({
+        type: "notification",
+        notification: { id: 1, type: "queued", payload: { ok: true }, sessionId: "ses_ws" },
+      });
+      expect(drainNotifications(1, "ses_ws")).toEqual([]);
     } finally {
       server.stop();
     }

@@ -1,17 +1,23 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  __resetRpcNotificationsForTest,
   drainNotifications,
   isTuiConnected,
   pushNotification,
+  pushStatusChange,
+  type RpcNotification,
+  registerNotificationSink,
+  registerStatusChangeSink,
 } from "../shared/rpc-notifications.js";
+
+beforeEach(() => {
+  __resetRpcNotificationsForTest();
+});
 
 describe("rpc notifications", () => {
   test("keeps messages queued until the client acks their id", () => {
-    const initial = drainNotifications(Number.MAX_SAFE_INTEGER);
-    expect(initial).toEqual([]);
-
     pushNotification("one", { ok: true }, "ses_1");
     const firstPoll = drainNotifications();
     expect(firstPoll).toHaveLength(1);
@@ -24,10 +30,40 @@ describe("rpc notifications", () => {
     expect(drainNotifications(lastReceivedId)).toEqual([]);
   });
 
-  test("scopes drain to the requesting session; other sessions' items survive", () => {
-    // Drain everything left from prior tests.
-    drainNotifications(Number.MAX_SAFE_INTEGER);
+  test("fans out live notifications to matching session sinks only", () => {
+    const a: RpcNotification[] = [];
+    const b: RpcNotification[] = [];
+    const global: RpcNotification[] = [];
+    registerNotificationSink({ sessionId: "ses_A", send: (notification) => a.push(notification) });
+    registerNotificationSink({ sessionId: "ses_B", send: (notification) => b.push(notification) });
+    registerNotificationSink({ send: (notification) => global.push(notification) });
 
+    pushNotification("for-a", { ok: true }, "ses_A");
+
+    expect(a.map((notification) => notification.type)).toEqual(["for-a"]);
+    expect(b).toEqual([]);
+    expect(global.map((notification) => notification.type)).toEqual(["for-a"]);
+  });
+
+  test("dead sink send does not block other sinks", () => {
+    const delivered: RpcNotification[] = [];
+    registerNotificationSink({
+      sessionId: "ses_A",
+      send: () => {
+        throw new Error("socket closed");
+      },
+    });
+    registerNotificationSink({
+      sessionId: "ses_A",
+      send: (notification) => delivered.push(notification),
+    });
+
+    pushNotification("for-a", { ok: true }, "ses_A");
+
+    expect(delivered.map((notification) => notification.type)).toEqual(["for-a"]);
+  });
+
+  test("scopes drain to the requesting session; other sessions' items survive", () => {
     pushNotification("for-a", { action: "show-status-dialog" }, "ses_A");
     pushNotification("for-b", { action: "show-status-dialog" }, "ses_B");
     pushNotification("global", { action: "show-status-dialog" });
@@ -44,28 +80,54 @@ describe("rpc notifications", () => {
   });
 
   test("session-less drain still receives all items", () => {
-    drainNotifications(Number.MAX_SAFE_INTEGER);
     pushNotification("x", { ok: true }, "ses_1");
     pushNotification("y", { ok: true }, "ses_2");
     const poll = drainNotifications(0);
     expect(poll.map((message) => message.type).sort()).toEqual(["x", "y"]);
   });
 
-  test("isTuiConnected is per-session: a TUI on session A does not mark session B connected", () => {
-    // A TUI draining for tuiA must not make tuiB's producers think a TUI is
-    // polling for tuiB (which would route tuiB's /aft-status to the dialog path
-    // and lose it in the unrelated TUI). Use ids no other test drains so the
-    // per-session window is unambiguous.
-    drainNotifications(0, "ses_tuiA_only");
-    expect(isTuiConnected("ses_tuiA_only")).toBe(true);
-    expect(isTuiConnected("ses_tuiB_never_drained")).toBe(false);
-    // The session-less (global) query still reports recent activity for legacy
-    // callers that have no session context.
+  test("hello-style backlog replay returns unacked notifications", () => {
+    pushNotification("first", { ok: true }, "ses_A");
+    const first = drainNotifications(0, "ses_A");
+    const firstId = first[0]!.id;
+    pushNotification("second", { ok: true }, "ses_A");
+
+    const replay = drainNotifications(firstId, "ses_A");
+
+    expect(replay.map((message) => message.type)).toEqual(["second"]);
+  });
+
+  test("isTuiConnected is exact per-session socket liveness", () => {
+    const unregister = registerNotificationSink({ sessionId: "ses_A", send: () => {} });
+
+    expect(isTuiConnected("ses_A")).toBe(true);
+    expect(isTuiConnected("ses_B")).toBe(false);
     expect(isTuiConnected()).toBe(true);
+
+    unregister();
+    expect(isTuiConnected("ses_A")).toBe(false);
+  });
+
+  test("status-change sinks are scoped like notification sinks", () => {
+    const a: string[] = [];
+    const b: string[] = [];
+    registerStatusChangeSink({
+      sessionId: "ses_A",
+      send: (event) => a.push(event.sessionId ?? "*"),
+    });
+    registerStatusChangeSink({
+      sessionId: "ses_B",
+      send: (event) => b.push(event.sessionId ?? "*"),
+    });
+
+    pushStatusChange("ses_A");
+    pushStatusChange();
+
+    expect(a).toEqual(["ses_A", "*"]);
+    expect(b).toEqual(["*"]);
   });
 
   test("queue-cap eviction is session-fair: a noisy session cannot evict another session's newest unseen item", () => {
-    drainNotifications(Number.MAX_SAFE_INTEGER);
     // One quiet session with a single pending dialog.
     pushNotification("quiet-dialog", { action: "show-status-dialog" }, "ses_quiet");
     // A noisy session floods well past the 100 cap.

@@ -1,11 +1,10 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
 
-// AFT sidebar slot — mirrors opencode-magic-context's sidebar pattern.
-// Header with "AFT" badge + version, then live status of search and semantic
-// indexes plus their on-disk size. Refreshes on session change and on
-// session.updated/message.updated events with a small debounce, same as
-// magic-context, so the panel stays current without polling.
+// AFT sidebar slot. Header with "AFT" badge + version, then live status of search and semantic
+// indexes plus their on-disk size. Refreshes on mount/session change and on
+// server-pushed status invalidations with a small debounce, so the panel stays
+// current without polling.
 
 import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
 import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
@@ -21,6 +20,11 @@ import {
 } from "../shared/status";
 import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
 import {
+  createDebouncedStatusRefresh,
+  refreshAftTuiSocketScope,
+  subscribeStatusInvalidations,
+} from "./notification-socket";
+import {
   type AftTuiPrefs,
   computeEffectiveOrder,
   DEFAULT_PREFS,
@@ -35,10 +39,6 @@ import {
 
 const SINGLE_BORDER = { type: "single" } as any;
 const REFRESH_DEBOUNCE_MS = 200;
-// The sidebar polls the bridge as a backstop because not every state change
-// (e.g. semantic index transitioning from "loading" → "ready" mid-session)
-// emits a session/message event. 1.5s matches the /aft-status dialog cadence.
-const POLL_INTERVAL_MS = 1500;
 
 function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "—";
@@ -277,7 +277,7 @@ export function scopedSidebarSnapshot(
  * mid-respawn after a binary swap, or a momentary session-dir key miss) arrives
  * over RPC as `success: true`, so a naive `setStatus` would overwrite a good
  * snapshot and collapse the panel to the lazy-bridge placeholder — the blank
- * flicker that recovers on the next poll. Suppress the downgrade only when we
+ * flicker that recovers on the next refresh. Suppress the downgrade only when we
  * already hold initialized data for the same context; never blocks the first
  * real snapshot, and a genuine context switch clears separately.
  */
@@ -353,8 +353,6 @@ const SidebarContent = (props: {
     sessionID: string;
   } | null = null;
   let generation = 0;
-  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
 
   const currentDirectory = () => props.api.state.path.directory ?? "";
   const requestRender = () => {
@@ -443,15 +441,14 @@ const SidebarContent = (props: {
           current.sessionID === sid &&
           current.snapshot.cache_role !== "not_initialized";
         if (shouldSuppressUninitializedDowngrade(snapshot.cache_role, haveGoodForContext)) return;
-        // Equality gate: at idle the 1.5s poll returns the same snapshot every
-        // tick. Minting a new status object would run SolidJS reactivity and
-        // schedule a host frame for no visible change. Skip the update when the
-        // freshly-fetched snapshot is byte-identical to what we already show for
-        // this exact context. JSON.stringify is a sound content comparison here:
-        // the snapshot is a plain object coerced from the status RPC's JSON, so
-        // equal serialization means equal data (any changed field reorders/edits
-        // the string and re-renders). Distinct from the server-side per-poll
-        // dir_size cost (tracked separately) — this only elides the render.
+        // Equality gate: a pushed invalidation can still produce the same
+        // snapshot (for example, a session-scoped status frame that does not
+        // affect this sidebar's visible fields). Minting a new status object
+        // would run SolidJS reactivity and schedule a host frame for no visible
+        // change. Skip the update when the freshly-fetched snapshot is
+        // byte-identical to what we already show for this exact context.
+        // JSON.stringify is sound here because the snapshot is a plain object
+        // coerced from the status RPC's JSON.
         if (
           current !== null &&
           current.directory === directory &&
@@ -473,13 +470,8 @@ const SidebarContent = (props: {
     }
   };
 
-  const scheduleRefresh = () => {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      debounceTimer = undefined;
-      void refresh();
-    }, REFRESH_DEBOUNCE_MS);
-  };
+  const statusDebouncer = createDebouncedStatusRefresh(refresh, REFRESH_DEBOUNCE_MS);
+  const scheduleRefresh = () => statusDebouncer.schedule();
 
   const reloadPrefs = async () => {
     const root = await readTuiPreferencesFile();
@@ -498,58 +490,33 @@ const SidebarContent = (props: {
     unwatchPrefs();
     generation++;
     abortInflight();
-    if (debounceTimer) clearTimeout(debounceTimer);
-    if (pollTimer) clearInterval(pollTimer);
+    statusDebouncer.dispose();
   });
 
   // Refresh on session id change + initial load
   createEffect(
     on(props.sessionID, () => {
+      refreshAftTuiSocketScope();
       void refresh();
     }),
   );
 
-  // Wire live updates: session/message events are cheap signals that
-  // *something* AFT-relevant probably changed (formatted edit, lsp activity,
-  // index pre-warm completion). The status RPC is debounced so we don't
-  // recompute disk usage on every keystroke.
+  // Wire live updates: the server pushes a lightweight invalidation whenever
+  // the bridge reports a status change. The sidebar coalesces bursts into one
+  // trailing status fetch and stays completely idle when no backend state changes.
   createEffect(
     on(
       props.sessionID,
       (sessionID) => {
         if (!sessionID) return;
-        const unsubs = [
-          props.api.event.on("message.updated", (event) => {
-            if (event.properties?.info?.sessionID !== sessionID) return;
-            scheduleRefresh();
-          }),
-          props.api.event.on("session.updated", (event) => {
-            if (event.properties?.info?.id !== sessionID) return;
-            scheduleRefresh();
-          }),
-        ];
-        // Background poller for state that doesn't emit session events
-        // (semantic index `loading` → `ready`, disk size growth during
-        // a background indexer rebuild). Self-cancelling on cleanup.
-        if (!pollTimer) {
-          pollTimer = setInterval(() => {
-            scheduleRefresh();
-          }, POLL_INTERVAL_MS);
-        }
+        const unsubscribe = subscribeStatusInvalidations((event) => {
+          if (event.sessionId && event.sessionId !== props.sessionID()) return;
+          scheduleRefresh();
+        });
         onCleanup(() => {
-          for (const unsub of unsubs) {
-            try {
-              unsub();
-            } catch {
-              // best effort
-            }
-          }
+          unsubscribe();
           generation++;
           abortInflight();
-          if (pollTimer) {
-            clearInterval(pollTimer);
-            pollTimer = undefined;
-          }
         });
       },
       { defer: false },

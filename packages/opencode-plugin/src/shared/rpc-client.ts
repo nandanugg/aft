@@ -10,6 +10,8 @@ type PortInfoSource = "instance" | "legacy";
 type ParsedPortInfo = { port: number; token: string | null; pid?: number; started_at?: number };
 type PortInfo = ParsedPortInfo & { source: PortInfoSource; path?: string };
 
+export type AftRpcEndpoint = { port: number; token: string | null };
+
 export interface AftRpcCallOptions {
   signal?: AbortSignal;
   /**
@@ -155,6 +157,13 @@ export class AftRpcClient {
     } catch {
       return false;
     }
+  }
+
+  /** Resolve the freshest live endpoint for the persistent TUI WebSocket. */
+  async resolveEndpoint(signal?: AbortSignal): Promise<AftRpcEndpoint | null> {
+    const [info] = await this.resolvePortInfos(signal);
+    if (!info) return null;
+    return { port: info.port, token: info.token };
   }
 
   /**
