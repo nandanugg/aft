@@ -932,9 +932,6 @@ export function migrateAftConfigFile(
   }
 }
 
-// JSONC parsing via comment-json (bundled at build time).
-// Preserves comments during round-trip in tui-config.ts.
-
 // ---------------------------------------------------------------------------
 // Partial parse (valid sections survive, invalid sections are skipped)
 // ---------------------------------------------------------------------------

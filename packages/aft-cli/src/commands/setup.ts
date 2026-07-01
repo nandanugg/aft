@@ -41,6 +41,18 @@ export async function runSetup(argv: string[]): Promise<number> {
         log.info(`${adapter.displayName}: ${result.message}`);
     }
 
+    // OpenCode's TUI sidebar plugin lives in tui.json(c). Registered here (and
+    // in doctor --fix) ONLY — the runtime plugin never injects it, so a user
+    // who removes the entry stays removed across launches.
+    if (adapter.ensureTuiPluginEntry) {
+      const tuiResult = await adapter.ensureTuiPluginEntry();
+      if (!tuiResult.ok) {
+        log.warn(`${adapter.displayName}: ${tuiResult.message}`);
+      } else if (tuiResult.action === "added" || tuiResult.action === "updated") {
+        log.success(`${adapter.displayName}: ${tuiResult.message}`);
+      }
+    }
+
     // Ensure aft.jsonc has $schema pointing at the generated JSON Schema so
     // editors get autocomplete + validation for AFT config fields.
     try {

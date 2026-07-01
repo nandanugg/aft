@@ -74,6 +74,14 @@ export interface HarnessAdapter {
    */
   ensurePluginEntry(): Promise<PluginEntryResult>;
 
+  /**
+   * Optional TUI-surface registration (OpenCode's tui.json(c) sidebar plugin).
+   * Registration is setup/doctor-owned: the runtime plugin must never inject
+   * this entry itself, so removing the entry stays removed across launches.
+   */
+  hasTuiPluginEntry?(): boolean;
+  ensureTuiPluginEntry?(): Promise<PluginEntryResult>;
+
   getPluginCacheInfo(): PluginCacheInfo;
   getStorageDir(): string;
   getLogFile(): string;

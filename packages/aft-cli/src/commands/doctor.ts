@@ -543,6 +543,17 @@ export function buildDoctorFixPlan(
     }
   }
 
+  for (const harness of report.harnesses) {
+    const adapter = adaptersByKind.get(harness.kind);
+    if (!adapter || !harness.hostInstalled) continue;
+    if (!adapter.ensureTuiPluginEntry || !adapter.hasTuiPluginEntry) continue;
+    if (adapter.hasTuiPluginEntry()) continue;
+    items.push({
+      kind: "plugin",
+      message: `Will add ${adapter.pluginEntryWithVersion} to ${harness.configPaths.tuiConfig} (TUI sidebar)`,
+    });
+  }
+
   for (const target of findPluginUpdateTargets(adapters, report)) {
     items.push({
       kind: "plugin-update",
@@ -886,12 +897,23 @@ export async function fixPluginEntries(adapters: HarnessAdapter[]): Promise<void
 }
 
 async function maybeFixPlugin(adapter: HarnessAdapter): Promise<void> {
-  if (!adapter.hasPluginEntry() && adapter.isInstalled()) {
+  if (!adapter.isInstalled()) return;
+  if (!adapter.hasPluginEntry()) {
     log.info(`${adapter.displayName}: attempting to register plugin…`);
     const r = await adapter.ensurePluginEntry();
     if (r.ok) {
       log.success(`${adapter.displayName}: ${r.message}`);
     } else {
+      log.error(`${adapter.displayName}: ${r.message}`);
+    }
+  }
+  // TUI sidebar entry (tui.json(c)) is registered only via setup/doctor — the
+  // runtime plugin never injects it, so a deliberate removal stays removed.
+  if (adapter.ensureTuiPluginEntry && adapter.hasTuiPluginEntry && !adapter.hasTuiPluginEntry()) {
+    const r = await adapter.ensureTuiPluginEntry();
+    if (r.ok && (r.action === "added" || r.action === "updated")) {
+      log.success(`${adapter.displayName}: ${r.message}`);
+    } else if (!r.ok) {
       log.error(`${adapter.displayName}: ${r.message}`);
     }
   }

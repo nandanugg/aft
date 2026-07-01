@@ -69,7 +69,6 @@ import {
   warmSessionDirectory,
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
-import { ensureTuiPluginEntry } from "./shared/tui-config.js";
 import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
@@ -813,12 +812,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   });
 
   rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
-
-  try {
-    ensureTuiPluginEntry();
-  } catch {
-    // Best-effort only
-  }
 
   // --- Startup notifications (fire-and-forget, best-effort) ---
   const notifyOpts: NotificationOptions = {

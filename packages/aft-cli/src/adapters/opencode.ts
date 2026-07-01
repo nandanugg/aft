@@ -261,6 +261,75 @@ export class OpenCodeAdapter implements HarnessAdapter {
     };
   }
 
+  hasTuiPluginEntry(): boolean {
+    const paths = this.detectConfigPaths();
+    if (!paths.tuiConfig) return false;
+    const { value } = readJsoncFile(paths.tuiConfig);
+    const plugins = Array.isArray(value?.plugin) ? value.plugin : [];
+    return plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
+  }
+
+  /**
+   * Register the TUI sidebar plugin in tui.json(c). Only setup/doctor call
+   * this: the plugin itself must never auto-inject the entry at load time,
+   * because that silently undoes a user's deliberate removal on every launch.
+   */
+  async ensureTuiPluginEntry(): Promise<PluginEntryResult> {
+    const paths = this.detectConfigPaths();
+    const configPath = paths.tuiConfig;
+    if (!configPath) {
+      return {
+        ok: false,
+        action: "error",
+        message: "No TUI config path detected",
+        configPath: paths.configDir,
+      };
+    }
+
+    if (paths.tuiConfigFormat === "none") {
+      writeJsoncFile(configPath, { plugin: [PLUGIN_ENTRY] }, "json");
+      return {
+        ok: true,
+        action: "added",
+        message: `Created ${configPath} and added ${PLUGIN_ENTRY} (TUI sidebar)`,
+        configPath,
+      };
+    }
+
+    const { value, error } = readJsoncFile(configPath);
+    if (error || !value) {
+      return {
+        ok: false,
+        action: "error",
+        message: `Could not parse ${configPath}: ${error ?? "unknown error"}`,
+        configPath,
+      };
+    }
+
+    const plugins = Array.isArray(value.plugin) ? value.plugin : [];
+    const already = plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
+    if (already) {
+      return {
+        ok: true,
+        action: "already_present",
+        message: `${PLUGIN_NAME} is already registered in ${configPath}`,
+        configPath,
+      };
+    }
+
+    plugins.push(PLUGIN_ENTRY);
+    // Mutate in place so comment-json keeps symbol-keyed comment metadata on
+    // the parsed object. Spreading into a fresh literal drops JSONC comments.
+    value.plugin = plugins;
+    writeJsoncFile(configPath, value, paths.tuiConfigFormat);
+    return {
+      ok: true,
+      action: "added",
+      message: `Added ${PLUGIN_ENTRY} to ${configPath} (TUI sidebar)`,
+      configPath,
+    };
+  }
+
   getPluginCacheInfo(): PluginCacheInfo {
     const path = join(getOpenCodeCacheDir(), "packages", PLUGIN_ENTRY);
     let cached: string | undefined;
