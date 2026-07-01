@@ -44,6 +44,28 @@ export function coerceStringArray(value: unknown): string[] {
 }
 
 /**
+ * Coerce a string param that has a compatibility alias in another harness.
+ *
+ * Models cross-pollinate tool schemas between hosts (e.g. sending `filePath` to
+ * Pi's `read`, whose schema field is `path`). Use this at the tool boundary to
+ * accept the alias only when the declared field is absent.
+ *
+ * Conservative by design:
+ *  - if the declared field is present, its value wins unchanged — even if it is
+ *    malformed or empty. We never override an explicit schema field.
+ *  - the alias is accepted only when it is a non-empty string after trimming.
+ *    The original alias text is returned unchanged so paths containing spaces are
+ *    preserved byte-for-byte.
+ */
+export function coerceAliasedStringParam(value: unknown, aliasValue: unknown): string | undefined {
+  if (value !== undefined) {
+    return typeof value === "string" ? value : undefined;
+  }
+  if (typeof aliasValue !== "string") return undefined;
+  return aliasValue.trim().length > 0 ? aliasValue : undefined;
+}
+
+/**
  * Coerce a polymorphic `string | string[]` tool argument (e.g. aft_outline's
  * `target`, which is a single path/URL OR an array of paths). Hosts deliver an
  * array as a JSON-stringified string (`'["a","b"]'`) despite the declared union,

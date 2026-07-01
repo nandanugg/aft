@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { coerceBoolean, coerceStringArray, coerceTargetParam } from "../coerce.js";
+import {
+  coerceAliasedStringParam,
+  coerceBoolean,
+  coerceStringArray,
+  coerceTargetParam,
+} from "../coerce.js";
 
 describe("coerceTargetParam", () => {
   test("passes a single path/URL string through unchanged", () => {
@@ -22,6 +27,29 @@ describe("coerceTargetParam", () => {
     expect(coerceTargetParam("[not json")).toBe("[not json");
     // A path that merely contains brackets but isn't a JSON array stays a string.
     expect(coerceTargetParam("weird[name].ts")).toBe("weird[name].ts");
+  });
+});
+
+describe("coerceAliasedStringParam", () => {
+  test("uses the declared field when it is already present", () => {
+    expect(coerceAliasedStringParam("path.ts", "alias.ts")).toBe("path.ts");
+    expect(coerceAliasedStringParam("", "alias.ts")).toBe("");
+  });
+
+  test("falls back to a non-empty alias only when the declared field is absent", () => {
+    expect(coerceAliasedStringParam(undefined, "alias.ts")).toBe("alias.ts");
+    expect(coerceAliasedStringParam(undefined, "  spaced path.ts  ")).toBe("  spaced path.ts  ");
+  });
+
+  test("does not let an alias override an explicit malformed field", () => {
+    expect(coerceAliasedStringParam(123, "alias.ts")).toBeUndefined();
+    expect(coerceAliasedStringParam(null, "alias.ts")).toBeUndefined();
+  });
+
+  test("ignores empty and non-string aliases", () => {
+    expect(coerceAliasedStringParam(undefined, "")).toBeUndefined();
+    expect(coerceAliasedStringParam(undefined, "   ")).toBeUndefined();
+    expect(coerceAliasedStringParam(undefined, 7)).toBeUndefined();
   });
 });
 

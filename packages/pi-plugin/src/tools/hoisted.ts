@@ -21,6 +21,7 @@ import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  coerceAliasedStringParam,
   coerceBoolean,
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
@@ -248,38 +249,108 @@ export async function assertExternalDirectoryPermission(
   );
 }
 
-const ReadParams = Type.Object({
-  path: Type.String({
-    description: "Path to the file to read (absolute or relative to project root)",
-  }),
-  offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
-  limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
-});
-
-const WriteParams = Type.Object({
-  filePath: Type.String({
-    description: "Path to the file to write (absolute or relative to project root)",
-  }),
-  content: Type.String({ description: "Full file contents to write" }),
-});
-
-const EditParams = Type.Object({
-  filePath: Type.String({
-    description: "Path to the file to edit (absolute or relative to project root)",
-  }),
-  oldString: Type.Optional(
-    Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
-  ),
-  newString: Type.Optional(Type.String({ description: "Replacement text (omit to delete match)" })),
-  replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
-  occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
-  appendContent: Type.Optional(
-    Type.String({
-      description:
-        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
+const ReadParams = Type.Union([
+  Type.Object({
+    path: Type.String({
+      description: "Path to the file to read (absolute or relative to project root)",
     }),
-  ),
-});
+    filePath: Type.Optional(
+      Type.String({
+        description: "Compatibility alias for `path`. Used only when `path` is absent.",
+      }),
+    ),
+    offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
+    limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  }),
+  Type.Object({
+    path: Type.Optional(
+      Type.String({
+        description: "Path to the file to read (absolute or relative to project root)",
+      }),
+    ),
+    filePath: Type.String({
+      description: "Compatibility alias for `path`. Used only when `path` is absent.",
+    }),
+    offset: optionalInt(1, Number.MAX_SAFE_INTEGER),
+    limit: optionalInt(1, Number.MAX_SAFE_INTEGER),
+  }),
+]);
+
+const WriteParams = Type.Union([
+  Type.Object({
+    filePath: Type.String({
+      description: "Path to the file to write (absolute or relative to project root)",
+    }),
+    path: Type.Optional(
+      Type.String({
+        description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
+      }),
+    ),
+    content: Type.String({ description: "Full file contents to write" }),
+  }),
+  Type.Object({
+    filePath: Type.Optional(
+      Type.String({
+        description: "Path to the file to write (absolute or relative to project root)",
+      }),
+    ),
+    path: Type.String({
+      description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
+    }),
+    content: Type.String({ description: "Full file contents to write" }),
+  }),
+]);
+
+const EditParams = Type.Union([
+  Type.Object({
+    filePath: Type.String({
+      description: "Path to the file to edit (absolute or relative to project root)",
+    }),
+    path: Type.Optional(
+      Type.String({
+        description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
+      }),
+    ),
+    oldString: Type.Optional(
+      Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
+    ),
+    newString: Type.Optional(
+      Type.String({ description: "Replacement text (omit to delete match)" }),
+    ),
+    replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
+    occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
+    appendContent: Type.Optional(
+      Type.String({
+        description:
+          "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
+      }),
+    ),
+  }),
+  Type.Object({
+    filePath: Type.Optional(
+      Type.String({
+        description: "Path to the file to edit (absolute or relative to project root)",
+      }),
+    ),
+    path: Type.String({
+      description: "Compatibility alias for `filePath`. Used only when `filePath` is absent.",
+    }),
+    oldString: Type.Optional(
+      Type.String({ description: "Text to find (exact match, fuzzy fallback)" }),
+    ),
+    newString: Type.Optional(
+      Type.String({ description: "Replacement text (omit to delete match)" }),
+    ),
+    replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence" })),
+    occurrence: optionalInt(0, Number.MAX_SAFE_INTEGER),
+    appendContent: Type.Optional(
+      Type.String({
+        description:
+          "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
+      }),
+    ),
+  }),
+]);
 
 const GrepParams = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for" }),
@@ -354,6 +425,28 @@ interface FileMutationDetails {
   noOp?: boolean;
 }
 
+function readPathArg(args: { path?: unknown; filePath?: unknown }): string | undefined {
+  return coerceAliasedStringParam(args.path, args.filePath);
+}
+
+function mutationFilePathArg(args: { filePath?: unknown; path?: unknown }): string | undefined {
+  return coerceAliasedStringParam(args.filePath, args.path);
+}
+
+function renderReadCall(
+  args: { path?: unknown; filePath?: unknown } | undefined,
+  theme: Theme,
+  context: RenderContextLike,
+): Text {
+  const text = reuseText(context.lastComponent);
+  const filePath = args ? readPathArg(args) : undefined;
+  const pathDisplay = filePath
+    ? theme.fg("accent", shortenPath(filePath))
+    : theme.fg("toolOutput", "...");
+  text.setText(`${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}`);
+  return text;
+}
+
 export function registerHoistedTools(
   pi: ExtensionAPI,
   ctx: PluginContext,
@@ -376,16 +469,20 @@ export function registerHoistedTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
+        const pathArg = readPathArg(params);
+        if (typeof pathArg !== "string") {
+          throw new Error("read: missing required `path`");
+        }
         const offset = coerceOptionalInt(params.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
         const limit = coerceOptionalInt(params.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
         // Resolve ~ / relative once and use the same value for the permission
         // check and the bridge. Without this, hoisted read bypassed Pi's
         // external-path prompt/deny layer while write/edit/grep were guarded.
-        const filePath = await resolvePathArg(extCtx.cwd, params.path);
+        const filePath = await resolvePathArg(extCtx.cwd, pathArg);
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
-        const rawArgs: Record<string, unknown> = { filePath: params.path };
+        const rawArgs: Record<string, unknown> = { filePath: pathArg };
         if (offset !== undefined) rawArgs.offset = offset;
         if (limit !== undefined) rawArgs.limit = limit;
         const response = await callToolCall(bridge, "read", rawArgs, extCtx);
@@ -420,6 +517,9 @@ export function registerHoistedTools(
         }
         return textResult(agentText, response);
       },
+      renderCall(args, theme, context) {
+        return renderReadCall(args, theme, context);
+      },
     });
   }
 
@@ -442,16 +542,20 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
+        const filePathArg = mutationFilePathArg(params);
+        if (typeof filePathArg !== "string") {
+          throw new Error("write: missing required `filePath`");
+        }
         // Resolve ~ and relative paths before the permission check. Pass the
         // original filePath string in the request so the path the agent
         // receives stays exactly as provided.
-        const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+        const filePath = await resolvePathArg(extCtx.cwd, filePathArg);
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const rawArgs: Record<string, unknown> = {
-          filePath: params.filePath,
+          filePath: filePathArg,
           content: params.content,
         };
         const preview = await callToolCall(bridge, "write", rawArgs, extCtx, { preview: true });
@@ -466,7 +570,7 @@ export function registerHoistedTools(
         return buildMutationResult(response);
       },
       renderCall(args, theme, context) {
-        return renderMutationCall("write", args?.filePath, theme, context);
+        return renderMutationCall("write", mutationFilePathArg(args ?? {}), theme, context);
       },
       renderResult(result, _options, theme, context) {
         return renderMutationResult(result, theme, context);
@@ -495,15 +599,19 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
+        const filePathArg = mutationFilePathArg(params);
+        if (typeof filePathArg !== "string") {
+          throw new Error("edit: missing required `filePath`");
+        }
         // Resolve ~ and relative paths before the permission check. Pass the
         // original filePath string in the request so the path the agent
         // receives stays exactly as provided.
-        const filePath = await resolvePathArg(extCtx.cwd, params.filePath);
+        const filePath = await resolvePathArg(extCtx.cwd, filePathArg);
         await assertExternalDirectoryPermission(extCtx, filePath, {
           restrictToProjectRoot: surface.restrictToProjectRoot,
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const rawArgs: Record<string, unknown> = { filePath: params.filePath };
+        const rawArgs: Record<string, unknown> = { filePath: filePathArg };
         for (const key of ["appendContent", "oldString", "newString"] as const) {
           if (params[key] !== undefined) rawArgs[key] = params[key];
         }
@@ -529,7 +637,7 @@ export function registerHoistedTools(
         return buildMutationResult(response);
       },
       renderCall(args, theme, context) {
-        return renderMutationCall("edit", args?.filePath, theme, context);
+        return renderMutationCall("edit", mutationFilePathArg(args ?? {}), theme, context);
       },
       renderResult(result, _options, theme, context) {
         return renderMutationResult(result, theme, context);

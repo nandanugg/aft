@@ -44,6 +44,7 @@ export {
 export type { CallgraphFormatOptions, CallgraphTheme } from "./callgraph-format.js";
 export { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "./callgraph-format.js";
 export {
+  coerceAliasedStringParam,
   coerceBoolean,
   coerceOptionalInt,
   coerceStringArray,

@@ -8,6 +8,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { formatReadFooter, registerHoistedTools } from "../tools/hoisted.js";
 import {
   executeTool,
@@ -28,6 +30,22 @@ async function tempRoot(): Promise<string> {
 
 function toolArgs(call: { params: Record<string, unknown> }): Record<string, unknown> {
   return call.params.arguments as Record<string, unknown>;
+}
+
+function schemaAccepts(schema: unknown, value: unknown): boolean {
+  return Value.Check(schema as TSchema, value);
+}
+
+function schemaVariants(schema: unknown): Array<{ properties?: Record<string, unknown> }> {
+  const record = schema as {
+    properties?: Record<string, unknown>;
+    anyOf?: Array<{ properties?: Record<string, unknown> }>;
+  };
+  return record.anyOf ?? [record];
+}
+
+function schemaHasProperty(schema: unknown, property: string): boolean {
+  return schemaVariants(schema).some((variant) => variant.properties?.[property] !== undefined);
 }
 
 afterEach(async () => {
@@ -71,6 +89,32 @@ describe("hoisted tool adapters", () => {
       content: Array<{ text: string }>;
     };
     expect(unbounded.content[0].text).toContain("Showing lines 1-2 of 10");
+  });
+
+  test("read accepts filePath as a compatibility alias without overriding path", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: true,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+    const readTool = tools.get("read")!;
+
+    expect(schemaAccepts(readTool.parameters, { filePath: "alias.ts" })).toBe(true);
+    await executeTool(readTool, { filePath: "alias.ts" });
+    expect(toolArgs(calls[0])).toEqual({ filePath: "alias.ts" });
+
+    expect(schemaAccepts(readTool.parameters, { path: "canonical.ts", filePath: "alias.ts" })).toBe(
+      true,
+    );
+    await executeTool(readTool, { path: "canonical.ts", filePath: "alias.ts" });
+    expect(toolArgs(calls[1])).toEqual({ filePath: "canonical.ts" });
+
+    expect(schemaAccepts(readTool.parameters, {})).toBe(false);
+    await expect(executeTool(readTool, {})).rejects.toThrow("missing required `path`");
   });
 
   test("read emits image content for vision-capable Pi models", async () => {
@@ -206,6 +250,64 @@ describe("hoisted tool adapters", () => {
       newString: "ignored",
       appendContent: "\nnext",
     });
+  });
+
+  test("edit accepts path as a compatibility alias without overriding filePath", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+    const editTool = tools.get("edit")!;
+
+    expect(
+      schemaAccepts(editTool.parameters, {
+        path: "alias.ts",
+        oldString: "before",
+        newString: "after",
+      }),
+    ).toBe(true);
+    await executeTool(editTool, {
+      path: "alias.ts",
+      oldString: "before",
+      newString: "after",
+    });
+    expect(toolArgs(calls[1])).toEqual({
+      filePath: "alias.ts",
+      oldString: "before",
+      newString: "after",
+    });
+
+    expect(
+      schemaAccepts(editTool.parameters, {
+        filePath: "canonical.ts",
+        path: "alias.ts",
+        oldString: "before",
+        newString: "after",
+      }),
+    ).toBe(true);
+    await executeTool(editTool, {
+      filePath: "canonical.ts",
+      path: "alias.ts",
+      oldString: "before",
+      newString: "after",
+    });
+    expect(toolArgs(calls[3])).toEqual({
+      filePath: "canonical.ts",
+      oldString: "before",
+      newString: "after",
+    });
+
+    expect(schemaAccepts(editTool.parameters, { oldString: "before", newString: "after" })).toBe(
+      false,
+    );
+    await expect(
+      executeTool(editTool, { oldString: "before", newString: "after" }),
+    ).rejects.toThrow("missing required `filePath`");
   });
 
   test("edit defaults diagnostics off and omits LSP payload", async () => {
@@ -481,6 +583,38 @@ describe("hoisted tool adapters", () => {
     expect(result.details.diagnostics).toBeUndefined();
   });
 
+  test("write accepts path as a compatibility alias without overriding filePath", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+    const writeTool = tools.get("write")!;
+
+    expect(schemaAccepts(writeTool.parameters, { path: "alias.ts", content: "x" })).toBe(true);
+    await executeTool(writeTool, { path: "alias.ts", content: "x" });
+    expect(toolArgs(calls[1])).toEqual({ filePath: "alias.ts", content: "x" });
+
+    expect(
+      schemaAccepts(writeTool.parameters, {
+        filePath: "canonical.ts",
+        path: "alias.ts",
+        content: "x",
+      }),
+    ).toBe(true);
+    await executeTool(writeTool, { filePath: "canonical.ts", path: "alias.ts", content: "x" });
+    expect(toolArgs(calls[3])).toEqual({ filePath: "canonical.ts", content: "x" });
+
+    expect(schemaAccepts(writeTool.parameters, { content: "x" })).toBe(false);
+    await expect(executeTool(writeTool, { content: "x" })).rejects.toThrow(
+      "missing required `filePath`",
+    );
+  });
+
   test("write follows lsp.diagnostics_on_edit (config-driven; no per-call param)", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
@@ -558,12 +692,8 @@ describe("hoisted tool adapters", () => {
 
     // Removed deliberately: agents never used it; diagnostics are the status
     // bar (passive) + aft_inspect (pull) + the lsp.diagnostics_on_edit config.
-    const writeProps = (tools.get("write")!.parameters as { properties: Record<string, unknown> })
-      .properties;
-    const editProps = (tools.get("edit")!.parameters as { properties: Record<string, unknown> })
-      .properties;
-    expect(writeProps.diagnostics).toBeUndefined();
-    expect(editProps.diagnostics).toBeUndefined();
+    expect(schemaHasProperty(tools.get("write")!.parameters, "diagnostics")).toBe(false);
+    expect(schemaHasProperty(tools.get("edit")!.parameters, "diagnostics")).toBe(false);
   });
 
   test("restrict=true hard-blocks external write (no prompt) before the bridge", async () => {
