@@ -19,6 +19,7 @@ import {
   type StatusCompression,
 } from "../shared/status";
 import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
+import { badgeTextColor } from "./badge-contrast";
 import {
   createDebouncedStatusRefresh,
   refreshAftTuiSocketScope,
@@ -592,7 +593,7 @@ const SidebarContent = (props: {
           {/* Triangle lives inside the accent badge so the toggle reads as one
               unit: "▶ AFT" / "▼ AFT". Hidden pre-init (nothing to collapse). */}
           <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
-            <text fg={props.theme.background}>
+            <text fg={badgeTextColor(props.theme.accent, props.theme.background)}>
               <b>
                 {notInitialized() ? "" : collapsed() ? "▶ " : "▼ "}
                 {prefs().header.label}
@@ -606,7 +607,7 @@ const SidebarContent = (props: {
               marginLeft={1}
               backgroundColor={props.theme.warning}
             >
-              <text fg={props.theme.background}>
+              <text fg={badgeTextColor(props.theme.warning, props.theme.background)}>
                 <b>DEGRADED</b>
               </text>
             </box>
