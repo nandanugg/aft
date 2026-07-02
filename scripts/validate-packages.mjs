@@ -207,12 +207,16 @@ if (cli) {
 // --- Publish-safety: no unpublishable protocols in published `dependencies` ---
 //
 // Published packages must never carry a `file:`/`workspace:`/`link:` dependency
-// or an unpublished internal source dep (e.g. @cortexkit/subc-client) in their
-// runtime `dependencies` — npm consumers would fail to install it. Such deps are
-// allowed ONLY as devDependencies (bundled into the dist at the consumer's build
-// time). aft-bridge depends on @cortexkit/subc-client this way for the subc
-// transport: it is a path devDependency that `bun build` inlines into each
-// published plugin dist, never a published runtime dependency.
+// in their runtime `dependencies` — npm consumers would fail to install it.
+//
+// @cortexkit/subc-client history: while it was an UNPUBLISHED path dep it had to
+// stay a devDependency (bundled into plugin dists). Now that it is published to
+// npm, aft-bridge declares it as a regular runtime dependency — REQUIRED because
+// aft-bridge's own published dist is built with tsc (no bundling): dist/
+// subc-transport.js carries a bare `from "@cortexkit/subc-client"` import that
+// consumers resolving the published aft-bridge (e.g. the raw-TSX TUI sidebar
+// under the OpenCode host) must be able to install. Shipping it as a devDep
+// broke the v0.43.0 TUI sidebar with a silent MODULE_NOT_FOUND.
 for (const { label, pkg } of [
   { label: "@cortexkit/aft-bridge", pkg: bridge },
   { label: "@cortexkit/aft-opencode", pkg: core },
@@ -228,12 +232,28 @@ for (const { label, pkg } of [
         `dependencies['${depName}'] uses unpublishable protocol '${depSpec}' (move to devDependencies + bundle)`,
       );
     }
-    if (depName === "@cortexkit/subc-client") {
-      fail(
-        label,
-        "@cortexkit/subc-client must be a devDependency (bundled), never a published runtime dependency",
-      );
-    }
+  }
+}
+
+// aft-bridge's published dist REQUIRES subc-client at runtime (bare import in
+// dist/subc-transport.js — tsc build, nothing inlined). Guard the dependency
+// direction so it can never silently regress to a devDep again.
+{
+  const deps = (bridge && bridge.dependencies) || {};
+  if (!deps["@cortexkit/subc-client"]) {
+    fail(
+      "@cortexkit/aft-bridge",
+      "@cortexkit/subc-client must be a runtime dependency: dist/subc-transport.js imports it bare (tsc build, not bundled) and consumers of the published package fail to resolve it otherwise",
+    );
+  }
+  if (
+    deps["@cortexkit/subc-client"] &&
+    /^(file:|workspace:|link:)/.test(deps["@cortexkit/subc-client"])
+  ) {
+    fail(
+      "@cortexkit/aft-bridge",
+      "@cortexkit/subc-client dependency must reference the published npm version, never a local path",
+    );
   }
 }
 
