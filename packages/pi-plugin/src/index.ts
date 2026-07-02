@@ -189,11 +189,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.42.0";
+const ANNOUNCEMENT_VERSION = "0.43.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Navigation and search tools now return leaner output: aft_zoom on a large class/struct returns a member menu instead of the whole body, aft_callgraph collapses standard-library noise, and aft_search expands only the top match within a budget — substantially less context per call, same answers.",
-  "Backups behind aft_safety undo are now configurable (backup.enabled, max_depth, max_file_size), and edits are faster (one appended snapshot instead of rewriting the whole stack).",
-  "Editing Rust code with &raw and files whose paths contain [brackets] or {braces} (e.g. Next.js dynamic routes) no longer fails.",
+  "Model compatibility: read/write/edit now accept filePath as an alias for path, so models that mix the two up no longer fail validation.",
+  'New enabled config toggle: set "enabled": false in a project\'s .cortexkit/aft.jsonc (or your user config) to turn AFT off there entirely.',
+  "Bash compression honesty fix: empty successful output stays empty instead of being replaced with synthesized text like 'kubectl: no resources found'.",
 ];
 
 /**

@@ -200,11 +200,12 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.42.0";
+const ANNOUNCEMENT_VERSION = "0.43.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Navigation and search tools now return leaner output: aft_zoom on a large class/struct returns a member menu instead of the whole body, aft_callgraph collapses standard-library noise, and aft_search expands only the top match within a budget — substantially less context per call, same answers.",
-  "Backups behind aft_safety undo are now configurable (backup.enabled, max_depth, max_file_size), and edits are faster (one appended snapshot instead of rewriting the whole stack).",
-  "Editing Rust code with &raw and files whose paths contain [brackets] or {braces} (e.g. Next.js dynamic routes) no longer fails.",
+  "Fewer permission prompts: system temp paths (/tmp and friends) no longer trigger external-directory asks, and aft_search now has its own permission id so a grep deny rule can't block it.",
+  'New enabled config toggle: set "enabled": false in a project\'s .cortexkit/aft.jsonc (or your user config) to turn AFT off there entirely.',
+  "Bash compression honesty fix: empty successful output stays empty instead of being replaced with synthesized text like 'kubectl: no resources found'.",
+  "TUI sidebar now updates over a push channel instead of polling (lower idle CPU), and AFT no longer re-adds itself to tui.json if you remove it (aft setup re-registers).",
 ];
 
 /**
