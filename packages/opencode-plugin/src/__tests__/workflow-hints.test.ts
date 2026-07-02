@@ -47,7 +47,8 @@ describe("buildWorkflowHints", () => {
     // only for when there's other work to overlap, and background-then-watch is
     // called out as the anti-pattern it is.
     expect(out).toContain("run them in the FOREGROUND");
-    expect(out).toContain("auto-promotes to background");
+    expect(out).toContain("wait: true");
+    expect(out).toContain("auto-promote can hand you a reminder");
     expect(out).toContain("`background: true` is ONLY for when you have OTHER useful work");
     expect(out).toContain("Do NOT background a command and then immediately `bash_watch` it");
     expect(out).toContain("the user can interrupt");

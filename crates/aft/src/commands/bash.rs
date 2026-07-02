@@ -44,6 +44,8 @@ struct BashParams {
     #[serde(default)]
     background: bool,
     #[serde(default)]
+    wait: bool,
+    #[serde(default)]
     pty: bool,
     #[serde(default)]
     pty_rows: Option<u16>,
@@ -91,6 +93,21 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     //      rejecting agent calls that defensively include the params
     // Bounds validation (1..60 rows, 1..140 cols) still applies via
     // `validate_pty_dimensions` below.
+
+    if params.wait && params.pty {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+        );
+    }
+    if params.wait && params.background {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "bash: wait:true cannot be used with background:true",
+        );
+    }
 
     if let Err(message) = validate_pty_dimensions(params.pty_rows, params.pty_cols) {
         return Response::error(&req.id, "invalid_request", message);

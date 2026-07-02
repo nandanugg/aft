@@ -26,6 +26,10 @@
         "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
         "type": "string"
       },
+      "wait": {
+        "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout. Use only when you know the result is required before doing anything else.",
+        "type": "boolean"
+      },
       "background": {
         "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
         "type": "boolean"

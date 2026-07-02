@@ -192,6 +192,58 @@ fn agent_supplied_argument_preview_is_ignored_and_normal_tool_call_mutates() {
     assert!(status.success());
 }
 
+#[test]
+fn tool_call_bash_wait_rejects_stringified_background_and_pty() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let background = send_tool_call(
+        &mut aft,
+        "bash-wait-background-reject",
+        "bash",
+        json!({
+            "command": "echo should-not-run",
+            "wait": "true",
+            "background": "true",
+        }),
+        false,
+    );
+    assert_eq!(background["success"], false, "response: {background:#}");
+    assert_eq!(background["code"], "invalid_request");
+    assert!(background["message"]
+        .as_str()
+        .unwrap()
+        .contains("wait:true cannot be used with background:true"));
+
+    let pty = send_tool_call(
+        &mut aft,
+        "bash-wait-pty-reject",
+        "bash",
+        json!({
+            "command": "echo should-not-run",
+            "wait": "true",
+            "pty": "true",
+        }),
+        false,
+    );
+    assert_eq!(pty["success"], false, "response: {pty:#}");
+    assert_eq!(pty["code"], "invalid_request");
+    assert!(pty["message"]
+        .as_str()
+        .unwrap()
+        .contains("wait:true cannot be used with pty:true"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 fn assert_preview_does_not_mutate(
     aft: &mut AftProcess,
     label: &str,

@@ -1565,6 +1565,38 @@ fn subc_bridge_bash_block_to_completion_waits_for_terminal() {
 }
 
 #[test]
+fn subc_bridge_bash_wait_true_waits_for_terminal() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_wait_true_waits_for_terminal",
+        Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(100)],
+        drive_bash_wait_true_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_wait_true_honors_short_timeout() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_wait_true_honors_short_timeout",
+        Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(5_000)],
+        drive_bash_wait_timeout_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_wait_rejects_background_and_pty() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_wait_rejects_background_and_pty",
+        Duration::from_secs(30),
+        drive_bash_wait_rejection_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_background_returns_launch_text() {
     run_subc_bridge_test(
         "subc_bridge_bash_background_returns_launch_text",
@@ -2151,6 +2183,121 @@ async fn drive_bash_block_to_completion_daemon(input: FakeDaemonInput) {
         "unexpected bash text: {text:?}"
     );
     assert!(!text.contains("promoted to background"));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let started = Instant::now();
+    send_tool_call(
+        &mut stream,
+        1,
+        117,
+        "bash",
+        json!({
+            "command": "sleep 1; printf 'wait-done\\n'",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "timeout": 5_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "wait:true bash response").await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "wait:true returned too early after {elapsed:?}"
+    );
+    assert_eq!(frame.header.corr, 117);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(text.contains("wait-done"), "unexpected bash text: {text:?}");
+    assert!(!text.contains("promoted to background"));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_wait_timeout_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        118,
+        "bash",
+        json!({
+            "command": "sleep 2; printf 'too-late\\n'",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "timeout": 200,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "wait:true timed-out bash response").await;
+    assert_eq!(frame.header.corr, 118);
+    assert!(!tool_result_is_error(&frame));
+    let text = tool_result_text(&frame);
+    assert!(
+        text.contains("[command timed out]"),
+        "expected timeout marker, got {text:?}"
+    );
+    assert!(!text.contains("promoted to background"));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_wait_rejection_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        119,
+        "bash",
+        json!({
+            "command": "echo should-not-run",
+            "wait": "true",
+            "background": "true",
+        }),
+    )
+    .await;
+    let background = read_frame_timeout(&mut stream, "wait+background rejection").await;
+    assert_eq!(background.header.corr, 119);
+    assert!(tool_result_is_error(&background));
+    let text = tool_result_text(&background);
+    assert!(
+        text.contains("wait:true cannot be used with background:true"),
+        "unexpected rejection text: {text:?}"
+    );
+
+    send_tool_call(
+        &mut stream,
+        1,
+        120,
+        "bash",
+        json!({
+            "command": "echo should-not-run",
+            "wait": "true",
+            "pty": "true",
+        }),
+    )
+    .await;
+    let pty = read_frame_timeout(&mut stream, "wait+pty rejection").await;
+    assert_eq!(pty.header.corr, 120);
+    assert!(tool_result_is_error(&pty));
+    let text = tool_result_text(&pty);
+    assert!(
+        text.contains("wait:true cannot be used with pty:true"),
+        "unexpected rejection text: {text:?}"
+    );
+
     send_connection_goodbye(&mut stream).await;
 }
 

@@ -160,6 +160,104 @@ fn orchestrated_block_to_completion_does_not_promote() {
 }
 
 #[test]
+fn orchestrated_wait_true_does_not_promote() {
+    let mut aft = spawn_with_wait("100");
+    let started = Instant::now();
+
+    let response = aft.send(&bash_request(
+        "bash-wait-orchestrated",
+        json!({
+            "command": "sleep 1; printf 'wait-done\\n'",
+            "timeout": 3_000,
+            "foreground_orchestrate": true,
+            "wait": true,
+        }),
+    ));
+
+    assert_eq!(response["success"], true, "response: {response:?}");
+    assert_eq!(response["status"], "completed", "response: {response:?}");
+    assert!(response["output"].as_str().unwrap().contains("wait-done"));
+    assert!(!response["output"]
+        .as_str()
+        .unwrap()
+        .contains("promoted to background"));
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "wait:true returned before the command could finish: {response:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn orchestrated_wait_true_honors_short_timeout() {
+    let mut aft = spawn_with_wait("5000");
+
+    let response = aft.send(&bash_request(
+        "bash-wait-timeout-orchestrated",
+        json!({
+            "command": "sleep 2; printf 'too-late\\n'",
+            "timeout": 200,
+            "foreground_orchestrate": true,
+            "wait": true,
+        }),
+    ));
+
+    assert_eq!(response["success"], true, "response: {response:?}");
+    assert_eq!(response["status"], "timed_out", "response: {response:?}");
+    assert_eq!(response["timed_out"], true, "response: {response:?}");
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .contains("[command timed out]"));
+    assert!(!response["output"]
+        .as_str()
+        .unwrap()
+        .contains("promoted to background"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn orchestrated_wait_rejects_background_and_pty() {
+    let mut aft = spawn_with_wait(SHORT_WAIT_MS);
+
+    let background = aft.send(&bash_request(
+        "bash-wait-background-reject",
+        json!({
+            "command": "echo should-not-run",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "background": true,
+        }),
+    ));
+    assert_eq!(background["success"], false, "response: {background:?}");
+    assert_eq!(background["code"], "invalid_request");
+    assert!(background["message"]
+        .as_str()
+        .unwrap()
+        .contains("wait:true cannot be used with background:true"));
+
+    let pty = aft.send(&bash_request(
+        "bash-wait-pty-reject",
+        json!({
+            "command": "echo should-not-run",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "pty": true,
+        }),
+    ));
+    assert_eq!(pty["success"], false, "response: {pty:?}");
+    assert_eq!(pty["code"], "invalid_request");
+    assert!(pty["message"]
+        .as_str()
+        .unwrap()
+        .contains("wait:true cannot be used with pty:true"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn orchestrated_background_returns_formatted_launch_immediately() {
     let mut aft = spawn_with_wait(SHORT_WAIT_MS);
     let dir = tempfile::tempdir().unwrap();

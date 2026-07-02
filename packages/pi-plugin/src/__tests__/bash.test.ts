@@ -157,7 +157,11 @@ describe("bash tool adapter", () => {
     expect(bashTool!.description).toContain("compressed");
     expect(bashTool!.description).toContain("Piped commands run verbatim");
     expect(bashTool!.description).toContain("background");
+    expect(bashTool!.description).toContain("wait: true");
     expect(bashTool!.description).toContain("bash_watch");
+    const properties = (bashTool!.parameters as { properties?: Record<string, unknown> })
+      .properties;
+    expect(properties?.wait).toBeDefined();
   });
 
   test("schema omits background and PTY params when bash.background is disabled", () => {
@@ -179,6 +183,7 @@ describe("bash tool adapter", () => {
       "timeout",
       "workdir",
       "description",
+      "wait",
       "compressed",
     ]);
     expect(properties?.background).toBeUndefined();
@@ -390,6 +395,81 @@ describe("bash tool adapter", () => {
     });
     expect(bashCall[2].keepBridgeOnTimeout).toBe(true);
     expect(bashCall[2].transportTimeoutMs).toBe(25_000);
+  });
+
+  test("wait true forwards foreground wait mode and scales transport timeout", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const calls: unknown[] = [];
+    const bridge = {
+      send: async (
+        command: string,
+        params: Record<string, unknown>,
+        options?: Record<string, unknown>,
+      ) => {
+        calls.push([command, params, options]);
+        return {
+          success: true,
+          status: "completed",
+          task_id: "task-wait",
+          exit_code: 0,
+          duration_ms: 100,
+          output: "waited",
+          truncated: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx);
+
+    const result = (await tools
+      .get("bash")!
+      .execute(
+        "test-call",
+        { command: "sleep 2", wait: "true", timeout: 250 },
+        undefined,
+        undefined,
+        { cwd: "/test" },
+      )) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toBe("waited");
+    expect(calls.map((call) => (call as [string])[0])).toEqual(["bash"]);
+    const bashCall = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
+    expect(bashCall[1]).toMatchObject({
+      wait: true,
+      block_to_completion: true,
+      timeout: 250,
+      background: false,
+      notify_on_completion: false,
+    });
+    expect(bashCall[2].transportTimeoutMs).toBe(10_250);
+  });
+
+  test("wait true rejects background and pty contradictions", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    registerBashTool(api, makeMockContext(makeMockBridge()));
+    const bashTool = tools.get("bash")!;
+
+    await expect(
+      bashTool.execute(
+        "test-call",
+        { command: "sleep 2", wait: true, background: true },
+        undefined,
+        undefined,
+        { cwd: "/test" },
+      ),
+    ).rejects.toThrow("wait:true cannot be used with background:true");
+    await expect(
+      bashTool.execute(
+        "test-call",
+        { command: "python", wait: true, pty: true },
+        undefined,
+        undefined,
+        { cwd: "/test" },
+      ),
+    ).rejects.toThrow("wait:true cannot be used with pty:true");
   });
 
   test("foreground leading grep appends aft_search hint", async () => {
@@ -1297,9 +1377,10 @@ describe("bash tool description (agent-facing wording)", () => {
 
   test("background on is foreground-first and names the background+bash_watch anti-pattern", () => {
     const on = registeredDescription(true).description;
-    // Lead with foreground-returns-inline + auto-promotion (the common case).
+    // Lead with foreground-returns-inline and the explicit wait knob for known long commands.
     expect(on).toContain("foreground");
-    expect(on).toContain("auto-promotes to background");
+    expect(on).toContain("wait: true");
+    expect(on).toContain("auto-promote can remind you while you work");
     // Demote background: true to the parallel-work-only case.
     expect(on).toContain("other useful work to do while it runs");
     // Name the exact anti-pattern this description previously caused.

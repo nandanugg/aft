@@ -69,12 +69,12 @@ const BASH_TRANSPORT_MARGIN_MS = 10_000;
 
 function orchestratedTransportTimeoutMs(
   blockToCompletion: boolean,
+  wait: boolean,
   effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
 ): number {
-  const waitBudget = blockToCompletion
-    ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS)
-    : foregroundWaitMs;
+  const waitBudget =
+    blockToCompletion || wait ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
   return waitBudget + BASH_TRANSPORT_MARGIN_MS;
 }
 
@@ -110,6 +110,12 @@ const BashBaseParams = {
     Type.String({
       description:
         "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax.",
+    }),
+  ),
+  wait: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout. Use only when you know the result is required before doing anything else.",
     }),
   ),
 };
@@ -343,7 +349,7 @@ export function registerBashTool(
     ? " Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`."
     : "";
   const tasksSentence = bashCfg.background
-    ? ' Commands run in the foreground and return inline; a long-running one auto-promotes to background and delivers a completion reminder when it finishes — so for the common "I am waiting on this result" case, just run it and wait, no flags needed. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` waits on the task (sync blocks until exit/pattern, async notifies) and `bash_status` peeks at it — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: "screen" })` plus `bash_write`.'
+    ? ' Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` waits on the task (sync blocks until exit/pattern, async notifies) and `bash_status` peeks at it — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: "screen" })` plus `bash_write`.'
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: "bash",
@@ -380,20 +386,31 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
         ? undefined
         : coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(params.compressed, true);
+      const requestedWait = coerceBoolean(params.wait);
+      const rawRequestedPty = coerceBoolean(params.pty);
+      const rawRequestedBackground = coerceBoolean(params.background);
+      if (requestedWait && rawRequestedPty) {
+        throw new Error(
+          "wait:true cannot be used with pty:true because PTY sessions run in background.",
+        );
+      }
+      if (requestedWait && rawRequestedBackground) {
+        throw new Error("wait:true cannot be used with background:true.");
+      }
       // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
-      const requestedPty = !backgroundDisabled && coerceBoolean(params.pty);
-      const effectiveBackground =
-        !backgroundDisabled && (coerceBoolean(params.background) || requestedPty);
-      const blockToCompletion = backgroundDisabled;
+      const requestedPty = !backgroundDisabled && rawRequestedPty;
+      const effectiveBackground = !backgroundDisabled && (rawRequestedBackground || requestedPty);
+      const blockToCompletion = backgroundDisabled || requestedWait;
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
       // FOREGROUND auto-promote path a `timeout` below the foreground wait
       // window is incoherent (the task would be killed before we promote it to
       // background), so treat it as unset and let the bridge apply its
-      // 30-minute default — this is the #102 fix. When background is disabled
-      // there is no promotion window, so `timeout` remains the hard cap.
+      // 30-minute default. When background is disabled,
+      // or when `wait:true` asks to block, there is no promotion window, so
+      // `timeout` remains the hard cap.
       const effectiveTimeout =
-        effectiveBackground || backgroundDisabled
+        requestedWait || effectiveBackground || backgroundDisabled
           ? timeout
           : resolveBashKillTimeout(timeout, foregroundWaitMs);
 
@@ -435,11 +452,13 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           pty_cols: ptyCols,
           foreground_orchestrate: true,
           block_to_completion: blockToCompletion,
+          wait: requestedWait,
         },
         extCtx,
         {
           transportTimeoutMs: orchestratedTransportTimeoutMs(
             blockToCompletion,
+            requestedWait,
             effectiveTimeout,
             foregroundWaitMs,
           ),

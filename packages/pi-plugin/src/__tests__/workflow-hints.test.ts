@@ -41,7 +41,8 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("**Long-running commands**");
     // Foreground-default guidance (parity with OpenCode).
     expect(out).toContain("run them in the FOREGROUND");
-    expect(out).toContain("auto-promotes to background");
+    expect(out).toContain("wait: true");
+    expect(out).toContain("auto-promote can hand you a reminder");
     expect(out).toContain("`background: true` is ONLY for when you have OTHER useful work");
     expect(out).toContain("Do NOT background a command and then immediately `bash_watch` it");
     expect(out).toContain("the user can interrupt");
@@ -149,7 +150,7 @@ describe("Pi buildHintsFromConfig", () => {
     expect(out).not.toBeNull();
     // Hoisted bash name (bash, not aft_bash) appears in the foreground-default
     // long-running guidance.
-    expect(out).toContain("`bash({ command })`");
+    expect(out).toContain("`bash({ command, wait: true })`");
     expect(out).toContain("**Codebase health & diagnostics**");
   });
 });

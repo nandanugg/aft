@@ -2598,6 +2598,7 @@ async fn handle_tool_call(
 struct BashTranslatedSettings {
     background: bool,
     pty: bool,
+    wait: bool,
     block_to_completion: bool,
     timeout: Option<u64>,
 }
@@ -2629,6 +2630,7 @@ fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashT
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pty: args.get("pty").and_then(Value::as_bool).unwrap_or(false),
+        wait: args.get("wait").and_then(Value::as_bool).unwrap_or(false),
         block_to_completion: args
             .get("block_to_completion")
             .and_then(Value::as_bool)
@@ -2860,8 +2862,10 @@ fn submit_deferred_bash(
                 }
 
                 let wait_window_ms =
-                    crate::commands::bash_orchestrate::resolve_foreground_wait_window_ms(
+                    crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
                         ctx.config().foreground_wait_window_ms,
+                        settings.timeout,
+                        settings.wait,
                     );
                 let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
                 let storage_dir =
@@ -2874,7 +2878,7 @@ fn submit_deferred_bash(
                         project_root,
                         storage_dir,
                         deadline,
-                        block_to_completion: settings.block_to_completion,
+                        block_to_completion: settings.block_to_completion || settings.wait,
                         timeout: settings.timeout,
                         wait_window_ms,
                     });

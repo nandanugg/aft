@@ -12,12 +12,14 @@ use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
 
 const TEST_FOREGROUND_WAIT_ENV: &str = "AFT_TEST_FOREGROUND_WAIT_MS";
+const DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct BashOrchestrateParams {
     foreground_orchestrate: bool,
     block_to_completion: bool,
+    wait: bool,
     background: bool,
     pty: bool,
     timeout: Option<u64>,
@@ -119,9 +121,13 @@ pub fn build_bash_outcome(
     let request_id = req.id.clone();
     let session_id = req.session().to_string();
     let attach_command = "bash".to_string();
-    let wait_window_ms = resolve_foreground_wait_window_ms(ctx.config().foreground_wait_window_ms);
+    let wait_window_ms = select_foreground_wait_window_ms(
+        ctx.config().foreground_wait_window_ms,
+        params.timeout,
+        params.wait,
+    );
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
-    let block_to_completion = params.block_to_completion;
+    let block_to_completion = params.block_to_completion || params.wait;
     let timeout = params.timeout;
     let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
     let project_root = ctx.config().project_root.clone();
@@ -307,6 +313,18 @@ pub(crate) fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
         .unwrap_or(configured)
 }
 
+pub(crate) fn select_foreground_wait_window_ms(
+    configured: u64,
+    timeout: Option<u64>,
+    wait: bool,
+) -> u64 {
+    if wait {
+        timeout.unwrap_or(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS)
+    } else {
+        resolve_foreground_wait_window_ms(configured)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +418,18 @@ mod tests {
             BashStep::Done(_) => panic!("running snapshot should not finish"),
             BashStep::Promote => panic!("block_to_completion should suppress promotion"),
         }
+    }
+
+    #[test]
+    fn select_foreground_wait_window_uses_timeout_budget_for_wait_true() {
+        assert_eq!(
+            select_foreground_wait_window_ms(8_000, Some(250), true),
+            250
+        );
+        assert_eq!(
+            select_foreground_wait_window_ms(8_000, None, true),
+            DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS
+        );
     }
 
     #[test]

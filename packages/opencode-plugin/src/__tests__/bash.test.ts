@@ -111,11 +111,13 @@ describe("OpenCode bash adapter", () => {
     expect(bash.description).toContain("compressed: false");
     expect(bash.description).toContain("Piped commands run verbatim");
     expect(bash.description).toContain("background: true");
+    expect(bash.description).toContain("wait: true");
 
     expect(safeParse(bash.args.command, "ls -la").success).toBe(true);
     expect(safeParse(bash.args.timeout, 120_000).success).toBe(true);
     expect(safeParse(bash.args.workdir, PROJECT_CWD).success).toBe(true);
     expect(safeParse(bash.args.description, "List files").success).toBe(true);
+    expect(safeParse(bash.args.wait, true).success).toBe(true);
     expect(safeParse(bash.args.background, true).success).toBe(true);
     expect(safeParse(bash.args.compressed, false).success).toBe(true);
     expect(safeParse(bash.args.ptyRows, 50).success).toBe(true);
@@ -123,6 +125,7 @@ describe("OpenCode bash adapter", () => {
 
     expect(safeParse(bash.args.command, 123).success).toBe(false);
     expect(safeParse(bash.args.timeout, "slow").success).toBe(false);
+    expect(safeParse(bash.args.wait, "true").success).toBe(false);
     expect(safeParse(bash.args.background, "yes").success).toBe(false);
     expect(safeParse(bash.args.compressed, "no").success).toBe(false);
     // optionalInt is a plain bounded `z.number().int().min(...).max(...).optional()`
@@ -158,6 +161,7 @@ describe("OpenCode bash adapter", () => {
       "timeout",
       "workdir",
       "description",
+      "wait",
       "compressed",
     ]);
     expect(bash.args.background).toBeUndefined();
@@ -551,6 +555,47 @@ describe("OpenCode bash adapter", () => {
     });
     expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
     expect(calls[0].options?.transportTimeoutMs).toBe(25_000);
+  });
+
+  test("wait true forwards foreground wait mode and scales transport timeout", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "task-wait",
+      exit_code: 0,
+      duration_ms: 100,
+      output: "waited",
+      truncated: false,
+    }));
+
+    const output = bashText(
+      await bash.execute(
+        { command: "sleep 2", wait: "true", timeout: 250 },
+        createMockSdkContext(),
+      ),
+    );
+
+    expect(output).toBe("waited");
+    expect(calls.map((call) => call.command)).toEqual(["bash"]);
+    expect(calls[0].params).toMatchObject({
+      wait: true,
+      block_to_completion: true,
+      timeout: 250,
+      background: false,
+      notify_on_completion: false,
+    });
+    expect(calls[0].options?.transportTimeoutMs).toBe(10_250);
+  });
+
+  test("wait true rejects background and pty contradictions", async () => {
+    const { tool: bash } = createHarness(() => ({ success: true, output: "" }));
+
+    await expect(
+      bash.execute({ command: "sleep 2", wait: true, background: true }, createMockSdkContext()),
+    ).rejects.toThrow("wait:true cannot be used with background:true");
+    await expect(
+      bash.execute({ command: "python", wait: true, pty: true }, createMockSdkContext()),
+    ).rejects.toThrow("wait:true cannot be used with pty:true");
   });
 
   test("foreground leading grep appends aft_search hint", async () => {
@@ -1524,9 +1569,10 @@ describe("bash tool description (agent-facing wording)", () => {
 
   test("background on is foreground-first and names the background+bash_watch anti-pattern", () => {
     const on = bashToolDescription(true, true, true);
-    // Lead with foreground-returns-inline + auto-promotion (the common case).
+    // Lead with foreground-returns-inline and the explicit wait knob for known long commands.
     expect(on).toContain("foreground");
-    expect(on).toContain("auto-promotes to background");
+    expect(on).toContain("wait: true");
+    expect(on).toContain("auto-promote can remind you while you work");
     // Demote background: true to the parallel-work-only case.
     expect(on).toContain("other useful work to do while it runs");
     // Name the exact anti-pattern this description previously caused.

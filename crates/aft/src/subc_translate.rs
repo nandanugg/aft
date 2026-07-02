@@ -268,8 +268,20 @@ fn translate_bash(args: &Value, project_root: &Path) -> Result<Translated, Trans
 
     let background = map_in.get("background").is_some_and(coerce_boolean);
     let pty = map_in.get("pty").is_some_and(coerce_boolean);
+    let wait = map_in.get("wait").is_some_and(coerce_boolean);
+    if wait && pty {
+        return Err(invalid_request(
+            "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+        ));
+    }
+    if wait && background {
+        return Err(invalid_request(
+            "bash: wait:true cannot be used with background:true",
+        ));
+    }
     out.insert("background".to_string(), Value::Bool(background));
     out.insert("pty".to_string(), Value::Bool(pty));
+    out.insert("wait".to_string(), Value::Bool(wait));
     out.insert(
         "notify_on_completion".to_string(),
         Value::Bool(background || pty),
