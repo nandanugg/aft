@@ -213,6 +213,10 @@ AFT works out of the box; everything below is optional. Configure it via `aft.js
 
 Set top-level `"enabled": false` in `~/.config/cortexkit/aft.jsonc` to disable AFT globally, or in `<project>/.cortexkit/aft.jsonc` to disable it only for that project; project config can set `enabled: true` to re-enable over a user-level default.
 
+| Key | Purpose |
+| --- | --- |
+| `inspect.duplicates.expected_mirrors` | Array of `[globA, globB]` pairs for intentional mirrored harnesses. Matching duplicate groups are suppressed but counted in `aft_inspect` output. |
+
 See the [configuration reference](docs/config.md) for the full schema, and the [CLI reference](docs/cli.md) for `setup`, `doctor`, and cache commands.
 
 ---

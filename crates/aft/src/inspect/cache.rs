@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
+use crate::config::Config;
 
 use super::job::{
     contribution_with_type_ref_names, type_ref_names_from_contribution, FileContribution,
@@ -113,7 +114,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v19: dead_code entry reachability executes side-effect-only imported modules,
 /// preserving same-file and transitive static-import liveness without marking all
 /// target exports used.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 19;
+/// v20: duplicates aggregate hashes include inspect.duplicates.expected_mirrors,
+/// so changing intentional mirror architecture rules invalidates cached roll-ups.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 20;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -428,6 +431,22 @@ impl InspectCache {
         &self,
         key: &JobKey,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.get_aggregated_with_config(key, None)
+    }
+
+    pub fn get_aggregated_for_config(
+        &self,
+        key: &JobKey,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
+        self.get_aggregated_with_config(key, Some(config))
+    }
+
+    fn get_aggregated_with_config(
+        &self,
+        key: &JobKey,
+        config: Option<&Config>,
+    ) -> Result<Option<serde_json::Value>, InspectCacheError> {
         if !key.category.is_tier2() {
             return Ok(self
                 .memory
@@ -447,6 +466,7 @@ impl InspectCache {
                 key.category,
                 &self.project_key,
                 &self.project_root,
+                config,
             )?
         };
 
@@ -497,6 +517,34 @@ impl InspectCache {
         scanned_files: &[PathBuf],
         contributions: &[FileContribution],
         aggregate: serde_json::Value,
+    ) -> Result<(), InspectCacheError> {
+        self.store_tier2_result_with_config(key, scanned_files, contributions, aggregate, None)
+    }
+
+    pub fn store_tier2_result_for_config(
+        &self,
+        key: JobKey,
+        scanned_files: &[PathBuf],
+        contributions: &[FileContribution],
+        aggregate: serde_json::Value,
+        config: &Config,
+    ) -> Result<(), InspectCacheError> {
+        self.store_tier2_result_with_config(
+            key,
+            scanned_files,
+            contributions,
+            aggregate,
+            Some(config),
+        )
+    }
+
+    fn store_tier2_result_with_config(
+        &self,
+        key: JobKey,
+        scanned_files: &[PathBuf],
+        contributions: &[FileContribution],
+        aggregate: serde_json::Value,
+        config: Option<&Config>,
     ) -> Result<(), InspectCacheError> {
         if !key.category.is_tier2() {
             self.store_aggregated(key, aggregate)?;
@@ -558,6 +606,7 @@ impl InspectCache {
             key.category,
             &self.project_key,
             &self.project_root,
+            config,
         )?;
         let aggregate_blob = serde_json::to_vec(&aggregate)?;
         tx.execute(
@@ -586,10 +635,20 @@ impl InspectCache {
         self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash))
     }
 
-    pub(crate) fn apply_contribution_updates(
+    pub(crate) fn apply_contribution_updates_for_config(
         &self,
         category: InspectCategory,
         updates: Tier2ContributionUpdates,
+        config: &Config,
+    ) -> Result<String, InspectCacheError> {
+        self.apply_contribution_updates_with_config(category, updates, Some(config))
+    }
+
+    fn apply_contribution_updates_with_config(
+        &self,
+        category: InspectCategory,
+        updates: Tier2ContributionUpdates,
+        config: Option<&Config>,
     ) -> Result<String, InspectCacheError> {
         let now = unix_seconds_now();
         let mut conn = self
@@ -654,8 +713,13 @@ impl InspectCache {
             )?;
         }
 
-        let contribution_set_hash =
-            contribution_set_hash_with_conn(&tx, category, &self.project_key, &self.project_root)?;
+        let contribution_set_hash = contribution_set_hash_with_conn(
+            &tx,
+            category,
+            &self.project_key,
+            &self.project_root,
+            config,
+        )?;
         tx.commit()?;
 
         self.memory
@@ -927,11 +991,33 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<String, InspectCacheError> {
+        self.contribution_set_hash_with_config(category, None)
+    }
+
+    pub fn contribution_set_hash_for_config(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<String, InspectCacheError> {
+        self.contribution_set_hash_with_config(category, Some(config))
+    }
+
+    fn contribution_set_hash_with_config(
+        &self,
+        category: InspectCategory,
+        config: Option<&Config>,
+    ) -> Result<String, InspectCacheError> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
-        contribution_set_hash_with_conn(&conn, category, &self.project_key, &self.project_root)
+        contribution_set_hash_with_conn(
+            &conn,
+            category,
+            &self.project_key,
+            &self.project_root,
+            config,
+        )
     }
 
     pub fn last_full_run(
@@ -1020,6 +1106,7 @@ fn contribution_set_hash_with_conn(
     category: InspectCategory,
     project_key: &str,
     project_root: &Path,
+    config: Option<&Config>,
 ) -> Result<String, InspectCacheError> {
     let mut stmt = conn.prepare(
         "SELECT file_path, file_hash FROM tier2_contributions \
@@ -1047,7 +1134,29 @@ fn contribution_set_hash_with_conn(
     ) {
         update_resolver_config_fingerprint_hash(&mut hasher, project_root)?;
     }
+    update_inspect_config_fingerprint_hash(&mut hasher, category, config);
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn update_inspect_config_fingerprint_hash(
+    hasher: &mut blake3::Hasher,
+    category: InspectCategory,
+    config: Option<&Config>,
+) {
+    if category != InspectCategory::Duplicates {
+        return;
+    }
+
+    hasher.update(b"inspect.duplicates.expected_mirrors\0");
+    let Some(config) = config else {
+        return;
+    };
+    for pair in &config.inspect.duplicates.expected_mirrors {
+        hasher.update(pair[0].as_bytes());
+        hasher.update(b"\0");
+        hasher.update(pair[1].as_bytes());
+        hasher.update(b"\0");
+    }
 }
 
 fn update_resolver_config_fingerprint_hash(
@@ -1710,6 +1819,57 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 19);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 20);
+    }
+
+    #[test]
+    fn duplicate_expected_mirrors_participate_in_aggregate_cache_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let left = project_root.join("plugin/a.ts");
+        let right = project_root.join("pi-plugin/a.ts");
+        fs::create_dir_all(left.parent().unwrap()).unwrap();
+        fs::create_dir_all(right.parent().unwrap()).unwrap();
+        fs::write(&left, "export const value = 1;\n").unwrap();
+        fs::write(&right, "export const value = 1;\n").unwrap();
+
+        let cache = InspectCache::open(temp.path().join("inspect"), project_root.clone()).unwrap();
+        let contributions = vec![
+            FileContribution::new(
+                InspectCategory::Duplicates,
+                left.clone(),
+                collect_freshness(&left),
+                serde_json::json!({ "file": "plugin/a.ts", "line_count": 1, "fragments": [] }),
+            ),
+            FileContribution::new(
+                InspectCategory::Duplicates,
+                right.clone(),
+                collect_freshness(&right),
+                serde_json::json!({ "file": "pi-plugin/a.ts", "line_count": 1, "fragments": [] }),
+            ),
+        ];
+        let config = Config::default();
+        cache
+            .store_tier2_result_for_config(
+                JobKey::for_project_category(InspectCategory::Duplicates),
+                &[left.clone(), right.clone()],
+                &contributions,
+                serde_json::json!({ "count": 0, "items": [] }),
+                &config,
+            )
+            .unwrap();
+
+        let without_mirrors = cache
+            .contribution_set_hash_for_config(InspectCategory::Duplicates, &config)
+            .unwrap();
+        let mut mirror_config = Config::default();
+        mirror_config.inspect.duplicates.expected_mirrors =
+            vec![["plugin/**".to_string(), "pi-plugin/**".to_string()]];
+        let with_mirrors = cache
+            .contribution_set_hash_for_config(InspectCategory::Duplicates, &mirror_config)
+            .unwrap();
+
+        assert_ne!(without_mirrors, with_mirrors);
     }
 }

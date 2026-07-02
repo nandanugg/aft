@@ -197,7 +197,13 @@ The schema is identical across harnesses. Only file location differs.
   // aft_inspect codebase-health scanner (recommended/all tiers).
   "inspect": {
     "enabled": true,              // set false to drop the aft_inspect tool
-    "tier2_idle_minutes": 5       // debounce before idle-triggered Tier 2 background scans
+    "tier2_idle_minutes": 5,      // debounce before idle-triggered Tier 2 background scans
+    "duplicates": {
+      // Intentional mirror pairs, matched against project-root-relative
+      // forward-slash paths. Groups fully spanning one pair are suppressed but
+      // still counted in the duplicates summary.
+      "expected_mirrors": [["plugin/**", "pi-plugin/**"]]
+    }
   },
 
   "experimental": {

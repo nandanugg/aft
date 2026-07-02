@@ -74,13 +74,17 @@ function writeTierFile(dir: string, filename: string, tier: TierContent | undefi
 function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undefined): void {
   const userDir = mkdtempSync(join(tmpdir(), "aft-parity-user-"));
   const projectDir = mkdtempSync(join(tmpdir(), "aft-parity-proj-"));
-  const projectOpencodeDir = join(projectDir, ".opencode");
-  mkdirSync(projectOpencodeDir, { recursive: true });
+  const userCortexKitDir = join(userDir, "cortexkit");
+  const projectCortexKitDir = join(projectDir, ".cortexkit");
+  mkdirSync(userCortexKitDir, { recursive: true });
+  mkdirSync(projectCortexKitDir, { recursive: true });
+  const savedXdgConfigHome = process.env.XDG_CONFIG_HOME;
 
   try {
-    process.env.OPENCODE_CONFIG_DIR = userDir;
-    writeTierFile(userDir, "aft.jsonc", caseDef.user);
-    writeTierFile(projectOpencodeDir, "aft.jsonc", caseDef.project);
+    process.env.XDG_CONFIG_HOME = userDir;
+    delete process.env.OPENCODE_CONFIG_DIR;
+    writeTierFile(userCortexKitDir, "aft.jsonc", caseDef.user);
+    writeTierFile(projectCortexKitDir, "aft.jsonc", caseDef.project);
 
     const merged = loadAftConfig(projectDir);
     const expected = goldenParamsFromMerged(merged);
@@ -93,6 +97,11 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
   } finally {
     rmSync(userDir, { recursive: true, force: true });
     rmSync(projectDir, { recursive: true, force: true });
+    if (savedXdgConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = savedXdgConfigHome;
+    }
     if (savedOpencodeConfigDir === undefined) {
       delete process.env.OPENCODE_CONFIG_DIR;
     } else {
@@ -204,6 +213,19 @@ const CASES: ParityCase[] = [
   {
     name: "keep_lsp_safe",
     project: { lsp: { python: "ty", diagnostics_on_edit: true } },
+  },
+  {
+    name: "inspect_expected_mirrors_project_safe",
+    project: {
+      inspect: {
+        duplicates: {
+          expected_mirrors: [
+            ["plugin/" + "**", "pi-plugin/" + "**"],
+            ["**/" + "*-opencode.ts", "**/" + "*-pi.ts"],
+          ],
+        },
+      },
+    },
   },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },

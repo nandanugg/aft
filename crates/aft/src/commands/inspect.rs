@@ -717,6 +717,11 @@ fn render_group_category(
     details: &Map<String, Value>,
     key: &str,
 ) {
+    if key == "duplicates" {
+        render_duplicates_category(lines, label, summary, details, key);
+        return;
+    }
+
     let Some(section) = summary.get(key) else {
         return;
     };
@@ -741,6 +746,151 @@ fn render_group_category(
             lines.push(format!("  {cost}  {}", files.join(" == ")));
         }
     }
+}
+
+fn render_duplicates_category(
+    lines: &mut Vec<String>,
+    label: &str,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+    key: &str,
+) {
+    let Some(section) = summary.get(key) else {
+        return;
+    };
+    if let Some(status) = section.get("status").and_then(Value::as_str) {
+        lines.push(format!("{label}: {status}"));
+        return;
+    }
+
+    let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let Some(duplicated_lines) = section.get("duplicated_lines").and_then(Value::as_u64) else {
+        if count == 0 {
+            lines.push(format!("{label}: 0"));
+            return;
+        }
+        lines.push(format!("{label}: {count} (top by cost):"));
+        render_duplicate_rows(lines, summary, details, key);
+        return;
+    };
+
+    let total_lines = section
+        .get("total_analyzed_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let percent = section
+        .get("duplicated_percent")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| duplicate_percent(duplicated_lines, total_lines));
+    let file_count = section
+        .get("duplicated_file_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let group_count = section
+        .get("total_groups")
+        .or_else(|| section.get("groups_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(count);
+    let suffix = if count > 0 { " (top by cost):" } else { "" };
+    lines.push(format!(
+        "{label}: {duplicated_lines} duplicated lines ({}% of {total_lines} analyzed lines) across {file_count} files, {group_count} {}{suffix}",
+        format_percent(percent),
+        plural_group(group_count),
+    ));
+    render_duplicate_suppression(lines, section);
+    if count > 0 {
+        render_duplicate_rows(lines, summary, details, key);
+    }
+}
+
+fn render_duplicate_rows(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+    key: &str,
+) {
+    if let Some(items) = category_items(summary, details, key) {
+        for item in items {
+            let cost = item.get("cost").and_then(Value::as_u64).unwrap_or(0);
+            let files: Vec<&str> = item
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            lines.push(format!("  {cost}  {}", files.join(" == ")));
+            if duplicate_group_file_count(&files) >= 3 {
+                lines
+                    .push("      suggestion: consider extracting into a shared module".to_string());
+            }
+        }
+    }
+}
+
+fn render_duplicate_suppression(lines: &mut Vec<String>, section: &Value) {
+    let mirror = section
+        .get("mirror_suppressed_groups")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if mirror > 0 {
+        lines.push(format!(
+            "  {mirror} mirror {} suppressed by expected_mirrors",
+            plural_group(mirror)
+        ));
+    }
+    let marker = section
+        .get("marker_suppressed_groups")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if marker > 0 {
+        lines.push(format!(
+            "  {marker} marker {} suppressed by aft:expected-duplicate",
+            plural_group(marker)
+        ));
+    }
+}
+
+fn plural_group(count: u64) -> &'static str {
+    if count == 1 {
+        "group"
+    } else {
+        "groups"
+    }
+}
+
+fn duplicate_group_file_count(files: &[&str]) -> usize {
+    files
+        .iter()
+        .map(|file| display_file_from_duplicate_occurrence(file))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+fn display_file_from_duplicate_occurrence(value: &str) -> &str {
+    let Some((file, range)) = value.rsplit_once(':') else {
+        return value;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return value;
+    };
+    if start.chars().all(|char| char.is_ascii_digit())
+        && end.chars().all(|char| char.is_ascii_digit())
+    {
+        file
+    } else {
+        value
+    }
+}
+
+fn duplicate_percent(duplicated_lines: u64, total_lines: u64) -> f64 {
+    if total_lines == 0 {
+        0.0
+    } else {
+        (duplicated_lines as f64 * 100.0) / total_lines as f64
+    }
+}
+
+fn format_percent(percent: f64) -> String {
+    format!("{percent:.1}")
 }
 
 fn render_todos(
@@ -863,11 +1013,35 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
             "count": count_from_payload(payload),
             "top": top_preview_from_payload(payload),
         }),
-        InspectCategory::Duplicates => serde_json::json!({
-            "count": count_from_payload(payload),
-            "total_groups": payload.and_then(|p| p.get("total_groups").or_else(|| p.get("groups_count"))).and_then(Value::as_u64).unwrap_or_else(|| count_from_payload(payload)),
-            "top": top_preview_from_payload(payload),
-        }),
+        InspectCategory::Duplicates => {
+            let mut section = Map::new();
+            section.insert(
+                "count".to_string(),
+                serde_json::json!(count_from_payload(payload)),
+            );
+            section.insert(
+                "total_groups".to_string(),
+                serde_json::json!(payload
+                    .and_then(|p| p.get("total_groups").or_else(|| p.get("groups_count")))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| count_from_payload(payload))),
+            );
+            for key in [
+                "duplicated_lines",
+                "duplicated_percent",
+                "duplicated_file_count",
+                "total_analyzed_lines",
+                "suppressed_groups",
+                "mirror_suppressed_groups",
+                "marker_suppressed_groups",
+            ] {
+                if let Some(value) = payload.and_then(|payload| payload.get(key)).cloned() {
+                    section.insert(key.to_string(), value);
+                }
+            }
+            section.insert("top".to_string(), top_preview_from_payload(payload));
+            Value::Object(section)
+        }
         _ => serde_json::json!({ "count": count_from_payload(payload) }),
     }
 }
@@ -1271,6 +1445,44 @@ mod render_text_tests {
         assert!(
             !text.contains("[AFT"),
             "status bar must be plugin-appended:\n{text}"
+        );
+    }
+
+    #[test]
+    fn renders_duplicate_framing_suppression_and_extraction_suggestions() {
+        let text = render(serde_json::json!({
+            "duplicates": {
+                "count": 1,
+                "total_groups": 1,
+                "duplicated_lines": 42,
+                "duplicated_percent": 10.4,
+                "duplicated_file_count": 3,
+                "total_analyzed_lines": 404,
+                "mirror_suppressed_groups": 2,
+                "marker_suppressed_groups": 1,
+                "top": [
+                    { "cost": 1083, "files": ["a/x.ts:1-9", "b/x.ts:1-9", "c/x.ts:1-9"] }
+                ]
+            }
+        }));
+
+        assert!(
+            text.contains(
+                "Duplicates: 42 duplicated lines (10.4% of 404 analyzed lines) across 3 files, 1 group (top by cost):"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("2 mirror groups suppressed by expected_mirrors"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 marker group suppressed by aft:expected-duplicate"),
+            "{text}"
+        );
+        assert!(
+            text.contains("suggestion: consider extracting into a shared module"),
+            "{text}"
         );
     }
 

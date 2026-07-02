@@ -1,0 +1,16 @@
+{
+  "inspect": {
+    "duplicates": {
+      "expected_mirrors": [
+        [
+          "plugin/**",
+          "pi-plugin/**"
+        ],
+        [
+          "**/*-opencode.ts",
+          "**/*-pi.ts"
+        ]
+      ]
+    }
+  }
+}

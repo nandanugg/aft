@@ -456,6 +456,7 @@ pub struct InspectResult {
     pub category: InspectCategory,
     pub project_root: PathBuf,
     pub inspect_dir: PathBuf,
+    pub config: Arc<Config>,
     pub outcome: Result<InspectScanSuccess, String>,
     pub duration: Duration,
 }
@@ -468,6 +469,7 @@ impl InspectResult {
             category: job.category,
             project_root: job.project_root.clone(),
             inspect_dir: job.inspect_dir.clone(),
+            config: Arc::clone(&job.config),
             outcome: Ok(success),
             duration,
         }
@@ -480,6 +482,7 @@ impl InspectResult {
             category: job.category,
             project_root: job.project_root.clone(),
             inspect_dir: job.inspect_dir.clone(),
+            config: Arc::clone(&job.config),
             outcome: Err(message.into()),
             duration,
         }

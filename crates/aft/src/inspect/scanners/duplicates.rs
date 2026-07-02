@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,6 +33,7 @@ const MAX_FRAGMENT_DEPTH: u32 = 1_500;
 const MAX_GROUP_ITEMS: usize = 100;
 const VARIABLE_SENTINEL: &str = "_var";
 const FIELD_SENTINEL: &str = "_field";
+const EXPECTED_DUPLICATE_MARKER: &str = "aft:expected-duplicate";
 
 thread_local! {
     static DUPLICATES_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
@@ -51,6 +53,8 @@ struct FileScan {
     display_path: String,
     language_skipped: Option<&'static str>,
     freshness: cache_freshness::FileFreshness,
+    line_count: u32,
+    expected_duplicate: bool,
     fragments: Vec<DuplicateFragment>,
 }
 
@@ -66,6 +70,7 @@ struct FragmentOccurrence {
 struct DuplicateGroup {
     files: Vec<String>,
     cost: u32,
+    duplicated_lines: u32,
     sample_file: String,
     sample_start_line: u32,
     sample_end_line: u32,
@@ -74,7 +79,23 @@ struct DuplicateGroup {
 #[derive(Debug, Clone, Deserialize)]
 struct DuplicateContribution {
     file: String,
+    #[serde(default)]
+    line_count: u32,
+    #[serde(default)]
+    expected_duplicate: bool,
     fragments: Vec<DuplicateFragment>,
+}
+
+#[derive(Debug)]
+struct ExpectedMirrorPair {
+    left: GlobSet,
+    right: GlobSet,
+}
+
+#[derive(Debug, Default)]
+struct SuppressionStats {
+    mirror_groups: usize,
+    marker_groups: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,8 +117,11 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
         Err(message) => return InspectResult::failed(job, message, started.elapsed()),
     };
 
-    let aggregate =
-        aggregate_file_scans(&file_scans, skipped_languages_from_file_scans(&file_scans));
+    let aggregate = aggregate_file_scans(
+        &file_scans,
+        skipped_languages_from_file_scans(&file_scans),
+        &job.config.inspect.duplicates.expected_mirrors,
+    );
     let contributions = file_scans
         .iter()
         .map(file_scan_to_contribution)
@@ -125,6 +149,8 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             display_path,
             language_skipped: Some("unknown"),
             freshness,
+            line_count: 0,
+            expected_duplicate: false,
             fragments: Vec::new(),
         });
     };
@@ -135,12 +161,16 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             display_path,
             language_skipped: Some(language_name(lang)),
             freshness,
+            line_count: 0,
+            expected_duplicate: false,
             fragments: Vec::new(),
         });
     }
 
     let source = fs::read_to_string(path)
         .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
+    let line_count = source_line_count(&source);
+    let expected_duplicate = source.contains(EXPECTED_DUPLICATE_MARKER);
     let tree = parse_source(path, lang, &source)?;
     let mut fragments = Vec::new();
     let mut hash_scratch = Vec::new();
@@ -164,6 +194,8 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
         display_path,
         language_skipped: None,
         freshness,
+        line_count,
+        expected_duplicate,
         fragments,
     })
 }
@@ -374,6 +406,8 @@ fn file_scan_to_contribution(scan: &FileScan) -> FileContribution {
         scan.freshness,
         json!({
             "file": scan.display_path,
+            "line_count": scan.line_count,
+            "expected_duplicate": scan.expected_duplicate,
             "fragments": scan.fragments,
         }),
     )
@@ -388,6 +422,7 @@ pub(crate) fn aggregate_duplicate_contributions(
         contributions,
         languages_skipped,
         Some(MAX_GROUP_ITEMS),
+        &[],
     )
 }
 
@@ -395,6 +430,7 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
     contributions: &[FileContribution],
     languages_skipped: Vec<String>,
     drill_down_limit: Option<usize>,
+    expected_mirrors: &[[String; 2]],
 ) -> serde_json::Value {
     let parsed = contributions
         .iter()
@@ -403,8 +439,14 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         })
         .collect::<Vec<_>>();
     let mut by_hash = BTreeMap::<String, Vec<FragmentOccurrence>>::new();
+    let mut line_counts = BTreeMap::<String, u32>::new();
+    let mut marker_files = BTreeSet::<String>::new();
 
     for scan in &parsed {
+        line_counts.insert(scan.file.clone(), scan.line_count);
+        if scan.expected_duplicate {
+            marker_files.insert(scan.file.clone());
+        }
         let file = Rc::<str>::from(scan.file.as_str());
         for fragment in &scan.fragments {
             push_occurrence(
@@ -420,24 +462,43 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         }
     }
 
-    aggregate_duplicate_occurrences(by_hash, parsed.len(), languages_skipped, drill_down_limit)
+    aggregate_duplicate_occurrences(
+        by_hash,
+        parsed.len(),
+        line_counts.values().copied().map(u64::from).sum(),
+        marker_files,
+        languages_skipped,
+        drill_down_limit,
+        expected_mirrors,
+    )
 }
 
 fn aggregate_file_scans(
     file_scans: &[FileScan],
     languages_skipped: Vec<String>,
+    expected_mirrors: &[[String; 2]],
 ) -> serde_json::Value {
-    aggregate_file_scans_with_limit(file_scans, languages_skipped, Some(MAX_GROUP_ITEMS))
+    aggregate_file_scans_with_limit(
+        file_scans,
+        languages_skipped,
+        Some(MAX_GROUP_ITEMS),
+        expected_mirrors,
+    )
 }
 
 fn aggregate_file_scans_with_limit(
     file_scans: &[FileScan],
     languages_skipped: Vec<String>,
     drill_down_limit: Option<usize>,
+    expected_mirrors: &[[String; 2]],
 ) -> serde_json::Value {
     let mut by_hash = BTreeMap::<String, Vec<FragmentOccurrence>>::new();
+    let mut marker_files = BTreeSet::<String>::new();
 
     for scan in file_scans {
+        if scan.expected_duplicate {
+            marker_files.insert(scan.display_path.clone());
+        }
         let file = Rc::<str>::from(scan.display_path.as_str());
         for fragment in &scan.fragments {
             push_occurrence(
@@ -456,8 +517,14 @@ fn aggregate_file_scans_with_limit(
     aggregate_duplicate_occurrences(
         by_hash,
         file_scans.len(),
+        file_scans
+            .iter()
+            .map(|scan| u64::from(scan.line_count))
+            .sum(),
+        marker_files,
         languages_skipped,
         drill_down_limit,
+        expected_mirrors,
     )
 }
 
@@ -476,8 +543,11 @@ fn push_occurrence(
 fn aggregate_duplicate_occurrences(
     by_hash: BTreeMap<String, Vec<FragmentOccurrence>>,
     scanned_files: usize,
+    total_analyzed_lines: u64,
+    marker_files: BTreeSet<String>,
     languages_skipped: Vec<String>,
     drill_down_limit: Option<usize>,
+    expected_mirrors: &[[String; 2]],
 ) -> serde_json::Value {
     // Collapse nested/overlapping duplicate fragments. tree-sitter records a
     // duplicate hash for EVERY named subtree, so one duplicated block emits the
@@ -493,12 +563,14 @@ fn aggregate_duplicate_occurrences(
     // is unenclosed.
     let surfaced_hashes = surfaced_duplicate_hashes(&by_hash);
 
+    let expected_mirrors = compile_expected_mirrors(expected_mirrors);
+    let mut suppression = SuppressionStats::default();
     let mut groups = by_hash
         .iter()
         .filter(|(hash, occurrences)| {
             occurrences.len() >= 2 && surfaced_hashes.contains(hash.as_str())
         })
-        .map(|(_, occurrences)| {
+        .filter_map(|(_, occurrences)| {
             let mut occurrences = occurrences.clone();
             occurrences.sort_by(|left, right| {
                 left.file
@@ -506,7 +578,16 @@ fn aggregate_duplicate_occurrences(
                     .then(left.start_line.cmp(&right.start_line))
                     .then(left.end_line.cmp(&right.end_line))
             });
-            occurrences_to_group(&occurrences)
+            let group = occurrences_to_group(&occurrences);
+            if expected_mirror_suppresses_group(&group, &expected_mirrors) {
+                suppression.mirror_groups += 1;
+                return None;
+            }
+            if marker_suppresses_group(&group, &marker_files) {
+                suppression.marker_groups += 1;
+                return None;
+            }
+            Some(group)
         })
         .collect::<Vec<_>>();
 
@@ -519,6 +600,9 @@ fn aggregate_duplicate_occurrences(
     });
 
     let groups_count = groups.len();
+    let duplicate_stats = duplicate_line_stats(&groups);
+    let duplicated_percent =
+        duplicate_percent(duplicate_stats.duplicated_lines, total_analyzed_lines);
     let drill_down_capped = drill_down_limit.is_some_and(|limit| groups_count > limit);
     let items = match drill_down_limit {
         Some(limit) => groups.into_iter().take(limit).collect::<Vec<_>>(),
@@ -535,6 +619,7 @@ fn aggregate_duplicate_occurrences(
             json!({
                 "files": group.files,
                 "cost": group.cost,
+                "duplicated_lines": group.duplicated_lines,
             })
         })
         .collect::<Vec<_>>();
@@ -543,6 +628,13 @@ fn aggregate_duplicate_occurrences(
         "count": groups_count,
         "total_groups": groups_count,
         "groups_count": groups_count,
+        "duplicated_lines": duplicate_stats.duplicated_lines,
+        "duplicated_percent": duplicated_percent,
+        "duplicated_file_count": duplicate_stats.file_count,
+        "total_analyzed_lines": total_analyzed_lines,
+        "suppressed_groups": suppression.mirror_groups + suppression.marker_groups,
+        "mirror_suppressed_groups": suppression.mirror_groups,
+        "marker_suppressed_groups": suppression.marker_groups,
         "items": items,
         "top": top,
         "drill_down_capped": drill_down_capped,
@@ -630,10 +722,161 @@ fn occurrences_to_group(occurrences: &[FragmentOccurrence]) -> DuplicateGroup {
             })
             .collect(),
         cost: sample.cost,
+        duplicated_lines: occurrences.iter().map(occurrence_line_count).sum(),
         sample_file: sample.file.to_string(),
         sample_start_line: sample.start_line,
         sample_end_line: sample.end_line,
     }
+}
+
+#[derive(Debug, Default)]
+struct DuplicateLineStats {
+    duplicated_lines: u64,
+    file_count: usize,
+}
+
+fn duplicate_line_stats(groups: &[DuplicateGroup]) -> DuplicateLineStats {
+    let mut by_file = BTreeMap::<String, Vec<(u32, u32)>>::new();
+    for group in groups {
+        for occurrence in &group.files {
+            let Some((file, start, end)) = parse_duplicate_occurrence(occurrence) else {
+                continue;
+            };
+            by_file
+                .entry(file.to_string())
+                .or_default()
+                .push((start, end));
+        }
+    }
+
+    let file_count = by_file.len();
+    let duplicated_lines = by_file
+        .values_mut()
+        .map(|intervals| merged_interval_line_count(intervals))
+        .sum();
+
+    DuplicateLineStats {
+        duplicated_lines,
+        file_count,
+    }
+}
+
+fn merged_interval_line_count(intervals: &mut [(u32, u32)]) -> u64 {
+    if intervals.is_empty() {
+        return 0;
+    }
+
+    intervals.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let mut total = 0u64;
+    let (mut current_start, mut current_end) = intervals[0];
+    for &(start, end) in &intervals[1..] {
+        if start <= current_end.saturating_add(1) {
+            current_end = current_end.max(end);
+        } else {
+            total += inclusive_line_count(current_start, current_end);
+            current_start = start;
+            current_end = end;
+        }
+    }
+    total + inclusive_line_count(current_start, current_end)
+}
+
+fn inclusive_line_count(start_line: u32, end_line: u32) -> u64 {
+    u64::from(end_line.saturating_sub(start_line).saturating_add(1))
+}
+
+fn occurrence_line_count(occurrence: &FragmentOccurrence) -> u32 {
+    occurrence
+        .end_line
+        .saturating_sub(occurrence.start_line)
+        .saturating_add(1)
+}
+
+fn parse_duplicate_occurrence(value: &str) -> Option<(&str, u32, u32)> {
+    let (file, range) = value.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    if !start.chars().all(|char| char.is_ascii_digit())
+        || !end.chars().all(|char| char.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some((file, start.parse().ok()?, end.parse().ok()?))
+}
+
+fn duplicate_percent(duplicated_lines: u64, total_analyzed_lines: u64) -> f64 {
+    if total_analyzed_lines == 0 {
+        0.0
+    } else {
+        (duplicated_lines as f64 * 100.0) / total_analyzed_lines as f64
+    }
+}
+
+fn source_line_count(source: &str) -> u32 {
+    source.lines().count().try_into().unwrap_or(u32::MAX)
+}
+
+fn compile_expected_mirrors(expected_mirrors: &[[String; 2]]) -> Vec<ExpectedMirrorPair> {
+    expected_mirrors
+        .iter()
+        .filter_map(|[left, right]| {
+            Some(ExpectedMirrorPair {
+                left: compile_single_glob(left)?,
+                right: compile_single_glob(right)?,
+            })
+        })
+        .collect()
+}
+
+fn compile_single_glob(pattern: &str) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    builder.add(Glob::new(pattern).ok()?);
+    builder.build().ok()
+}
+
+fn expected_mirror_suppresses_group(
+    group: &DuplicateGroup,
+    expected_mirrors: &[ExpectedMirrorPair],
+) -> bool {
+    if expected_mirrors.is_empty() {
+        return false;
+    }
+    let files = group_files(group);
+    expected_mirrors.iter().any(|pair| {
+        let mut has_left = false;
+        let mut has_right = false;
+        for file in &files {
+            let left = pair.left.is_match(file.as_str());
+            let right = pair.right.is_match(file.as_str());
+            if !left && !right {
+                return false;
+            }
+            has_left |= left;
+            has_right |= right;
+        }
+        has_left && has_right
+    })
+}
+
+fn marker_suppresses_group(group: &DuplicateGroup, marker_files: &BTreeSet<String>) -> bool {
+    !marker_files.is_empty()
+        && group_files(group)
+            .iter()
+            .any(|file| marker_files.contains(file.as_str()))
+}
+
+fn group_files(group: &DuplicateGroup) -> BTreeSet<String> {
+    group
+        .files
+        .iter()
+        .map(|occurrence| display_file_from_occurrence(occurrence).to_string())
+        .collect()
+}
+
+fn display_file_from_occurrence(value: &str) -> &str {
+    parse_duplicate_occurrence(value)
+        .map(|(file, _, _)| file)
+        .unwrap_or(value)
 }
 
 fn display_path(project_root: &Path, path: &Path) -> String {
@@ -716,6 +959,15 @@ mod tests {
 
     /// Build a duplicates FileContribution from (start, end, cost, hash) fragments.
     fn contribution(file: &str, fragments: &[(u32, u32, u32, &str)]) -> FileContribution {
+        contribution_with_options(file, 100, false, fragments)
+    }
+
+    fn contribution_with_options(
+        file: &str,
+        line_count: u32,
+        expected_duplicate: bool,
+        fragments: &[(u32, u32, u32, &str)],
+    ) -> FileContribution {
         let frag_json = fragments
             .iter()
             .map(|(start, end, cost, hash)| {
@@ -731,7 +983,12 @@ mod tests {
             InspectCategory::Duplicates,
             file,
             freshness(),
-            json!({ "file": file, "fragments": frag_json }),
+            json!({
+                "file": file,
+                "line_count": line_count,
+                "expected_duplicate": expected_duplicate,
+                "fragments": frag_json,
+            }),
         )
     }
 
@@ -804,6 +1061,79 @@ mod tests {
         assert_eq!(group_count(&aggregate), 1, "aggregate: {aggregate:#}");
         // The surfaced group is the child, not either unique block.
         assert_eq!(aggregate["items"][0]["cost"], 400);
+    }
+
+    #[test]
+    fn framing_counts_unique_duplicated_lines_against_analyzed_lines() {
+        let contributions = vec![
+            contribution_with_options("src/a.ts", 10, false, &[(2, 4, 300, "block")]),
+            contribution_with_options("src/b.ts", 10, false, &[(6, 8, 300, "block")]),
+            contribution_with_options("src/c.ts", 5, false, &[]),
+        ];
+
+        let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
+
+        assert_eq!(aggregate["duplicated_lines"], 6);
+        assert_eq!(aggregate["total_analyzed_lines"], 25);
+        assert_eq!(aggregate["duplicated_percent"].as_f64(), Some(24.0));
+        assert_eq!(aggregate["duplicated_file_count"], 2);
+        assert_eq!(aggregate["total_groups"], 1);
+    }
+
+    #[test]
+    fn expected_mirrors_suppress_only_groups_fully_straddling_pair() {
+        let contributions = vec![
+            contribution("plugin/a.ts", &[(1, 6, 300, "mirror")]),
+            contribution("pi-plugin/a.ts", &[(1, 6, 300, "mirror")]),
+            contribution("plugin/b.ts", &[(10, 16, 400, "within-left")]),
+            contribution("plugin/c.ts", &[(10, 16, 400, "within-left")]),
+            contribution("plugin/d.ts", &[(20, 26, 500, "has-neither")]),
+            contribution("pi-plugin/d.ts", &[(20, 26, 500, "has-neither")]),
+            contribution("other/d.ts", &[(20, 26, 500, "has-neither")]),
+        ];
+        let expected_mirrors = vec![["plugin/**".to_string(), "pi-plugin/**".to_string()]];
+
+        let aggregate = aggregate_duplicate_contributions_with_limit(
+            &contributions,
+            Vec::new(),
+            None,
+            &expected_mirrors,
+        );
+
+        assert_eq!(aggregate["total_groups"], 2, "aggregate: {aggregate:#}");
+        assert_eq!(aggregate["mirror_suppressed_groups"], 1);
+        assert!(aggregate["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file.as_str().unwrap().starts_with("plugin/b.ts:"))));
+        assert!(aggregate["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file.as_str().unwrap().starts_with("other/d.ts:"))));
+    }
+
+    #[test]
+    fn expected_duplicate_marker_suppresses_groups_in_marked_files() {
+        let contributions = vec![
+            contribution_with_options("src/marked.ts", 20, true, &[(1, 8, 300, "block")]),
+            contribution_with_options("src/plain.ts", 20, false, &[(1, 8, 300, "block")]),
+        ];
+
+        let aggregate = aggregate_duplicate_contributions(&contributions, Vec::new());
+
+        assert_eq!(aggregate["total_groups"], 0, "aggregate: {aggregate:#}");
+        assert_eq!(aggregate["marker_suppressed_groups"], 1);
+        assert_eq!(aggregate["suppressed_groups"], 1);
     }
 
     #[test]

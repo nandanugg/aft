@@ -255,6 +255,21 @@ function buildSchema(): Record<string, unknown> {
                 minimum: 0,
                 description: "Discard threshold for near-duplicate detection cost metric.",
               },
+              expected_mirrors: {
+                type: "array",
+                items: {
+                  type: "array",
+                  items: [
+                    { type: "string", minLength: 1 },
+                    { type: "string", minLength: 1 },
+                  ],
+                  additionalItems: false,
+                  minItems: 2,
+                  maxItems: 2,
+                },
+                description:
+                  "Intentional mirror path pairs for duplicate suppression. Each [globA, globB] pair matches project-root-relative forward-slash paths; groups fully straddling the pair are counted as suppressed instead of reported.",
+              },
               anonymize: {
                 type: "object",
                 properties: {

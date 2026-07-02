@@ -371,11 +371,15 @@ pub struct RawInspectDuplicates {
     #[serde(deserialize_with = "deserialize_opt_u64")]
     pub discard_cost: Option<u64>,
     pub anonymize: Option<RawInspectAnonymize>,
+    pub expected_mirrors: Option<Vec<[String; 2]>>,
 }
 
 impl RawInspectDuplicates {
     fn is_empty(&self) -> bool {
-        self.lower_bound.is_none() && self.discard_cost.is_none() && self.anonymize.is_none()
+        self.lower_bound.is_none()
+            && self.discard_cost.is_none()
+            && self.anonymize.is_none()
+            && self.expected_mirrors.is_none()
     }
 }
 
@@ -880,6 +884,9 @@ fn merge_inspect_duplicates(
     let mut duplicates = base.unwrap_or_default();
     duplicates.lower_bound = override_duplicates.lower_bound.or(duplicates.lower_bound);
     duplicates.discard_cost = override_duplicates.discard_cost.or(duplicates.discard_cost);
+    duplicates.expected_mirrors = override_duplicates
+        .expected_mirrors
+        .or(duplicates.expected_mirrors);
     duplicates.anonymize =
         merge_inspect_anonymize(duplicates.anonymize, override_duplicates.anonymize);
 
@@ -1066,8 +1073,18 @@ fn resolve_semantic_config(raw: Option<&RawSemantic>) -> SemanticBackendConfig {
 
 fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
     let mut inspect = InspectConfig::default();
-    if let Some(enabled) = raw.and_then(|raw| raw.enabled) {
+    let Some(raw) = raw else {
+        return inspect;
+    };
+    if let Some(enabled) = raw.enabled {
         inspect.enabled = enabled;
+    }
+    if let Some(expected_mirrors) = raw
+        .duplicates
+        .as_ref()
+        .and_then(|duplicates| duplicates.expected_mirrors.clone())
+    {
+        inspect.duplicates.expected_mirrors = expected_mirrors;
     }
     inspect
 }

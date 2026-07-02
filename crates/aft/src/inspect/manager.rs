@@ -698,7 +698,7 @@ impl InspectManager {
             .lock()
             .map(|guard| guard.contains_key(&key))
             .unwrap_or(false);
-        match cache.get_aggregated(&key) {
+        match cache.get_aggregated_for_config(&key, snapshot.config.as_ref()) {
             Ok(Some(payload)) => {
                 match self.tier2_cached_aggregate_is_fresh(snapshot, category, cache) {
                     Ok(true) => filter_outcome_for_scope_with_contributions(
@@ -935,7 +935,7 @@ impl InspectManager {
         }
 
         let contribution_set_hash = cache
-            .contribution_set_hash(job.category)
+            .contribution_set_hash_for_config(job.category, job.config.as_ref())
             .map_err(|error| error.to_string())?;
         let Some(aggregate) = cache
             .load_aggregate_if_hash_matches(job.category, &contribution_set_hash)
@@ -1054,7 +1054,7 @@ impl InspectManager {
             || !updates.metadata_updates.is_empty();
         if !has_updates {
             if let Some(aggregate) = cache
-                .get_aggregated(&job.key)
+                .get_aggregated_for_config(&job.key, job.config.as_ref())
                 .map_err(|error| error.to_string())?
             {
                 cache
@@ -1072,11 +1072,11 @@ impl InspectManager {
         let db_started = Instant::now();
         let mut contribution_set_hash = if has_updates {
             cache
-                .apply_contribution_updates(job.category, updates)
+                .apply_contribution_updates_for_config(job.category, updates, job.config.as_ref())
                 .map_err(|error| error.to_string())?
         } else {
             cache
-                .contribution_set_hash(job.category)
+                .contribution_set_hash_for_config(job.category, job.config.as_ref())
                 .map_err(|error| error.to_string())?
         };
         phases.db = db_started.elapsed();
@@ -1148,7 +1148,11 @@ impl InspectManager {
                 };
                 let db_started = Instant::now();
                 contribution_set_hash = cache
-                    .apply_contribution_updates(job.category, rescan_updates)
+                    .apply_contribution_updates_for_config(
+                        job.category,
+                        rescan_updates,
+                        job.config.as_ref(),
+                    )
                     .map_err(|error| error.to_string())?;
                 phases.db += db_started.elapsed();
                 aggregate_job.callgraph_snapshot = rescan_job.callgraph_snapshot.clone();
@@ -1339,7 +1343,7 @@ impl InspectManager {
         cache: &InspectCache,
         snapshot: &InspectSnapshot,
     ) -> JobOutcome {
-        match cache.get_aggregated(key) {
+        match cache.get_aggregated_for_config(key, snapshot.config.as_ref()) {
             Ok(Some(cached)) => filter_outcome_for_scope_with_contributions(
                 JobOutcome::Stale {
                     cached: Some(cached),
@@ -1410,11 +1414,12 @@ impl InspectManager {
         match result.outcome {
             Ok(success) => {
                 let store_result = if result.category.is_tier2() {
-                    cache.store_tier2_result(
+                    cache.store_tier2_result_for_config(
                         result.key.clone(),
                         &success.scanned_files,
                         &success.contributions,
                         success.aggregate.clone(),
+                        result.config.as_ref(),
                     )
                 } else {
                     cache.store_aggregated(result.key, success.aggregate.clone())
@@ -2258,6 +2263,7 @@ fn roll_up_duplicate_contributions(
         contributions,
         skipped_languages(&job.scope_files, LanguageSkipMode::Duplicates),
         drill_down_limit,
+        &job.config.inspect.duplicates.expected_mirrors,
     )
 }
 
@@ -2558,10 +2564,81 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
                 filter_values_for_scope(top, scope);
             }
         }
+        if object.contains_key("duplicated_lines") {
+            recompute_duplicate_payload_stats(object);
+        }
         object.remove("by_language");
     }
 
     payload
+}
+
+fn recompute_duplicate_payload_stats(object: &mut serde_json::Map<String, Value>) {
+    let values = object
+        .get("items")
+        .or_else(|| object.get("groups"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let (duplicated_lines, duplicated_file_count) = duplicate_line_stats_from_values(&values);
+    let total_analyzed_lines = object
+        .get("total_analyzed_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let duplicated_percent = if total_analyzed_lines == 0 {
+        0.0
+    } else {
+        (duplicated_lines as f64 * 100.0) / total_analyzed_lines as f64
+    };
+    object.insert("duplicated_lines".to_string(), json!(duplicated_lines));
+    object.insert(
+        "duplicated_file_count".to_string(),
+        json!(duplicated_file_count),
+    );
+    object.insert("duplicated_percent".to_string(), json!(duplicated_percent));
+}
+
+fn duplicate_line_stats_from_values(values: &[Value]) -> (u64, usize) {
+    let mut by_file = BTreeMap::<String, Vec<(u64, u64)>>::new();
+    for value in values {
+        let Some(files) = value.get("files").and_then(Value::as_array) else {
+            continue;
+        };
+        for occurrence in files.iter().filter_map(Value::as_str) {
+            let Some((file, start, end)) = parse_duplicate_occurrence(occurrence) else {
+                continue;
+            };
+            by_file
+                .entry(file.to_string())
+                .or_default()
+                .push((start, end));
+        }
+    }
+    let file_count = by_file.len();
+    let duplicated_lines = by_file
+        .values_mut()
+        .map(|intervals| merged_duplicate_interval_lines(intervals))
+        .sum();
+    (duplicated_lines, file_count)
+}
+
+fn merged_duplicate_interval_lines(intervals: &mut [(u64, u64)]) -> u64 {
+    if intervals.is_empty() {
+        return 0;
+    }
+    intervals.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let (mut current_start, mut current_end) = intervals[0];
+    let mut total = 0;
+    for &(start, end) in &intervals[1..] {
+        if start <= current_end.saturating_add(1) {
+            current_end = current_end.max(end);
+        } else {
+            total += current_end.saturating_sub(current_start).saturating_add(1);
+            current_start = start;
+            current_end = end;
+        }
+    }
+    total + current_end.saturating_sub(current_start).saturating_add(1)
 }
 
 fn recompute_scoped_top_preview(

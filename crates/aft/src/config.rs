@@ -83,11 +83,21 @@ impl Default for SemanticBackendConfig {
 #[serde(default)]
 pub struct InspectConfig {
     pub enabled: bool,
+    pub duplicates: InspectDuplicatesConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InspectDuplicatesConfig {
+    pub expected_mirrors: Vec<[String; 2]>,
 }
 
 impl Default for InspectConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            duplicates: InspectDuplicatesConfig::default(),
+        }
     }
 }
 

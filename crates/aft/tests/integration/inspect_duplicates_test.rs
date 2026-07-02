@@ -50,6 +50,17 @@ fn run_scan(root: &Path) -> InspectScanSuccess {
         .expect("duplicates scan should succeed")
 }
 
+fn expected_duplicate_flag_for(success: &InspectScanSuccess, relative: &str) -> bool {
+    success
+        .contributions
+        .iter()
+        .find(|contribution| contribution.file_path.ends_with(relative))
+        .unwrap_or_else(|| panic!("missing contribution for {relative}"))
+        .contribution["expected_duplicate"]
+        .as_bool()
+        .expect("expected_duplicate is a bool")
+}
+
 fn fragments_for<'a>(success: &'a InspectScanSuccess, relative: &str) -> &'a Vec<Value> {
     success
         .contributions
@@ -284,4 +295,36 @@ fn inspect_duplicates_unsupported_language_contributes_empty_fragments() {
         .expect("languages_skipped is an array")
         .iter()
         .any(|language| language == "bash"));
+}
+
+#[test]
+fn inspect_duplicates_expected_duplicate_marker_suppresses_file_groups() {
+    let (_temp_dir, root) = fixture_root();
+    let source = r#"
+// aft:expected-duplicate -- fixture source intentionally duplicates the calculate function from another file.
+export function calculate(input: number) {
+  const first = input + 1;
+  const second = first + 2;
+  const third = second + first;
+  const fourth = third + 3;
+  const fifth = fourth + third;
+  return fifth + second;
+}
+"#;
+    let mirror = source.replace(
+        "// aft:expected-duplicate -- fixture source intentionally duplicates the calculate function from another file.\n",
+        "",
+    );
+    write_file(&root, "src/marked.ts", source);
+    write_file(&root, "src/plain.ts", &mirror);
+
+    let success = run_scan(&root);
+
+    assert!(expected_duplicate_flag_for(&success, "src/marked.ts"));
+    assert_eq!(
+        success.aggregate["total_groups"], 0,
+        "{:?}",
+        success.aggregate
+    );
+    assert_eq!(success.aggregate["marker_suppressed_groups"], 1);
 }

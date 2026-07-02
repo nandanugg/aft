@@ -230,6 +230,9 @@ const InspectConfigSchema = z.object({
     .object({
       lower_bound: z.number().int().positive().optional(),
       discard_cost: z.number().int().min(0).optional(),
+      expected_mirrors: z
+        .array(z.tuple([z.string().trim().min(1), z.string().trim().min(1)]))
+        .optional(),
       anonymize: z
         .object({
           variables: z.boolean().optional(),
