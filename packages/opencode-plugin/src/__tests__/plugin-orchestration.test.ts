@@ -165,8 +165,8 @@ describe("Lane G plugin orchestration regressions", () => {
   });
 
   test("glob external permission treats existing outside file as file scope", async () => {
-    const project = realpathSync(mkdtempSync(join(tmpdir(), "aft-glob-project-")));
-    const outside = realpathSync(mkdtempSync(join(tmpdir(), "aft-glob-outside-")));
+    const project = realpathSync(mkdtempSync(join(process.cwd(), ".aft-glob-project-")));
+    const outside = realpathSync(mkdtempSync(join(process.cwd(), ".aft-glob-outside-")));
     const outsideFile = join(outside, "one.ts");
     writeFileSync(outsideFile, "export const one = 1;\n");
     const asks: Array<Record<string, unknown>> = [];

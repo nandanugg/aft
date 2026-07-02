@@ -3,8 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { realpath, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { importTools } from "../../tools/imports.js";
@@ -165,7 +164,7 @@ maybeDescribe("e2e import commands", () => {
   test("aft_import asks external-directory and edit permissions", async () => {
     const h = await harness();
     const tool = importTools(pluginContext(h)).aft_import;
-    const external = mkdtempSync(join(tmpdir(), "aft-import-external-"));
+    const external = mkdtempSync(join(dirname(h.tempDir), "aft-import-external-"));
     try {
       const externalFile = join(external, "external.ts");
       await writeFile(externalFile, "export const value = 1;\n", "utf8");

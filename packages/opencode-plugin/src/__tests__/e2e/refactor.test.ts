@@ -3,8 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { refactoringTools } from "../../tools/refactoring.js";
@@ -133,7 +132,7 @@ maybeDescribe("e2e refactor commands", () => {
   test("aft_refactor asks external-directory and edit permissions", async () => {
     const h = await harness();
     const tool = refactoringTools(pluginContext(h)).aft_refactor;
-    const external = mkdtempSync(join(tmpdir(), "aft-refactor-external-"));
+    const external = mkdtempSync(join(dirname(h.tempDir), "aft-refactor-external-"));
     try {
       const externalFile = join(external, "external.ts");
       await writeFile(

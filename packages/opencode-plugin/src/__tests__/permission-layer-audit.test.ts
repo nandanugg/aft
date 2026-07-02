@@ -132,8 +132,12 @@ function recordingAsk(
   }) as unknown as ToolContext["ask"];
 }
 
+async function makeRepoLocalTempRoot(prefix: string): Promise<string> {
+  return await realpath(await mkdtemp(path.join(process.cwd(), prefix)));
+}
+
 async function makeProjectAndExternalDirs(): Promise<{ project: string; external: string }> {
-  tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-permission-audit-")));
+  tmpRoot = await makeRepoLocalTempRoot(".aft-permission-audit-");
   const project = path.join(tmpRoot, "project");
   const external = path.join(tmpRoot, "external");
   await mkdir(project, { recursive: true });
@@ -146,7 +150,7 @@ async function makeCanonicalizationDirs(): Promise<{
   external: string;
   inRootTarget: string;
 }> {
-  tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-permission-canon-")));
+  tmpRoot = await makeRepoLocalTempRoot(".aft-permission-canon-");
   const project = path.join(tmpRoot, "project");
   const external = path.join(tmpRoot, "external");
   const inRootTarget = path.join(project, "real-target");
@@ -342,7 +346,7 @@ describe("permission audit regressions", () => {
   });
 
   test("relative import paths use the session project root for both approval and bridge dispatch", async () => {
-    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-path-parity-")));
+    tmpRoot = await makeRepoLocalTempRoot(".aft-path-parity-");
     const project = path.join(tmpRoot, "project");
     const launchCwd = path.join(tmpRoot, "launch-cwd");
     await mkdir(path.join(project, "src"), { recursive: true });
@@ -397,7 +401,7 @@ describe("permission audit regressions", () => {
   });
 
   test("hoisted write paths use the session project root for approval and bridge dispatch", async () => {
-    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-hoisted-path-parity-")));
+    tmpRoot = await makeRepoLocalTempRoot(".aft-hoisted-path-parity-");
     const project = path.join(tmpRoot, "project");
     const launchCwd = path.join(tmpRoot, "launch-cwd");
     await mkdir(path.join(project, "src"), { recursive: true });
@@ -515,6 +519,48 @@ describe("permission audit regressions", () => {
     const externalAsks = await externalAskCallsFor(project, target);
 
     expectExternalAsk(externalAsks);
+  });
+
+  test("external_directory ask is skipped for system temp paths", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const target = path.join(tmpdir(), "aft-temp-exemption", "read.txt");
+
+    const externalAsks = await externalAskCallsFor(project, target);
+
+    expect(_permissionsInternalsForTest.isSystemTempPath(target)).toBe(true);
+    expect(externalAsks).toHaveLength(0);
+  });
+
+  test("hoisted read and edit skip external_directory asks for system temp paths", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { tools } = createHarness(hoistedTools, (_command, _params, options) =>
+      options?.preview
+        ? { success: true, preview_diff: "", text: "preview ok" }
+        : { success: true, text: "ok" },
+    );
+    const tempFile = path.join(tmpdir(), "aft-temp-exemption", "file.ts");
+
+    await tools.read.execute({ filePath: tempFile }, sdkCtx);
+    await tools.edit.execute(
+      { filePath: tempFile, oldString: "before", newString: "after" },
+      sdkCtx,
+    );
+
+    expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
+    expect(askCalls.map((call) => call.permission)).toEqual(["read", "edit"]);
+  });
+
+  test("hoisted read still asks external_directory for non-temp external paths", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+    const { tools } = createHarness(hoistedTools, () => ({ success: true, text: "ok" }));
+
+    await tools.read.execute({ filePath: path.join(external, "read.ts") }, sdkCtx);
+
+    expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
   });
 
   test("external_directory ask expands ~/ before containment", async () => {
@@ -688,7 +734,7 @@ describe("permission audit regressions", () => {
   });
 
   test("aft_safety checkpoint preflight warms session root before resolving relative files", async () => {
-    tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-checkpoint-path-parity-")));
+    tmpRoot = await makeRepoLocalTempRoot(".aft-checkpoint-path-parity-");
     const project = path.join(tmpRoot, "project");
     const launchCwd = path.join(project, "subdir");
     await mkdir(launchCwd, { recursive: true });

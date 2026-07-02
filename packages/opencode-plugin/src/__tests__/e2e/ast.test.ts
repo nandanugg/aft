@@ -3,8 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { astTools } from "../../tools/ast.js";
@@ -238,7 +237,7 @@ maybeDescribe("e2e ast commands", () => {
   test("ast_grep_replace asks edit permission only for apply mode", async () => {
     const h = await harness();
     const replace = astTools(pluginContext(h)).ast_grep_replace;
-    const external = mkdtempSync(join(tmpdir(), "aft-ast-external-"));
+    const external = mkdtempSync(join(dirname(h.tempDir), "aft-ast-external-"));
     try {
       const externalFile = join(external, "external.ts");
       await writeFile(

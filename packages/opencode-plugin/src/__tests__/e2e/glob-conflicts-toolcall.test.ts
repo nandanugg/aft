@@ -4,8 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { conflictTools } from "../../tools/conflicts.js";
@@ -64,7 +63,7 @@ maybeDescribe("glob/conflicts tool_call e2e", () => {
   test("glob asks before searching an external directory", async () => {
     const h = await harness();
     await writeGlobFixture(h.tempDir);
-    const external = mkdtempSync(join(tmpdir(), "aft-glob-external-"));
+    const external = mkdtempSync(join(dirname(h.tempDir), "aft-glob-external-"));
     try {
       await writeGlobFixture(external);
       const askCalls: AskCall[] = [];
@@ -106,7 +105,7 @@ maybeDescribe("glob/conflicts tool_call e2e", () => {
   test("conflicts asks before inspecting another repository", async () => {
     const h = await harness();
     await writeGlobFixture(h.tempDir);
-    const external = mkdtempSync(join(tmpdir(), "aft-conflicts-external-"));
+    const external = mkdtempSync(join(dirname(h.tempDir), "aft-conflicts-external-"));
     try {
       createCleanRepo(external);
       const askCalls: AskCall[] = [];

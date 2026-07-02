@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
 
@@ -20,6 +21,8 @@ const UNSUPPORTED_ASK_HOST =
  */
 const RESTRICT_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const restrictNoticeLastSentAt = new Map<string, number>();
+const POSIX_SYSTEM_TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
+const MACOS_SYSTEM_TEMP_ROOTS = ["/var/folders", "/private/var/folders"];
 
 function restrictNoticeWording(target: string): string {
   return (
@@ -140,6 +143,18 @@ function containsPath(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+function systemTempRoots(): string[] {
+  const roots = [tmpdir()];
+  if (process.platform !== "win32") roots.push(...POSIX_SYSTEM_TEMP_ROOTS);
+  if (process.platform === "darwin") roots.push(...MACOS_SYSTEM_TEMP_ROOTS);
+  return roots;
+}
+
+function isSystemTempPath(target: string): boolean {
+  const normalizedTarget = normalizePath(target);
+  return systemTempRoots().some((root) => containsPath(normalizePath(root), normalizedTarget));
+}
+
 /**
  * Convert POSIX-style drive paths to Windows drive paths.
  *
@@ -221,7 +236,11 @@ function normalizePathPattern(p: string): string {
   return path.join(normalizePath(dir), match[2]);
 }
 
-export const _permissionsInternalsForTest = { containsPath, normalizePathPattern };
+export const _permissionsInternalsForTest = {
+  containsPath,
+  isSystemTempPath,
+  normalizePathPattern,
+};
 
 /**
  * Trigger OpenCode's host-side `external_directory` permission check when the
@@ -230,18 +249,16 @@ export const _permissionsInternalsForTest = { containsPath, normalizePathPattern
  *
  * Why this exists: AFT hoisted tools previously only called `permission: "edit"`,
  * which bypassed OpenCode's separate `external_directory` rule (default `ask`).
- * That meant `/tmp/anything` writes routed through AFT silently bypassed the
- * prompt OpenCode native `write`/`edit`/`apply_patch`/`read` show. This helper
- * closes that gap so AFT's hoisted surface matches native behavior.
+ * This helper keeps that rule active for ordinary out-of-root paths while
+ * suppressing asks for system temp directories, which are unstable world-writable
+ * scratch space.
  *
  * Returns `undefined` on allow (or when target is inside project), or a
  * denial message string on deny so callers can wrap with
  * `permissionDeniedResponse(...)`.
  *
- * Always call this BEFORE the regular `askEditPermission` so the user sees the
- * external-directory prompt first (matching opencode native ordering). When the
- * external-directory rule is `allow` (e.g. for `${os.tmpdir()}/opencode/*`), the
- * call short-circuits and the regular permission flow continues normally.
+ * Always call this BEFORE the regular `askEditPermission` so any required
+ * external-directory prompt appears before the edit/read prompt.
  */
 export async function assertExternalDirectoryPermission(
   ctx: PluginContext,
@@ -286,6 +303,8 @@ export async function assertExternalDirectoryPermission(
     notifyRestrictBlocked(ctx, context, absoluteTarget);
     return restrictDenialMessage(absoluteTarget);
   }
+
+  if (isSystemTempPath(absoluteTarget)) return undefined;
 
   if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
 

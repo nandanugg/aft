@@ -3,8 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
@@ -114,7 +113,7 @@ maybeDescribe("e2e delete and move commands", () => {
   test("aft_move asks external-directory and edit permissions", async () => {
     const h = await harness();
     const tool = hoistedTools(pluginContext(h)).aft_move;
-    const external = mkdtempSync(join(tmpdir(), "aft-move-external-"));
+    const external = mkdtempSync(join(dirname(h.tempDir), "aft-move-external-"));
     try {
       const externalSource = join(external, "external-source.txt");
       const externalDest = join(external, "external-dest.txt");

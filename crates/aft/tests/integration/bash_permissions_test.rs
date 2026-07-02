@@ -3,6 +3,18 @@ use super::helpers::AftProcess;
 use serde_json::json;
 use tempfile::TempDir;
 
+fn non_system_temp_dir(prefix: &str) -> TempDir {
+    let base = std::env::current_dir()
+        .expect("current dir")
+        .join("target")
+        .join("aft-non-system-temp-tests");
+    std::fs::create_dir_all(&base).expect("create non-system temp test dir");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .expect("create non-system temp dir")
+}
+
 fn configure(aft: &mut AftProcess, root: &TempDir) {
     let response = aft.send(
         &serde_json::to_string(&json!({
@@ -55,6 +67,27 @@ fn bash(aft: &mut AftProcess, id: &str, command: &str) -> serde_json::Value {
     )
 }
 
+fn has_external_directory_ask(response: &serde_json::Value) -> bool {
+    response["asks"]
+        .as_array()
+        .is_some_and(|asks| asks.iter().any(|ask| ask["kind"] == "external_directory"))
+}
+
+fn has_external_directory_pattern_containing(response: &serde_json::Value, needle: &str) -> bool {
+    response["asks"].as_array().is_some_and(|asks| {
+        asks.iter().any(|ask| {
+            ask["kind"] == "external_directory"
+                && ask["patterns"].as_array().is_some_and(|patterns| {
+                    patterns.iter().any(|p| {
+                        p.as_str().is_some_and(|pattern| {
+                            pattern.contains(needle) && pattern.ends_with("/*")
+                        })
+                    })
+                })
+        })
+    })
+}
+
 #[test]
 fn simple_echo_requires_bash_permission() {
     // Regression: previously AFT silently skipped `echo` from bash
@@ -89,23 +122,45 @@ fn simple_echo_requires_bash_permission() {
 }
 
 #[test]
-fn rm_outside_project_root_requires_external_directory() {
+fn system_temp_path_does_not_require_external_directory() {
     let root = TempDir::new().unwrap();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
-    let response = bash(&mut aft, "rm", "rm /tmp/foo.txt");
+    let temp_file = std::env::temp_dir().join("aft-bash-temp-exemption.txt");
+    let command = format!("cat {}", temp_file.display());
+    let response = bash(&mut aft, "cat-temp", &command);
     assert_eq!(response["success"], false, "response: {response:?}");
     assert_eq!(response["code"], "permission_required");
     assert!(
-        response["asks"].as_array().unwrap().iter().any(|ask| {
-            ask["kind"] == "external_directory"
-                && ask["patterns"].as_array().unwrap().iter().any(|p| {
-                    p.as_str()
-                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
-                })
-        }),
-        "response: {response:?}"
+        !has_external_directory_ask(&response),
+        "system temp paths must not emit external_directory asks: {response:?}"
+    );
+    assert!(
+        response["asks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ask| ask["kind"] == "bash"),
+        "bash execution should remain permission-gated: {response:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn etc_hosts_still_requires_external_directory() {
+    let root = TempDir::new().unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let response = bash(&mut aft, "cat-etc-hosts", "cat /etc/hosts");
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "permission_required");
+    assert!(
+        has_external_directory_pattern_containing(&response, "/etc"),
+        "non-temp external paths must still ask: {response:?}"
     );
 
     assert!(aft.shutdown().success());
@@ -117,16 +172,16 @@ fn bash_permission_scan_collects_redirect_target() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
-    let response = bash(&mut aft, "redirect", "echo hi > /tmp/aft-redirect-out");
+    let outside = non_system_temp_dir("aft-redirect-");
+    let redirect_target = outside.path().join("aft-redirect-out");
+    let response = bash(
+        &mut aft,
+        "redirect",
+        &format!("echo hi > {}", redirect_target.display()),
+    );
     assert_eq!(response["success"], false, "response: {response:?}");
     assert!(
-        response["asks"].as_array().unwrap().iter().any(|ask| {
-            ask["kind"] == "external_directory"
-                && ask["patterns"].as_array().unwrap().iter().any(|p| {
-                    p.as_str()
-                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
-                })
-        }),
+        has_external_directory_pattern_containing(&response, "aft-redirect-"),
         "expected external_directory ask for redirect target: {response:?}"
     );
 
@@ -158,20 +213,16 @@ fn bash_permission_scan_collects_cd_redirect_target() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
+    let outside = non_system_temp_dir("aft-cd-redirect-");
+    let redirect_target = outside.path().join("aft-cd-redirect-out");
     let response = bash(
         &mut aft,
         "cd-redirect",
-        "cd /tmp > /tmp/aft-cd-redirect-out",
+        &format!("cd /tmp > {}", redirect_target.display()),
     );
     assert_eq!(response["success"], false, "response: {response:?}");
     assert!(
-        response["asks"].as_array().unwrap().iter().any(|ask| {
-            ask["kind"] == "external_directory"
-                && ask["patterns"].as_array().unwrap().iter().any(|p| {
-                    p.as_str()
-                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
-                })
-        }),
+        has_external_directory_pattern_containing(&response, "aft-cd-redirect-"),
         "expected external_directory ask for cd redirect target: {response:?}"
     );
 
@@ -206,7 +257,7 @@ fn dynamic_file_args_do_not_emit_external_directory_wildcard() {
 #[test]
 fn relative_redirect_permission_grant_matches_absolute_cwd_pattern() {
     let root = TempDir::new().unwrap();
-    let outside = TempDir::new().unwrap();
+    let outside = non_system_temp_dir("aft-relative-redirect-");
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -253,35 +304,37 @@ fn bash_permission_scan_handles_source() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
-    let response = bash(&mut aft, "source", "source /tmp/aft-source.sh");
+    let outside = non_system_temp_dir("aft-source-");
+    let source_target = outside.path().join("aft-source.sh");
+    let response = bash(
+        &mut aft,
+        "source",
+        &format!("source {}", source_target.display()),
+    );
     assert_eq!(response["success"], false, "response: {response:?}");
     assert!(
-        response["asks"].as_array().unwrap().iter().any(|ask| {
-            ask["kind"] == "external_directory"
-                && ask["patterns"].as_array().unwrap().iter().any(|p| {
-                    p.as_str()
-                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
-                })
-        }),
+        has_external_directory_pattern_containing(&response, "aft-source-"),
         "expected external_directory ask for source target: {response:?}"
     );
 
-    let dot = bash(&mut aft, "dot-source", ". /tmp/aft-dot-source.sh");
+    let dot_target = outside.path().join("aft-dot-source.sh");
+    let dot = bash(
+        &mut aft,
+        "dot-source",
+        &format!(". {}", dot_target.display()),
+    );
     assert_eq!(dot["success"], false, "response: {dot:?}");
-    assert!(dot["asks"].as_array().unwrap().iter().any(|ask| {
-        ask["kind"] == "external_directory"
-            && ask["patterns"].as_array().unwrap().iter().any(|p| {
-                p.as_str()
-                    .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
-            })
-    }));
+    assert!(has_external_directory_pattern_containing(
+        &dot,
+        "aft-source-"
+    ));
 
     assert!(aft.shutdown().success());
 }
 
 #[test]
 fn symlink_path_resolving_outside_project_requires_permission() {
-    let dir = TempDir::new().unwrap();
+    let dir = non_system_temp_dir("aft-symlink-");
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     std::fs::create_dir_all(&root).unwrap();
@@ -321,16 +374,15 @@ fn chained_cd_then_rm_uses_subcommand_directory() {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
-    let response = bash(&mut aft, "chain", "cd /tmp && rm foo");
+    let outside = non_system_temp_dir("aft-chain-");
+    let response = bash(
+        &mut aft,
+        "chain",
+        &format!("cd {} && rm foo", outside.path().display()),
+    );
     assert_eq!(response["success"], false, "response: {response:?}");
     assert!(
-        response["asks"].as_array().unwrap().iter().any(|ask| {
-            ask["kind"] == "external_directory"
-                && ask["patterns"].as_array().unwrap().iter().any(|p| {
-                    p.as_str()
-                        .is_some_and(|p| p.contains("tmp/") && p.ends_with("/*"))
-                })
-        }),
+        has_external_directory_pattern_containing(&response, "aft-chain-"),
         "response: {response:?}"
     );
 

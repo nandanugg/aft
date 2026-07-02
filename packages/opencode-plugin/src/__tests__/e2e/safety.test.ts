@@ -2,8 +2,7 @@
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { safetyTools } from "../../tools/safety.js";
@@ -146,13 +145,16 @@ maybeDescribe("e2e safety commands", () => {
 
     await h.bridge.send("write", { file: filePath, content: "v4\n" });
     const history = toolResultText(await tool.execute({ op: "history", filePath }, runtime(h)));
-    expect(history).toContain(filePath);
+    const home = process.env.HOME;
+    const expectedHistoryPath =
+      home && filePath.startsWith(home) ? filePath.replace(home, "~") : filePath;
+    expect(history).toContain(expectedHistoryPath);
     expect(history).toMatch(/^1\. /m);
   });
 
   test("aft_safety asks external-directory and edit permissions for undo and restore", async () => {
     const h = await harness();
-    const externalDir = await mkdtemp(join(tmpdir(), "aft-safety-external-"));
+    const externalDir = await mkdtemp(join(dirname(h.tempDir), "aft-safety-external-"));
     const externalFile = join(externalDir, "outside.txt");
     const tool = safetyTools(pluginContext(h)).aft_safety;
 

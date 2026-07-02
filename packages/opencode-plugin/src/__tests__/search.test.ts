@@ -1,7 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
-import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
@@ -23,6 +22,10 @@ type AskCall = {
   patterns?: string[];
   metadata?: Record<string, unknown>;
 };
+
+function makeSearchRoot(): string {
+  return fs.realpathSync(fs.mkdtempSync(path.join(process.cwd(), ".aft-search-plugin-")));
+}
 
 function createMockClient(): any {
   return {
@@ -240,7 +243,7 @@ describe("searchTools", () => {
   });
 
   test("grep checks external permission per parsed multi-path fragment", async () => {
-    const tmpRoot = fs.realpathSync(fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-")));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const inside = path.join(project, "src");
@@ -272,7 +275,7 @@ describe("searchTools", () => {
   });
 
   test("glob rejects when any parsed multi-path fragment is externally denied", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const inside = path.join(project, "src");
@@ -310,7 +313,7 @@ describe("searchTools", () => {
   });
 
   test("grep searches existing fragments and reports skipped missing paths", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const src = path.join(project, "src");
@@ -341,7 +344,7 @@ describe("searchTools", () => {
   });
 
   test("grep keeps all-valid multi-path searches complete", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const src = path.join(project, "src");
@@ -369,7 +372,7 @@ describe("searchTools", () => {
   });
 
   test("grep falls through to path_not_found when every fragment is missing", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       fs.mkdirSync(project, { recursive: true });
@@ -403,7 +406,7 @@ describe("searchTools", () => {
   });
 
   test("grep treats an existing single path containing a space as one path", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const spaced = path.join(project, "with space");
@@ -429,7 +432,7 @@ describe("searchTools", () => {
   });
 
   test("glob reports skipped missing fragments while searching existing paths", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const src = path.join(project, "src");
@@ -456,7 +459,7 @@ describe("searchTools", () => {
   });
 
   test("glob keeps all-valid multi-path searches complete", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const src = path.join(project, "src");
@@ -484,7 +487,7 @@ describe("searchTools", () => {
   });
 
   test("glob falls through to path_not_found when every fragment is missing", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       fs.mkdirSync(project, { recursive: true });
@@ -518,7 +521,7 @@ describe("searchTools", () => {
   });
 
   test("glob treats an existing single path containing a space as one path", async () => {
-    const tmpRoot = fs.mkdtempSync(path.join(tmpdir(), "aft-search-plugin-"));
+    const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
       const spaced = path.join(project, "with space");

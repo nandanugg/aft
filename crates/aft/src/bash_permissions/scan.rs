@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
 
@@ -414,23 +414,7 @@ fn dynamic(text: &str) -> bool {
 }
 
 fn resolve_existing(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !result.pop() {
-                    result.push(component.as_os_str());
-                }
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
+    std::fs::canonicalize(path).unwrap_or_else(|_| super::normalize_path(path))
 }
 
 fn permission_dir(path: &Path) -> PathBuf {
@@ -503,7 +487,7 @@ fn push_external_path(
     project_root: &Path,
     path: &Path,
 ) {
-    if path.starts_with(project_root) {
+    if path.starts_with(project_root) || super::is_system_temp_path(path) {
         return;
     }
     let dir = permission_dir(path);
@@ -529,6 +513,7 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bash_permissions::normalize_path;
 
     #[test]
     fn pwd_expands_against_scan_cwd() {

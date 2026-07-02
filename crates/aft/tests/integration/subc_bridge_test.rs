@@ -3664,20 +3664,42 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
         "untrusted out-of-root validate_path",
     );
 
+    let untrusted_temp_file = std::env::temp_dir().join(format!(
+        "aft-subc-forced-restrict-temp-read-{}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&untrusted_temp_file, "temp should stay blocked\n")
+        .expect("write forced-restrict temp fixture");
+    let untrusted_temp_read = call_tool_response(
+        &mut stream,
+        2,
+        205,
+        "read",
+        json!({ "filePath": untrusted_temp_file.to_string_lossy() }),
+        "untrusted system-temp read",
+    )
+    .await;
+    assert_tool_error_code(
+        &untrusted_temp_read,
+        "path_outside_root",
+        "untrusted system-temp read",
+    );
+    let _ = std::fs::remove_file(&untrusted_temp_file);
+
     for (corr, name, args) in [
         (
-            205,
+            206,
             "bash",
             json!({ "params": { "command": "printf denied", "timeout": 5000 } }),
         ),
         (
-            206,
+            207,
             "bash_status",
             json!({ "params": { "task_id": "bash-denied" } }),
         ),
-        (207, "bash_drain_completions", json!({})),
+        (208, "bash_drain_completions", json!({})),
         (
-            208,
+            209,
             "bash_ack_completions",
             json!({ "task_ids": ["bash-denied"] }),
         ),

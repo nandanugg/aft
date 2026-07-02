@@ -5,7 +5,6 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
@@ -29,7 +28,7 @@ type AskCall = {
 const tempRoots: string[] = [];
 
 async function tempProject(): Promise<string> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "aft-opencode-reading-")));
+  const root = await realpath(await mkdtemp(join(process.cwd(), ".aft-opencode-reading-")));
   tempRoots.push(root);
   return root;
 }

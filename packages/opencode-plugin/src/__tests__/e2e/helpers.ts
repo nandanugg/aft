@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { constants, type Dirent } from "node:fs";
 import { access, cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, relative, resolve } from "node:path";
 import {
   BinaryBridge,
   type BridgeOptions,
@@ -244,7 +244,11 @@ export async function createHarness(
     throw new Error(preparedBinary.skipReason ?? "aft binary unavailable");
   }
 
-  const tempDir = await mkdtemp(join(tmpdir(), options?.tempPrefix ?? "aft-plugin-e2e-"));
+  // Keep e2e projects outside both the repository and OS temp directories so
+  // external-directory tests cover ordinary out-of-project paths.
+  const tempDir = await mkdtemp(
+    join(dirname(PROJECT_ROOT), `.${options?.tempPrefix ?? "aft-plugin-e2e-"}`),
+  );
 
   let bridge: BinaryBridge | undefined;
   try {
