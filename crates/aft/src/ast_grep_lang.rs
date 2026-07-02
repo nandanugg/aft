@@ -38,6 +38,7 @@ pub enum AstGrepLang {
     Perl,
     Pascal,
     R,
+    ObjC,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +117,7 @@ impl AstGrepLang {
             LangId::Perl => Some(Self::Perl),
             LangId::Pascal => Some(Self::Pascal),
             LangId::R => Some(Self::R),
+            LangId::ObjC => Some(Self::ObjC),
             LangId::Scala => None,
             LangId::Bash => None, // ast-grep doesn't support Bash
             // Markdown, CSS, HTML etc. don't have meaningful AST patterns
@@ -149,6 +151,7 @@ impl AstGrepLang {
             "perl" | "pl" | "pm" => Some(Self::Perl),
             "pascal" | "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(Self::Pascal),
             "r" => Some(Self::R),
+            "objc" | "objective-c" | "objectivec" | "obj-c" => Some(Self::ObjC),
             _ => None,
         }
     }
@@ -202,6 +205,7 @@ impl AstGrepLang {
             Self::Perl => &["pl", "pm", "t"],
             Self::Pascal => &["pas", "pp", "dpr", "dpk", "lpr"],
             Self::R => &["R", "r"],
+            Self::ObjC => &["m", "mm"],
         }
     }
 
@@ -353,7 +357,8 @@ impl Language for AstGrepLang {
             | Self::Php
             | Self::Lua
             | Self::Perl
-            | Self::R => '\u{00B5}', // µ
+            | Self::R
+            | Self::ObjC => '\u{00B5}', // µ
             Self::Pascal => '_',
             // $ is valid in TS, JS, Go, Solidity, and Vue template identifiers
             _ => '$',
@@ -387,6 +392,7 @@ impl LanguageExt for AstGrepLang {
             Self::Perl => tree_sitter_perl::LANGUAGE.into(),
             Self::Pascal => tree_sitter_pascal::LANGUAGE.into(),
             Self::R => tree_sitter_r::LANGUAGE.into(),
+            Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
         }
     }
 }
@@ -430,6 +436,11 @@ mod tests {
         assert_eq!(AstGrepLang::from_str("perl"), Some(AstGrepLang::Perl));
         assert_eq!(AstGrepLang::from_str("pascal"), Some(AstGrepLang::Pascal));
         assert_eq!(AstGrepLang::from_str("r"), Some(AstGrepLang::R));
+        assert_eq!(AstGrepLang::from_str("objc"), Some(AstGrepLang::ObjC));
+        assert_eq!(
+            AstGrepLang::from_str("objective-c"),
+            Some(AstGrepLang::ObjC)
+        );
         assert_eq!(AstGrepLang::from_str("markdown"), None);
     }
 
@@ -522,6 +533,11 @@ mod tests {
                 "result <- sum(values)\n",
                 "$NAME <- sum($VALUES)",
             ),
+            (
+                AstGrepLang::ObjC,
+                "id result = [obj foo:bar];\n",
+                "[obj foo:$ARG]",
+            ),
         ];
 
         for (lang, source, pattern) in probes {
@@ -577,6 +593,7 @@ helper();
         assert_eq!(AstGrepLang::Lua.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Perl.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::R.expando_char(), '\u{00B5}');
+        assert_eq!(AstGrepLang::ObjC.expando_char(), '\u{00B5}');
         assert_eq!(AstGrepLang::Pascal.expando_char(), '_');
         assert_eq!(AstGrepLang::TypeScript.expando_char(), '$');
         assert_eq!(AstGrepLang::JavaScript.expando_char(), '$');
@@ -704,6 +721,48 @@ helper();
             .find(|child| child.kind() == "identifier")
             .expect("µNAME should parse as one identifier token");
         assert_eq!(identifier.text(), "µNAME");
+    }
+
+    #[test]
+    fn objc_meta_var_pattern_uses_micro_expando_and_binds_capture() {
+        let lang = AstGrepLang::ObjC;
+        let source = "id result = [obj foo:bar];\n";
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let found = root.find("[obj foo:$ARG]");
+        assert!(
+            found.is_some(),
+            "Objective-C meta-var pattern must match message expression"
+        );
+        assert_eq!(
+            found.unwrap().get_env().get_match("ARG").unwrap().text(),
+            "bar"
+        );
+    }
+
+    #[test]
+    fn objc_micro_expando_parses_as_identifier_token() {
+        let lang = AstGrepLang::ObjC;
+        let processed = lang.pre_process_pattern("[obj foo:$ARG]");
+        assert!(
+            processed.contains('\u{00B5}'),
+            "Objective-C meta-var should use µ expando, got {processed:?}"
+        );
+        let grep = lang.ast_grep(processed.as_ref());
+        let root = grep.root();
+        let mut stack = root.children().collect::<Vec<_>>();
+        let mut saw_expando_identifier = false;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && node.text() == "µARG" {
+                saw_expando_identifier = true;
+                break;
+            }
+            stack.extend(node.children());
+        }
+        assert!(
+            saw_expando_identifier,
+            "µARG should parse as one Objective-C identifier token"
+        );
     }
 
     #[test]

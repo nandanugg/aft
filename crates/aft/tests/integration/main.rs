@@ -76,6 +76,7 @@ mod markdown_test;
 mod migrate_storage_test;
 mod move_file_test;
 mod move_symbol_test;
+mod objc_test;
 mod outline_files_mode_test;
 mod outline_languages_test;
 mod outline_zoom_test;

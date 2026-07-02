@@ -14,6 +14,8 @@ export const OUTLINE_EXTENSIONS = new Set([
   ".py",
   ".rb",
   ".c",
+  ".m",
+  ".mm",
   ".cpp",
   ".h",
   ".hpp",

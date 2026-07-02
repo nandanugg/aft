@@ -50,6 +50,7 @@ impl IndentStyle {
                 IndentStyle::Spaces(4)
             }
             LangId::Solidity
+            | LangId::ObjC
             | LangId::Java
             | LangId::Kotlin
             | LangId::Swift

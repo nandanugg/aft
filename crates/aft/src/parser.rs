@@ -427,6 +427,20 @@ const R_QUERY: &str = r#"
 (function_definition) @function.def
 "#;
 
+const OBJC_QUERY: &str = r#"
+;; Objective-C class and protocol containers. The extractor derives names from
+;; the first identifier child because the grammar does not field-name them.
+(class_interface) @class.def
+(class_implementation) @class.def
+(protocol_declaration) @interface.def
+
+;; Method bodies, property declarations, C functions, and typedefs in .m/.mm files.
+(method_definition) @method.def
+(property_declaration) @property.def
+(function_definition) @fn.def
+(type_definition) @type.def
+"#;
+
 const SCSS_QUERY: &str = r#"
 ;; SCSS definitions
 (mixin_statement
@@ -641,6 +655,7 @@ pub enum LangId {
     Yaml,
     Pascal,
     R,
+    ObjC,
 }
 
 /// Maps file extension to language identifier.
@@ -675,6 +690,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "yaml" | "yml" => Some(LangId::Yaml),
         "pas" | "pp" | "dpr" | "dpk" | "lpr" => Some(LangId::Pascal),
         "R" | "r" => Some(LangId::R),
+        "m" | "mm" => Some(LangId::ObjC),
         _ => None,
     }
 }
@@ -710,6 +726,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
         LangId::Pascal => tree_sitter_pascal::LANGUAGE.into(),
         LangId::R => tree_sitter_r::LANGUAGE.into(),
+        LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
     }
 }
 
@@ -743,6 +760,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Yaml => None, // YAML uses direct tree walking like JSON
         LangId::Pascal => Some(PASCAL_QUERY),
         LangId::R => Some(R_QUERY),
+        LangId::ObjC => Some(OBJC_QUERY),
     }
 }
 
@@ -790,6 +808,8 @@ static PERL_QUERY_CACHE: LazyLock<Result<Query, String>> =
 static PASCAL_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Pascal));
 static R_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::R));
+static OBJC_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::ObjC));
 
 fn compile_query(lang: LangId) -> Result<Query, String> {
     let query_src = query_for(lang).ok_or_else(|| format!("missing query for {lang:?}"))?;
@@ -823,6 +843,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Perl => Some(&*PERL_QUERY_CACHE),
         LangId::Pascal => Some(&*PASCAL_QUERY_CACHE),
         LangId::R => Some(&*R_QUERY_CACHE),
+        LangId::ObjC => Some(&*OBJC_QUERY_CACHE),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
     };
 
@@ -1440,6 +1461,7 @@ pub fn extract_symbols_from_tree(
         LangId::Perl => extract_perl_symbols(source, &root, query),
         LangId::Pascal => extract_pascal_symbols(source, &root, query),
         LangId::R => extract_r_symbols(source, &root, query),
+        LangId::ObjC => extract_objc_symbols(source, &root, query),
         LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
             unreachable!("handled before query lookup")
         }
@@ -1522,6 +1544,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             LangId::Go
             | LangId::C
             | LangId::Cpp
+            | LangId::ObjC
             | LangId::Zig
             | LangId::CSharp
             | LangId::Bash
@@ -4311,6 +4334,237 @@ fn r_is_top_level_assignment(node: &Node) -> bool {
         }
     }
     false
+}
+
+fn extract_objc_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+    let lang = LangId::ObjC;
+    let capture_names = query.capture_names();
+
+    let mut symbols = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, *root, source.as_bytes());
+
+    while let Some(m) = {
+        matches.advance();
+        matches.get()
+    } {
+        for cap in m.captures {
+            let Some(&name) = capture_names.get(cap.index as usize) else {
+                continue;
+            };
+
+            let def_node = cap.node;
+            match name {
+                "class.def" => {
+                    if let Some(symbol_name) = objc_container_name(source, &def_node) {
+                        let scope_chain = objc_scope_chain(&def_node, source);
+                        symbols.push(Symbol {
+                            name: symbol_name,
+                            kind: SymbolKind::Class,
+                            range: node_range_with_decorators(&def_node, source, lang),
+                            signature: Some(extract_signature(source, &def_node)),
+                            parent: scope_chain.last().cloned(),
+                            scope_chain,
+                            exported: false,
+                        });
+                    }
+                }
+                "interface.def" => {
+                    if let Some(symbol_name) = objc_container_name(source, &def_node) {
+                        let scope_chain = objc_scope_chain(&def_node, source);
+                        symbols.push(Symbol {
+                            name: symbol_name,
+                            kind: SymbolKind::Interface,
+                            range: node_range_with_decorators(&def_node, source, lang),
+                            signature: Some(extract_signature(source, &def_node)),
+                            parent: scope_chain.last().cloned(),
+                            scope_chain,
+                            exported: false,
+                        });
+                    }
+                }
+                "method.def" => {
+                    if let Some(symbol_name) = objc_method_selector(source, &def_node) {
+                        let scope_chain = objc_scope_chain(&def_node, source);
+                        symbols.push(Symbol {
+                            name: symbol_name,
+                            kind: SymbolKind::Method,
+                            range: node_range_with_decorators(&def_node, source, lang),
+                            signature: Some(extract_signature(source, &def_node)),
+                            parent: scope_chain.last().cloned(),
+                            scope_chain,
+                            exported: false,
+                        });
+                    }
+                }
+                "property.def" => {
+                    if let Some(symbol_name) = objc_property_name(source, &def_node) {
+                        let scope_chain = objc_scope_chain(&def_node, source);
+                        symbols.push(Symbol {
+                            name: symbol_name,
+                            kind: SymbolKind::Variable,
+                            range: node_range_with_decorators(&def_node, source, lang),
+                            signature: Some(extract_signature(source, &def_node)),
+                            parent: scope_chain.last().cloned(),
+                            scope_chain,
+                            exported: false,
+                        });
+                    }
+                }
+                "fn.def" => {
+                    if let Some(symbol_name) = objc_function_name(source, &def_node) {
+                        let scope_chain = objc_scope_chain(&def_node, source);
+                        symbols.push(Symbol {
+                            name: symbol_name,
+                            kind: SymbolKind::Function,
+                            range: node_range_with_decorators(&def_node, source, lang),
+                            signature: Some(extract_signature(source, &def_node)),
+                            parent: scope_chain.last().cloned(),
+                            scope_chain,
+                            exported: false,
+                        });
+                    }
+                }
+                "type.def" => {
+                    if let Some(symbol_name) = objc_typedef_name(source, &def_node) {
+                        let scope_chain = objc_scope_chain(&def_node, source);
+                        symbols.push(Symbol {
+                            name: symbol_name,
+                            kind: SymbolKind::TypeAlias,
+                            range: node_range_with_decorators(&def_node, source, lang),
+                            signature: Some(extract_signature(source, &def_node)),
+                            parent: scope_chain.last().cloned(),
+                            scope_chain,
+                            exported: false,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+fn objc_container_name(source: &str, node: &Node) -> Option<String> {
+    objc_first_direct_identifier(source, node)
+}
+
+fn objc_method_selector(source: &str, node: &Node) -> Option<String> {
+    let mut bare_selector = None;
+    let mut keyword_segments = Vec::new();
+    let mut cursor = node.walk();
+
+    let direct_named_children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    for (index, child) in direct_named_children.iter().enumerate() {
+        match child.kind() {
+            "identifier" => {
+                let next_kind = direct_named_children.get(index + 1).map(|next| next.kind());
+                if next_kind == Some("method_parameter") {
+                    keyword_segments.push(format!(
+                        "{}:",
+                        node_text(source, child).trim_end_matches(':')
+                    ));
+                } else {
+                    bare_selector.get_or_insert_with(|| node_text(source, child).to_string());
+                }
+            }
+            "keyword_declarator" => {
+                if let Some(segment) = objc_first_direct_identifier(source, child) {
+                    keyword_segments.push(format!("{}:", segment.trim_end_matches(':')));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if keyword_segments.is_empty() {
+        bare_selector
+    } else {
+        Some(keyword_segments.join(""))
+    }
+}
+
+fn objc_property_name(source: &str, node: &Node) -> Option<String> {
+    find_child_by_kind(*node, "atomic_declaration")
+        .as_ref()
+        .and_then(|declaration| objc_declarator_name(source, declaration))
+        .or_else(|| objc_declarator_name(source, node))
+}
+
+fn objc_function_name(source: &str, node: &Node) -> Option<String> {
+    node.child_by_field_name("declarator")
+        .as_ref()
+        .and_then(|declarator| objc_declarator_name(source, declarator))
+}
+
+fn objc_typedef_name(source: &str, node: &Node) -> Option<String> {
+    node.child_by_field_name("declarator")
+        .as_ref()
+        .and_then(|declarator| objc_declarator_name(source, declarator))
+}
+
+fn objc_scope_chain(node: &Node, source: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_interface" | "class_implementation" | "protocol_declaration"
+        ) {
+            if let Some(name) = objc_container_name(source, &parent) {
+                scopes.push(name);
+            }
+        }
+        current = parent.parent();
+    }
+    scopes.reverse();
+    scopes
+}
+
+fn objc_first_direct_identifier(source: &str, node: &Node) -> Option<String> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+
+    loop {
+        let child = cursor.node();
+        if child.kind() == "identifier" {
+            return Some(node_text(source, &child).to_string());
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn objc_declarator_name(source: &str, node: &Node) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return Some(node_text(source, node).to_string());
+    }
+
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        if let Some(name) = objc_declarator_name(source, &declarator) {
+            return Some(name);
+        }
+    }
+
+    (0..node.child_count()).rev().find_map(|child_index| {
+        let child = node.child(child_index as u32)?;
+        if child.is_named() {
+            objc_declarator_name(source, &child)
+        } else {
+            None
+        }
+    })
 }
 
 fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {

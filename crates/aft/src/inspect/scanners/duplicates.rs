@@ -663,6 +663,7 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::Perl
             | LangId::Pascal
             | LangId::R
+            | LangId::ObjC
     )
 }
 fn language_name(lang: LangId) -> &'static str {
@@ -695,6 +696,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Pascal => "pascal",
         LangId::R => "r",
+        LangId::ObjC => "objc",
     }
 }
 

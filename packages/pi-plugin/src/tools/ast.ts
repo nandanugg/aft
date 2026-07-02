@@ -1,6 +1,6 @@
 /**
  * ast_grep_search + ast_grep_replace — AST-aware pattern search/rewrite.
- * 8 languages: typescript, tsx, javascript, python, rust, go, pascal, r.
+ * 9 languages: typescript, tsx, javascript, python, rust, go, pascal, r, objc.
  */
 
 import { coerceBoolean } from "@cortexkit/aft-bridge";
@@ -33,7 +33,7 @@ import {
 } from "./render-helpers.js";
 
 const AstLang = StringEnum(
-  ["typescript", "tsx", "javascript", "python", "rust", "go", "pascal", "r"] as const,
+  ["typescript", "tsx", "javascript", "python", "rust", "go", "pascal", "r", "objc"] as const,
   {
     description: "Target language",
   },

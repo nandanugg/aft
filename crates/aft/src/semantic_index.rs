@@ -3260,7 +3260,9 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "pm"
                 | "t"
                 | "r"
-                | "R",
+                | "R"
+                | "m"
+                | "mm",
         )
     )
 }
