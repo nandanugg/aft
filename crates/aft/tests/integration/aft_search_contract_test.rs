@@ -651,6 +651,60 @@ fn standalone_grep_keeps_generated_artifacts_in_mtime_order() {
 }
 
 #[test]
+fn standalone_grep_uses_display_path_tiebreak_for_equal_mtimes() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).expect("create source dir");
+    let zeta = src.join("zeta.txt");
+    let alpha = src.join("alpha.txt");
+    std::fs::write(&zeta, "EqualMtimeNeedle\n").expect("write zeta fixture");
+    std::fs::write(&alpha, "EqualMtimeNeedle\n").expect("write alpha fixture");
+
+    let fixed_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    for path in [&zeta, &alpha] {
+        filetime::set_file_mtime(path, fixed_mtime).expect("set identical fixture mtime");
+    }
+
+    let ctx = test_context(project.path());
+    let first = response_value(handle_grep(&grep_request("EqualMtimeNeedle", 10), &ctx));
+    let second = response_value(handle_grep(&grep_request("EqualMtimeNeedle", 10), &ctx));
+
+    assert_eq!(
+        first["success"], true,
+        "first grep should succeed: {first:?}"
+    );
+    assert_eq!(
+        second["success"], true,
+        "second grep should succeed: {second:?}"
+    );
+    let first_matches = first["matches"].as_array().expect("first matches array");
+    assert_eq!(
+        first_matches.len(),
+        2,
+        "expected both tie fixtures: {first:?}"
+    );
+    assert_eq!(
+        serde_json::to_vec(&first["matches"]).expect("serialize first matches"),
+        serde_json::to_vec(&second["matches"]).expect("serialize second matches"),
+        "equal-mtime grep order should be byte-identical across runs"
+    );
+
+    let files = first_matches
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .expect("grep match file")
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        files[0].ends_with("src/alpha.txt") && files[1].ends_with("src/zeta.txt"),
+        "equal-mtime files should sort by normalized display path: {files:?}"
+    );
+}
+
+#[test]
 fn literal_grep_filters_test_support_files_unless_requested() {
     let project = tempfile::tempdir().expect("create project dir");
     let source_file = project.path().join("src/lib.rs");

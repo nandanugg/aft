@@ -1315,7 +1315,7 @@ impl SearchIndexSnapshot {
             matches
         };
 
-        sort_shared_grep_matches_by_cached_mtime_desc(&mut matches, |path| {
+        sort_shared_grep_matches_by_cached_mtime_desc(&mut matches, &self.project_root, |path| {
             self.path_to_id
                 .get(path)
                 .and_then(|file_id| self.files.get(*file_id as usize))
@@ -3036,7 +3036,7 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
     (!normalized.as_os_str().is_empty()).then_some(normalized)
 }
 
-/// Sort paths newest-first by mtime, falling back to lexicographic order.
+/// Sort paths newest-first by mtime, falling back to normalized display-path order.
 ///
 /// Pre-v0.15.2 this called `path_modified_time(...)` directly inside the
 /// `sort_by()` closure. That made the comparator non-deterministic — a
@@ -3051,15 +3051,29 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
     use std::collections::HashMap;
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
+    let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
     for path in paths.iter() {
         mtimes
             .entry(path.clone())
             .or_insert_with(|| path_modified_time(path));
+        display_paths
+            .entry(path.clone())
+            .or_insert_with(|| normalized_display_sort_key(None, path));
     }
     paths.sort_by(|left, right| {
         let left_mtime = mtimes.get(left).and_then(|v| *v);
         let right_mtime = mtimes.get(right).and_then(|v| *v);
-        right_mtime.cmp(&left_mtime).then_with(|| left.cmp(right))
+        let left_display = display_paths
+            .get(left)
+            .map(String::as_bytes)
+            .unwrap_or_default();
+        let right_display = display_paths
+            .get(right)
+            .map(String::as_bytes)
+            .unwrap_or_default();
+        right_mtime
+            .cmp(&left_mtime)
+            .then_with(|| left_display.cmp(right_display))
     });
 }
 
@@ -3068,18 +3082,33 @@ pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
 pub(crate) fn sort_grep_matches_by_mtime_desc(matches: &mut [GrepMatch], project_root: &Path) {
     use std::collections::HashMap;
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::new();
+    let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(matches.len());
     for m in matches.iter() {
         mtimes.entry(m.file.clone()).or_insert_with(|| {
             let resolved = resolve_match_path(project_root, &m.file);
             path_modified_time(&resolved)
         });
+        display_paths
+            .entry(m.file.clone())
+            .or_insert_with(|| normalized_display_sort_key(Some(project_root), &m.file));
     }
     matches.sort_by(|left, right| {
         let left_mtime = mtimes.get(&left.file).and_then(|v| *v);
         let right_mtime = mtimes.get(&right.file).and_then(|v| *v);
+        let left_display = display_paths
+            .get(&left.file)
+            .map(String::as_bytes)
+            .unwrap_or_default();
+        let right_display = display_paths
+            .get(&right.file)
+            .map(String::as_bytes)
+            .unwrap_or_default();
+        // The display-path tiebreak makes complete result sets deterministic.
+        // If a parallel grep stops early after hitting a cap, the capped subset
+        // can still depend on which worker reaches the cap first.
         right_mtime
             .cmp(&left_mtime)
-            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left_display.cmp(right_display))
             .then_with(|| left.line.cmp(&right.line))
             .then_with(|| left.column.cmp(&right.column))
     });
@@ -3091,24 +3120,40 @@ pub(crate) fn sort_grep_matches_by_mtime_desc(matches: &mut [GrepMatch], project
 /// the file is modified mid-sort. Snapshot once.
 fn sort_shared_grep_matches_by_cached_mtime_desc<F>(
     matches: &mut [SharedGrepMatch],
+    project_root: &Path,
     modified_for_path: F,
 ) where
     F: Fn(&Path) -> Option<SystemTime>,
 {
     use std::collections::HashMap;
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(matches.len());
+    let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(matches.len());
     for m in matches.iter() {
         let path = m.file.as_path().to_path_buf();
         mtimes
             .entry(path.clone())
             .or_insert_with(|| modified_for_path(&path));
+        display_paths
+            .entry(path.clone())
+            .or_insert_with(|| normalized_display_sort_key(Some(project_root), &path));
     }
     matches.sort_by(|left, right| {
         let left_mtime = mtimes.get(left.file.as_path()).and_then(|v| *v);
         let right_mtime = mtimes.get(right.file.as_path()).and_then(|v| *v);
+        let left_display = display_paths
+            .get(left.file.as_path())
+            .map(String::as_bytes)
+            .unwrap_or_default();
+        let right_display = display_paths
+            .get(right.file.as_path())
+            .map(String::as_bytes)
+            .unwrap_or_default();
+        // The display-path tiebreak makes complete result sets deterministic.
+        // If a parallel grep stops early after hitting a cap, the capped subset
+        // can still depend on which worker reaches the cap first.
         right_mtime
             .cmp(&left_mtime)
-            .then_with(|| left.file.as_path().cmp(right.file.as_path()))
+            .then_with(|| left_display.cmp(right_display))
             .then_with(|| left.line.cmp(&right.line))
             .then_with(|| left.column.cmp(&right.column))
     });
@@ -3364,6 +3409,13 @@ fn path_modified_time(path: &Path) -> Option<SystemTime> {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
+}
+
+fn normalized_display_sort_key(project_root: Option<&Path>, path: &Path) -> String {
+    let display_path = project_root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    to_glob_path(display_path)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
