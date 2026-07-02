@@ -171,6 +171,25 @@ fn subc_format_matches_typescript_golden_fixtures() {
 }
 
 #[test]
+fn bash_error_renders_as_text_not_raw_json() {
+    // The MCP e2e probe caught a denied bash call returning the raw response
+    // JSON as its text content because "bash" was missing from the formatted
+    // tool set. Every bash render (deny, deferred result, promotion) must
+    // produce prose, never a serialized envelope.
+    let response = Response::error(
+        "probe",
+        "bash_denied_untrusted",
+        "remote/MCP-facade binds cannot run shell commands",
+    );
+    let text = format_response_with_context("bash", &response, &FormatContext::default());
+    assert_eq!(text, "remote/MCP-facade binds cannot run shell commands");
+    assert!(
+        !text.contains("\"success\""),
+        "bash error text leaked raw JSON: {text}"
+    );
+}
+
+#[test]
 fn callgraph_format_matches_typescript_golden_fixtures() {
     let root = fixtures_root();
     let mut cases: Vec<PathBuf> = fs::read_dir(&root)
