@@ -364,7 +364,7 @@
     "type": "object",
     "properties": {
       "sections": {
-        "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code']). Use 'all' for every active category. Omit for summary-only mode.",
+        "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode.",
         "anyOf": [
           {
             "type": "string"

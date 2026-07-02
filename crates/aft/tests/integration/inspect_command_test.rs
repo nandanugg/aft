@@ -542,7 +542,7 @@ fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    for category in ["dead_code", "unused_exports", "duplicates"] {
+    for category in ["dead_code", "unused_exports", "duplicates", "cycles"] {
         assert!(
             !scanner_state_contains(&response, "pending_categories", category),
             "{category} should finish during direct inspect: {response:#}"
@@ -554,6 +554,7 @@ fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     }
     assert_summary_count(&response, "unused_exports", 2);
     assert_summary_count(&response, "duplicates", 0);
+    assert_summary_count(&response, "cycles", 0);
 }
 
 #[test]
@@ -1890,6 +1891,58 @@ fn inspect_command_dead_code_reports_unreachable_cycle_after_tier2_run() {
             ("src/a.ts".to_string(), "a".to_string()),
             ("src/b.ts".to_string(), "b".to_string()),
         ]
+    );
+}
+
+#[test]
+fn inspect_command_cycles_render_chain_and_import_edges_after_tier2_run() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/a.ts",
+        "import { b } from './b';\nexport const a = b;\n",
+    );
+    write_file(
+        &root,
+        "src/b.ts",
+        "import { a } from './a';\nexport const b = a;\n",
+    );
+    let ctx = configured_context(&root);
+
+    tier2_run(&ctx, &["cycles"]);
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-cycles",
+            "command": "inspect",
+            "sections": "cycles",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_summary_count(&response, "cycles", 1);
+    assert_eq!(response["summary"]["cycles"]["largest"], 2);
+    let details = response["details"]["cycles"]
+        .as_array()
+        .expect("cycles details");
+    assert_eq!(
+        details.len(),
+        1,
+        "cycle should be reported once: {response:#}"
+    );
+    assert_eq!(
+        details[0]["cycle"].as_str(),
+        Some("src/a.ts -> src/b.ts -> src/a.ts")
+    );
+    let text = response["text"].as_str().expect("inspect text");
+    assert!(
+        text.contains("Import cycles: 1 import cycle (largest: 2 files)"),
+        "cycles summary line missing: {text}"
+    );
+    assert!(
+        text.contains("src/a.ts -> src/b.ts via import::Named './b' line 1"),
+        "cycle import edge missing: {text}"
     );
 }
 

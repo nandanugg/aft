@@ -182,6 +182,8 @@ pub struct OxcResolvedEdge {
     pub specifier: String,
     pub resolved_file: Option<PathBuf>,
     pub kind: String,
+    pub line: u32,
+    pub is_type_only: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

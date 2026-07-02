@@ -118,7 +118,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// so changing intentional mirror architecture rules invalidates cached roll-ups.
 /// v21: Rust dead_code contributions carry attribute-root entry facts for
 /// externally-invoked functions such as Tauri commands and ABI exports.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 21;
+/// v22: cycles persists TS/JS resolved import-edge facts and rolls them up into
+/// strongly connected module components.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 22;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1132,7 +1134,7 @@ fn contribution_set_hash_with_conn(
     update_manifest_fingerprint_hash(&mut hasher, project_root)?;
     if matches!(
         category,
-        InspectCategory::DeadCode | InspectCategory::UnusedExports
+        InspectCategory::DeadCode | InspectCategory::UnusedExports | InspectCategory::Cycles
     ) {
         update_resolver_config_fingerprint_hash(&mut hasher, project_root)?;
     }
@@ -1821,7 +1823,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 21);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 22);
     }
 
     #[test]

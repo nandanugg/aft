@@ -72,6 +72,7 @@ fn dispatch_category(job: InspectJob) -> InspectResult {
         InspectCategory::DeadCode => scanners::dead_code::run_dead_code_scan(&job),
         InspectCategory::UnusedExports => scanners::unused_exports::run_unused_exports_scan(&job),
         InspectCategory::Duplicates => scanners::duplicates::run_duplicates_scan(&job),
+        InspectCategory::Cycles => scanners::cycles::run_cycles_scan(&job),
         InspectCategory::Diagnostics => {
             // Diagnostics are backed by the AppContext LSP manager and run via
             // the serial LSP/status lane in `handle_inspect` — never through

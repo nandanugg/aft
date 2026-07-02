@@ -43,6 +43,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         InspectCategory::DeadCode,
         InspectCategory::UnusedExports,
         InspectCategory::Duplicates,
+        InspectCategory::Cycles,
     ] {
         let manager = manager.clone();
         let snapshot = snapshot.clone();
@@ -96,6 +97,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             InspectCategory::DeadCode,
             InspectCategory::UnusedExports,
             InspectCategory::Duplicates,
+            InspectCategory::Cycles,
         ]
         .iter()
         .all(|category| force_paths_completed.contains(category))
@@ -612,6 +614,7 @@ fn render_inspect_text(
 
     // Tier-2 findings, highest-signal first.
     render_group_category(&mut lines, "Duplicates", summary, details, "duplicates");
+    render_cycles_category(&mut lines, summary, details);
     render_symbol_category(&mut lines, "Dead code", summary, details, "dead_code");
     render_symbol_category(
         &mut lines,
@@ -623,6 +626,84 @@ fn render_inspect_text(
     render_todos(&mut lines, summary, details);
 
     lines.join("\n")
+}
+
+fn render_cycles_category(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+) {
+    if !details.contains_key("cycles") {
+        return;
+    }
+    let Some(section) = summary.get("cycles") else {
+        return;
+    };
+    if let Some(status) = section.get("status").and_then(Value::as_str) {
+        lines.push(format!("Import cycles: {status}"));
+        return;
+    }
+    let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    if count == 0 {
+        lines.push("Import cycles: 0".to_string());
+        return;
+    }
+    let largest = section.get("largest").and_then(Value::as_u64).unwrap_or(0);
+    let cycle_word = if count == 1 { "cycle" } else { "cycles" };
+    let file_word = if largest == 1 { "file" } else { "files" };
+    lines.push(format!(
+        "Import cycles: {count} import {cycle_word} (largest: {largest} {file_word})"
+    ));
+    let Some(items) = details.get("cycles").and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let cycle = item.get("cycle").and_then(Value::as_str).unwrap_or("?");
+        let edge_kind = item
+            .get("edge_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        lines.push(format!("  {cycle} [{edge_kind}]"));
+        if let Some(edges) = item.get("edges").and_then(Value::as_array) {
+            for edge in edges {
+                let from = edge.get("from").and_then(Value::as_str).unwrap_or("?");
+                let to = edge.get("to").and_then(Value::as_str).unwrap_or("?");
+                let imports = edge
+                    .get("imports")
+                    .and_then(Value::as_array)
+                    .map(|imports| {
+                        imports
+                            .iter()
+                            .map(render_cycle_import)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                if imports.is_empty() {
+                    lines.push(format!("    {from} -> {to}"));
+                } else {
+                    lines.push(format!("    {from} -> {to} via {imports}"));
+                }
+            }
+        }
+    }
+}
+
+fn render_cycle_import(import: &Value) -> String {
+    let specifier = import
+        .get("specifier")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let kind = import
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("import");
+    let line = import.get("line").and_then(Value::as_u64).unwrap_or(0);
+    if line == 0 {
+        format!("{kind} '{specifier}'")
+    } else {
+        format!("{kind} '{specifier}' line {line}")
+    }
 }
 
 /// Pick the fuller drill-down list when present (sections requested), else the
@@ -1042,6 +1123,10 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
             section.insert("top".to_string(), top_preview_from_payload(payload));
             Value::Object(section)
         }
+        InspectCategory::Cycles => serde_json::json!({
+            "count": count_from_payload(payload),
+            "largest": payload.and_then(|p| p.get("largest")).and_then(Value::as_u64).unwrap_or(0),
+        }),
         _ => serde_json::json!({ "count": count_from_payload(payload) }),
     }
 }

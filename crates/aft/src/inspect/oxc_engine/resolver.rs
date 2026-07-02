@@ -171,6 +171,8 @@ impl ModuleResolver {
                             specifier: import.source.clone(),
                             resolved_file: target.map(|id| facts[id.0].path.clone()),
                             kind: format!("import::{:?}", import.kind),
+                            line: import.line,
+                            is_type_only: import.is_type_only,
                         });
                         ResolvedImport {
                             fact: import.clone(),
@@ -193,6 +195,8 @@ impl ModuleResolver {
                             specifier: re_export.source.clone(),
                             resolved_file: target.map(|id| facts[id.0].path.clone()),
                             kind: format!("re_export::{:?}", re_export.kind),
+                            line: re_export.line,
+                            is_type_only: re_export.is_type_only,
                         });
                         ResolvedReExport {
                             fact: re_export.clone(),
@@ -218,6 +222,8 @@ impl ModuleResolver {
                                 specifier: source.clone(),
                                 resolved_file: target.map(|id| facts[id.0].path.clone()),
                                 kind: "dynamic_import".to_string(),
+                                line: dynamic.line,
+                                is_type_only: false,
                             });
                         }
                         ResolvedDynamicImport {

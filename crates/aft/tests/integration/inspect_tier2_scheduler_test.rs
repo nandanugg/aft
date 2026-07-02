@@ -204,7 +204,10 @@ fn watcher_tick_after_quiet_gap_triggers_tier2_refresh() {
         Some(Tier2TriggerReason::Debounce)
     );
 
-    let response = wait_for_tier2(&ctx, &["dead_code", "unused_exports", "duplicates"]);
+    let response = wait_for_tier2(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
     assert_eq!(
         response["scanner_state"]["tier2_trigger_reason"].as_str(),
         Some("debounce"),

@@ -111,8 +111,8 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count.\n\n" +
+      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Rust module cycles are out of scope for `cycles`.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     args: {
@@ -121,7 +121,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code']). Use 'all' for every active category. Omit for summary-only mode.",
+            "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode.",
           ),
       ),
       scope: arg(

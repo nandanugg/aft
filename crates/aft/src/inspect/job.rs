@@ -21,6 +21,7 @@ pub enum InspectCategory {
     DeadCode,
     UnusedExports,
     Duplicates,
+    Cycles,
     Complexity,
     CircularDeps,
     OutdatedDeps,
@@ -30,13 +31,14 @@ pub enum InspectCategory {
 }
 
 impl InspectCategory {
-    pub const ACTIVE: [InspectCategory; 6] = [
+    pub const ACTIVE: [InspectCategory; 7] = [
         InspectCategory::Diagnostics,
         InspectCategory::Metrics,
         InspectCategory::Todos,
         InspectCategory::DeadCode,
         InspectCategory::UnusedExports,
         InspectCategory::Duplicates,
+        InspectCategory::Cycles,
     ];
 
     pub const DISABLED: [InspectCategory; 6] = [
@@ -56,6 +58,7 @@ impl InspectCategory {
             InspectCategory::DeadCode => "dead_code",
             InspectCategory::UnusedExports => "unused_exports",
             InspectCategory::Duplicates => "duplicates",
+            InspectCategory::Cycles => "cycles",
             InspectCategory::Complexity => "complexity",
             InspectCategory::CircularDeps => "circular_deps",
             InspectCategory::OutdatedDeps => "outdated_deps",
@@ -73,6 +76,7 @@ impl InspectCategory {
             InspectCategory::DeadCode
             | InspectCategory::UnusedExports
             | InspectCategory::Duplicates
+            | InspectCategory::Cycles
             | InspectCategory::Complexity
             | InspectCategory::CircularDeps
             | InspectCategory::ApiSurface => InspectTier::Tier2,
@@ -116,6 +120,7 @@ impl FromStr for InspectCategory {
             "dead_code" => Ok(Self::DeadCode),
             "unused_exports" => Ok(Self::UnusedExports),
             "duplicates" => Ok(Self::Duplicates),
+            "cycles" => Ok(Self::Cycles),
             "complexity" => Ok(Self::Complexity),
             "circular_deps" => Ok(Self::CircularDeps),
             "outdated_deps" => Ok(Self::OutdatedDeps),

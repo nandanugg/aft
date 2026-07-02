@@ -28,7 +28,7 @@ const InspectParams = Type.Object({
   sections: Type.Optional(
     Type.Union([Type.String(), Type.Array(Type.String())], {
       description:
-        "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code']). Use 'all' for every active category. Omit for summary-only mode.",
+        "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode.",
     }),
   ),
   scope: Type.Optional(
@@ -49,7 +49,7 @@ const InspectParams = Type.Object({
 
 type StringOrStringArray = string | string[];
 
-const TIER2_INSPECT_CATEGORIES = new Set(["dead_code", "unused_exports", "duplicates"]);
+const TIER2_INSPECT_CATEGORIES = new Set(["dead_code", "unused_exports", "duplicates", "cycles"]);
 const INSPECT_TIER2_RUN_TIMEOUT_MS = 5 * 60_000;
 // Pi has no session.idle hook like OpenCode, so on-demand Tier 2 warmups are
 // rate-limited per bridge/category to the same default idle window (4 minutes).
@@ -314,6 +314,7 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
     tier2SummaryPart(summary, "dead_code", "dead code"),
     tier2SummaryPart(summary, "unused_exports", "unused exports"),
     tier2SummaryPart(summary, "duplicates", "duplicates"),
+    tier2SummaryPart(summary, "cycles", "cycles"),
   ].filter((part): part is string => Boolean(part));
 
   const sections = [theme.fg("accent", parts.join(" · "))];
@@ -377,8 +378,8 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_inspect",
     label: "inspect",
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Pi may still trigger a deduped background warmup for categories that remain pending.\n\n" +
+      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\n" +
+      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Pi may still trigger a deduped background warmup for categories that remain pending. Rust module cycles are out of scope for `cycles`.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     parameters: InspectParams,

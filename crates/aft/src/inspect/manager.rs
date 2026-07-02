@@ -1859,6 +1859,7 @@ fn run_tier2_scan(job: &InspectJob, oxc_result: Option<&OxcEngineResult>) -> Ins
             scanners::unused_exports::run_unused_exports_scan_with_oxc(job, oxc_result)
         }
         InspectCategory::Duplicates => scanners::duplicates::run_duplicates_scan(job),
+        InspectCategory::Cycles => scanners::cycles::run_cycles_scan_with_oxc(job, oxc_result),
         other => InspectResult::failed(
             job,
             format!("inspect category '{other}' is not an active Tier 2 scanner"),
@@ -1885,6 +1886,9 @@ fn roll_up_tier2_contributions_with_limit(
         }
         InspectCategory::Duplicates => {
             roll_up_duplicate_contributions(job, contributions, drill_down_limit)
+        }
+        InspectCategory::Cycles => {
+            roll_up_cycle_contributions(job, contributions, drill_down_limit)
         }
         _ => json!({
             "count": 0,
@@ -2267,6 +2271,19 @@ fn roll_up_duplicate_contributions(
     )
 }
 
+fn roll_up_cycle_contributions(
+    job: &InspectJob,
+    contributions: &[FileContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
+    super::scanners::cycles::aggregate_cycle_contributions_with_limit(
+        &job.project_root,
+        contributions,
+        skipped_languages(&job.scope_files, LanguageSkipMode::Cycles),
+        drill_down_limit,
+    )
+}
+
 fn cap_payload_drill_down(mut payload: Value, limit: usize) -> Value {
     let mut capped = false;
     if let Some(items) = payload.get_mut("items").and_then(Value::as_array_mut) {
@@ -2349,13 +2366,14 @@ struct OxcFactsContribution {
 #[derive(Debug, Clone, Copy)]
 enum LanguageSkipMode {
     Duplicates,
+    Cycles,
     UnusedExports,
 }
 
 fn category_uses_oxc(category: InspectCategory) -> bool {
     matches!(
         category,
-        InspectCategory::DeadCode | InspectCategory::UnusedExports
+        InspectCategory::DeadCode | InspectCategory::UnusedExports | InspectCategory::Cycles
     )
 }
 
@@ -2372,12 +2390,14 @@ fn skipped_language(file: &Path, mode: LanguageSkipMode) -> Option<String> {
     let Some(language) = crate::parser::detect_language(file) else {
         return match mode {
             LanguageSkipMode::Duplicates => Some("unknown".to_string()),
+            LanguageSkipMode::Cycles => Some("unknown".to_string()),
             LanguageSkipMode::UnusedExports => None,
         };
     };
 
     let skipped = match mode {
         LanguageSkipMode::Duplicates => !duplicates_supports_language(language),
+        LanguageSkipMode::Cycles => !is_js_ts_language(language),
         LanguageSkipMode::UnusedExports => !is_js_ts_language(language),
     };
     skipped.then(|| language_name(language).to_string())
@@ -2526,8 +2546,18 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         .and_then(|value| value.as_array_mut())
     {
         let count = filter_values_for_scope(items, scope);
+        let largest_cycle = items
+            .iter()
+            .filter_map(|item| item.get("files").and_then(Value::as_array).map(Vec::len))
+            .max();
         if let Some(object) = payload.as_object_mut() {
             object.insert("count".to_string(), serde_json::json!(count));
+            if object.contains_key("largest") {
+                object.insert(
+                    "largest".to_string(),
+                    serde_json::json!(largest_cycle.unwrap_or(0)),
+                );
+            }
             if object.contains_key("total_groups") {
                 object.insert("total_groups".to_string(), serde_json::json!(count));
             }

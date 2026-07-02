@@ -208,6 +208,20 @@ fn aggregate_contains_symbol(
         })
 }
 
+fn cycle_items(success: &InspectScanSuccess) -> Vec<Value> {
+    success.aggregate["items"]
+        .as_array()
+        .expect("cycle items")
+        .clone()
+}
+
+fn cycle_chains(success: &InspectScanSuccess) -> Vec<String> {
+    cycle_items(success)
+        .iter()
+        .filter_map(|item| item.get("cycle")?.as_str().map(str::to_string))
+        .collect()
+}
+
 #[test]
 fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
     let (temp_dir, root, mutated_file) = build_fixture();
@@ -252,6 +266,146 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
         third.aggregate, cold.aggregate,
         "stat-diff incremental aggregate must match a cold hash-all scan after an mtime-advancing edit"
     );
+}
+
+#[test]
+fn inspect_cycles_reports_import_sccs_once_and_excludes_type_only_edges() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project-cycles");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(
+        &root,
+        "src/two_a.ts",
+        "import { twoB } from './two_b';\nexport const twoA = twoB;\n",
+    );
+    write_file(
+        &root,
+        "src/two_b.ts",
+        "import { twoA } from './two_a';\nexport const twoB = twoA;\n",
+    );
+    write_file(
+        &root,
+        "src/three_a.ts",
+        "import { threeB } from './three_b';\nexport const threeA = threeB;\n",
+    );
+    write_file(
+        &root,
+        "src/three_b.ts",
+        "import { threeC } from './three_c';\nexport const threeB = threeC;\n",
+    );
+    write_file(
+        &root,
+        "src/three_c.ts",
+        "import { threeA } from './three_a';\nexport const threeC = threeA;\n",
+    );
+    write_file(
+        &root,
+        "src/type_a.ts",
+        "import type { TypeB } from './type_b';\nexport type TypeA = { b?: TypeB };\n",
+    );
+    write_file(
+        &root,
+        "src/type_b.ts",
+        "import type { TypeA } from './type_a';\nexport type TypeB = { a?: TypeA };\n",
+    );
+    write_file(
+        &root,
+        "src/chain_a.ts",
+        "import { chainB } from './chain_b';\nexport const chainA = chainB;\n",
+    );
+    write_file(
+        &root,
+        "src/chain_b.ts",
+        "import { chainC } from './chain_c';\nexport const chainB = chainC;\n",
+    );
+    write_file(&root, "src/chain_c.ts", "export const chainC = 1;\n");
+
+    let manager = InspectManager::new();
+    let (success, _elapsed) = run_reuse_category(
+        &manager,
+        snapshot(&root, &root.join(".aft-cache").join("inspect")),
+        InspectCategory::Cycles,
+    );
+
+    assert_eq!(success.aggregate["count"], 2);
+    assert_eq!(success.aggregate["largest"], 3);
+    assert_eq!(
+        cycle_chains(&success),
+        vec![
+            "src/three_a.ts -> src/three_b.ts -> src/three_c.ts -> src/three_a.ts".to_string(),
+            "src/two_a.ts -> src/two_b.ts -> src/two_a.ts".to_string(),
+        ]
+    );
+    let rendered = success.aggregate.to_string();
+    assert!(
+        !rendered.contains("type_a.ts"),
+        "type-only cycle must be ignored: {rendered}"
+    );
+    assert!(
+        !rendered.contains("chain_a.ts"),
+        "acyclic chain must be ignored: {rendered}"
+    );
+    assert!(
+        cycle_items(&success).iter().all(|item| item
+            .get("cycle")
+            .and_then(Value::as_str)
+            .is_some_and(|cycle| !cycle.contains('\\'))),
+        "cycle display paths must use forward slashes: {:#}",
+        success.aggregate
+    );
+    assert!(
+        cycle_items(&success)
+            .iter()
+            .all(|item| item.get("edge_kind").and_then(Value::as_str) == Some("static")),
+        "fixture cycles are static imports: {:#}",
+        success.aggregate
+    );
+}
+
+#[test]
+fn inspect_cycles_incremental_rescans_only_changed_file() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project-cycles-incremental");
+    fs::create_dir_all(&root).expect("create project");
+    let changed_file = write_file(
+        &root,
+        "src/a.ts",
+        "import { b } from './b';\nexport const a = b;\n",
+    );
+    write_file(
+        &root,
+        "src/b.ts",
+        "import { a } from './a';\nexport const b = a;\n",
+    );
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+
+    let first_manager = InspectManager::new();
+    let (first, _elapsed) = run_reuse_category(
+        &first_manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::Cycles,
+    );
+    assert_eq!(first.aggregate["count"], 1);
+    assert_eq!(relative_paths(&root, &first.scanned_files).len(), 2);
+
+    fs::write(
+        &changed_file,
+        "// keep the import edge while changing this file's cached facts\nimport { b } from './b';\nexport const a = b;\n",
+    )
+    .expect("edit one cycle file");
+
+    let second_manager = InspectManager::new();
+    let (second, _elapsed) = run_reuse_category(
+        &second_manager,
+        snapshot(&root, &inspect_dir),
+        InspectCategory::Cycles,
+    );
+    assert_eq!(
+        relative_paths(&root, &second.scanned_files),
+        vec!["src/a.ts"]
+    );
+    assert_eq!(second.aggregate["count"], first.aggregate["count"]);
+    assert_eq!(cycle_chains(&second), cycle_chains(&first));
 }
 
 #[test]
