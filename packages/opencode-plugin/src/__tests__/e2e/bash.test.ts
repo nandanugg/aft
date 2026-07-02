@@ -230,7 +230,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.output).toContain("promoted to background");
     expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expectNoClientPollOrPromote(bridgeCalls);
-  });
+    // Explicit budget: spawn + 25ms wait-window + promote crosses several
+    // process boundaries; bun's 5s default flakes when a parallel suite pins
+    // the machine (it timed out during a loaded release-gate run).
+  }, 30_000);
 
   test("background true returns server launch text and task id without polling", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
@@ -243,7 +246,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.output).toContain("Background task started:");
     expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expectNoClientPollOrPromote(bridgeCalls);
-  });
+  }, 30_000);
 
   skipOnWindows("workdir is respected", async () => {
     const { h, bash } = await pluginHarness();
