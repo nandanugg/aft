@@ -5,7 +5,8 @@
 **Overall:** TypeScript plugin + Rust worker process communicating over either a session-scoped NDJSON bridge (standalone mode) or the Subconscious (subc) daemon transport. A unified CLI (`packages/aft-cli/`) serves setup/doctor across all harnesses; shared transport, binary resolution, and ONNX helpers live in `packages/aft-bridge/`.
 
 **Key Characteristics:**
-- Use `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` to register harness tools and map them onto the unified `tool_call` command.
+- Use the master configuration switch `enabled` (configured globally or per-project in `aft.jsonc`) to short-circuit plugin loading and disable AFT execution.
+- Use `packages/opencode-plugin/src/index.ts` and `packages/pi-plugin/src/index.ts` to register harness tools and map them onto the unified `tool_call` command when enabled.
 - Use `packages/aft-bridge/src/transport-factory.ts` to instantiate either `BridgePool` (standalone NDJSON bridge, isolating one `aft` process per project root) or `SubcTransportPool` (daemon-backed transport) satisfying the shared `AftTransportPool` interface.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
@@ -16,7 +17,7 @@
 **OpenCode integration layer:**
 - Purpose: Register tools, load config, and attach post-execution metadata.
 - Location: `packages/opencode-plugin/src/index.ts`
-- Contains: Plugin bootstrap, tool-surface selection, hoisting logic, disabled-tool filtering, session-directory management, RPC server, auto-update checker hook
+- Contains: Plugin bootstrap, tool-surface selection, hoisting logic, disabled-tool filtering, session-directory management, RPC server (exposing a live WebSocket endpoint for TUI notification and status invalidation pushes), auto-update checker hook
 - Depends on: `packages/opencode-plugin/src/config.ts`, `packages/opencode-plugin/src/tools/*.ts`, `packages/aft-bridge/`
 - Used by: OpenCode plugin loading through `@cortexkit/aft-opencode`
 
@@ -44,14 +45,14 @@
 **Tool definition layer (OpenCode):**
 - Purpose: Convert OpenCode tool arguments into the unified `tool_call` protocol request and perform permission checks.
 - Location: `packages/opencode-plugin/src/tools/`
-- Contains: Hoisted tools (edit/write/apply_patch), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, LSP tools, search tools, semantic tools, inspect tools, permissions helpers, and the `callToolCall` transport wrapper (`packages/opencode-plugin/src/tools/_shared.ts`)
+- Contains: Hoisted tools (edit/write/apply_patch), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, LSP tools, search tools, semantic tools (governed by isolated `aft_search` host permission checks independent from `grep`), inspect tools, permissions helpers, and the `callToolCall` transport wrapper (`packages/opencode-plugin/src/tools/_shared.ts`)
 - Depends on: `packages/aft-bridge/src/pool.ts`, `packages/opencode-plugin/src/shared/`, `packages/opencode-plugin/src/metadata-store.ts`
 - Used by: `packages/opencode-plugin/src/index.ts`
 
 **Tool definition layer (Pi):**
 - Purpose: Convert Pi tool arguments into the unified `tool_call` protocol request and perform permission checks.
 - Location: `packages/pi-plugin/src/tools/`
-- Contains: Hoisted tools (read/write/edit/grep), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, inspect tools, semantic tools, render helpers, diff-format helper, and the `callToolCall` transport wrapper (`packages/pi-plugin/src/tools/_shared.ts`)
+- Contains: Hoisted tools (read/write/edit/grep) supporting cross-harness compatibility aliases (e.g. accepting `filePath` for `path` or vice versa), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, inspect tools, semantic tools, render helpers, diff-format helper, and the `callToolCall` transport wrapper (`packages/pi-plugin/src/tools/_shared.ts`)
 - Depends on: `packages/aft-bridge/src/pool.ts`, `packages/pi-plugin/src/shared/`
 - Used by: `packages/pi-plugin/src/index.ts`
 
@@ -160,6 +161,11 @@
 - Purpose: Consume the daemon's held-open `bg_events` wake lane.
 - Location: `packages/aft-bridge/src/subc-transport.ts`
 - Pattern: Resubscribe itself independently on stream drop or error without waiting for tool traffic, driving unconditional forced-drains.
+
+**BindTrust:**
+- Purpose: Enforce caller-identity (principal) trust levels on the subconscious routing daemon connection.
+- Location: `crates/aft/src/subc.rs`
+- Pattern: Map route binds onto `FirstParty` or `Untrusted` levels by inspecting the caller's principal metadata. `Principal::Direct` and reserved `llm-runner`/`aft` module principals resolve to `FirstParty` trust. Other callers (e.g., facade `subc-mcp` module, unverified principal, or absent principal) map to `Untrusted` trust. `Untrusted` routes deny bash/shell executions, force project-root path restriction check validation even if globally disabled in user config, and block background task observation/wake replay.
 
 **Tool groups (OpenCode):**
 - Purpose: Group related OpenCode tool definitions by capability surface.
@@ -329,7 +335,7 @@
 
 1. ANSI strip (when `[ansi].strip` is true; default true)
 2. `[strip]` regexes drop matching lines (multiline mode)
-3. `[shortcircuit]` checks remaining content; if matched, return `replacement`
+3. `[shortcircuit]` checks remaining content; if matched, return `replacement`. Builtin filters never fabricate non-empty output for empty inputs (empty output stays empty).
 4. `[truncate]` middle-truncates per line at `line_max` chars
 5. `[cap]` enforces `max_lines` with `keep = "head" | "tail" | "middle"`
 

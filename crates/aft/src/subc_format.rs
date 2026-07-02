@@ -237,6 +237,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
     matches!(
         bare_name,
         "status"
+            | "bash"
             | "read"
             | "write"
             | "edit"

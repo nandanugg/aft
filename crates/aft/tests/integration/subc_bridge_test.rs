@@ -5829,10 +5829,15 @@ async fn collect_tool_responses_and_route_bind_ack(
 
 fn tool_response_json(frame: &Frame) -> Value {
     let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
-    let text = body["content"][0]["text"]
-        .as_str()
-        .expect("tool result text");
-    serde_json::from_str(text).expect("embedded AFT response JSON")
+    // Read the flat envelope the first-party plugin consumes. The `content`
+    // text block is the MCP-facing render (prose for formatted tools), so
+    // parsing it as JSON only works for tools without a server-side formatter.
+    let structured = &body["structuredContent"];
+    assert!(
+        structured.is_object(),
+        "tool response missing structuredContent envelope: {body}"
+    );
+    structured.clone()
 }
 
 /// Wait until a finished bg task's completion is actually attached in-band to a
