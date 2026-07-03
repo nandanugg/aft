@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::cache_freshness::{self, FileFreshness};
-use crate::inspect::job::normalize_path;
+use crate::inspect::job::{canonicalize_normalized, normalize_path};
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
     ImportFact, OxcEngineError, OxcEngineResult, OxcResolvedEdge, ReExportFact,
@@ -97,7 +97,7 @@ pub(crate) fn run_cycles_scan_with_oxc(
     };
 
     let project_root =
-        fs::canonicalize(&job.project_root).unwrap_or_else(|_| normalize_path(&job.project_root));
+        canonicalize_normalized(&job.project_root);
     let mut contributions = Vec::new();
     let mut oxc_paths = BTreeSet::new();
     let parse_errors_by_file = parse_errors_by_file(oxc_result);
@@ -170,7 +170,7 @@ pub(crate) fn aggregate_cycle_contributions_with_limit(
         .collect::<Vec<_>>();
 
     let project_root =
-        fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
+        canonicalize_normalized(project_root);
     let graph = if parsed
         .iter()
         .any(|contribution| contribution.oxc_facts.is_some())

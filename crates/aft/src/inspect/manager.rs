@@ -13,8 +13,9 @@ use super::cache::{InspectCache, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
-    is_test_file, normalize_path, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob,
-    InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    canonicalize_normalized, is_test_file, normalize_path, CallgraphSnapshot, FileContribution,
+    InspectCategory, InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey,
+    JobOutcome, JobScope,
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
@@ -2140,7 +2141,7 @@ fn roll_up_unused_exports_oxc_contributions(
             let path = job.project_root.join(&scan.file);
             Some(FileFacts {
                 file_id: FileId(0),
-                path: fs::canonicalize(&path).unwrap_or_else(|_| normalize_path(&path)),
+                path: canonicalize_normalized(&path),
                 content_hash: oxc_facts.content_hash.clone(),
                 exports: oxc_facts.exports.clone(),
                 imports: oxc_facts.imports.clone(),

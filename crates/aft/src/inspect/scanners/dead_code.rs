@@ -12,7 +12,8 @@ use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
-    is_test_file, is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
+    canonicalize_normalized, is_test_file, is_test_support_file, CALLGRAPH_PROVENANCE_REEXPORT,
+    DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
@@ -2171,9 +2172,8 @@ fn relative_path(project_root: &Path, path: &Path) -> String {
     } else {
         project_root.join(path)
     };
-    let normalized_root =
-        fs::canonicalize(project_root).unwrap_or_else(|_| normalize_path(project_root));
-    let normalized = fs::canonicalize(&absolute).unwrap_or_else(|_| normalize_path(&absolute));
+    let normalized_root = canonicalize_normalized(project_root);
+    let normalized = canonicalize_normalized(&absolute);
     normalized
         .strip_prefix(&normalized_root)
         .unwrap_or(normalized.as_path())

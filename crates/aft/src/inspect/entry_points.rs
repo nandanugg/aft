@@ -6,7 +6,7 @@ use globset::{Glob, GlobSetBuilder};
 use serde_json::Value;
 
 use super::frameworks::{detected_route_frameworks, Framework};
-use super::job::normalize_path;
+use super::job::{canonicalize_normalized, normalize_path};
 
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
@@ -671,7 +671,7 @@ fn contains_path(paths: &BTreeSet<PathBuf>, file: &Path) -> bool {
 }
 
 fn snapshot_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    canonicalize_normalized(path)
 }
 
 fn relative_path(project_root: &Path, path: &Path) -> String {

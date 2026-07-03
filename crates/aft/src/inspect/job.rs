@@ -626,6 +626,14 @@ pub(crate) fn is_test_file(relative_path: &str) -> bool {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    // Strip Windows verbatim prefixes before component normalization so paths
+    // that went through fs::canonicalize (\\?\C:\ form) compare equal to paths
+    // that never did. The oxc engine's resolver applies the same rule; the two
+    // normalizers must stay in agreement or membership/strip_prefix checks
+    // that cross the engine boundary silently miss on Windows.
+    #[cfg(windows)]
+    let path = &windows_non_verbatim_path(path);
+
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -639,6 +647,40 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+/// Canonicalize a path for comparison inside the inspect subsystem.
+///
+/// Never returns the raw `fs::canonicalize` result: on Windows that is a
+/// verbatim (`\\?\C:\`) path, and mixing verbatim and non-verbatim forms in
+/// the same comparison is this subsystem's recurring bug class. Both branches
+/// route through [`normalize_path`].
+pub(crate) fn canonicalize_normalized(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => normalize_path(&canonical),
+        Err(_) => normalize_path(path),
+    }
+}
+
+#[cfg(windows)]
+fn windows_non_verbatim_path(path: &Path) -> PathBuf {
+    let mut raw = path.to_string_lossy().replace('/', "\\");
+    if let Some(stripped) = raw.strip_prefix("\\\\?\\UNC\\") {
+        raw = format!("\\\\{stripped}");
+    } else if let Some(stripped) = raw.strip_prefix("\\\\?\\") {
+        raw = stripped.to_string();
+    } else if let Some(stripped) = raw.strip_prefix("\\\\??\\") {
+        raw = stripped.to_string();
+    }
+
+    if raw.as_bytes().get(1) == Some(&b':') {
+        let drive = raw.as_bytes()[0];
+        if drive.is_ascii_lowercase() {
+            raw.replace_range(0..1, &(drive as char).to_ascii_uppercase().to_string());
+        }
+    }
+
+    PathBuf::from(raw)
 }
 
 #[cfg(test)]
