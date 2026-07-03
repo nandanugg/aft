@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wait for the GitHub Actions release workflow to complete for a given tag.
-# Usage: ./scripts/wait-release.sh v0.7.5 [--max-wait <seconds>] [--no-fail-fast]
+# Usage: ./scripts/wait-release.sh v0.7.5 [--max-wait <seconds>] [--no-fail-fast] [--run-id <id>]
 # Polls every 5 seconds, exits 0 on success, 1 on failure, 2 on timeout.
 #
 # Behavior:
@@ -16,6 +16,8 @@
 #     release.
 #   - Use --no-fail-fast to disable cancel-on-first-failure (script will then
 #     wait for natural workflow completion regardless of any job failure).
+#   - Use --run-id to skip run discovery and watch a known release run ID
+#     directly.
 #   - Output uses plain newlines so line-buffered pipes flush every status
 #     update. Per-job transitions are printed once so callers see progress.
 #   - Default max-wait is 35 minutes (2100s). Healthy releases finish in
@@ -33,6 +35,8 @@ MAX_WAIT="${MAX_WAIT_SECONDS:-5400}"
 REPO="cortexkit/aft"
 INTERVAL=5
 FAIL_FAST=1
+RUN_ID_OVERRIDE=""
+TAG_SHA=""
 
 # Jobs allowed to fail without rolling back the release.
 # This is a substring match against the job name in `gh run view --json jobs`.
@@ -45,12 +49,24 @@ JOB_FAILURE_ALLOWLIST=(
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --max-wait)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for $1" >&2
+        exit 64
+      fi
       MAX_WAIT="$2"
       shift 2
       ;;
     --no-fail-fast)
       FAIL_FAST=0
       shift
+      ;;
+    --run-id)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for $1" >&2
+        exit 64
+      fi
+      RUN_ID_OVERRIDE="$2"
+      shift 2
       ;;
     -*)
       echo "Unknown flag: $1" >&2
@@ -69,7 +85,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$TAG" ]]; then
-  echo "Usage: wait-release.sh <tag> [--max-wait <seconds>] [--no-fail-fast]" >&2
+  echo "Usage: wait-release.sh <tag> [--max-wait <seconds>] [--no-fail-fast] [--run-id <id>]" >&2
   exit 64
 fi
 
@@ -85,6 +101,17 @@ if ! GH_AUTH_OUTPUT=$(gh auth status --hostname github.com 2>&1); then
   exit 1
 fi
 
+# Match the live run to the tag's current commit, not to this script's start
+# time. That lets a re-armed waiter attach after the workflow is already
+# queued, in_progress, or completed, while still ignoring older runs from a
+# deleted+repushed tag that used the same tag name on a different commit.
+if [[ -z "$RUN_ID_OVERRIDE" ]]; then
+  if ! TAG_SHA=$(git rev-list -n1 "$TAG" 2>/dev/null); then
+    echo "ERROR: could not resolve tag ${TAG} locally. Fetch the tag or pass --run-id <id>." >&2
+    exit 1
+  fi
+fi
+
 START_TIME=$(date +%s)
 GH_API_FAILURES=0
 MAX_GH_API_FAILURES=3
@@ -94,16 +121,26 @@ MAX_GH_API_FAILURES=3
 # state into a tab-separated string and grep it. Format: "<name>\t<state>\n"
 PRINTED_STATES=""
 
-# Runs created before this moment (minus skew slack) are stale — see gh_run_list.
-RUN_CUTOFF_ISO=$(date -u -v-120S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '-120 seconds' +%Y-%m-%dT%H:%M:%SZ)
-
 gh_run_list() {
-  gh run list --repo "$REPO" --workflow release.yml --branch "$TAG" --limit 5 --json status,conclusion,databaseId,createdAt
+  gh run list --repo "$REPO" --workflow release.yml --branch "$TAG" --limit 20 --json status,conclusion,databaseId,createdAt,headBranch,headSha
 }
 
-gh_run_jobs() {
+gh_run_view() {
   local run_id="$1"
-  gh run view --repo "$REPO" "$run_id" --json jobs
+  gh run view --repo "$REPO" "$run_id" --json status,conclusion,jobs
+}
+
+select_matching_run() {
+  local runs_json="$1"
+  echo "$runs_json" | jq -c --arg tag "$TAG" --arg sha "$TAG_SHA" '
+    [ .[]
+      | select(.headBranch == $tag)
+      | select(.headSha == $sha)
+    ]
+    | sort_by(.createdAt)
+    | reverse
+    | .[0] // empty
+  '
 }
 
 is_allowlisted_job() {
@@ -120,7 +157,6 @@ is_allowlisted_job() {
 # Outputs "<name>\t<conclusion>" on stdout for the first matching job.
 find_failed_job() {
   local jobs_json="$1"
-  local match
   # Filter: completed conclusion in (failure, cancelled, timed_out, action_required)
   # but skip jobs that are intentionally continue-on-error AND in the allowlist.
   while IFS=$'\t' read -r name conclusion; do
@@ -175,9 +211,9 @@ cancel_run() {
     if (( elapsed >= 60 )); then
       break
     fi
-    if RUN_JSON=$(gh_run_list 2>/dev/null); then
+    if RUN_VIEW_JSON=$(gh_run_view "$run_id" 2>/dev/null); then
       local s
-      s=$(echo "$RUN_JSON" | jq -r '.[0].status // ""')
+      s=$(echo "$RUN_VIEW_JSON" | jq -r '.status // ""')
       if [[ "$s" == "completed" ]]; then
         break
       fi
@@ -195,10 +231,35 @@ while true; do
     exit 2
   fi
 
-  if ! RUN_JSON=$(gh_run_list 2>&1); then
+  if [[ -n "$RUN_ID_OVERRIDE" ]]; then
+    RUN_ID="$RUN_ID_OVERRIDE"
+  else
+    if ! RUN_JSON=$(gh_run_list 2>&1); then
+      GH_API_FAILURES=$((GH_API_FAILURES + 1))
+      echo "ERROR: gh run list failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
+      echo "$RUN_JSON" >&2
+      if (( GH_API_FAILURES >= MAX_GH_API_FAILURES )); then
+        exit 1
+      fi
+      sleep "$INTERVAL"
+      continue
+    fi
+    GH_API_FAILURES=0
+
+    MATCH_JSON=$(select_matching_run "$RUN_JSON")
+    if [[ -z "$MATCH_JSON" ]]; then
+      echo "  [+${ELAPSED}s] Workflow not started yet..."
+      sleep "$INTERVAL"
+      continue
+    fi
+
+    RUN_ID=$(echo "$MATCH_JSON" | jq -r '.databaseId // ""')
+  fi
+
+  if ! RUN_VIEW_JSON=$(gh_run_view "$RUN_ID" 2>&1); then
     GH_API_FAILURES=$((GH_API_FAILURES + 1))
-    echo "ERROR: gh run list failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
-    echo "$RUN_JSON" >&2
+    echo "ERROR: gh run view failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
+    echo "$RUN_VIEW_JSON" >&2
     if (( GH_API_FAILURES >= MAX_GH_API_FAILURES )); then
       exit 1
     fi
@@ -207,20 +268,8 @@ while true; do
   fi
   GH_API_FAILURES=0
 
-  # A deleted+repushed tag leaves the previous run attached to the same tag
-  # ref. Watching that stale run reports its old failure instantly (bit us on
-  # the v0.37.2 retag). Only consider runs created after this script started,
-  # minus slack for clock skew; runs are newest-first so take the first match.
-  FRESH_JSON=$(echo "$RUN_JSON" | jq --arg cutoff "$RUN_CUTOFF_ISO" '[.[] | select(.createdAt >= $cutoff)]')
-  STATUS=$(echo "$FRESH_JSON" | jq -r '.[0].status // "not_found"')
-  CONCLUSION=$(echo "$FRESH_JSON" | jq -r '.[0].conclusion // ""')
-  RUN_ID=$(echo "$FRESH_JSON" | jq -r '.[0].databaseId // ""')
-
-  if [ "$STATUS" = "not_found" ]; then
-    echo "  [+${ELAPSED}s] Workflow not started yet..."
-    sleep "$INTERVAL"
-    continue
-  fi
+  STATUS=$(echo "$RUN_VIEW_JSON" | jq -r '.status // "not_found"')
+  CONCLUSION=$(echo "$RUN_VIEW_JSON" | jq -r '.conclusion // ""')
 
   if [ "$STATUS" = "completed" ]; then
     if [ "$CONCLUSION" = "success" ]; then
@@ -236,18 +285,16 @@ while true; do
 
   # Workflow is in_progress / queued / requested. Pull per-job state for
   # progress + fail-fast detection.
-  if JOBS_JSON=$(gh_run_jobs "$RUN_ID" 2>/dev/null); then
-    print_job_transitions "$JOBS_JSON"
-    if (( FAIL_FAST == 1 )); then
-      if FAILED_LINE=$(find_failed_job "$JOBS_JSON"); then
-        FAILED_NAME=$(echo -e "$FAILED_LINE" | cut -f1)
-        FAILED_CONC=$(echo -e "$FAILED_LINE" | cut -f2)
-        echo "❌ Job failed: ${FAILED_NAME} (conclusion=${FAILED_CONC})"
-        echo "   Cancelling remaining run; downstream publish jobs will not proceed."
-        cancel_run "$RUN_ID"
-        echo "   https://github.com/${REPO}/actions/runs/${RUN_ID}"
-        exit 1
-      fi
+  print_job_transitions "$RUN_VIEW_JSON"
+  if (( FAIL_FAST == 1 )); then
+    if FAILED_LINE=$(find_failed_job "$RUN_VIEW_JSON"); then
+      FAILED_NAME=$(echo -e "$FAILED_LINE" | cut -f1)
+      FAILED_CONC=$(echo -e "$FAILED_LINE" | cut -f2)
+      echo "❌ Job failed: ${FAILED_NAME} (conclusion=${FAILED_CONC})"
+      echo "   Cancelling remaining run; downstream publish jobs will not proceed."
+      cancel_run "$RUN_ID"
+      echo "   https://github.com/${REPO}/actions/runs/${RUN_ID}"
+      exit 1
     fi
   fi
 
