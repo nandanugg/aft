@@ -716,8 +716,10 @@ async function runFixFlow(argv: string[]): Promise<number> {
     } else {
       log.info("AFT binary not found. Downloading…");
       try {
-        const bridgePackageName: string = "@cortexkit/aft-bridge";
-        const { ensureBinary } = (await import(bridgePackageName)) as {
+        // Literal specifier so the bundle inlines aft-bridge instead of
+        // resolving the installed package at runtime (whose dist chain loads
+        // subc-client's TypeScript entry, which Node cannot load).
+        const { ensureBinary } = (await import("@cortexkit/aft-bridge")) as {
           ensureBinary: (version?: string) => Promise<string | null>;
         };
         const path = await ensureBinary(`v${report.cliVersion}`);

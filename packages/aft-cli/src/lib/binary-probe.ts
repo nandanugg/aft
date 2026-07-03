@@ -8,8 +8,12 @@ import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
 
 async function loadPluginVersion(): Promise<string> {
   try {
-    const bridgePackageName: string = "@cortexkit/aft-bridge";
-    const bridge = (await import(bridgePackageName)) as Record<string, unknown>;
+    // Literal specifier so the CLI bundle inlines aft-bridge. A variable
+    // specifier leaves a runtime import that resolves to the INSTALLED
+    // aft-bridge package, whose dist pulls @cortexkit/subc-client — published
+    // as TypeScript source, which Node (npx) refuses to load from
+    // node_modules ("Stripping types is currently unsupported").
+    const bridge = (await import("@cortexkit/aft-bridge")) as Record<string, unknown>;
     if (typeof bridge.PLUGIN_VERSION === "string" && bridge.PLUGIN_VERSION.length > 0) {
       return bridge.PLUGIN_VERSION;
     }
