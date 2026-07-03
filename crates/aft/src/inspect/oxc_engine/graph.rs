@@ -9,6 +9,7 @@ use super::types::{
     ExportFact, FileId, ImportKind, LivenessVerdict, OxcExportVerdict, OxcFileVerdicts,
     OxcReExportContext, ReExportKind, OXC_PROVENANCE,
 };
+use crate::inspect::entry_points::EXECUTABLE_ROOT_ALL_EXPORTS;
 use crate::inspect::frameworks::{detected_decorator_frameworks, Framework};
 use crate::inspect::job::is_test_file;
 
@@ -281,6 +282,7 @@ impl<'a> GraphBuilder<'a> {
                     .facts
                     .exports
                     .iter()
+                    .filter(|fact| export_fact_is_candidate(&module.facts.path, fact))
                     .cloned()
                     .map(|fact| ExportState {
                         fact,
@@ -506,6 +508,21 @@ impl<'a> GraphBuilder<'a> {
         let origin = ReferenceOrigin::NonTest;
         for (root, exports) in roots {
             let mut newly_live_modules = BTreeSet::new();
+            if exports.contains(EXECUTABLE_ROOT_ALL_EXPORTS) {
+                let mut visited_files = BTreeSet::new();
+                let visible =
+                    self.visible_export_resolutions(FileId(root), true, &mut visited_files);
+                for resolution in visible.values() {
+                    self.mark_resolution_used_or_uncertain(
+                        resolution.clone(),
+                        "entry_point",
+                        &origin,
+                        &mut newly_live_modules,
+                    );
+                }
+                self.root_modules.extend(newly_live_modules);
+                continue;
+            }
             for export_name in exports {
                 let mut visited = BTreeSet::new();
                 let resolution = self.resolve_export_name(FileId(root), &export_name, &mut visited);
@@ -1088,6 +1105,18 @@ fn export_has_framework_decorator(
         .decorators
         .iter()
         .any(|decorator| decorator_matches_framework(module, &decorator.segments, frameworks))
+}
+
+fn export_fact_is_candidate(path: &Path, fact: &ExportFact) -> bool {
+    !(fact.declared && is_declaration_file(path))
+}
+
+fn is_declaration_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts")
+        })
 }
 
 fn decorator_matches_framework(

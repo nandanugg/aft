@@ -556,6 +556,171 @@ export function unusedDependency() { return 0; }
 }
 
 #[test]
+fn oxc_engine_tool_config_roots_seed_default_export_reachability() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "playwright.config.ts",
+            "import { liveDependency } from './src/service';
+const config = { use: liveDependency() };
+export default config;
+export function helper() { return 0; }
+",
+        ),
+        (
+            "src/service.ts",
+            "export function liveDependency() { return 1; }
+export function unusedDependency() { return 0; }
+",
+        ),
+    ]);
+    let config = root.join("playwright.config.ts");
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![config.clone()],
+            executable_root_exports: BTreeMap::from([(
+                config,
+                BTreeSet::from(["default".to_string()]),
+            )]),
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "playwright.config.ts",
+        "default",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "playwright.config.ts",
+        "helper",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "src/service.ts",
+        "liveDependency",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/service.ts",
+        "unusedDependency",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_storybook_csf_roots_seed_named_and_default_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/Button.stories.ts",
+            "export default { title: 'Button' };
+export const Primary = {};
+export const Secondary = {};
+",
+        ),
+        ("src/unrelated.ts", "export const dead = 1;\n"),
+    ]);
+    let story = root.join("src/Button.stories.ts");
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![story.clone()],
+            executable_root_exports: BTreeMap::from([(story, BTreeSet::from(["*".to_string()]))]),
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "src/Button.stories.ts",
+        "default",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/Button.stories.ts",
+        "Primary",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/Button.stories.ts",
+        "Secondary",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(&result, "src/unrelated.ts", "dead", LivenessVerdict::Unused);
+}
+
+#[test]
+fn oxc_engine_mocha_root_hook_exports_seed_reachability() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "nest/hooks/mocha-init-hook.ts",
+            "import { liveDependency } from '../../src/service';
+export const mochaHooks = { beforeAll() { return liveDependency(); } };
+export function helper() { return 0; }
+",
+        ),
+        (
+            "src/service.ts",
+            "export function liveDependency() { return 1; }
+export function unusedDependency() { return 0; }
+",
+        ),
+    ]);
+    let hook = root.join("nest/hooks/mocha-init-hook.ts");
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![hook.clone()],
+            executable_root_exports: BTreeMap::from([(
+                hook,
+                BTreeSet::from(["mochaHooks".to_string()]),
+            )]),
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "nest/hooks/mocha-init-hook.ts",
+        "mochaHooks",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "nest/hooks/mocha-init-hook.ts",
+        "helper",
+        LivenessVerdict::Unused,
+    );
+    assert_verdict(
+        &result,
+        "src/service.ts",
+        "liveDependency",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/service.ts",
+        "unusedDependency",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
 fn oxc_engine_nestjs_decorator_roots_exported_class_only() {
     let (_temp, root, paths) = fixture_project(&[
         (
@@ -1140,6 +1305,105 @@ fn oxc_engine_resolves_tsconfig_paths_and_fingerprints_config() {
             .any(|input| input.path.ends_with("tsconfig.json")),
         "tsconfig.json should be fingerprinted: {:#?}",
         result.resolver_config_inputs
+    );
+}
+
+#[test]
+fn oxc_engine_resolves_sveltekit_lib_alias_without_generated_tsconfig() {
+    let (_temp, root, mut paths) = fixture_project(&[
+        (
+            "package.json",
+            r#"{
+                "devDependencies": { "@sveltejs/kit": "latest" },
+                "scripts": { "dev": "vite dev" }
+            }"#,
+        ),
+        (
+            "src/lib/util.ts",
+            "export function live() { return 1; }
+export function dead() { return 0; }
+",
+        ),
+        (
+            "src/routes/+page.ts",
+            "import { live } from '$lib/util';
+live();
+",
+        ),
+    ]);
+    paths.retain(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"));
+
+    let result = analyze(&root, &paths);
+
+    assert_verdict(&result, "src/lib/util.ts", "live", LivenessVerdict::Used);
+    assert_verdict(&result, "src/lib/util.ts", "dead", LivenessVerdict::Unused);
+}
+
+#[test]
+fn oxc_engine_package_exports_subpath_barrels_seed_star_reexports() {
+    let (_temp, root, mut paths) = fixture_project(&[
+        (
+            "package.json",
+            r#"{
+                "name": "@fixtures/protobuf-es",
+                "exports": { "./codegenv2": "./src/codegenv2/index.ts" }
+            }"#,
+        ),
+        ("src/codegenv2/index.ts", "export * from './paths';\n"),
+        (
+            "src/codegenv2/paths.ts",
+            "export function enumFromJson() { return 1; }
+export function pathInFileDesc() { return 2; }
+",
+        ),
+    ]);
+    paths.retain(|path| path.extension().and_then(|ext| ext.to_str()) != Some("json"));
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            public_api_files: vec![root.join("src/codegenv2/index.ts")],
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_no_verdict(&result, "src/codegenv2/index.ts", "enumFromJson");
+    assert_verdict(
+        &result,
+        "src/codegenv2/paths.ts",
+        "enumFromJson",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/codegenv2/paths.ts",
+        "pathInFileDesc",
+        LivenessVerdict::Used,
+    );
+}
+
+#[test]
+fn oxc_engine_ambient_declaration_module_exports_are_not_candidates() {
+    let (_temp, root, paths) = fixture_project(&[(
+        "react-email.d.ts",
+        "declare module 'react-email' {
+  export function render(): string;
+  export const unused: number;
+}
+",
+    )]);
+
+    let result = analyze(&root, &paths);
+    let file_verdicts = result
+        .files
+        .iter()
+        .find(|item| item.relative_file == "react-email.d.ts")
+        .unwrap_or_else(|| panic!("missing declaration verdicts: {:#?}", result.files));
+
+    assert!(
+        file_verdicts.exports.is_empty(),
+        "ambient external declarations should not produce dead/unused candidates: {file_verdicts:#?}"
     );
 }
 

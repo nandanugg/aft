@@ -10,6 +10,7 @@ use super::types::{
     DynamicImportFact, FileFacts, FileId, ImportFact, OxcResolvedEdge, ReExportFact,
     ResolverConfigInput,
 };
+use crate::inspect::frameworks::{detected_route_frameworks, Framework};
 
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 const BUILD_OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "output", "esm", "cjs"];
@@ -88,12 +89,19 @@ pub struct ModuleResolver {
     path_to_id: FxHashMap<PathBuf, FileId>,
     file_set: BTreeSet<PathBuf>,
     root_package_name: Option<String>,
+    sveltekit_lib_alias: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PackageEntries {
+    root: Vec<String>,
+    subpaths: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
 struct ResolverPassCache {
     nearest_configs: FxHashMap<(PathBuf, String), Option<PathBuf>>,
-    package_entries: FxHashMap<PathBuf, Option<Vec<String>>>,
+    package_entries: FxHashMap<PathBuf, Option<PackageEntries>>,
     resolutions: FxHashMap<(PathBuf, String), Option<FileId>>,
     resolved_path_ids: FxHashMap<PathBuf, Option<FileId>>,
 }
@@ -133,12 +141,14 @@ impl ModuleResolver {
             }
         }
         let root_package_name = package_json_name(&project_root.join("package.json"));
+        let sveltekit_lib_alias = sveltekit_lib_alias_enabled(&project_root.join("package.json"));
         Self {
             project_root,
             resolver: create_resolver(),
             path_to_id,
             file_set,
             root_package_name,
+            sveltekit_lib_alias,
         }
     }
 
@@ -269,6 +279,7 @@ impl ModuleResolver {
 
         let resolved_path = self
             .resolve_with_oxc(&from_file, from_dir, specifier)
+            .or_else(|| self.resolve_sveltekit_lib_fallback(specifier))
             .or_else(|| self.resolve_local_fallback(from_dir, specifier))
             .or_else(|| self.resolve_package_fallback(specifier, tracker, cache));
 
@@ -309,6 +320,26 @@ impl ModuleResolver {
             .find(|candidate| self.file_set.contains(candidate) || candidate.is_file())
     }
 
+    fn resolve_sveltekit_lib_fallback(&self, specifier: &str) -> Option<PathBuf> {
+        if !self.sveltekit_lib_alias {
+            return None;
+        }
+        let Some(rest) = specifier.strip_prefix("$lib") else {
+            return None;
+        };
+        if !rest.is_empty() && !rest.starts_with('/') {
+            return None;
+        }
+        let base = self
+            .project_root
+            .join("src/lib")
+            .join(rest.trim_start_matches('/'));
+        candidate_paths(&base)
+            .into_iter()
+            .map(|candidate| normalize_path(&candidate))
+            .find(|candidate| self.file_set.contains(candidate) || candidate.is_file())
+    }
+
     fn resolve_package_fallback(
         &self,
         specifier: &str,
@@ -330,18 +361,21 @@ impl ModuleResolver {
                 let value = fs::read_to_string(&package_json)
                     .ok()
                     .and_then(|source| serde_json::from_str::<Value>(&source).ok())?;
-                let mut entries = Vec::new();
-                collect_package_entries(&value, &mut entries);
-                Some(entries)
+                Some(collect_package_entries(&value))
             });
         let package_entries = cached_entries.as_ref()?;
 
         let subpath_entries;
         let entries = if let Some(subpath) = subpath {
-            subpath_entries = vec![subpath.trim_start_matches('/').to_string()];
-            subpath_entries.as_slice()
+            let key = format!("./{}", subpath.trim_start_matches('/'));
+            if let Some(entries) = package_entries.subpaths.get(&key) {
+                entries.as_slice()
+            } else {
+                subpath_entries = vec![subpath.trim_start_matches('/').to_string()];
+                subpath_entries.as_slice()
+            }
         } else {
-            package_entries.as_slice()
+            package_entries.root.as_slice()
         };
 
         entries
@@ -445,6 +479,14 @@ fn nearest_named_file(start_dir: &Path, boundary: &Path, file_name: &str) -> Opt
 
 fn candidate_paths(base: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    push_candidate_paths(base, &mut candidates);
+    if let Some(source_base) = declaration_file_source_base(base) {
+        push_candidate_paths(&source_base, &mut candidates);
+    }
+    candidates
+}
+
+fn push_candidate_paths(base: &Path, candidates: &mut Vec<PathBuf>) {
     candidates.push(base.to_path_buf());
 
     let has_remappable_ext = base
@@ -462,8 +504,16 @@ fn candidate_paths(base: &Path) -> Vec<PathBuf> {
     for extension in JS_MODULE_EXTENSIONS {
         candidates.push(base.join(format!("index.{extension}")));
     }
+}
 
-    candidates
+fn declaration_file_source_base(base: &Path) -> Option<PathBuf> {
+    let file_name = base.file_name()?.to_str()?;
+    for suffix in [".d.ts", ".d.mts", ".d.cts"] {
+        if let Some(stem) = file_name.strip_suffix(suffix) {
+            return Some(base.with_file_name(stem));
+        }
+    }
+    None
 }
 
 fn package_json_name(package_json: &Path) -> Option<String> {
@@ -474,6 +524,18 @@ fn package_json_name(package_json: &Path) -> Option<String> {
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn sveltekit_lib_alias_enabled(package_json: &Path) -> bool {
+    let Some(value) = fs::read_to_string(package_json)
+        .ok()
+        .and_then(|source| serde_json::from_str::<Value>(&source).ok())
+    else {
+        return false;
+    };
+    detected_route_frameworks(&value)
+        .iter()
+        .any(|framework| matches!(framework, Framework::SvelteKit | Framework::SvelteKitHooks))
 }
 
 fn package_name_and_subpath(specifier: &str) -> Option<(String, Option<String>)> {
@@ -493,18 +555,38 @@ fn package_name_and_subpath(specifier: &str) -> Option<(String, Option<String>)>
     }
 }
 
-fn collect_package_entries(package_json: &Value, entries: &mut Vec<String>) {
+fn collect_package_entries(package_json: &Value) -> PackageEntries {
+    let mut entries = PackageEntries::default();
     if let Some(browser) = package_json.get("browser") {
-        collect_package_export_strings(browser, entries);
+        collect_package_export_strings(browser, &mut entries.root);
     }
     if let Some(module) = package_json.get("module").and_then(Value::as_str) {
-        entries.push(module.to_string());
+        entries.root.push(module.to_string());
     }
     if let Some(main) = package_json.get("main").and_then(Value::as_str) {
-        entries.push(main.to_string());
+        entries.root.push(main.to_string());
     }
     if let Some(exports) = package_json.get("exports") {
-        collect_package_export_strings(exports, entries);
+        collect_package_exports(exports, &mut entries);
+    }
+    entries
+}
+
+fn collect_package_exports(value: &Value, entries: &mut PackageEntries) {
+    match value {
+        Value::Object(map) if map.keys().any(|key| key.starts_with('.')) => {
+            for (key, value) in map {
+                if key == "." {
+                    collect_package_export_strings(value, &mut entries.root);
+                } else if key.starts_with("./") {
+                    collect_package_export_strings(
+                        value,
+                        entries.subpaths.entry(key.clone()).or_default(),
+                    );
+                }
+            }
+        }
+        _ => collect_package_export_strings(value, &mut entries.root),
     }
 }
 
@@ -539,12 +621,16 @@ fn package_entry_bases(package_dir: &Path, entry: &str) -> Vec<PathBuf> {
 }
 
 fn remap_build_output_to_src(rel: &str) -> Option<String> {
+    const BUILD_FLAVOR_DIRS: &[&str] = &["esm", "cjs"];
     let mut components = rel.split('/');
     let first = components.next()?;
     if !BUILD_OUTPUT_DIRS.contains(&first) {
         return None;
     }
-    let rest = components.collect::<Vec<_>>();
+    let mut rest = components.collect::<Vec<_>>();
+    if rest.len() > 1 && BUILD_FLAVOR_DIRS.contains(&rest[0]) {
+        rest.remove(0);
+    }
     if rest.is_empty() {
         return None;
     }

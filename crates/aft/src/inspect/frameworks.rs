@@ -7,6 +7,7 @@ pub(crate) enum Framework {
     Next,
     Nuxt,
     SvelteKit,
+    SvelteKitHooks,
     RemixReactRouter,
     Astro,
     NestJs,
@@ -38,6 +39,7 @@ impl Framework {
                 "plugins/**/*.{ts,js}",
             ],
             Self::SvelteKit => &["src/routes/**/+*.{ts,js}"],
+            Self::SvelteKitHooks => &["src/hooks.server.{ts,js}", "src/hooks.client.{ts,js}"],
             Self::RemixReactRouter => &[
                 "app/routes/**/*.{ts,tsx,js,jsx}",
                 "app/root.{ts,tsx,js,jsx}",
@@ -67,6 +69,14 @@ impl Framework {
             Self::Nuxt => &["default"],
             Self::SvelteKit => &[
                 "load", "actions", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
+            ],
+            Self::SvelteKitHooks => &[
+                "handle",
+                "handleError",
+                "handleFetch",
+                "init",
+                "reroute",
+                "transport",
             ],
             Self::RemixReactRouter => &["default", "loader", "action", "meta", "links"],
             Self::Astro => &[
@@ -167,7 +177,7 @@ impl Framework {
         match self {
             Self::Next => &["next"],
             Self::Nuxt => &["nuxt"],
-            Self::SvelteKit => &["@sveltejs/kit"],
+            Self::SvelteKit | Self::SvelteKitHooks => &["@sveltejs/kit"],
             Self::RemixReactRouter => &[
                 "@remix-run/react",
                 "@remix-run/node",
@@ -188,7 +198,7 @@ impl Framework {
         match self {
             Self::Next => &["next"],
             Self::Nuxt => &["nuxt", "nuxi"],
-            Self::SvelteKit => &["svelte-kit", "vite"],
+            Self::SvelteKit | Self::SvelteKitHooks => &["svelte-kit", "vite"],
             Self::RemixReactRouter => &["remix", "react-router"],
             Self::Astro => &["astro"],
             Self::NestJs => &["nest"],
@@ -201,6 +211,7 @@ pub(crate) fn detected_route_frameworks(manifest: &Value) -> BTreeSet<Framework>
         Framework::Next,
         Framework::Nuxt,
         Framework::SvelteKit,
+        Framework::SvelteKitHooks,
         Framework::RemixReactRouter,
         Framework::Astro,
     ]

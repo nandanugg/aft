@@ -8,7 +8,13 @@ use serde_json::Value;
 use super::frameworks::{detected_route_frameworks, Framework};
 use super::job::{canonicalize_normalized, normalize_path};
 
+pub(crate) const EXECUTABLE_ROOT_ALL_EXPORTS: &str = "*";
+
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
+const STORYBOOK_STORY_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
+const TOOL_CONFIG_DEFAULT_EXPORTS: &[&str] = &["default"];
+const STORYBOOK_CSF_EXPORTS: &[&str] = &[EXECUTABLE_ROOT_ALL_EXPORTS];
+const MOCHA_ROOT_HOOK_EXPORTS: &[&str] = &["mochaHooks"];
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EntryPointSet {
@@ -112,6 +118,7 @@ pub(crate) fn resolve_entry_points(project_root: &Path) -> EntryPointSet {
     if !manifest_found || !entry_points.has_liveness_roots() {
         collect_fallback_entry_points(&project_root, &mut entry_points);
     }
+    collect_conventional_executable_root_entry_points(&project_root, &mut entry_points);
 
     entry_points
 }
@@ -369,7 +376,32 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
         }
     }
 
+    collect_package_tool_config_entry_points(package_dir, &value, entry_points);
+
     collect_framework_route_entry_points(package_dir, &value, entry_points);
+}
+
+fn collect_package_tool_config_entry_points(
+    package_dir: &Path,
+    manifest: &Value,
+    entry_points: &mut EntryPointSet,
+) {
+    let mut path_entries = BTreeSet::new();
+    for pointer in [&["mocha", "require"][..]] {
+        if let Some(value) = json_value_at_path(manifest, pointer) {
+            collect_json_entry_strings(value, &mut path_entries);
+        }
+    }
+
+    let exports = export_set(MOCHA_ROOT_HOOK_EXPORTS);
+    for entry in path_entries {
+        insert_package_executable_entry_exports(package_dir, &entry, entry_points, &exports);
+    }
+}
+
+fn json_value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
 }
 
 fn collect_framework_route_entry_points(
@@ -497,6 +529,55 @@ fn collect_script_entry_points(
     }
 }
 
+fn collect_conventional_executable_root_entry_points(
+    project_root: &Path,
+    entry_points: &mut EntryPointSet,
+) {
+    for path in entry_point_walk_files(project_root) {
+        if let Some(exports) = conventional_executable_root_exports(&path) {
+            entry_points.insert_executable_root_exports(&path, exports);
+        }
+    }
+}
+
+fn conventional_executable_root_exports(file: &Path) -> Option<BTreeSet<String>> {
+    if is_tool_config_file(file) {
+        return Some(export_set(TOOL_CONFIG_DEFAULT_EXPORTS));
+    }
+    if is_storybook_story_file(file) {
+        return Some(export_set(STORYBOOK_CSF_EXPORTS));
+    }
+    None
+}
+
+fn is_tool_config_file(file: &Path) -> bool {
+    if !has_js_module_extension(file, JS_MODULE_EXTENSIONS) {
+        return false;
+    }
+    file.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.ends_with(".config"))
+}
+
+fn is_storybook_story_file(file: &Path) -> bool {
+    if !has_js_module_extension(file, STORYBOOK_STORY_EXTENSIONS) {
+        return false;
+    }
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".stories."))
+}
+
+fn has_js_module_extension(file: &Path, extensions: &[&str]) -> bool {
+    file.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extensions.contains(&extension))
+}
+
+fn export_set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
 fn collect_json_entry_strings(value: &Value, entries: &mut BTreeSet<String>) {
     match value {
         Value::String(entry) => {
@@ -529,6 +610,22 @@ fn insert_package_entry(
 
     if let Some(path) = resolve_package_entry(package_dir, entry) {
         insert_resolved_entry_point(entry_points, &path, kind);
+    }
+}
+
+fn insert_package_executable_entry_exports(
+    package_dir: &Path,
+    entry: &str,
+    entry_points: &mut EntryPointSet,
+    exports: &BTreeSet<String>,
+) {
+    let entry = entry.trim();
+    if entry.is_empty() || entry.starts_with('#') || entry.contains('*') {
+        return;
+    }
+
+    if let Some(path) = resolve_package_entry(package_dir, entry) {
+        entry_points.insert_executable_root_exports(&path, exports.clone());
     }
 }
 
@@ -573,12 +670,16 @@ fn resolve_package_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
 /// pointing at an unrelated `src/` file.
 fn remap_build_output_to_src(rel: &str) -> Option<String> {
     const BUILD_DIRS: &[&str] = &["dist", "build", "out", "output", "esm", "cjs"];
+    const BUILD_FLAVOR_DIRS: &[&str] = &["esm", "cjs"];
     let mut components = rel.split('/');
     let first = components.next()?;
     if !BUILD_DIRS.contains(&first) {
         return None;
     }
-    let rest: Vec<&str> = components.collect();
+    let mut rest: Vec<&str> = components.collect();
+    if rest.len() > 1 && BUILD_FLAVOR_DIRS.contains(&rest[0]) {
+        rest.remove(0);
+    }
     if rest.is_empty() {
         return None;
     }
@@ -587,6 +688,14 @@ fn remap_build_output_to_src(rel: &str) -> Option<String> {
 
 fn candidate_paths(base: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    push_candidate_paths(base, &mut candidates);
+    if let Some(source_base) = declaration_file_source_base(base) {
+        push_candidate_paths(&source_base, &mut candidates);
+    }
+    candidates
+}
+
+fn push_candidate_paths(base: &Path, candidates: &mut Vec<PathBuf>) {
     candidates.push(base.to_path_buf());
 
     // A `.js`/`.mjs`/... specifier (NodeNext) resolves to its `.ts`/`.tsx`/...
@@ -606,8 +715,16 @@ fn candidate_paths(base: &Path) -> Vec<PathBuf> {
     for extension in JS_MODULE_EXTENSIONS {
         candidates.push(base.join(format!("index.{extension}")));
     }
+}
 
-    candidates
+fn declaration_file_source_base(base: &Path) -> Option<PathBuf> {
+    let file_name = base.file_name()?.to_str()?;
+    for suffix in [".d.ts", ".d.mts", ".d.cts"] {
+        if let Some(stem) = file_name.strip_suffix(suffix) {
+            return Some(base.with_file_name(stem));
+        }
+    }
+    None
 }
 
 fn is_relative_module(module_path: &str) -> bool {
@@ -921,6 +1038,81 @@ mod tests {
     }
 
     #[test]
+    fn tool_config_files_seed_default_export_as_executable_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "private": true, "scripts": { "test": "vitest" } }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("playwright.config.ts"), "export default {}\n").unwrap();
+        std::fs::write(root.join("eslint.config.mjs"), "export default []\n").unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        let executable_roots = entry_points.executable_root_exports();
+
+        for file in ["playwright.config.ts", "eslint.config.mjs"] {
+            let path = root.join(file);
+            assert!(entry_points.is_liveness_root_file(&path));
+            assert!(!entry_points.is_public_api_file(&path));
+            assert_eq!(
+                executable_roots.get(&snapshot_path(&path)).cloned(),
+                Some(BTreeSet::from(["default".to_string()])),
+                "{file} should seed only the CLI-called default export"
+            );
+        }
+    }
+
+    #[test]
+    fn storybook_csf_files_seed_all_exports_as_executable_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(root.join("package.json"), r#"{ "private": true }"#).unwrap();
+        let story = root.join("src/Button.stories.tsx");
+        std::fs::create_dir_all(story.parent().expect("story parent")).unwrap();
+        std::fs::write(&story, "export default {}; export const Primary = {};\n").unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        let executable_roots = entry_points.executable_root_exports();
+
+        assert!(entry_points.is_liveness_root_file(&story));
+        assert!(!entry_points.is_public_api_file(&story));
+        assert_eq!(
+            executable_roots.get(&snapshot_path(&story)).cloned(),
+            Some(BTreeSet::from([EXECUTABLE_ROOT_ALL_EXPORTS.to_string()])),
+            "CSF default and named story exports should be framework-called"
+        );
+    }
+
+    #[test]
+    fn package_mocha_require_paths_seed_root_hook_exports() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let hook = root.join("nest/hooks/mocha-init-hook.ts");
+        std::fs::create_dir_all(hook.parent().expect("hook parent")).unwrap();
+        std::fs::write(&hook, "export const mochaHooks = {};\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "private": true,
+                "mocha": { "require": ["ts-node/register", "nest/hooks/mocha-init-hook.ts"] }
+            }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        let executable_roots = entry_points.executable_root_exports();
+
+        assert!(entry_points.is_liveness_root_file(&hook));
+        assert_eq!(
+            executable_roots.get(&snapshot_path(&hook)).cloned(),
+            Some(BTreeSet::from(["mochaHooks".to_string()])),
+            "package.json mocha.require should seed the Mocha root-hook export"
+        );
+    }
+
+    #[test]
     fn framework_route_files_are_executable_roots_not_public_api() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -970,6 +1162,35 @@ mod tests {
                 "{file} should carry a framework export allowlist: {executable_roots:#?}"
             );
         }
+    }
+
+    #[test]
+    fn sveltekit_hooks_are_executable_roots_with_hook_exports() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let hook = root.join("src/hooks.server.ts");
+        std::fs::create_dir_all(hook.parent().expect("hook parent")).unwrap();
+        std::fs::write(&hook, "export const handle = () => {};\n").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "devDependencies": { "@sveltejs/kit": "latest" },
+                "scripts": { "dev": "vite dev" }
+            }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+        let executable_roots = entry_points.executable_root_exports();
+        let exports = executable_roots
+            .get(&snapshot_path(&hook))
+            .expect("SvelteKit hook file should be an executable root");
+
+        assert!(entry_points.is_liveness_root_file(&hook));
+        assert!(!entry_points.is_public_api_file(&hook));
+        assert!(exports.contains("handle"));
+        assert!(exports.contains("handleError"));
+        assert!(!exports.contains("GET"));
     }
 
     #[test]
@@ -1058,6 +1279,49 @@ mod tests {
         assert!(
             entry_points.is_public_api_file(&root.join("src/index.ts")),
             "src/index.ts should be recognized as public-API via dist->src remap"
+        );
+    }
+
+    #[test]
+    fn package_exports_subpaths_resolve_to_public_api_source_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("src/codegenv2")).unwrap();
+        std::fs::create_dir_all(root.join("src/experimental")).unwrap();
+        std::fs::write(
+            root.join("src/codegenv2/index.ts"),
+            "export * from './paths';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/experimental/index.ts"),
+            "export const x = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "@fixtures/protobuf-es",
+                "exports": {
+                    "./codegenv2": {
+                        "types": "./dist/codegenv2/index.d.ts",
+                        "import": "./dist/esm/codegenv2/index.js"
+                    },
+                    "./experimental": "./src/experimental/index.ts"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let entry_points = resolve_entry_points(root);
+
+        assert!(
+            entry_points.is_public_api_file(&root.join("src/codegenv2/index.ts")),
+            "conditional subpath exports should remap dist/esm and .d.ts targets to source"
+        );
+        assert!(
+            entry_points.is_public_api_file(&root.join("src/experimental/index.ts")),
+            "direct source subpath exports should become public API files"
         );
     }
 
