@@ -1,0 +1,8 @@
+# The audit data root is intentionally outside the AFT repository. These entries
+# keep accidental local reruns in this directory out of commits.
+AFT_TESTS/
+_results/
+repos/
+storage/
+*.log
+*.jsonl

@@ -1,0 +1,74 @@
+[
+  {
+    "slug": "dub",
+    "category": "ts_next_app_barrels_paths",
+    "url": "https://github.com/dubinc/dub.git",
+    "notes": "Next.js app with app router, barrels, and tsconfig path aliases."
+  },
+  {
+    "slug": "nest",
+    "category": "nestjs_backend_decorators",
+    "url": "https://github.com/nestjs/nest.git",
+    "notes": "NestJS framework/backend codebase exercising decorators and DI entry points."
+  },
+  {
+    "slug": "appwrite-console",
+    "category": "sveltekit_file_routes",
+    "url": "https://github.com/appwrite/console.git",
+    "notes": "SvelteKit app with file-route conventions and TS path aliases."
+  },
+  {
+    "slug": "vite",
+    "category": "ts_library_monorepo",
+    "url": "https://github.com/vitejs/vite.git",
+    "notes": "TypeScript library monorepo with workspaces and published package entry points."
+  },
+  {
+    "slug": "express",
+    "category": "plain_node_cjs",
+    "url": "https://github.com/expressjs/express.git",
+    "notes": "Plain CommonJS Node.js project using require/module.exports."
+  },
+  {
+    "slug": "atuin",
+    "category": "rust_workspace_macro_heavy",
+    "url": "https://github.com/atuinsh/atuin.git",
+    "notes": "Rust workspace with Tokio/Axum service code, derives, and macro-heavy async paths."
+  },
+  {
+    "slug": "gitbutler",
+    "category": "rust_tauri_app",
+    "url": "https://github.com/gitbutlerapp/gitbutler.git",
+    "notes": "Rust + Tauri desktop app with attribute commands and frontend/backend boundaries."
+  },
+  {
+    "slug": "soft-serve",
+    "category": "go_service",
+    "url": "https://github.com/charmbracelet/soft-serve.git",
+    "notes": "Go SSH/git service exercising the Go callgraph-store lane."
+  },
+  {
+    "slug": "fastapi",
+    "category": "python_project_no_dead_code_lane",
+    "url": "https://github.com/fastapi/fastapi.git",
+    "notes": "Python project; verify inspect does not fabricate unsupported dead-code findings."
+  },
+  {
+    "slug": "okhttp",
+    "category": "java_kotlin_outline_tier",
+    "url": "https://github.com/square/okhttp.git",
+    "notes": "Java/Kotlin project; verify outline-tier categories and no unsupported fabrication."
+  },
+  {
+    "slug": "biome",
+    "category": "mixed_ts_rust_monorepo",
+    "url": "https://github.com/biomejs/biome.git",
+    "notes": "Mixed TypeScript + Rust monorepo."
+  },
+  {
+    "slug": "protobuf-es",
+    "category": "heavy_codegen_generated_dirs",
+    "url": "https://github.com/bufbuild/protobuf-es.git",
+    "notes": "TypeScript protobuf/codegen-heavy repository for generated-output noise checks."
+  }
+]
