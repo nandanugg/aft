@@ -1205,8 +1205,18 @@ fn disk_read_tail_does_not_truncate_live_file() {
     let task_id = spawn_bg(&mut aft, SESSION, command, None);
     let stdout_path = task_file(storage.path(), SESSION, &task_id, "stdout");
 
-    std::thread::sleep(Duration::from_millis(600));
-    let before = fs::metadata(&stdout_path).unwrap().len();
+    // Poll for the first output instead of a fixed sleep: on a loaded runner
+    // the detached child can take well over half a second to start writing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let before = loop {
+        let len = fs::metadata(&stdout_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if len > 0 || std::time::Instant::now() >= deadline {
+            break len;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let snapshot = status(&mut aft, SESSION, &task_id);
     assert!(!snapshot["output_preview"].as_str().unwrap().is_empty());
     std::thread::sleep(Duration::from_millis(600));
