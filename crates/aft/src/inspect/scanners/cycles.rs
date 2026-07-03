@@ -96,8 +96,7 @@ pub(crate) fn run_cycles_scan_with_oxc(
         );
     };
 
-    let project_root =
-        canonicalize_normalized(&job.project_root);
+    let project_root = canonicalize_normalized(&job.project_root);
     let mut contributions = Vec::new();
     let mut oxc_paths = BTreeSet::new();
     let parse_errors_by_file = parse_errors_by_file(oxc_result);
@@ -169,8 +168,7 @@ pub(crate) fn aggregate_cycle_contributions_with_limit(
         })
         .collect::<Vec<_>>();
 
-    let project_root =
-        canonicalize_normalized(project_root);
+    let project_root = canonicalize_normalized(project_root);
     let graph = if parsed
         .iter()
         .any(|contribution| contribution.oxc_facts.is_some())
