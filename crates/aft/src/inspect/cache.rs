@@ -129,7 +129,7 @@ impl From<serde_json::Error> for InspectCacheError {
 /// changes dead/unused verdict roll-ups without changing per-file facts.
 /// v26: TS/JS per-file facts record exported-symbol decorators, and NestJS
 /// decorator roots change dead/unused verdict roll-ups.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 26;
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 27;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
