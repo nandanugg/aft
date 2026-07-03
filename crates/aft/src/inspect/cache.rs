@@ -1832,7 +1832,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 26);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 27);
     }
 
     #[test]
