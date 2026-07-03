@@ -307,6 +307,16 @@ fn create_fixture_project(root: &Path) {
     )
     .expect("write read fixture");
     fs::write(root.join("src/search.txt"), "another needle\n").expect("write search fixture");
+    // Pin identical mtimes on the grep fixtures: the direct and tool_call
+    // envelopes come from two separately-created projects, and grep orders by
+    // mtime-desc with a path tiebreak. Without pinning, one project's writes
+    // can straddle a filesystem timestamp tick while the other's tie, making
+    // the two orderings legitimately differ.
+    let grep_fixture_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    for fixture in ["src/read.txt", "src/search.txt"] {
+        filetime::set_file_mtime(root.join(fixture), grep_fixture_mtime)
+            .expect("pin grep fixture mtime");
+    }
     fs::write(root.join("src/edit.txt"), "replace old value\n").expect("write edit fixture");
     fs::write(root.join("src/patch.txt"), "before\n").expect("write patch fixture");
     fs::write(

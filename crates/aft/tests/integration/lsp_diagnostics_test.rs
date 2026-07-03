@@ -1592,12 +1592,36 @@ fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
         "watcher should resync the diagnosed file with didChange"
     );
 
-    let after = {
-        let lsp = ctx.lsp();
-        lsp.get_diagnostics_for_file(file)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
+    // The fake server publishes asynchronously after the didChange resync, so
+    // poll instead of reading once: on a loaded runner the publish can land
+    // milliseconds after the documentChanged notification is observed. Check
+    // the store BEFORE waiting on each iteration — the publish event may have
+    // already been consumed while collecting the documentChanged notification,
+    // in which case waiting for another publish would block forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let after = loop {
+        let current = {
+            let lsp = ctx.lsp();
+            lsp.get_diagnostics_for_file(file)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if current
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("E0002"))
+            || std::time::Instant::now() >= deadline
+        {
+            break current;
+        }
+        // Pump the event loop without asserting: the awaited publish may
+        // already be behind us, and the deadline above owns failure.
+        let _ = collect_event(&mut ctx.lsp(), |event| {
+            matches!(
+                event,
+                LspEvent::Notification { method, .. } if method == "textDocument/publishDiagnostics"
+            )
+        });
     };
     assert!(
         after
