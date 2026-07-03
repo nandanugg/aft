@@ -824,6 +824,166 @@ fn oxc_engine_same_file_value_reference_keeps_composed_export_used() {
 }
 
 #[test]
+fn oxc_engine_same_file_nested_catch_call_before_declaration_keeps_export_used() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/main.ts", "console.log('entry');\n"),
+        (
+            "src/plugin.ts",
+            r#"export function plugin() {
+  return {
+    async transform(source: string, importer: string) {
+      let imports: string[] = []
+      try {
+        imports = parseImports(source)
+      } catch (_e: unknown) {
+        const { message, showCodeFrame } = createParseErrorInfo(importer, source)
+        throw new Error(showCodeFrame ? message : message)
+      }
+      return imports
+    },
+  }
+}
+
+function parseImports(source: string): string[] {
+  return [source]
+}
+
+export function createParseErrorInfo(
+  importer: string,
+  source: string,
+): { message: string; showCodeFrame: boolean } {
+  return { message: importer + source, showCodeFrame: true }
+}
+
+export function orphanParseErrorInfo() {
+  return null
+}
+"#,
+        ),
+    ]);
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![root.join("src/main.ts")],
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "src/plugin.ts",
+        "createParseErrorInfo",
+        LivenessVerdict::Used,
+    );
+    assert_eq!(
+        verdict(&result, "src/plugin.ts", "createParseErrorInfo").reason,
+        "same_file_value_reference"
+    );
+    assert!(
+        result
+            .facts
+            .iter()
+            .find(|facts| facts.path.ends_with("src/plugin.ts"))
+            .expect("missing plugin facts")
+            .same_file_value_references
+            .contains("createParseErrorInfo"),
+        "same-file references should include the call before the exported declaration: {:#?}",
+        result.facts
+    );
+    assert_verdict(
+        &result,
+        "src/plugin.ts",
+        "orphanParseErrorInfo",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
+fn oxc_engine_same_file_object_shorthand_keeps_exported_functions_used() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/main.ts", "console.log('entry');\n"),
+        (
+            "src/client.ts",
+            r#"type ViteHotContext = { _internal?: unknown }
+
+export function updateStyle(id: string, content: string): void {
+  void id
+  void content
+}
+
+export function removeStyle(id: string): void {
+  void id
+}
+
+export function createHotContext(ownerPath: string): ViteHotContext {
+  void ownerPath
+  return {}
+}
+
+declare const DevRuntime: { new (): { createModuleHotContext(moduleId: string): ViteHotContext } }
+
+if (typeof DevRuntime !== 'undefined') {
+  class ViteDevRuntime extends DevRuntime {
+    override createModuleHotContext(moduleId: string) {
+      const ctx = createHotContext(moduleId)
+      ctx._internal = { updateStyle, removeStyle }
+      return ctx
+    }
+  }
+  void ViteDevRuntime
+}
+
+export function orphanStyle() {
+  return null
+}
+"#,
+        ),
+    ]);
+
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![root.join("src/main.ts")],
+            entry_reachability: true,
+            ..AnalyzeOptions::default()
+        },
+    );
+
+    assert_verdict(
+        &result,
+        "src/client.ts",
+        "updateStyle",
+        LivenessVerdict::Used,
+    );
+    assert_verdict(
+        &result,
+        "src/client.ts",
+        "removeStyle",
+        LivenessVerdict::Used,
+    );
+    let facts = result
+        .facts
+        .iter()
+        .find(|facts| facts.path.ends_with("src/client.ts"))
+        .expect("missing client facts");
+    assert!(
+        facts.same_file_value_references.contains("updateStyle")
+            && facts.same_file_value_references.contains("removeStyle"),
+        "same-file references should include object shorthand values: {:#?}",
+        facts.same_file_value_references
+    );
+    assert_verdict(
+        &result,
+        "src/client.ts",
+        "orphanStyle",
+        LivenessVerdict::Unused,
+    );
+}
+
+#[test]
 fn oxc_engine_genuine_dead_exports_remain_unused() {
     let (_temp, root, paths) = fixture_project(&[
         (

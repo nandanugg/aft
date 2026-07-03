@@ -236,6 +236,11 @@ pub fn compute_verdicts(
     graph.apply_decorator_entry_point_seeding();
     graph.record_reference_origins();
     if entry_reachability {
+        // A same-file value reference proves that an exported helper is used
+        // locally, even when the file itself is not reached from an entry point.
+        // This does not enqueue the file, so entry reachability still controls
+        // cross-file propagation.
+        graph.apply_same_file_references();
         graph.apply_entry_reachability();
     } else {
         graph.apply_same_file_references();
