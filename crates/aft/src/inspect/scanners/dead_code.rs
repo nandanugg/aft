@@ -33,6 +33,7 @@ pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 2;
 
 type ExportNode = (String, String);
 type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
+type MethodNamesByLanguage = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Debug, Default)]
 struct ImportedExportLiveness {
@@ -576,7 +577,7 @@ fn materialize_dead_code_contributions(
             let dispatched_method_names = outbound_calls_for_file
                 .iter()
                 .copied()
-                .filter_map(dispatched_method_name_from_call)
+                .flat_map(|call| dispatched_method_names_from_call(call, &contribution.file))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -745,7 +746,7 @@ fn aggregate_materialized_dead_code_contributions(
     scanned_files: usize,
 ) -> serde_json::Value {
     let edges_by_source = edges_by_source(parsed);
-    let dispatched_method_names = collect_dispatched_method_names(parsed);
+    let dispatched_method_names = collect_dispatched_method_names_by_language(parsed);
     let reachable = reachable_exports(parsed, &edges_by_source, &dispatched_method_names);
     let referenced_type_names = collect_referenced_type_names(parsed);
 
@@ -827,7 +828,11 @@ fn aggregate_materialized_dead_code_contributions(
                 let node = (contribution.file.clone(), export.symbol.clone());
                 if reachable.contains(&node)
                     || is_public_api_file
-                    || dispatched_method_names.contains(symbol_liveness_name(&export.symbol))
+                    || dispatch_liveness_keeps_export_live(
+                        contribution,
+                        export,
+                        &dispatched_method_names,
+                    )
                 {
                     continue;
                 }
@@ -967,11 +972,18 @@ fn edges_by_source(
     edges
 }
 
-fn collect_dispatched_method_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
-    contributions
-        .iter()
-        .flat_map(|contribution| contribution.dispatched_method_names.iter().cloned())
-        .collect()
+fn collect_dispatched_method_names_by_language(
+    contributions: &[DeadCodeContribution],
+) -> MethodNamesByLanguage {
+    let mut by_language: MethodNamesByLanguage = BTreeMap::new();
+    for contribution in contributions {
+        let language = language_for_file(&contribution.file).to_string();
+        by_language
+            .entry(language)
+            .or_default()
+            .extend(contribution.dispatched_method_names.iter().cloned());
+    }
+    by_language
 }
 
 fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
@@ -994,10 +1006,12 @@ fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTre
 fn reachable_exports(
     contributions: &[DeadCodeContribution],
     edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
-    dispatched_method_names: &BTreeSet<String>,
+    dispatched_method_names: &MethodNamesByLanguage,
 ) -> BTreeSet<ExportNode> {
     let imported_exports_by_file = imported_exports_by_file(contributions);
     let namespace_imports_by_file = namespace_imported_exports_by_file(contributions);
+    let dispatch_live_source_names_by_file =
+        dispatch_live_source_names_by_file(contributions, dispatched_method_names);
     let mut expanded_file_imports = BTreeSet::new();
     let mut reachable = BTreeSet::new();
     let mut queue = VecDeque::new();
@@ -1013,20 +1027,16 @@ fn reachable_exports(
         }
     }
 
-    // Methods reached only via receiver dispatch (`obj.method()`) carry no
-    // resolvable call edge — the receiver type is unknown — so they never
-    // become reachable BFS nodes. They ARE rescued from the dead list by name
-    // (`dispatched_method_names`), but that rescue keeps only the method itself
-    // alive; it does NOT propagate liveness THROUGH the method body. Every free
-    // function the method calls is then orphaned and reported dead despite
-    // having real callers (e.g. `BgTaskRegistry::spawn` -> `task_paths`, which
-    // has 33 callers yet was flagged dead). Seed each dispatch-live method body
-    // as a BFS root, keyed by its scoped caller identity (`Type::method`, the
-    // form `edges_by_source` uses for sources) so liveness flows through to the
-    // method's callees. This widens the existing dead_code under-reporting bias
-    // by exactly one hop and never severs a live chain.
+    // Methods reached only via receiver or interface dispatch often have no
+    // precise call edge because the concrete receiver type is unknown. They are
+    // rescued from the dead list by method name, but that alone would not let
+    // liveness flow through the method body. Go uses the method-only gate below;
+    // other languages keep their existing name-based behavior.
     for source in edges_by_source.keys() {
-        if dispatched_method_names.contains(symbol_liveness_name(&source.1)) {
+        if dispatch_live_source_names_by_file
+            .get(&source.0)
+            .is_some_and(|method_names| method_names.contains(symbol_liveness_name(&source.1)))
+        {
             queue.push_back(source.clone());
         }
     }
@@ -1070,6 +1080,59 @@ fn reachable_exports(
     }
 
     reachable
+}
+
+fn dispatch_live_source_names_by_file(
+    contributions: &[DeadCodeContribution],
+    dispatched_method_names: &MethodNamesByLanguage,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for contribution in contributions {
+        let language = language_for_file(&contribution.file);
+        let Some(language_method_names) = dispatched_method_names.get(language) else {
+            continue;
+        };
+        if language != "go" {
+            by_file
+                .entry(contribution.file.clone())
+                .or_default()
+                .extend(language_method_names.iter().cloned());
+            continue;
+        }
+
+        for export in &contribution.exports {
+            if export_is_method(export)
+                && language_method_names.contains(symbol_liveness_name(&export.symbol))
+            {
+                by_file
+                    .entry(contribution.file.clone())
+                    .or_default()
+                    .insert(symbol_liveness_name(&export.symbol).to_string());
+            }
+        }
+    }
+    by_file
+}
+
+fn dispatch_liveness_keeps_export_live(
+    contribution: &DeadCodeContribution,
+    export: &ExportContribution,
+    dispatched_method_names: &MethodNamesByLanguage,
+) -> bool {
+    let language = language_for_file(&contribution.file);
+    let Some(method_names) = dispatched_method_names.get(language) else {
+        return false;
+    };
+    let name_is_dispatched = method_names.contains(symbol_liveness_name(&export.symbol));
+    if language == "go" {
+        export_is_method(export) && name_is_dispatched
+    } else {
+        name_is_dispatched
+    }
+}
+
+fn export_is_method(export: &ExportContribution) -> bool {
+    export.kind == "method"
 }
 
 fn imported_exports_by_file(
@@ -1964,6 +2027,25 @@ fn resolve_unqualified_target(
     }
 }
 
+fn dispatched_method_names_from_call(
+    call: &CallgraphOutboundCall,
+    caller_file: &str,
+) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    let is_go = language_for_file(caller_file) == "go";
+    if is_go {
+        if let Some(interface_methods) = go_well_known_interface_methods_from_call(call) {
+            names.extend(interface_methods.iter().map(|name| (*name).to_string()));
+            return names.into_iter().collect();
+        }
+    }
+
+    if let Some(name) = dispatched_method_name_from_call(call) {
+        names.insert(name);
+    }
+    names.into_iter().collect()
+}
+
 fn dispatched_method_name_from_call(call: &CallgraphOutboundCall) -> Option<String> {
     let (target, full_callee) = split_call_target_metadata(&call.target);
     if let Some(full_callee) = full_callee {
@@ -1982,6 +2064,21 @@ fn dispatched_method_name_from_callee(callee: &str) -> Option<String> {
     }
 
     clean_symbol(callee.rsplit('.').next()?.trim().trim_start_matches('?'))
+}
+
+fn go_well_known_interface_methods_from_call(
+    call: &CallgraphOutboundCall,
+) -> Option<&'static [&'static str]> {
+    let (target, full_callee) = split_call_target_metadata(&call.target);
+    let callee = full_callee.unwrap_or(target).trim();
+    // Go interface methods are invoked by library code outside the project
+    // graph. These entry calls add method names only; the final liveness check
+    // is still gated to Go method exports, not functions.
+    match callee {
+        "sort.Sort" | "sort.Stable" | "sort.IsSorted" => Some(&["Len", "Less", "Swap"]),
+        "list.New" => Some(&["FilterValue"]),
+        _ => None,
+    }
 }
 
 fn split_call_target_metadata(target: &str) -> (&str, Option<&str>) {

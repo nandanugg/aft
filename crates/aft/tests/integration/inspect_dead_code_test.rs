@@ -141,6 +141,19 @@ fn aggregate_has_item(success: &InspectScanSuccess, file: &str, symbol: &str) ->
         .any(|item| item["file"] == file && item["symbol"] == symbol)
 }
 
+fn aggregate_has_item_kind(
+    success: &InspectScanSuccess,
+    file: &str,
+    symbol: &str,
+    kind: &str,
+) -> bool {
+    success.aggregate["items"]
+        .as_array()
+        .expect("dead-code items")
+        .iter()
+        .any(|item| item["file"] == file && item["symbol"] == symbol && item["kind"] == kind)
+}
+
 fn assert_oxc_verdict(
     result: &OxcEngineResult,
     file: &str,
@@ -1162,6 +1175,76 @@ impl NeverConstructed {
     assert!(
         aggregate_has_item(&first_success, "src/planted_dead.rs", "new"),
         "genuinely-dead constructor should remain reported: {:#}",
+        first_success.aggregate
+    );
+}
+
+#[test]
+fn inspect_dead_code_keeps_go_sort_interface_methods_live() {
+    let (_temp_dir, root, paths) = fixture_project(&[(
+        "src/main.go",
+        r#"package main
+
+import "sort"
+
+type sortable []int
+
+func main() {
+	values := sortable{3, 1, 2}
+	sort.Sort(values)
+}
+
+func (s sortable) Len() int { return len(s) }
+
+func (s sortable) Less(i, j int) bool { return s[i] < s[j] }
+
+func (s sortable) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+func (s sortable) Unused() {}
+
+func Less(i, j int) bool { return false }
+"#,
+    )]);
+    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+
+    let first_snapshot = projected_snapshot_from_store(&project_root, &paths, ".go-store-one");
+    let first_outbound = outbound_call_set_bytes(&first_snapshot);
+    let first_scope_files = first_snapshot.files.clone();
+    let first_success = scan(job(&project_root, first_scope_files, Some(first_snapshot)));
+
+    let second_snapshot = projected_snapshot_from_store(&project_root, &paths, ".go-store-two");
+    let second_outbound = outbound_call_set_bytes(&second_snapshot);
+    let second_scope_files = second_snapshot.files.clone();
+    let second_success = scan(job(
+        &project_root,
+        second_scope_files,
+        Some(second_snapshot),
+    ));
+
+    assert_eq!(
+        first_outbound, second_outbound,
+        "Go sort.Interface fixture outbound-call set must be byte-identical across cold builds"
+    );
+    assert_eq!(
+        first_success.aggregate["count"], second_success.aggregate["count"],
+        "Go sort.Interface fixture dead-code count must be deterministic across cold builds"
+    );
+
+    for method in ["Len", "Less", "Swap"] {
+        assert!(
+            !aggregate_has_item_kind(&first_success, "src/main.go", method, "method"),
+            "{method} is invoked by sort.Sort through sort.Interface and must be live: {:#}",
+            first_success.aggregate
+        );
+    }
+    assert!(
+        aggregate_has_item_kind(&first_success, "src/main.go", "Unused", "method"),
+        "unreferenced Go method should remain dead: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item_kind(&first_success, "src/main.go", "Less", "function"),
+        "dispatch-name liveness must not rescue a same-named plain function: {:#}",
         first_success.aggregate
     );
 }
