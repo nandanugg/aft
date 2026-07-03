@@ -8,8 +8,8 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData};
 use crate::error::AftError;
-use crate::imports::{ImportKind, ImportStatement};
-use crate::parser::LangId;
+use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
+use crate::parser::{grammar_for, LangId};
 use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, Transaction};
@@ -18,6 +18,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tree_sitter::{Node, Parser};
 
 const SCHEMA_VERSION: i64 = 1;
 const BACKEND_TREESITTER: &str = "treesitter";
@@ -2392,8 +2393,9 @@ fn schema_fingerprint() -> String {
     // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
     // edge sources, broader call extraction) even if the table SHAPE is
     // unchanged, so existing on-disk stores rebuild and pick up the new edges.
-    // v8-attr-entry: Rust external-entry attributes now set node entry flags.
-    let input = format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v8-attr-entry");
+    // Rust scoped aliases, inline modules, reexports, and turbofish calls now add edges.
+    let input =
+        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v9-rust-resolver-batch");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
@@ -2861,8 +2863,11 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let rel_path = relative_path(project_root, &abs_path);
     let source = std::fs::read_to_string(&abs_path)?;
     let freshness = collect_source_freshness(&abs_path, &source)?;
-    let data = callgraph::build_file_data_from_source(&abs_path, &source)?;
+    let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
+    if lang == LangId::Rust {
+        extend_rust_imports_with_nested_uses(&source, &mut data);
+    }
     let mut nodes = build_node_records(&rel_path, &source, &data)?;
     let node_by_scoped: HashMap<String, String> = nodes
         .iter()
@@ -2870,7 +2875,22 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         .collect();
     let import_dependencies =
         import_dependencies(project_root, &abs_path, &data.import_block.imports);
+    let line_index = LineIndex::new(&source);
     let reexports = collect_reexport_refs(project_root, &abs_path, &rel_path, &source);
+    let rust_reexports = if lang == LangId::Rust {
+        collect_rust_pub_use_reexport_refs(
+            project_root,
+            &abs_path,
+            &rel_path,
+            &data.import_block.imports,
+            &line_index,
+        )
+    } else {
+        ReexportRefs {
+            raw_refs: Vec::new(),
+            surface_parts: Vec::new(),
+        }
+    };
     let source_less_exports = collect_source_less_export_alias_refs(&rel_path, &source);
     let mut raw_refs = Vec::new();
     raw_refs.extend(build_call_refs(
@@ -2879,7 +2899,6 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &node_by_scoped,
         &import_dependencies,
     ));
-    let line_index = LineIndex::new(&source);
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
@@ -2888,8 +2907,10 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &line_index,
     ));
     let mut surface_parts = reexports.surface_parts;
+    surface_parts.extend(rust_reexports.surface_parts);
     surface_parts.extend(source_less_exports.surface_parts);
     raw_refs.extend(reexports.raw_refs);
+    raw_refs.extend(rust_reexports.raw_refs);
     raw_refs.extend(source_less_exports.raw_refs);
     let dispatch_hints = build_dispatch_hints(&rel_path, &data, &node_by_scoped);
     let surface_fingerprint = surface_fingerprint(&mut nodes, &data, &surface_parts);
@@ -3097,6 +3118,142 @@ fn build_import_refs(
     refs
 }
 
+fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
+    let grammar = grammar_for(LangId::Rust);
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return;
+    };
+
+    let mut seen = data
+        .import_block
+        .imports
+        .iter()
+        .map(|import| (import.byte_range.start, import.byte_range.end))
+        .collect::<HashSet<_>>();
+    let mut nested_imports = Vec::new();
+    collect_rust_use_imports(source, tree.root_node(), &mut seen, &mut nested_imports);
+    if nested_imports.is_empty() {
+        return;
+    }
+
+    data.import_block.imports.extend(nested_imports);
+    data.import_block
+        .imports
+        .sort_by_key(|import| import.byte_range.start);
+    data.import_block.byte_range = import_byte_range_from_imports(&data.import_block.imports);
+}
+
+fn collect_rust_use_imports(
+    source: &str,
+    node: Node<'_>,
+    seen: &mut HashSet<(usize, usize)>,
+    imports: &mut Vec<ImportStatement>,
+) {
+    if node.kind() == "use_declaration" {
+        let range = node.byte_range();
+        if seen.insert((range.start, range.end)) {
+            if let Some(import) = rust_import_from_use_node(source, node) {
+                imports.push(import);
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        collect_rust_use_imports(source, cursor.node(), seen, imports);
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
+fn rust_import_from_use_node(source: &str, node: Node<'_>) -> Option<ImportStatement> {
+    let raw_text = source[node.byte_range()].to_string();
+    let body = rust_use_body(&raw_text)?.to_string();
+    let visibility = rust_use_visibility(&raw_text);
+    let names = rust_use_list_names(&body);
+    let group = classify_rust_import_group(&body);
+    let byte_range = node.byte_range();
+
+    Some(ImportStatement {
+        module_path: body,
+        names: names.clone(),
+        default_import: visibility.clone(),
+        namespace_import: None,
+        kind: ImportKind::Value,
+        group,
+        byte_range,
+        raw_text,
+        form: ImportForm::RustUse {
+            visibility,
+            named: names,
+        },
+    })
+}
+
+fn import_byte_range_from_imports(imports: &[ImportStatement]) -> Option<std::ops::Range<usize>> {
+    let start = imports.iter().map(|import| import.byte_range.start).min()?;
+    let end = imports.iter().map(|import| import.byte_range.end).max()?;
+    Some(start..end)
+}
+
+fn rust_use_visibility(raw_text: &str) -> Option<String> {
+    let use_pos = raw_text.find("use ")?;
+    let prefix = raw_text[..use_pos].trim();
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.to_string())
+    }
+}
+
+fn rust_use_body(raw_text: &str) -> Option<&str> {
+    let use_pos = raw_text.find("use ")?;
+    Some(raw_text[use_pos + 4..].trim().trim_end_matches(';').trim())
+}
+
+fn rust_use_list_names(body: &str) -> Vec<String> {
+    let Some(open) = body.find("::{") else {
+        return Vec::new();
+    };
+    let Some(close) = body[open + 3..].find('}').map(|offset| open + 3 + offset) else {
+        return Vec::new();
+    };
+    body[open + 3..close]
+        .split(',')
+        .filter_map(|spec| {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                None
+            } else {
+                Some(spec.to_string())
+            }
+        })
+        .collect()
+}
+
+fn classify_rust_import_group(body: &str) -> ImportGroup {
+    let first = body
+        .split("::")
+        .next()
+        .unwrap_or(body)
+        .split_whitespace()
+        .next()
+        .unwrap_or(body);
+    match first.trim() {
+        "std" | "core" | "alloc" => ImportGroup::Stdlib,
+        "crate" | "self" | "super" => ImportGroup::Internal,
+        _ => ImportGroup::External,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReexportRefs {
     raw_refs: Vec<RawRef>,
@@ -3167,6 +3324,128 @@ fn collect_reexport_refs(
         raw_refs,
         surface_parts,
     }
+}
+
+fn collect_rust_pub_use_reexport_refs(
+    project_root: &Path,
+    abs_path: &Path,
+    rel_path: &str,
+    imports: &[ImportStatement],
+    line_index: &LineIndex,
+) -> ReexportRefs {
+    let mut raw_refs = Vec::new();
+    let mut surface_parts = Vec::new();
+    let mut ordinal = 0usize;
+
+    for import in imports {
+        let Some(visibility) = &import.default_import else {
+            continue;
+        };
+        if !visibility.starts_with("pub") {
+            continue;
+        }
+        let Some((module_path, named, wildcard)) = rust_pub_use_reexport_parts(import) else {
+            continue;
+        };
+        ordinal += 1;
+        let ref_id = ref_id(&[
+            rel_path,
+            "rust_reexport",
+            &import.byte_range.start.to_string(),
+            &import.byte_range.end.to_string(),
+            &module_path,
+            &ordinal.to_string(),
+        ]);
+        surface_parts.push(format!("reexport\t{}", import.raw_text));
+        raw_refs.push(RawRef {
+            ref_id,
+            caller_node: None,
+            caller_symbol: None,
+            caller_file: rel_path.to_string(),
+            kind: "reexport".to_string(),
+            short_name: None,
+            full_ref: Some(rust_reexport_statement_for_index(&named, &import.raw_text)),
+            module_path: Some(module_path.clone()),
+            import_kind: Some("reexport".to_string()),
+            local_name: None,
+            requested_name: None,
+            namespace_alias: None,
+            wildcard,
+            line: line_index.byte_to_line(import.byte_range.start),
+            byte_start: import.byte_range.start,
+            byte_end: import.byte_range.end,
+            dependencies: rust_module_dependencies(project_root, abs_path, &module_path),
+        });
+    }
+
+    ReexportRefs {
+        raw_refs,
+        surface_parts,
+    }
+}
+
+fn rust_pub_use_reexport_parts(
+    import: &ImportStatement,
+) -> Option<(String, HashMap<String, String>, bool)> {
+    let body = rust_use_body(&import.raw_text).unwrap_or(import.module_path.as_str());
+    let body = body.trim();
+    if let Some(module_path) = body.strip_suffix("::*") {
+        return Some((module_path.trim().to_string(), HashMap::new(), true));
+    }
+
+    if let Some(brace_start) = body.find("::{") {
+        let module_path = body[..brace_start].trim().to_string();
+        let names = rust_reexport_names_from_specs(&body[brace_start + 3..body.rfind('}')?]);
+        if names.is_empty() {
+            return None;
+        }
+        return Some((module_path, names, false));
+    }
+
+    let (module_path, spec) = body.rsplit_once("::")?;
+    let names = rust_reexport_names_from_specs(spec);
+    if names.is_empty() {
+        return None;
+    }
+    Some((module_path.trim().to_string(), names, false))
+}
+
+fn rust_reexport_names_from_specs(specs: &str) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for spec in specs.split(',') {
+        let spec = spec.trim();
+        if spec.is_empty() || spec == "self" {
+            continue;
+        }
+        if let Some((source, local)) = spec.split_once(" as ") {
+            let source = source.trim();
+            let local = local.trim();
+            if !source.is_empty() && !local.is_empty() && source != "self" {
+                names.insert(local.to_string(), source.to_string());
+            }
+        } else {
+            names.insert(spec.to_string(), spec.to_string());
+        }
+    }
+    names
+}
+
+fn rust_reexport_statement_for_index(named: &HashMap<String, String>, fallback: &str) -> String {
+    if named.is_empty() {
+        return fallback.to_string();
+    }
+    let mut specs = named
+        .iter()
+        .map(|(local, source)| {
+            if local == source {
+                source.clone()
+            } else {
+                format!("{source} as {local}")
+            }
+        })
+        .collect::<Vec<_>>();
+    specs.sort();
+    format!("pub use {{{}}};", specs.join(", "))
 }
 
 fn quoted_module_path(statement: &str) -> Option<String> {
@@ -3365,7 +3644,7 @@ fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
 
     let resolved = match index.lang_for(&caller_file) {
         Some(LangId::Rust) => {
-            resolve_rust_target(index, &caller_file, full_ref, short_name, caller_data)
+            resolve_rust_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
         }
         Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
             resolve_js_ts_target(index, &caller_file, full_ref, short_name, caller_data)
@@ -3554,14 +3833,13 @@ fn resolve_rust_target(
     full_ref: &str,
     short_name: &str,
     caller_data: &FileCallData,
+    raw: &RawRef,
 ) -> Option<(String, String, String)> {
     if full_ref.contains("::") {
-        if let Some(target_file) = rust_target_for_qualified(index, caller_file, full_ref) {
-            return Some((
-                "resolved".to_string(),
-                target_file,
-                rust_target_symbol(full_ref, short_name),
-            ));
+        if let Some((target_file, target_symbol)) =
+            rust_target_for_qualified(index, caller_file, full_ref, short_name, caller_data, raw)
+        {
+            return Some(("resolved".to_string(), target_file, target_symbol));
         }
     }
 
@@ -3580,19 +3858,44 @@ fn rust_target_for_qualified(
     index: &ProjectIndex<'_>,
     caller_file: &str,
     full_ref: &str,
-) -> Option<String> {
+    short_name: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Option<(String, String)> {
     let mut segments: Vec<&str> = full_ref.split("::").collect();
     if segments.len() < 2 {
         return None;
     }
     segments.pop();
-    if !matches!(segments.first().copied(), Some("crate" | "self" | "super")) {
-        if let Some(target) = rust_workspace_file_for_segments(index, &segments) {
+    let requested_symbol = rust_target_symbol(full_ref, short_name);
+
+    for path in rust_module_path_candidates(&segments, caller_data, raw) {
+        let path_refs = path.iter().map(String::as_str).collect::<Vec<_>>();
+        if !matches!(path_refs.first().copied(), Some("crate" | "self" | "super")) {
+            if let Some(target_file) = rust_workspace_file_for_segments(index, &path_refs) {
+                return Some(rust_resolve_reexport_if_symbol_missing(
+                    index,
+                    target_file,
+                    requested_symbol.clone(),
+                ));
+            }
+        }
+
+        let module_segments = rust_resolve_segments(caller_file, &path_refs)?;
+        if let Some(target) =
+            rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
+        {
             return Some(target);
         }
+        if let Some(target_file) = rust_file_for_segments(index, caller_file, &module_segments) {
+            return Some(rust_resolve_reexport_if_symbol_missing(
+                index,
+                target_file,
+                requested_symbol.clone(),
+            ));
+        }
     }
-    let module_segments = rust_resolve_segments(caller_file, &segments)?;
-    rust_file_for_segments(index, caller_file, &module_segments)
+    None
 }
 
 fn rust_target_symbol(full_ref: &str, short_name: &str) -> String {
@@ -3602,6 +3905,129 @@ fn rust_target_symbol(full_ref: &str, short_name: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(short_name)
         .to_string()
+}
+
+fn rust_resolve_reexport_if_symbol_missing(
+    index: &ProjectIndex<'_>,
+    target_file: String,
+    target_symbol: String,
+) -> (String, String) {
+    if index
+        .node_for_symbol(&target_file, &target_symbol)
+        .is_some()
+    {
+        return (target_file, target_symbol);
+    }
+    if let Some(resolved) = resolve_exported_symbol(index, &target_file, &target_symbol, 0) {
+        resolved
+    } else {
+        (target_file, target_symbol)
+    }
+}
+
+fn rust_module_path_candidates(
+    segments: &[&str],
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Vec<Vec<String>> {
+    let mut candidates = Vec::new();
+    if let Some(first) = segments.first().copied() {
+        for import in &caller_data.import_block.imports {
+            if !rust_import_is_visible_to_call(import, raw) {
+                continue;
+            }
+            let Some((local_name, mut path_segments)) = rust_module_alias_segments(import) else {
+                continue;
+            };
+            if local_name == first {
+                path_segments.extend(segments[1..].iter().map(|segment| (*segment).to_string()));
+                rust_push_unique_path_candidate(&mut candidates, path_segments);
+            }
+        }
+    }
+    rust_push_unique_path_candidate(
+        &mut candidates,
+        segments
+            .iter()
+            .map(|segment| (*segment).to_string())
+            .collect(),
+    );
+    candidates
+}
+
+fn rust_push_unique_path_candidate(candidates: &mut Vec<Vec<String>>, candidate: Vec<String>) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> bool {
+    import.byte_range.start <= raw.byte_start
+}
+
+fn rust_module_alias_segments(import: &ImportStatement) -> Option<(String, Vec<String>)> {
+    let path = import.module_path.trim().trim_end_matches(';').trim();
+    if path.contains("::{") || path.contains('{') || path.contains('*') {
+        return None;
+    }
+    let (path_without_alias, alias) = path
+        .split_once(" as ")
+        .map(|(left, right)| (left.trim(), Some(right.trim())))
+        .unwrap_or((path, None));
+    let segments = path_without_alias
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let local_name = alias.or_else(|| segments.last().copied())?.to_string();
+    if local_name.chars().next().is_some_and(char::is_uppercase) {
+        return None;
+    }
+    Some((
+        local_name,
+        segments
+            .into_iter()
+            .map(|segment| segment.to_string())
+            .collect(),
+    ))
+}
+
+fn rust_inline_scoped_target(
+    index: &ProjectIndex<'_>,
+    caller_file: &str,
+    module_segments: &[String],
+    short_name: &str,
+) -> Option<(String, String)> {
+    let src_prefix = rust_src_prefix(caller_file);
+    let mut file_paths = index.files.keys().cloned().collect::<Vec<_>>();
+    file_paths.sort();
+    if let Some(position) = file_paths.iter().position(|file| file == caller_file) {
+        let caller = file_paths.remove(position);
+        file_paths.insert(0, caller);
+    }
+
+    for file_path in file_paths {
+        if index.lang_for(&file_path) != Some(LangId::Rust)
+            || rust_src_prefix(&file_path) != src_prefix
+        {
+            continue;
+        }
+        let file_module_segments = rust_module_segments_for_rel(&file_path);
+        if !module_segments.starts_with(&file_module_segments) {
+            continue;
+        }
+        let scoped_segments = &module_segments[file_module_segments.len()..];
+        if scoped_segments.is_empty() {
+            continue;
+        }
+        let mut scoped_symbol = scoped_segments.join("::");
+        scoped_symbol.push_str("::");
+        scoped_symbol.push_str(short_name);
+        if index.node_for_symbol(&file_path, &scoped_symbol).is_some() {
+            return Some((file_path, scoped_symbol));
+        }
+    }
+    None
 }
 
 fn rust_target_for_use(
@@ -6486,7 +6912,7 @@ fn module_dependencies(
     abs_path: &Path,
     module_path: &str,
 ) -> BTreeSet<String> {
-    let mut deps = BTreeSet::new();
+    let mut deps = rust_module_dependencies(project_root, abs_path, module_path);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
     if let Some(resolved) = callgraph::resolve_module_path(caller_dir, module_path) {
         deps.insert(relative_path(project_root, &resolved));
@@ -6498,6 +6924,76 @@ fn module_dependencies(
         }
     }
     deps
+}
+
+fn rust_module_dependencies(
+    project_root: &Path,
+    abs_path: &Path,
+    module_path: &str,
+) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
+    let rel_path = relative_path(project_root, &canonicalize_path(abs_path));
+    let Some(path_segments) = rust_module_dependency_segments(&rel_path, module_path) else {
+        return deps;
+    };
+    let src_prefix = rust_src_prefix(&rel_path);
+    rust_push_module_dependency_candidate(project_root, &mut deps, &src_prefix, &path_segments);
+    if !path_segments.is_empty() {
+        rust_push_module_dependency_candidate(
+            project_root,
+            &mut deps,
+            &src_prefix,
+            &path_segments[..path_segments.len() - 1],
+        );
+    }
+    deps
+}
+
+fn rust_module_dependency_segments(rel_path: &str, module_path: &str) -> Option<Vec<String>> {
+    let path = rust_module_path_without_alias_or_use_list(module_path);
+    let segments = path
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() || matches!(segments[0], "std" | "core" | "alloc") {
+        return None;
+    }
+    rust_resolve_segments(rel_path, &segments)
+}
+
+fn rust_module_path_without_alias_or_use_list(module_path: &str) -> &str {
+    let path = module_path
+        .trim()
+        .trim_end_matches(';')
+        .split_once(" as ")
+        .map(|(left, _)| left.trim())
+        .unwrap_or_else(|| module_path.trim().trim_end_matches(';'));
+    path.find("::{").map(|brace| &path[..brace]).unwrap_or(path)
+}
+
+fn rust_push_module_dependency_candidate(
+    project_root: &Path,
+    deps: &mut BTreeSet<String>,
+    src_prefix: &str,
+    segments: &[String],
+) {
+    let candidates = if segments.is_empty() {
+        vec![
+            format!("{src_prefix}/lib.rs"),
+            format!("{src_prefix}/main.rs"),
+        ]
+    } else {
+        vec![
+            format!("{}/{}.rs", src_prefix, segments.join("/")),
+            format!("{}/{}/mod.rs", src_prefix, segments.join("/")),
+        ]
+    };
+    for candidate in candidates {
+        if project_root.join(&candidate).is_file() {
+            deps.insert(candidate);
+        }
+    }
 }
 
 fn relative_module_candidates(base: &Path) -> Vec<PathBuf> {
@@ -6797,6 +7293,7 @@ mod cold_build_insert_tests {
     use super::*;
     use crate::imports::ImportBlock;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -7576,6 +8073,456 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
             });
         }
         Ok(values.join("\u{1f}"))
+    }
+}
+
+#[cfg(test)]
+mod rust_resolution_tests {
+    use super::*;
+    use crate::inspect::job::CallgraphSnapshot;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn rust_function_scoped_module_alias_resolves_and_projects_live() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "scoped-alias-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"pub mod finalization_contract;
+
+pub fn run_alias() {
+    use crate::finalization_contract as fc;
+    fc::check_mason_contract();
+}
+"#,
+        );
+        write_file(
+            root,
+            "src/finalization_contract.rs",
+            r#"pub fn check_mason_contract() {}
+fn planted_dead() {}
+"#,
+        );
+
+        let (store, snapshot) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/finalization_contract.rs",
+            "check_mason_contract",
+            "src/lib.rs",
+            "run_alias",
+        );
+        assert_projected_call(
+            root,
+            &snapshot,
+            "src/finalization_contract.rs",
+            "check_mason_contract",
+        );
+        assert_no_projected_call(
+            root,
+            &snapshot,
+            "src/finalization_contract.rs",
+            "planted_dead",
+        );
+        assert!(
+            store
+                .direct_callers_of(Path::new("src/finalization_contract.rs"), "planted_dead")
+                .expect("planted dead callers")
+                .is_empty(),
+            "planted-dead guard should stay without callers"
+        );
+    }
+
+    #[test]
+    fn rust_inline_sibling_module_qualified_calls_resolve_scoped_targets() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "inline-module-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"mod work_graph { fn operations() {} }
+mod manifest { fn operations() {} }
+mod audit { fn operations() {} }
+mod dispatch { fn operations() {} }
+mod finalization { fn operations() {} }
+
+pub fn run_inline_operations() {
+    work_graph::operations();
+    manifest::operations();
+    audit::operations();
+    dispatch::operations();
+    finalization::operations();
+}
+
+fn planted_dead() {}
+"#,
+        );
+
+        let (store, snapshot) = cold_build_twice(root);
+        for module in [
+            "work_graph",
+            "manifest",
+            "audit",
+            "dispatch",
+            "finalization",
+        ] {
+            assert_direct_caller(
+                &store,
+                "src/lib.rs",
+                &format!("{module}::operations"),
+                "src/lib.rs",
+                "run_inline_operations",
+            );
+        }
+        assert_projected_call(root, &snapshot, "src/lib.rs", "operations");
+        assert_no_projected_call(root, &snapshot, "src/lib.rs", "planted_dead");
+    }
+
+    #[test]
+    fn rust_workspace_pub_use_reexport_resolves_to_source_file() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/but-action\", \"crates/app\"]\n",
+        )
+        .expect("write workspace manifest");
+        write_file(
+            root,
+            "crates/but-action/Cargo.toml",
+            r#"[package]
+name = "but-action"
+version = "0.1.0"
+edition = "2021"
+"#,
+        );
+        write_file(
+            root,
+            "crates/but-action/src/lib.rs",
+            "mod action;\npub use action::{list_actions};\n",
+        );
+        write_file(
+            root,
+            "crates/but-action/src/action.rs",
+            "pub fn list_actions() {}\nfn planted_dead() {}\n",
+        );
+        write_file(
+            root,
+            "crates/app/Cargo.toml",
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+"#,
+        );
+        write_file(
+            root,
+            "crates/app/src/lib.rs",
+            "pub fn run_actions() {\n    but_action::list_actions();\n}\n",
+        );
+
+        let (store, snapshot) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "crates/but-action/src/action.rs",
+            "list_actions",
+            "crates/app/src/lib.rs",
+            "run_actions",
+        );
+        assert!(
+            store
+                .direct_callers_of(Path::new("crates/but-action/src/lib.rs"), "list_actions")
+                .expect("lib reexport callers")
+                .is_empty(),
+            "call should target the reexported source function, not lib.rs"
+        );
+        assert_projected_call(
+            root,
+            &snapshot,
+            "crates/but-action/src/action.rs",
+            "list_actions",
+        );
+        assert_no_projected_call(
+            root,
+            &snapshot,
+            "crates/but-action/src/action.rs",
+            "planted_dead",
+        );
+    }
+
+    #[test]
+    fn rust_generic_self_turbofish_method_dispatch_resolves() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "generic-self-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"pub struct Matcher;
+
+impl Matcher {
+    pub fn run(&self) -> bool {
+        self.fuzzy_match_optimal::<usize>("needle")
+    }
+
+    fn fuzzy_match_optimal<T>(&self, _needle: &str) -> bool {
+        let _ = std::marker::PhantomData::<T>;
+        true
+    }
+
+    fn planted_dead(&self) {}
+}
+
+pub fn entry() -> bool {
+    let matcher = Matcher;
+    matcher.run()
+}
+"#,
+        );
+
+        let (store, snapshot) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Matcher::fuzzy_match_optimal",
+            "src/lib.rs",
+            "Matcher::run",
+        );
+        assert_projected_call(root, &snapshot, "src/lib.rs", "fuzzy_match_optimal");
+        assert_no_projected_call(root, &snapshot, "src/lib.rs", "planted_dead");
+    }
+
+    #[test]
+    fn rust_manifest_operations_named_import_is_not_the_missing_edge() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "manifest-operations-fixture");
+        write_file(
+            root,
+            "src/main.rs",
+            r#"mod dispatch;
+use dispatch::{manifest_operations};
+
+fn main() {
+    manifest_operations();
+}
+"#,
+        );
+        write_file(
+            root,
+            "src/dispatch.rs",
+            r#"mod work_graph { fn operations() {} }
+mod manifest { fn operations() {} }
+mod audit { fn operations() {} }
+mod descriptor { fn operations() {} }
+mod writer { fn operations() {} }
+
+pub fn manifest_operations() {
+    manifest::operations();
+}
+
+pub fn work_graph_operations() {
+    work_graph::operations();
+}
+
+pub fn audit_operations() {
+    audit::operations();
+}
+
+pub fn descriptor_operations() {
+    descriptor::operations();
+}
+
+pub fn writer_operations() {
+    writer::operations();
+}
+
+fn planted_dead() {}
+"#,
+        );
+
+        let (store, snapshot) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/dispatch.rs",
+            "manifest_operations",
+            "src/main.rs",
+            "main",
+        );
+        assert_direct_caller(
+            &store,
+            "src/dispatch.rs",
+            "manifest::operations",
+            "src/dispatch.rs",
+            "manifest_operations",
+        );
+        assert_projected_call(root, &snapshot, "src/dispatch.rs", "manifest_operations");
+        assert_projected_call(root, &snapshot, "src/dispatch.rs", "operations");
+        assert_no_projected_call(root, &snapshot, "src/dispatch.rs", "planted_dead");
+    }
+
+    fn cold_build_twice(root: &Path) -> (CallGraphStore, CallgraphSnapshot) {
+        let files = rust_files(root);
+        let first = CallGraphStore::open(root.join(".store-first"), root.to_path_buf())
+            .expect("open first store");
+        first.cold_build(&files).expect("first cold build");
+        let first_snapshot =
+            project_dead_code_snapshot(first.sqlite_path()).expect("first projected snapshot");
+
+        let second = CallGraphStore::open(root.join(".store-second"), root.to_path_buf())
+            .expect("open second store");
+        second.cold_build(&files).expect("second cold build");
+        let second_snapshot =
+            project_dead_code_snapshot(second.sqlite_path()).expect("second projected snapshot");
+
+        assert_eq!(
+            projection_rows(&first_snapshot),
+            projection_rows(&second_snapshot),
+            "cold-build projection should be deterministic"
+        );
+        (first, first_snapshot)
+    }
+
+    fn projection_rows(snapshot: &CallgraphSnapshot) -> Vec<String> {
+        let mut rows = Vec::new();
+        for export in &snapshot.exported_symbols {
+            rows.push(format!(
+                "export\t{}\t{}\t{}\t{}",
+                export.file.display(),
+                export.symbol,
+                export.kind,
+                export.line
+            ));
+        }
+        for call in &snapshot.outbound_calls {
+            rows.push(format!(
+                "call\t{}\t{}\t{}\t{}\t{}",
+                call.caller_file.display(),
+                call.caller_symbol,
+                call.target,
+                call.line,
+                call.provenance
+            ));
+        }
+        for file in &snapshot.entry_points {
+            rows.push(format!("entry_file\t{}", file.display()));
+        }
+        for (file, symbols) in &snapshot.entry_point_symbols {
+            for symbol in symbols {
+                rows.push(format!("entry_symbol\t{}\t{symbol}", file.display()));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn assert_direct_caller(
+        store: &CallGraphStore,
+        target_rel: &str,
+        target_symbol: &str,
+        caller_rel: &str,
+        caller_symbol: &str,
+    ) {
+        let callers = store
+            .direct_callers_of(Path::new(target_rel), target_symbol)
+            .unwrap_or_else(|error| {
+                panic!("direct callers for {target_rel}::{target_symbol}: {error}")
+            });
+        assert!(
+            callers.iter().any(|site| {
+                site.caller.file == caller_rel && site.caller.symbol == caller_symbol
+            }),
+            "expected {caller_rel}::{caller_symbol} to call {target_rel}::{target_symbol}; callers: {callers:#?}"
+        );
+    }
+
+    fn assert_projected_call(
+        root: &Path,
+        snapshot: &CallgraphSnapshot,
+        target_rel: &str,
+        symbol: &str,
+    ) {
+        let target = projected_target(root, target_rel, symbol);
+        assert!(
+            snapshot.outbound_calls.iter().any(|call| {
+                call.target == target
+                    || call.target.starts_with(&format!(
+                        "{target}{}",
+                        crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR
+                    ))
+            }),
+            "expected projected call to {target}; calls: {:#?}",
+            snapshot.outbound_calls
+        );
+    }
+
+    fn assert_no_projected_call(
+        root: &Path,
+        snapshot: &CallgraphSnapshot,
+        target_rel: &str,
+        symbol: &str,
+    ) {
+        let target = projected_target(root, target_rel, symbol);
+        assert!(
+            snapshot.outbound_calls.iter().all(|call| {
+                call.target != target
+                    && !call.target.starts_with(&format!(
+                        "{target}{}",
+                        crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR
+                    ))
+            }),
+            "did not expect projected call to {target}; calls: {:#?}",
+            snapshot.outbound_calls
+        );
+    }
+
+    fn projected_target(root: &Path, target_rel: &str, symbol: &str) -> String {
+        let path = fs::canonicalize(root.join(target_rel)).expect("canonical target path");
+        format!("{}::{symbol}", path.display())
+    }
+
+    fn write_rust_manifest(root: &Path, name: &str) {
+        write_file(
+            root,
+            "Cargo.toml",
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+    }
+
+    fn write_file(root: &Path, rel_path: &str, source: &str) -> PathBuf {
+        let path = root.join(rel_path);
+        fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
+        fs::write(&path, source).expect("write fixture file");
+        path
+    }
+
+    fn rust_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        collect_rust_files(root, &mut files);
+        files.sort();
+        files
+    }
+
+    fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read fixture dir") {
+            let entry = entry.expect("read fixture entry");
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if !name.starts_with(".store") {
+                    collect_rust_files(&path, files);
+                }
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
     }
 }
 

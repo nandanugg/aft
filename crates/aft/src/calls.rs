@@ -158,6 +158,7 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
         | "attribute"
         | "member_access_expression"
         | "qualified_identifier"
+        | "generic_function"
         | "generic_name"
         | "template_function"
         | "template_method" => {
@@ -195,6 +196,7 @@ pub fn extract_full_callee(node: &tree_sitter::Node, source: &str) -> Option<Str
     }
 
     let func_node = callee_node(node)?;
+    let func_node = strip_generic_callee_wrapper(func_node);
 
     Some(source[func_node.byte_range()].trim().to_string())
 }
@@ -213,6 +215,16 @@ fn callee_node<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>
     }
 }
 
+fn strip_generic_callee_wrapper<'a>(node: tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
+    if node.kind() == "generic_function" {
+        node.child_by_field_name("function")
+            .or_else(|| node.named_child(0))
+            .unwrap_or(node)
+    } else {
+        node
+    }
+}
+
 fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
     let index = node.child_by_field_name("index")?;
     let text = source[index.byte_range()].trim();
@@ -226,6 +238,7 @@ fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Optio
 
 /// Extract the last segment of a member expression (the method/property name).
 pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<String> {
+    let node = strip_generic_callee_wrapper(*node);
     if let Some(name) = node.child_by_field_name("name") {
         if let Some(segment) = extract_last_segment(&name, source) {
             return Some(segment);
@@ -240,7 +253,7 @@ pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<St
                 "property_identifier" | "field_identifier" | "identifier" => {
                     return Some(source[child.byte_range()].to_string());
                 }
-                "generic_name" | "template_function" | "template_method" => {
+                "generic_function" | "generic_name" | "template_function" | "template_method" => {
                     if let Some(segment) = extract_last_segment(&child, source) {
                         return Some(segment);
                     }
