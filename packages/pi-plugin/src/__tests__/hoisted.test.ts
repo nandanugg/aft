@@ -67,7 +67,18 @@ describe("hoisted tool adapters", () => {
 
     expectRootObjectSchema(tools.get("read")!.parameters);
     expectRootObjectSchema(tools.get("write")!.parameters);
-    expectRootObjectSchema(tools.get("edit")!.parameters);
+    const editSchema = tools.get("edit")!.parameters;
+    expectRootObjectSchema(editSchema);
+    expect(schemaHasProperty(editSchema, "edits")).toBe(true);
+    expect(
+      schemaAccepts(editSchema, {
+        filePath: "batch.ts",
+        edits: [
+          { oldString: "before", newString: "after" },
+          { startLine: 2, endLine: 3, content: "replacement" },
+        ],
+      }),
+    ).toBe(true);
   });
 
   test("read maps offset/limit to inclusive start_line/end_line and appends footer", async () => {
@@ -266,6 +277,134 @@ describe("hoisted tool adapters", () => {
       newString: "ignored",
       appendContent: "\nnext",
     });
+  });
+
+  test("edit batch mode forwards a two-edit camelCase payload through tool_call", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({
+      success: true,
+      text: "Edited (+2/-2, 2 edits).",
+      edits_applied: 2,
+      diff: { additions: 2, deletions: 2 },
+    }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("edit")!, {
+      filePath: "batch.ts",
+      edits: [
+        { oldString: "before", newString: "after" },
+        { startLine: 4, endLine: 6, content: "replacement" },
+      ],
+    })) as { content: Array<{ text: string }>; details: { editsApplied?: number } };
+
+    expect(result.content[0].text).toBe("Edited (+2/-2, 2 edits).");
+    expect(result.details.editsApplied).toBe(2);
+    expect(calls.map((call) => call.command)).toEqual(["tool_call"]);
+    expect(calls[0].params).toMatchObject({ name: "edit" });
+    expect(toolArgs(calls[0])).toEqual({
+      filePath: "batch.ts",
+      edits: [
+        { oldString: "before", newString: "after" },
+        { startLine: 4, endLine: 6, content: "replacement" },
+      ],
+    });
+  });
+
+  test("edit gives appendContent precedence over edits and oldString/newString", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => {
+      if (params.appendContent !== undefined) {
+        return { success: true, text: "append wins", diff: { additions: 1, deletions: 0 } };
+      }
+      if (params.edits !== undefined) {
+        return { success: true, text: "edits win", diff: { additions: 1, deletions: 1 } };
+      }
+      return { success: true, text: "replace wins", diff: { additions: 1, deletions: 1 } };
+    });
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("edit")!, {
+      filePath: "modes.ts",
+      appendContent: "\nnext",
+      edits: [{ startLine: 2, content: "ignored because append wins" }],
+      oldString: "before",
+      newString: "after",
+    })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toBe("append wins");
+    expect(toolArgs(calls[0])).toEqual({
+      filePath: "modes.ts",
+      appendContent: "\nnext",
+      edits: [{ startLine: 2, content: "ignored because append wins" }],
+      oldString: "before",
+      newString: "after",
+    });
+  });
+
+  test("edit gives edits precedence over oldString/newString", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((_command, params) => {
+      if (params.appendContent !== undefined) {
+        return { success: true, text: "append wins", diff: { additions: 1, deletions: 0 } };
+      }
+      if (params.edits !== undefined) {
+        return { success: true, text: "edits win", diff: { additions: 1, deletions: 1 } };
+      }
+      return { success: true, text: "replace wins", diff: { additions: 1, deletions: 1 } };
+    });
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    const result = (await executeTool(tools.get("edit")!, {
+      filePath: "modes.ts",
+      edits: [{ oldString: "before", newString: "after" }],
+      oldString: "before",
+      newString: "after",
+    })) as { content: Array<{ text: string }> };
+
+    expect(result.content[0].text).toBe("edits win");
+    expect(toolArgs(calls[0])).toEqual({
+      filePath: "modes.ts",
+      edits: [{ oldString: "before", newString: "after" }],
+      oldString: "before",
+      newString: "after",
+    });
+  });
+
+  test("edit rejects invalid batch edit shapes with the batch error wording", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({ success: true, text: "unused" }));
+    registerHoistedTools(api, makePluginContext(bridge), {
+      hoistRead: false,
+      hoistWrite: false,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    });
+
+    await expect(
+      executeTool(tools.get("edit")!, {
+        filePath: "broken.ts",
+        edits: [{ startLine: 2, content: "replacement" }],
+      }),
+    ).rejects.toThrow("batch: edit[0] 'line_end' must be a positive integer (1-based)");
   });
 
   test("edit accepts path as a compatibility alias without overriding filePath", async () => {

@@ -93,6 +93,25 @@ describe("buildMutationResult", () => {
     expect(result.details?.replacements).toBeUndefined();
   });
 
+  test("preserves edits_applied for batch renderer summaries", () => {
+    const result = buildMutationResult({
+      text: "Edited (+4/-4, 2 edits).",
+      edits_applied: 2,
+      diff: {
+        additions: 4,
+        deletions: 4,
+        truncated: true,
+      },
+    });
+
+    expect(result.details?.editsApplied).toBe(2);
+    const text = result.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text?: string }).text ?? "")
+      .join("");
+    expect(text).toContain("2 edits");
+  });
+
   test("appends LSP diagnostics in a human-readable block", () => {
     const result = buildMutationResult({
       replacements: 1,

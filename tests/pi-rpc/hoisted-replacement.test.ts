@@ -117,6 +117,30 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
     expect(resultText(toolEnd)).toContain("3 replacements");
   }, 120_000);
 
+  test("edit edits[] applies two real file mutations atomically", async () => {
+    const toolEnd = await withPiTool(
+      {
+        name: "edit",
+        arguments: {
+          filePath: "batch.txt",
+          edits: [
+            { oldString: "one", newString: "ONE" },
+            { startLine: 3, endLine: 3, content: "THREE" },
+          ],
+        },
+      },
+      {
+        message: "Apply two edits to batch.txt in one tool call.",
+        setup: async (env) => writeFile(join(env.workdir, "batch.txt"), "one\ntwo\nthree\n"),
+        afterTool: async (env) => {
+          expect(await readFile(join(env.workdir, "batch.txt"), "utf8")).toBe("ONE\ntwo\nTHREE\n");
+        },
+      },
+    );
+    expect(toolEnd.isError).toBe(false);
+    expect(resultText(toolEnd)).toContain("2 edits");
+  }, 120_000);
+
   test("grep accepts brace-glob include filters across TypeScript and Rust", async () => {
     const toolEnd = await withPiTool(
       { name: "grep", arguments: { pattern: "needle", include: "*.{ts,rs}" } },

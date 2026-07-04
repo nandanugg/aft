@@ -255,6 +255,24 @@ const WriteParams = Type.Object({
   content: Type.String({ description: "Full file contents to write" }),
 });
 
+const BatchEditParams = Type.Object({
+  oldString: Type.Optional(
+    Type.String({ description: "Text to find for a batch find/replace edit" }),
+  ),
+  newString: Type.Optional(
+    Type.String({ description: "Replacement text for a batch find/replace edit" }),
+  ),
+  startLine: Type.Optional(
+    Type.Any({ description: "1-based start line for a batch line-range edit" }),
+  ),
+  endLine: Type.Optional(Type.Any({ description: "1-based end line for a batch line-range edit" })),
+  content: Type.Optional(
+    Type.String({
+      description: "Replacement text for a batch line-range edit (empty string deletes the lines)",
+    }),
+  ),
+});
+
 const EditParams = Type.Object({
   filePath: Type.Optional(
     Type.String({
@@ -275,7 +293,13 @@ const EditParams = Type.Object({
   appendContent: Type.Optional(
     Type.String({
       description:
-        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, oldString/newString are ignored.",
+        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, edits/oldString/newString are ignored.",
+    }),
+  ),
+  edits: Type.Optional(
+    Type.Array(BatchEditParams, {
+      description:
+        "Batch edits — array of { oldString, newString } or { startLine, endLine, content } objects applied atomically to one file.",
     }),
   ),
 });
@@ -320,6 +344,7 @@ interface FileMutationDetails {
   additions: number;
   deletions: number;
   replacements?: number;
+  editsApplied?: number;
   diagnostics?: unknown[];
   /**
    * True when Rust returned `diff.truncated = true` — the before/after strings
@@ -359,6 +384,60 @@ function readPathArg(args: { path?: unknown; filePath?: unknown }): string | und
 
 function mutationFilePathArg(args: { filePath?: unknown; path?: unknown }): string | undefined {
   return coerceAliasedStringParam(args.filePath, args.path);
+}
+
+function hasOwn(record: Record<string, unknown>, key: string): boolean {
+  return Object.hasOwn(record, key);
+}
+
+function validateBatchEdit(edit: unknown, index: number): void {
+  if (!edit || typeof edit !== "object" || Array.isArray(edit)) {
+    throw new Error(`batch: edit[${index}] must be an object`);
+  }
+
+  const record = edit as Record<string, unknown>;
+  if (typeof record.oldString === "string") {
+    return;
+  }
+
+  if (hasOwn(record, "startLine")) {
+    if (
+      typeof record.startLine !== "number" ||
+      !Number.isInteger(record.startLine) ||
+      record.startLine < 0
+    ) {
+      throw new Error(`batch: edit[${index}] 'line_start' must be a positive integer (1-based)`);
+    }
+    if (record.startLine === 0) {
+      throw new Error(`batch: edit[${index}] 'line_start' must be >= 1 (1-based)`);
+    }
+    if (
+      typeof record.endLine !== "number" ||
+      !Number.isInteger(record.endLine) ||
+      record.endLine < 0
+    ) {
+      throw new Error(`batch: edit[${index}] 'line_end' must be a positive integer (1-based)`);
+    }
+    if (record.endLine === 0) {
+      throw new Error(`batch: edit[${index}] 'line_end' must be >= 1 (1-based)`);
+    }
+    return;
+  }
+
+  throw new Error(`batch: edit[${index}] must have either 'match' or 'line_start'/'line_end'`);
+}
+
+function validateBatchEdits(edits: unknown): void {
+  if (edits === undefined) return;
+  if (!Array.isArray(edits)) {
+    throw new Error("batch: missing required param 'edits' (expected array)");
+  }
+  if (edits.length === 0) {
+    throw new Error("batch: 'edits' array must not be empty");
+  }
+  edits.forEach((edit, index) => {
+    validateBatchEdit(edit, index);
+  });
 }
 
 function renderReadCall(
@@ -506,13 +585,14 @@ export function registerHoistedTools(
       name: "edit",
       label: "edit",
       description:
-        "Find-and-replace edit with progressive fuzzy matching (handles whitespace and Unicode drift). Uses `filePath`, `oldString`, `newString`. Errors on multiple matches — use `occurrence` to pick one, or `replaceAll: true`.",
+        "Edit part of a file via `appendContent`, batch `edits[]`, or `oldString`/`newString` find-and-replace. Mode priority: appendContent > edits > oldString. Find/replace errors on multiple matches — use `occurrence` or `replaceAll: true`.",
       promptSnippet:
-        "Targeted find-and-replace (uses filePath/oldString/newString; occurrence or replaceAll for disambiguation; fuzzy whitespace matching). Pass appendContent to append to a file (creates if missing).",
+        "Partial file edits via appendContent, edits[], or oldString/newString (mode priority: appendContent > edits > oldString).",
       promptGuidelines: [
         "Prefer edit over write when changing part of an existing file.",
+        "Use appendContent when adding text to the end of a file.",
+        "Use edits[] for multiple atomic changes in one file.",
         "Include enough surrounding context in oldString to make the match unique, or set replaceAll/occurrence explicitly.",
-        "Use appendContent (instead of read+write) when adding text to the end of a file.",
       ],
       parameters: EditParams,
       async execute(
@@ -522,10 +602,21 @@ export function registerHoistedTools(
         _onUpdate,
         extCtx,
       ) {
+        const argsRecord = params as Record<string, unknown>;
+        if (argsRecord.startLine !== undefined || argsRecord.endLine !== undefined) {
+          throw new Error(
+            "edit: 'startLine'/'endLine' are not top-level parameters. " +
+              "For line-range edits, nest them inside the `edits` array: " +
+              '`edits: [{ startLine: N, endLine: M, content: "..." }]`. ' +
+              "For find/replace, use `oldString`/`newString` instead.",
+          );
+        }
+
         const filePathArg = mutationFilePathArg(params);
         if (typeof filePathArg !== "string") {
           throw new Error("edit: missing required parameter `filePath`");
         }
+        if (params.appendContent === undefined) validateBatchEdits(params.edits);
         // Resolve ~ and relative paths before the permission check. Pass the
         // original filePath string in the request so the path the agent
         // receives stays exactly as provided.
@@ -535,8 +626,8 @@ export function registerHoistedTools(
         });
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const rawArgs: Record<string, unknown> = { filePath: filePathArg };
-        for (const key of ["appendContent", "oldString", "newString"] as const) {
-          if (params[key] !== undefined) rawArgs[key] = params[key];
+        for (const key of ["appendContent", "edits", "oldString", "newString"] as const) {
+          if (argsRecord[key] !== undefined) rawArgs[key] = argsRecord[key];
         }
         // Coerce at the boundary: stringified replaceAll must forward true (coerceBoolean).
         if (params.replaceAll !== undefined) rawArgs.replaceAll = coerceBoolean(params.replaceAll);
@@ -620,9 +711,9 @@ export function registerHoistedTools(
 // ---------------------------------------------------------------------------
 
 /**
- * Shape the bridge `edit_match` / `write` response into an `AgentToolResult`
- * Pi can render. Exported for unit tests covering truncation and diagnostics
- * behavior without spinning up a real bridge.
+ * Shape a bridge mutation response into an `AgentToolResult` Pi can render.
+ * Exported for unit tests covering truncation, diagnostics, and batch-edit
+ * summaries without spinning up a real bridge.
  */
 export function buildMutationResult(
   response: Record<string, unknown>,
@@ -639,6 +730,7 @@ export function buildMutationResult(
   const additions = diffObj?.additions ?? 0;
   const deletions = diffObj?.deletions ?? 0;
   const replacements = response.replacements as number | undefined;
+  const editsApplied = response.edits_applied as number | undefined;
   const diagnostics = response.lsp_diagnostics as unknown[] | undefined;
   const truncated = diffObj?.truncated === true;
   // Rust v0.27.1: `no_op: true` when the file content is byte-identical to
@@ -700,6 +792,7 @@ export function buildMutationResult(
       additions,
       deletions,
       replacements,
+      editsApplied,
       diagnostics,
       truncated: truncated || undefined,
       formatted,
@@ -778,7 +871,7 @@ function reuseContainer(last: Component | undefined): Container {
   return last instanceof Container ? last : new Container();
 }
 
-function renderMutationCall(
+export function renderMutationCall(
   toolName: "write" | "edit",
   filePath: string | undefined,
   theme: Theme,
@@ -792,7 +885,7 @@ function renderMutationCall(
   return text;
 }
 
-function renderMutationResult(
+export function renderMutationResult(
   result: AgentToolResult<FileMutationDetails>,
   theme: Theme,
   context: RenderContextLike,
@@ -823,7 +916,13 @@ function renderMutationResult(
     const additions = details?.additions ?? 0;
     const deletions = details?.deletions ?? 0;
     const text = reuseText(context.lastComponent);
-    const summary = theme.fg("success", `+${additions}/-${deletions}`);
+    const countDetail =
+      typeof details?.editsApplied === "number" && details.editsApplied > 1
+        ? `, ${details.editsApplied} edits`
+        : typeof details?.replacements === "number" && details.replacements > 1
+          ? `, ${details.replacements} replacements`
+          : "";
+    const summary = theme.fg("success", `+${additions}/-${deletions}${countDetail}`);
     let suffix = "";
     if (details?.truncated) {
       suffix = ` ${theme.fg("muted", "(diff truncated)")}`;
