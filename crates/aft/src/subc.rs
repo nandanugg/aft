@@ -2395,7 +2395,7 @@ async fn handle_tool_call(
         session_id: Some(identity.session.clone()),
         request_id: request_id.clone(),
         diagnostics_on_edit,
-        preview: false,
+        preview: call.preview,
     };
     let arguments_for_run = call.arguments.clone();
     let bare_name_for_run = bare_name.clone();
@@ -3501,6 +3501,12 @@ struct ToolCallRequest {
     name: String,
     #[serde(default)]
     arguments: Value,
+    /// Server-owned preview control (B1c-0): the plugin's mutation flow is
+    /// preview -> permission ask -> apply. Dropping this field made "preview"
+    /// calls mutate disk before the permission prompt and the subsequent
+    /// apply fail with not-found.
+    #[serde(default)]
+    preview: bool,
 }
 
 static SUBC_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
