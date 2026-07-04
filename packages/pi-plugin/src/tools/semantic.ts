@@ -64,6 +64,12 @@ const SearchParams = Type.Object({
         "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
     }),
   ),
+  path: Type.Optional(
+    Type.String({
+      description:
+        "Search a different project root (absolute or ~ path). Requires that project to have been indexed by AFT.",
+    }),
+  ),
 });
 
 /** Exported for renderer unit tests. */
@@ -217,6 +223,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       if (params.topK !== undefined) req.topK = params.topK;
       if (params.hint !== undefined) req.hint = params.hint;
       if (params.includeTests !== undefined) req.includeTests = params.includeTests;
+      if (params.path !== undefined) req.path = params.path;
       const response = await callToolCall(bridge, "search", req, extCtx);
       if (response.success === false) {
         throw new Error(response.text || response.message || "search failed");

@@ -1,12 +1,14 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+
 import { semanticTools } from "../../tools/semantic.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk } from "../test-helpers";
@@ -211,6 +213,63 @@ maybeDescribe("e2e semantic search tool", () => {
     expect(state.isUnavailable || state.isBuilding || state.isDisabled).toBe(true);
     expect(output).toContain("lexical");
   });
+
+  test("aft_search can borrow an already-indexed sibling project", async () => {
+    const harness = await createHarness(preparedBinary, {
+      fixtureNames: [],
+      timeoutMs: 20_000,
+      tempPrefix: "aft-plugin-external-search-",
+    });
+    harnesses.push(harness);
+
+    const projectA = join(harness.tempDir, "project-a");
+    const projectB = join(harness.tempDir, "project-b");
+    await Promise.all([createFixtureProject(projectA), createFixtureProject(projectB)]);
+    initGit(projectA);
+    initGit(projectB);
+
+    const storageDir = join(harness.tempDir, ".storage");
+    const pool = new BridgePool(
+      harness.binaryPath,
+      { timeoutMs: 20_000 },
+      configureParamsFromLegacyOverrides({
+        search_index: true,
+        semantic_search: false,
+        storage_dir: storageDir,
+        harness: "opencode",
+      }),
+    );
+    pools.push(pool);
+
+    await pool.getBridge(projectA).send("semantic_search", {
+      query: "handle_request",
+      hint: "literal",
+      top_k: 5,
+    });
+
+    const tools = semanticTools(createPluginContext(pool, storageDir));
+    const sdkCtx = createSdkContext(projectB);
+    const expectedFile = join(projectA, "src", "lib.rs");
+    const deadline = Date.now() + 20_000;
+    let output = "";
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        output = await tools.aft_search.execute(
+          { query: "handle_request", hint: "literal", path: projectA },
+          sdkCtx,
+        );
+        if (output.includes(expectedFile)) break;
+      } catch (error) {
+        lastError = error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    if (!output.includes(expectedFile) && lastError) throw lastError;
+    expect(output).toContain(expectedFile);
+    expect(output).toContain("handle_request");
+  });
 });
 
 async function createFixtureProject(root: string): Promise<void> {
@@ -239,4 +298,18 @@ async function createFixtureProject(root: string): Promise<void> {
       "utf8",
     ),
   ]);
+}
+
+function initGit(root: string): void {
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], {
+    cwd: root,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["config", "user.name", "AFT Test"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "--no-gpg-sign", "-m", "initial"], {
+    cwd: root,
+    stdio: "ignore",
+  });
 }

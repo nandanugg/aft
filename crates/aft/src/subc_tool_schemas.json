@@ -246,6 +246,10 @@
       "includeTests": {
         "description": "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
         "type": "boolean"
+      },
+      "path": {
+        "description": "Search a different project root (absolute or ~ path). Requires that project to have been indexed by AFT.",
+        "type": "string"
       }
     },
     "required": [

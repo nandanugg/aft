@@ -17,10 +17,18 @@ use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
+use crate::readonly_artifacts::{
+    open_search_index_read_only, open_semantic_index_read_only, resolve_git_root_from_user_path,
+    ReadOnlyArtifact,
+};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, GrepMatch, GrepResult, IndexStatus, SearchIndex,
+    SearchIndexSnapshot,
 };
-use crate::semantic_index::{is_onnx_runtime_unavailable, EmbeddingModel, SemanticResult};
+use crate::semantic_index::{
+    is_onnx_runtime_unavailable, EmbeddingModel, SemanticIndex, SemanticIndexFingerprint,
+    SemanticResult,
+};
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
@@ -34,6 +42,7 @@ const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
 const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
+const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 /// Cap on the rank-0 full-symbol preview. Sized to absorb the follow-up zoom for
 /// virtually every real function/type so the agent doesn't re-read a file it
 /// already saw in search; a symbol exceeding it falls back to the line-budget
@@ -87,6 +96,8 @@ struct SemanticSearchParams {
     hint: SearchHint,
     #[serde(default, alias = "includeTests")]
     include_tests: bool,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +167,39 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let top_k = params.top_k.clamp(1, MAX_TOP_K);
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
+    let requested_path = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    if let Some(requested_path) = requested_path {
+        let external_root = match resolve_git_root_from_user_path(&project_root, &requested_path) {
+            Ok(root) => root,
+            Err(error) if error == "not_a_git_root" => {
+                return Response::error(
+                    &req.id,
+                    "not_a_git_root",
+                    format!("path is not inside a git repository: {requested_path}"),
+                );
+            }
+            Err(error) => return Response::error(&req.id, "path_resolution_failed", error),
+        };
+
+        if external_root != project_root {
+            if ctx.config().restrict_to_project_root || ctx.request_force_restrict(&req.id) {
+                return Response::error(
+                    &req.id,
+                    "path_outside_root",
+                    format!(
+                        "aft_search path is outside the configured project root while path restriction is enabled: {}",
+                        external_root.display()
+                    ),
+                );
+            }
+            return handle_external_search(req, ctx, params, top_k, shape, external_root);
+        }
+    }
     let semantic_status_snapshot = ctx
         .semantic_index_status()
         .read()
@@ -201,6 +245,466 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             &project_root,
         ),
     }
+}
+
+fn handle_external_search(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: SemanticSearchParams,
+    top_k: usize,
+    shape: QueryShape,
+    external_root: PathBuf,
+) -> Response {
+    let storage_dir = ctx.config().storage_dir.clone();
+    let search_index = match open_search_index_read_only(&external_root, storage_dir.as_deref()) {
+        ReadOnlyArtifact::Fresh(index) => index,
+        ReadOnlyArtifact::Absent => {
+            return external_index_error(
+                &req.id,
+                "not_indexed",
+                format!(
+                    "No AFT search index found for {}. Start an AFT session in that project to build the index before searching it from another root.",
+                    external_root.display()
+                ),
+                &external_root,
+                serde_json::Map::new(),
+            );
+        }
+        ReadOnlyArtifact::Stale(stale) => {
+            let mut extras = serde_json::Map::new();
+            extras.insert(
+                "drift_count".to_string(),
+                serde_json::json!(stale.drift_count),
+            );
+            return external_index_error(
+                &req.id,
+                "index_stale",
+                format!(
+                    "AFT search index for {} is stale: {}.",
+                    external_root.display(),
+                    stale.reason
+                ),
+                &external_root,
+                extras,
+            );
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let regex_explicit = params.hint == SearchHint::Regex;
+    let mode = choose_mode(params.hint, &params.query, &shape, true, &mut warnings);
+
+    match mode {
+        SearchMode::Regex | SearchMode::Literal => handle_external_grep_search(
+            req,
+            &params.query,
+            top_k,
+            &shape,
+            mode,
+            regex_explicit,
+            warnings,
+            &external_root,
+            params.include_tests,
+            &search_index,
+        ),
+        SearchMode::Semantic | SearchMode::Hybrid => handle_external_semantic_or_hybrid_search(
+            req,
+            ctx,
+            params,
+            top_k,
+            shape,
+            mode,
+            warnings,
+            external_root,
+            search_index,
+        ),
+    }
+}
+
+fn handle_external_grep_search(
+    req: &RawRequest,
+    query: &str,
+    top_k: usize,
+    shape: &QueryShape,
+    mode: SearchMode,
+    regex_explicit: bool,
+    mut warnings: Vec<String>,
+    external_root: &Path,
+    include_tests: bool,
+    search_index: &SearchIndex,
+) -> Response {
+    let auto_regex = mode == SearchMode::Regex && !regex_explicit;
+    let mut effective_mode = mode;
+    let compile_literal_fallback = || -> Result<_, Response> {
+        match pattern_compile::compile(
+            query,
+            CompileOpts {
+                literal: true,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(compiled) => Ok(compiled),
+            CompileResult::InvalidPattern { message, .. } => Err(Response::error_with_data(
+                &req.id,
+                "invalid_pattern",
+                message,
+                external_response_extras(external_root),
+            )),
+            CompileResult::UnsupportedSyntax { feature, .. } => Err(Response::error_with_data(
+                &req.id,
+                "unsupported_pattern",
+                format!(
+                    "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
+                ),
+                external_response_extras(external_root),
+            )),
+        }
+    };
+
+    let compiled = match pattern_compile::compile(
+        query,
+        CompileOpts {
+            literal: mode == SearchMode::Literal,
+            ..CompileOpts::default()
+        },
+    ) {
+        CompileResult::Ok(compiled) => compiled,
+        CompileResult::InvalidPattern { message, .. } => {
+            if auto_regex {
+                warnings.push(auto_regex_literal_fallback_warning(
+                    short_regex_compile_reason(&message),
+                ));
+                effective_mode = SearchMode::Literal;
+                match compile_literal_fallback() {
+                    Ok(compiled) => compiled,
+                    Err(response) => return response,
+                }
+            } else {
+                return Response::error_with_data(
+                    &req.id,
+                    "invalid_pattern",
+                    message,
+                    external_response_extras(external_root),
+                );
+            }
+        }
+        CompileResult::UnsupportedSyntax { feature, .. } => {
+            if auto_regex {
+                warnings.push(auto_regex_literal_fallback_warning(format!(
+                    "{feature} is not supported"
+                )));
+                effective_mode = SearchMode::Literal;
+                match compile_literal_fallback() {
+                    Ok(compiled) => compiled,
+                    Err(response) => return response,
+                }
+            } else {
+                return Response::error_with_data(
+                    &req.id,
+                    "unsupported_pattern",
+                    format!(
+                        "Pattern uses regex syntax not supported by AFT's engine: {feature}. Use hint:'literal' or rewrite without {feature}."
+                    ),
+                    external_response_extras(external_root),
+                );
+            }
+        }
+    };
+
+    let literal = effective_mode == SearchMode::Literal;
+    let grep_limit = grep_candidate_limit(top_k, include_tests);
+    let mut result =
+        search_index
+            .snapshot()
+            .search_grep(&compiled, &[], &[], external_root, grep_limit);
+    result = filter_grep_result_for_tests(result, include_tests, external_root, top_k);
+
+    let result_source = if literal { "literal" } else { "regex" };
+    let result_values = result
+        .matches
+        .iter()
+        .map(|grep_match| grep_match_to_json(grep_match, result_source))
+        .collect::<Vec<_>>();
+    let interpreted_as = interpreted_as_label(effective_mode);
+    let display_root = absolute_display_root(external_root);
+    let text = format_grep_search_text(&result, &display_root, interpreted_as);
+    let extras = external_response_extras(external_root)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    search_response(
+        req,
+        SearchResponseParts {
+            query,
+            interpreted_as,
+            query_kind: query_kind_label(shape.kind),
+            semantic_status: "external",
+            status: "ready",
+            complete: true,
+            text,
+            results: result_values,
+            more_available: result.truncated || result.total_matches > result.matches.len(),
+            engine_capped: result.engine_capped,
+            fully_degraded: false,
+            warnings,
+            extras,
+        },
+    )
+}
+
+fn handle_external_semantic_or_hybrid_search(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: SemanticSearchParams,
+    top_k: usize,
+    shape: QueryShape,
+    mode: SearchMode,
+    mut warnings: Vec<String>,
+    external_root: PathBuf,
+    search_index: SearchIndex,
+) -> Response {
+    let lexical = if mode == SearchMode::Hybrid {
+        collect_lexical_files_from_snapshot(
+            Some(search_index.snapshot()),
+            &params.query,
+            &shape,
+            params.include_tests,
+            &external_root,
+        )
+    } else {
+        LexicalCollection {
+            files: Vec::new(),
+            ready: true,
+            engine_capped: false,
+        }
+    };
+
+    let storage_dir = ctx.config().storage_dir.clone();
+    let semantic_index = match open_semantic_index_read_only(&external_root, storage_dir.as_deref())
+    {
+        ReadOnlyArtifact::Fresh(index) => match semantic_fingerprint_matches_session(ctx, &index) {
+            true => Some(index),
+            false => {
+                warnings.push(
+                    "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
+                );
+                None
+            }
+        },
+        ReadOnlyArtifact::Stale(stale) => {
+            warnings.push(format!(
+                "External semantic index is stale: {}; returning lexical-only results.",
+                stale.reason
+            ));
+            None
+        }
+        ReadOnlyArtifact::Absent => {
+            warnings.push(
+                "External semantic index is not available; returning lexical-only results from the trigram index.".to_string(),
+            );
+            None
+        }
+    };
+
+    let Some(semantic_index) = semantic_index else {
+        let lexical = collect_lexical_files_from_snapshot(
+            Some(search_index.snapshot()),
+            &params.query,
+            &shape,
+            params.include_tests,
+            &external_root,
+        );
+        return external_lexical_only_response(
+            req,
+            &params,
+            mode,
+            &shape,
+            "Semantic search is not available for the external root.".to_string(),
+            lexical,
+            warnings,
+            &external_root,
+            top_k,
+        );
+    };
+
+    let query_vector =
+        match embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())) {
+            Ok(query_vector) => query_vector,
+            Err(error) => {
+                if params.hint == SearchHint::Semantic {
+                    return semantic_error_response(&req.id, &error);
+                }
+                let lexical = collect_lexical_files_from_snapshot(
+                    Some(search_index.snapshot()),
+                    &params.query,
+                    &shape,
+                    params.include_tests,
+                    &external_root,
+                );
+                return external_lexical_only_response(
+                    req,
+                    &params,
+                    mode,
+                    &shape,
+                    format!("Semantic search unavailable: {error}"),
+                    lexical,
+                    warnings,
+                    &external_root,
+                    top_k,
+                );
+            }
+        };
+
+    let semantic_limit = if params.include_tests {
+        semantic_candidate_limit(top_k)
+    } else {
+        MAX_TOP_K
+    };
+    let semantic_fetch_limit = semantic_limit.saturating_add(1);
+    let mut semantic_results = semantic_index.search(&query_vector, semantic_fetch_limit);
+    let semantic_more_available = semantic_results.len() > semantic_limit;
+    if semantic_more_available {
+        semantic_results.truncate(semantic_limit);
+    }
+    rerank_semantic_candidates(&mut semantic_results, &shape, &params.query);
+
+    let mut results = fuse_hybrid_results(
+        semantic_results,
+        lexical.files,
+        &shape,
+        top_k.saturating_add(1),
+        params.include_tests,
+        &external_root,
+    );
+    let fused_more_available = results.len() > top_k;
+    if fused_more_available {
+        results.truncate(top_k);
+    }
+    let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
+    let snippets_incomplete =
+        enrich_snippets_from_source_with_context(&mut results, &external_root, None);
+    let display_root = absolute_display_root(&external_root);
+
+    search_response(
+        req,
+        SearchResponseParts {
+            query: &params.query,
+            interpreted_as: interpreted_as_label(mode),
+            query_kind: query_kind_label(shape.kind),
+            semantic_status: "ready",
+            status: "ready",
+            complete: true,
+            text: format_semantic_text_with_display_root(
+                &results,
+                &display_root,
+                more_available,
+                snippets_incomplete,
+                None,
+            ),
+            results: results.iter().map(result_to_json).collect::<Vec<_>>(),
+            more_available,
+            engine_capped: lexical.engine_capped,
+            fully_degraded: false,
+            warnings,
+            extras: external_response_extras(&external_root)
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        },
+    )
+}
+
+fn external_lexical_only_response(
+    req: &RawRequest,
+    params: &SemanticSearchParams,
+    mode: SearchMode,
+    shape: &QueryShape,
+    detail: String,
+    lexical: LexicalCollection,
+    mut warnings: Vec<String>,
+    external_root: &Path,
+    top_k: usize,
+) -> Response {
+    let lexical_count = lexical.files.len();
+    let lexical_engine_capped = lexical.engine_capped;
+    let results = fuse_hybrid_results(
+        Vec::new(),
+        lexical.files,
+        shape,
+        top_k,
+        params.include_tests,
+        external_root,
+    );
+    let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
+    warnings.push(
+        "Semantic search unavailable for external root; returning lexical-only fallback results."
+            .to_string(),
+    );
+    let display_root = absolute_display_root(external_root);
+    let mut extras = semantic_unavailable_extras(true);
+    for (key, value) in external_response_extras(external_root)
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+    {
+        extras.insert(key, value);
+    }
+
+    search_response(
+        req,
+        SearchResponseParts {
+            query: &params.query,
+            interpreted_as: fallback_executed_label(mode, true),
+            query_kind: query_kind_label(shape.kind),
+            semantic_status: "unavailable",
+            status: "ready",
+            complete: false,
+            text: format_lexical_unavailable_text(&detail, &results, &display_root),
+            results: result_values,
+            more_available: lexical_count > top_k || lexical_engine_capped,
+            engine_capped: lexical_engine_capped,
+            fully_degraded: false,
+            warnings,
+            extras,
+        },
+    )
+}
+
+fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex) -> bool {
+    let config = ctx.config().semantic.clone();
+    let expected = SemanticIndexFingerprint::for_config_dimension(&config, index.dimension());
+    index
+        .fingerprint()
+        .map(|fingerprint| fingerprint.as_string() == expected.as_string())
+        .unwrap_or(false)
+}
+
+fn external_index_error(
+    request_id: &str,
+    code: &str,
+    message: String,
+    external_root: &Path,
+    mut extras: serde_json::Map<String, serde_json::Value>,
+) -> Response {
+    for (key, value) in external_response_extras(external_root)
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+    {
+        extras.insert(key, value);
+    }
+    Response::error_with_data(request_id, code, message, serde_json::Value::Object(extras))
+}
+
+fn external_response_extras(external_root: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "external_root": external_root.display().to_string(),
+        SUPPRESS_STATUS_BAR_FIELD: true,
+    })
+}
+
+fn absolute_display_root(root: &Path) -> PathBuf {
+    root.join(".aft-external-display-root-nonprefix")
 }
 
 fn default_top_k() -> usize {
@@ -1462,6 +1966,26 @@ fn collect_lexical_files(
     include_tests: bool,
     project_root: &Path,
 ) -> LexicalCollection {
+    let snapshot = {
+        let search_index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        search_index
+            .as_ref()
+            .filter(|index| index.ready)
+            .map(SearchIndex::snapshot)
+    };
+    collect_lexical_files_from_snapshot(snapshot, query, shape, include_tests, project_root)
+}
+
+fn collect_lexical_files_from_snapshot(
+    snapshot: Option<SearchIndexSnapshot>,
+    query: &str,
+    shape: &QueryShape,
+    include_tests: bool,
+    project_root: &Path,
+) -> LexicalCollection {
     // No `should_use_lexical` gate here: collect_lexical_files is only called
     // when choose_mode picked Hybrid, which already means we want the lexical
     // lane. The shape weight was a second, conflicting gate that suppressed
@@ -1484,19 +2008,12 @@ fn collect_lexical_files(
     // allow-list made named config/doc files (Cargo.toml, README.md,
     // package.json) structurally unreachable in hybrid mode — exactly the
     // literal-filename hits the lexical lane exists to catch.
-    let snapshot = {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(index) = search_index.as_ref().filter(|index| index.ready) else {
-            return LexicalCollection {
-                files: Vec::new(),
-                ready: false,
-                engine_capped: false,
-            };
+    let Some(snapshot) = snapshot else {
+        return LexicalCollection {
+            files: Vec::new(),
+            ready: false,
+            engine_capped: false,
         };
-        index.snapshot()
     };
     let production_file_filter =
         |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
@@ -1520,6 +2037,24 @@ fn search_index_ready(ctx: &AppContext) -> bool {
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
+    let index_dimension = {
+        let semantic_index = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        semantic_index
+            .as_ref()
+            .filter(|index| index.len() > 0)
+            .map(|index| index.dimension())
+    };
+    embed_query_for_dimension(query, ctx, index_dimension)
+}
+
+fn embed_query_for_dimension(
+    query: &str,
+    ctx: &AppContext,
+    index_dimension: Option<usize>,
+) -> Result<Vec<f32>, String> {
     let mut model_ref = ctx.semantic_embedding_model().lock();
 
     if model_ref.is_none() {
@@ -1548,16 +2083,6 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
         .map_err(|error| format!("failed to embed query: {error}"))?;
     drop(model_ref);
 
-    let index_dimension = {
-        let semantic_index = ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        semantic_index
-            .as_ref()
-            .filter(|index| index.len() > 0)
-            .map(|index| index.dimension())
-    };
     if let Some(index_dimension) = index_dimension {
         if index_dimension != query_vector.len() {
             return Err(format!(
@@ -1997,11 +2522,27 @@ fn format_semantic_text(
     snippets_incomplete: bool,
     ctx: Option<&AppContext>,
 ) -> String {
+    format_semantic_text_with_display_root(
+        results,
+        project_root,
+        more_available,
+        snippets_incomplete,
+        ctx,
+    )
+}
+
+fn format_semantic_text_with_display_root(
+    results: &[HybridResult],
+    display_root: &Path,
+    more_available: bool,
+    snippets_incomplete: bool,
+    ctx: Option<&AppContext>,
+) -> String {
     if results.is_empty() {
         return "Found 0 results.".to_string();
     }
 
-    let mut text = format_result_sections_with_context(results, project_root, ctx);
+    let mut text = format_result_sections_with_context(results, display_root, ctx);
     // Drop the unconditional "[index: ready]" tag — it was pure per-call tax on
     // the common path. Degraded/building/unavailable paths carry their own
     // distinct "[semantic: ...]" labels, so absence of a label means ready.

@@ -127,6 +127,10 @@ impl SemanticIndexFingerprint {
         serde_json::to_string(self).unwrap_or_else(|_| String::new())
     }
 
+    pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
+        Self::from_config(config, dimension)
+    }
+
     fn matches_expected(&self, expected: &str) -> bool {
         let encoded = self.as_string();
         !encoded.is_empty() && encoded == expected
@@ -2277,6 +2281,21 @@ impl SemanticIndex {
 
     pub fn fingerprint(&self) -> Option<&SemanticIndexFingerprint> {
         self.fingerprint.as_ref()
+    }
+
+    pub(crate) fn indexed_file_metadata(&self) -> Vec<(PathBuf, SystemTime, u64, blake3::Hash)> {
+        self.file_mtimes
+            .iter()
+            .filter_map(|(path, mtime)| {
+                let size = self.file_sizes.get(path)?;
+                let content_hash = self.file_hashes.get(path)?;
+                Some((path.clone(), *mtime, *size, *content_hash))
+            })
+            .collect()
+    }
+
+    pub(crate) fn indexed_file_paths(&self) -> HashSet<PathBuf> {
+        self.file_mtimes.keys().cloned().collect()
     }
 
     pub fn backend_label(&self) -> Option<&str> {

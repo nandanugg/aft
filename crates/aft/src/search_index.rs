@@ -751,6 +751,21 @@ impl SearchIndex {
     }
 
     pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
+        Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
+    }
+
+    pub(crate) fn read_from_disk_strict_read_only(
+        cache_dir: &Path,
+        current_canonical_root: &Path,
+    ) -> Option<Self> {
+        Self::read_from_disk_with_options(cache_dir, current_canonical_root, false)
+    }
+
+    fn read_from_disk_with_options(
+        cache_dir: &Path,
+        current_canonical_root: &Path,
+        allow_legacy_repair: bool,
+    ) -> Option<Self> {
         debug_assert!(current_canonical_root.is_absolute());
         let cache_path = cache_dir.join("cache.bin");
         let cache_file = open_cache_file_read(&cache_path).ok()?;
@@ -970,7 +985,7 @@ impl SearchIndex {
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
         };
 
-        if migrated_counts {
+        if migrated_counts && allow_legacy_repair {
             if let Ok(_lock) = CacheLock::acquire(cache_dir) {
                 let head = index.git_head.clone();
                 index.write_to_disk(cache_dir, head.as_deref());

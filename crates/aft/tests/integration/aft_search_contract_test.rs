@@ -9,8 +9,8 @@ use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
 use aft::context::{AppContext, SemanticIndexStatus};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
-use aft::search_index::SearchIndex;
-use aft::semantic_index::SemanticIndex;
+use aft::search_index::{artifact_cache_key, resolve_cache_dir, SearchIndex};
+use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
 use serde_json::Value;
 
 fn request(query: &str) -> RawRequest {
@@ -32,6 +32,20 @@ fn request_with_top_k(query: &str, hint: Option<&str>, top_k: usize) -> RawReque
         value["hint"] = serde_json::json!(hint);
     }
     serde_json::from_value(value).expect("build semantic search request")
+}
+
+fn request_with_path(query: &str, hint: Option<&str>, path: &Path) -> RawRequest {
+    let mut value = serde_json::json!({
+        "id": "aft-search-contract",
+        "command": "semantic_search",
+        "query": query,
+        "top_k": 5,
+        "path": path.display().to_string(),
+    });
+    if let Some(hint) = hint {
+        value["hint"] = serde_json::json!(hint);
+    }
+    serde_json::from_value(value).expect("build semantic search request with path")
 }
 
 fn grep_request(pattern: &str, max_results: usize) -> RawRequest {
@@ -75,6 +89,83 @@ fn test_context(project_root: &Path) -> AppContext {
             ..Config::default()
         },
     )
+}
+
+fn test_context_with_storage(project_root: &Path, storage_dir: &Path) -> AppContext {
+    AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(project_root.to_path_buf()),
+            storage_dir: Some(storage_dir.to_path_buf()),
+            ..Config::default()
+        },
+    )
+}
+
+fn init_git(root: &Path) {
+    let status = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(root)
+        .status()
+        .expect("git init");
+    assert!(status.success(), "git init failed");
+    for (key, value) in [
+        ("user.email", "test@example.com"),
+        ("user.name", "AFT Test"),
+    ] {
+        let status = std::process::Command::new("git")
+            .args(["config", key, value])
+            .current_dir(root)
+            .status()
+            .expect("git config");
+        assert!(status.success(), "git config {key} failed");
+    }
+}
+
+fn commit_all(root: &Path) {
+    let status = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .status()
+        .expect("git add");
+    assert!(status.success(), "git add failed");
+    let status = std::process::Command::new("git")
+        .args(["commit", "--no-gpg-sign", "-m", "initial"])
+        .current_dir(root)
+        .status()
+        .expect("git commit");
+    assert!(status.success(), "git commit failed");
+}
+
+fn git_project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static str) {
+    let (project, source_file, source) = project_with_needle();
+    init_git(project.path());
+    commit_all(project.path());
+    (project, source_file, source)
+}
+
+fn persist_search_index(root: &Path, storage_dir: &Path) {
+    let canonical_root = std::fs::canonicalize(root).expect("canonical root");
+    let cache_dir = resolve_cache_dir(&canonical_root, Some(storage_dir));
+    let mut index = SearchIndex::build(&canonical_root);
+    index.write_to_disk(&cache_dir, None);
+}
+
+fn persist_mismatched_semantic_index(root: &Path, source_file: &Path, storage_dir: &Path) {
+    let canonical_root = std::fs::canonicalize(root).expect("canonical root");
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let canonical_source = std::fs::canonicalize(source_file).expect("canonical source file");
+    let mut index = SemanticIndex::build(&canonical_root, &[canonical_source], &mut embed, 8)
+        .expect("build semantic index");
+    index.set_fingerprint(SemanticIndexFingerprint {
+        backend: "openai_compatible".to_string(),
+        model: "other-model".to_string(),
+        base_url: "http://127.0.0.1".to_string(),
+        dimension: 3,
+        chunking_version: 1,
+    });
+    index.write_to_disk(storage_dir, &artifact_cache_key(&canonical_root));
 }
 
 fn openai_context(project_root: &Path, base_url: String) -> AppContext {
@@ -434,6 +525,117 @@ fn blank_queries_are_rejected_before_routing() {
         assert_eq!(response["code"], "invalid_request");
         assert_eq!(response["message"], "query must be non-empty");
     }
+}
+
+#[test]
+fn same_root_path_param_is_byte_identical_to_default_search() {
+    let (project, _source_file, _source) = git_project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let without_path = response_value(handle_semantic_search(
+        &request_with("needle_symbol", Some("literal")),
+        &ctx,
+    ));
+    let with_path = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(
+        serde_json::to_vec(&with_path).expect("serialize with path"),
+        serde_json::to_vec(&without_path).expect("serialize without path"),
+        "same-root path must preserve the single-root response contract byte-for-byte"
+    );
+}
+
+#[test]
+fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
+    let (external_project, external_source, _source) = git_project_with_needle();
+    let session_project = tempfile::tempdir().expect("session project");
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    persist_mismatched_semantic_index(external_project.path(), &external_source, storage.path());
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", None, external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "external search should succeed with lexical fallback: {response:?}"
+    );
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["lexical_only_fallback"], true);
+    assert_eq!(response["semantic_status"], "unavailable");
+    assert_eq!(response["interpreted_as"], "lexical");
+    assert_eq!(
+        response["external_root"],
+        std::fs::canonicalize(external_project.path())
+            .expect("canonical external root")
+            .display()
+            .to_string()
+    );
+    assert!(
+        response["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.contains("different embedding backend or model"))),
+        "expected fingerprint mismatch warning: {response:?}"
+    );
+    let results = response["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|result| result["source"] == "lexical"
+            && result["file"].as_str().is_some_and(|file| {
+                Path::new(file).is_absolute() && file.replace('\\', "/").ends_with("src/lib.rs")
+            })),
+        "expected absolute lexical result from external project: {response:?}"
+    );
+}
+
+#[test]
+fn external_path_obeys_force_restrict_guard() {
+    let (external_project, _external_source, _source) = git_project_with_needle();
+    let session_project = tempfile::tempdir().expect("session project");
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+    let request = request_with_path("needle_symbol", Some("literal"), external_project.path());
+
+    let unrestricted = response_value(handle_semantic_search(&request, &ctx));
+    assert_eq!(
+        unrestricted["success"], true,
+        "external search should proceed without force restriction: {unrestricted:?}"
+    );
+    assert!(
+        unrestricted["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .any(|result| result["file"].as_str().is_some_and(|file| {
+                Path::new(file).is_absolute() && file.replace('\\', "/").ends_with("src/lib.rs")
+            })),
+        "expected absolute external result before force restriction: {unrestricted:?}"
+    );
+
+    let restricted = ctx.with_force_restrict(&request.id, || {
+        response_value(handle_semantic_search(&request, &ctx))
+    });
+    assert_eq!(restricted["success"], false);
+    assert_eq!(restricted["code"], "path_outside_root");
+    assert!(
+        restricted["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("path restriction is enabled")),
+        "expected force-restrict error message: {restricted:?}"
+    );
 }
 
 #[test]

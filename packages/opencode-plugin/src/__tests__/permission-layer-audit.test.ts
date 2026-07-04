@@ -332,6 +332,72 @@ describe("permission audit regressions", () => {
     expect(grepCalls).toEqual([]);
   });
 
+  test("aft_search external-root permission asks once per root and caches denial", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+
+    await tools.aft_search.execute({ query: "TODO", hint: "literal", path: external }, sdkCtx);
+    await tools.aft_search.execute({ query: "TODO", hint: "literal", path: external }, sdkCtx);
+
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(1);
+    expect(calls).toEqual([
+      { command: "search", params: { query: "TODO", hint: "literal", path: external } },
+      { command: "search", params: { query: "TODO", hint: "literal", path: external } },
+    ]);
+
+    const deniedAskCalls: AskCall[] = [];
+    const { calls: deniedCalls, tools: deniedTools } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "should not run",
+    }));
+    const deniedCtx = createSdkContext(
+      project,
+      recordingAsk(deniedAskCalls, {
+        permission: "aft_search_external",
+        message: "external search denied",
+      }),
+      "permission-audit-denied-session",
+    );
+
+    const firstDenied = await deniedTools.aft_search.execute(
+      { query: "TODO", hint: "literal", path: external },
+      deniedCtx,
+    );
+    const secondDenied = await deniedTools.aft_search.execute(
+      { query: "TODO", hint: "literal", path: external },
+      deniedCtx,
+    );
+
+    expect(parsePermissionDenied(firstDenied).message).toBe("external search denied");
+    expect(parsePermissionDenied(secondDenied).message).toBe("external search denied");
+    expect(deniedAskCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(
+      1,
+    );
+    expect(deniedCalls).toEqual([]);
+  });
+
+  test("aft_search external path hard-blocks under restrict_to_project_root", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness((ctx) =>
+      semanticTools({
+        ...ctx,
+        config: { ...ctx.config, restrict_to_project_root: true } as PluginContext["config"],
+      }),
+    );
+
+    const raw = await tools.aft_search.execute(
+      { query: "TODO", hint: "semantic", path: external },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(parsePermissionDenied(raw).message).toContain("restrict_to_project_root");
+    expect(askCalls).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
   test("aft_import rejects empty module sentinels before bridge dispatch", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const { calls, tools } = createHarness(importTools);

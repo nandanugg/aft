@@ -135,6 +135,18 @@ pub fn attach_bg_completions(
 /// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
 /// last-known. Omitted entirely until the Tier-2 cache is populated once.
 pub fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
+    // Cross-root indexed searches report on a borrowed project, so attaching the
+    // session project's diagnostics footer would falsely attribute unrelated
+    // counts to the external results. The command sets this private marker and
+    // the finalizer removes it before the response reaches the caller.
+    if response
+        .data
+        .as_object_mut()
+        .and_then(|data| data.remove("_aft_suppress_status_bar"))
+        .is_some()
+    {
+        return;
+    }
     if matches!(
         command,
         "configure"

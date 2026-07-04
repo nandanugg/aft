@@ -2,7 +2,11 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import { callToolCall, coerceOptionalInt, isEmptyParam, optionalInt } from "./_shared.js";
-import { askSearchPermission, permissionDeniedResponse } from "./permissions.js";
+import {
+  askSearchPermission,
+  assertAftSearchExternalPermission,
+  permissionDeniedResponse,
+} from "./permissions.js";
 
 const z = tool.schema;
 
@@ -47,6 +51,14 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
             "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
           ),
       ),
+      path: arg(
+        z
+          .string()
+          .optional()
+          .describe(
+            "Search a different project root (absolute or ~ path). Requires that project to have been indexed by AFT.",
+          ),
+      ),
     },
     execute: async (args, context): Promise<string> => {
       if (
@@ -58,6 +70,8 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       }
       const query = args.query;
       const hint = typeof args.hint === "string" ? args.hint : undefined;
+      const pathArg =
+        typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
 
       // For non-semantic hints, call askSearchPermission before executing the
       // search. This uses the aft_search permission id so rules targeting only
@@ -67,11 +81,17 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         if (denied) return permissionDeniedResponse(denied);
       }
 
+      if (pathArg) {
+        const denied = await assertAftSearchExternalPermission(ctx, context, pathArg);
+        if (denied) return permissionDeniedResponse(denied);
+      }
+
       const rawArgs: Record<string, unknown> = { query };
       const topK = coerceOptionalInt(args.topK, "topK", 1, 100);
       if (topK !== undefined) rawArgs.topK = topK;
       if (hint) rawArgs.hint = hint;
       if (typeof args.includeTests === "boolean") rawArgs.includeTests = args.includeTests;
+      if (pathArg) rawArgs.path = pathArg;
       const response = await callToolCall(ctx, context, "search", rawArgs);
 
       if (response.success === false) {

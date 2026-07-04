@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -21,6 +22,8 @@ const UNSUPPORTED_ASK_HOST =
  */
 const RESTRICT_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const restrictNoticeLastSentAt = new Map<string, number>();
+const aftSearchExternalDecisionCache = new Map<string, string | undefined>();
+const aftSearchExternalPendingAsks = new Map<string, Promise<string | undefined>>();
 const POSIX_SYSTEM_TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
 const MACOS_SYSTEM_TEMP_ROOTS = ["/var/folders", "/private/var/folders"];
 
@@ -336,7 +339,111 @@ export async function assertExternalDirectoryPermission(
   }
 }
 
-type SearchPermissionId = "grep" | "aft_search";
+function gitRootForNearestExistingParent(resolved: string): string | undefined {
+  const nearest = normalizeNearestExistingParent(resolved);
+  let cwd = nearest;
+  try {
+    if (fs.statSync(nearest).isFile()) cwd = path.dirname(nearest);
+  } catch {
+    // `normalizeNearestExistingParent` should return an existing path when it
+    // can, but keep the permission check best-effort and let Rust report
+    // `not_a_git_root` for unusual races.
+  }
+  try {
+    const out = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out ? normalizePath(out) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ask OpenCode for permission to expose indexed content from a different git root.
+ * This deliberately uses a tool-specific permission id rather than
+ * `external_directory`: a user may allow ordinary path reads while still wanting
+ * a separate audit point for search results produced from borrowed indexes.
+ */
+export async function assertAftSearchExternalPermission(
+  ctx: PluginContext,
+  context: ToolContext,
+  target: string,
+): Promise<string | undefined> {
+  if (!target) return undefined;
+
+  const resolved = resolveAbsolutePath(context, target);
+  const absoluteTarget = normalizePath(resolved);
+  const externalRoot =
+    gitRootForNearestExistingParent(resolved) ?? normalizeNearestExistingParent(resolved);
+
+  const root = projectRootFor(context);
+  const directory = root ? normalizePath(root) : root;
+  const rawWorktree = (context as { worktree?: string }).worktree;
+  const worktree = rawWorktree && rawWorktree !== "/" ? normalizePath(rawWorktree) : rawWorktree;
+
+  if (directory && containsPath(directory, externalRoot)) return undefined;
+  if (
+    worktree &&
+    worktree !== "/" &&
+    worktree !== directory &&
+    containsPath(worktree, externalRoot)
+  ) {
+    return undefined;
+  }
+
+  if (ctx.config.restrict_to_project_root === true) {
+    notifyRestrictBlocked(ctx, context, externalRoot);
+    return restrictDenialMessage(externalRoot);
+  }
+
+  if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
+
+  const sessionKey = (context as { sessionID?: string }).sessionID ?? "unknown-session";
+  const cacheKey = `${sessionKey}\0${externalRoot}`;
+  if (aftSearchExternalDecisionCache.has(cacheKey)) {
+    return aftSearchExternalDecisionCache.get(cacheKey);
+  }
+  const pending = aftSearchExternalPendingAsks.get(cacheKey);
+  if (pending) return pending;
+
+  const rawGlob =
+    process.platform === "win32"
+      ? normalizePathPattern(path.join(externalRoot, "*"))
+      : path.join(externalRoot, "*").replaceAll("\\", "/");
+  const askPromise = (async () => {
+    try {
+      await runAsk(
+        context.ask({
+          permission: "aft_search_external",
+          patterns: [rawGlob],
+          always: [rawGlob],
+          metadata: {
+            filepath: absoluteTarget,
+            root: externalRoot,
+          },
+        }),
+      );
+      aftSearchExternalDecisionCache.set(cacheKey, undefined);
+      return undefined;
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : "Permission denied (aft_search_external).";
+      aftSearchExternalDecisionCache.set(cacheKey, message);
+      return message;
+    } finally {
+      aftSearchExternalPendingAsks.delete(cacheKey);
+    }
+  })();
+  aftSearchExternalPendingAsks.set(cacheKey, askPromise);
+  return askPromise;
+}
+
+type SearchPermissionId = "grep" | "aft_search" | "aft_search_external";
 
 /**
  * Trigger an OpenCode host-side search permission check using grep-compatible

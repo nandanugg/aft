@@ -1173,6 +1173,14 @@ fn translate_search(args: &Value) -> Result<Translated, TranslateError> {
     if let Some(include_tests) = map_in.get("includeTests").and_then(Value::as_bool) {
         out.insert("include_tests".to_string(), Value::Bool(include_tests));
     }
+    if let Some(path) = map_in
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        out.insert("path".to_string(), Value::String(path.to_string()));
+    }
 
     Ok(Translated {
         command: "semantic_search".into(),

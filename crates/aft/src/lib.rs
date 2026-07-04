@@ -89,6 +89,7 @@ pub mod pattern_compile;
 pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;
+pub mod readonly_artifacts;
 pub mod response_finalize;
 pub mod run_tool_call;
 pub mod runtime_drain;
