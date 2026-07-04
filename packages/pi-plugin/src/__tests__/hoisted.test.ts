@@ -404,7 +404,7 @@ describe("hoisted tool adapters", () => {
         filePath: "broken.ts",
         edits: [{ startLine: 2, content: "replacement" }],
       }),
-    ).rejects.toThrow("batch: edit[0] 'line_end' must be a positive integer (1-based)");
+    ).rejects.toThrow("batch: edit[0] 'endLine' must be a positive integer (1-based)");
   });
 
   test("edit accepts path as a compatibility alias without overriding filePath", async () => {

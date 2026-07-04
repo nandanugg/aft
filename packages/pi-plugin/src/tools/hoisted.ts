@@ -406,25 +406,25 @@ function validateBatchEdit(edit: unknown, index: number): void {
       !Number.isInteger(record.startLine) ||
       record.startLine < 0
     ) {
-      throw new Error(`batch: edit[${index}] 'line_start' must be a positive integer (1-based)`);
+      throw new Error(`batch: edit[${index}] 'startLine' must be a positive integer (1-based)`);
     }
     if (record.startLine === 0) {
-      throw new Error(`batch: edit[${index}] 'line_start' must be >= 1 (1-based)`);
+      throw new Error(`batch: edit[${index}] 'startLine' must be >= 1 (1-based)`);
     }
     if (
       typeof record.endLine !== "number" ||
       !Number.isInteger(record.endLine) ||
       record.endLine < 0
     ) {
-      throw new Error(`batch: edit[${index}] 'line_end' must be a positive integer (1-based)`);
+      throw new Error(`batch: edit[${index}] 'endLine' must be a positive integer (1-based)`);
     }
     if (record.endLine === 0) {
-      throw new Error(`batch: edit[${index}] 'line_end' must be >= 1 (1-based)`);
+      throw new Error(`batch: edit[${index}] 'endLine' must be >= 1 (1-based)`);
     }
     return;
   }
 
-  throw new Error(`batch: edit[${index}] must have either 'match' or 'line_start'/'line_end'`);
+  throw new Error(`batch: edit[${index}] must have either 'oldString' or 'startLine'/'endLine'`);
 }
 
 function validateBatchEdits(edits: unknown): void {
