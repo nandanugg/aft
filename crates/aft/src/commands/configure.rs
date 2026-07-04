@@ -2807,14 +2807,16 @@ mod tests {
         );
     }
 
-    /// Shared mutex serializing the home-root tests below. Both tests
-    /// mutate process-global `HOME` / `USERPROFILE` env vars, and `cargo
+    /// Serialize the home-root tests below on the process-wide env lock.
+    /// They mutate process-global `HOME` / `USERPROFILE` env vars, and `cargo
     /// test` runs unit tests concurrently within the same process — without
-    /// serialization a parallel `set_var("HOME", X)` in test A can race
-    /// `resolve_home_dir()` in test B and produce flaky failures.
-    fn home_env_mutex() -> &'static std::sync::Mutex<()> {
-        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        M.get_or_init(|| std::sync::Mutex::new(()))
+    /// serialization a parallel `set_var("HOME", X)` in another env-mutating
+    /// test (e.g. the gitignore-neutralizing tests in `context.rs`) can race
+    /// `resolve_home_dir()` here and produce flaky failures. A module-local
+    /// mutex is not enough: the lock must be shared with every other test
+    /// that touches these variables.
+    fn home_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env::process_env_lock()
     }
 
     /// Shared mutex serializing the watcher tests below. They install watcher
@@ -2827,7 +2829,7 @@ mod tests {
 
     #[test]
     fn handle_configure_enters_degraded_mode_when_project_root_is_home() {
-        let _guard = home_env_mutex().lock().unwrap();
+        let _guard = home_env_mutex();
         // Simulate the Desktop-launches-from-`~` case by pointing `HOME` at a
         // tempdir and using that same tempdir as `project_root`. The
         // canonical-equality check inside `handle_configure` is the same
@@ -2895,7 +2897,7 @@ mod tests {
 
     #[test]
     fn handle_configure_stays_full_featured_for_subdirectory_of_home() {
-        let _guard = home_env_mutex().lock().unwrap();
+        let _guard = home_env_mutex();
         // A real subdirectory of `$HOME` (the legitimate case: most projects
         // live under `~/Work`, `~/Documents`, etc.) must NOT trip the
         // degraded gate. We point HOME at a tempdir and configure against a
