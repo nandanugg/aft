@@ -71,7 +71,7 @@ maybeDescribe(describeName, () => {
       newString: "gamma",
     });
     expect(stale.success).toBe(false);
-  });
+  }, 20_000);
 
   test("preview write and preview apply_patch leave disk unchanged", async () => {
     const transport = await bridge();
@@ -107,7 +107,7 @@ maybeDescribe(describeName, () => {
     const applyPatch = await transport.toolCall("preview-patch", "apply_patch", { patchText });
     expect(applyPatch.success).toBe(true);
     expect(await readFile(patchTarget, "utf8")).toBe("after\n");
-  });
+  }, 20_000);
 
   test("long wait:true bash honors transportTimeoutMs beyond the subc default deadline", async () => {
     const transport = await bridge();
@@ -143,7 +143,7 @@ maybeDescribe(describeName, () => {
     });
     expect(second.success).toBe(true);
     expect(JSON.stringify(second)).toContain("permission-ok");
-  });
+  }, 20_000);
 
   test("background completions nudge, drain, ack, then stay quiet", async () => {
     const transport = await bridge();
@@ -168,7 +168,9 @@ maybeDescribe(describeName, () => {
     expect(postAckNudges.length).toBeLessThanOrEqual(1);
     const afterAckDrain = await transport.send("bash_drain_completions", { session_id: session });
     expect(completionTaskIds(afterAckDrain)).not.toContain(taskId);
-  });
+    // Internal waits (nudge 12s + drain 8s + quiet 3s) exceed bun's 5s default
+    // test timeout under CI load; budget for the worst case.
+  }, 30_000);
 
   test("two sessions on one root do not leak background completions across drains", async () => {
     const transport = await bridge();
@@ -188,7 +190,7 @@ maybeDescribe(describeName, () => {
     const drainB = await waitForCompletion(transport, sessionB, taskId, 8_000);
     expect(completionTaskIds(drainB)).toContain(taskId);
     await transport.send("bash_ack_completions", { session_id: sessionB, task_ids: [taskId] });
-  });
+  }, 20_000);
 });
 
 function permissionPatterns(result: ToolCallResult): string[] {
