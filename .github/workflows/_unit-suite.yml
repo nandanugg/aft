@@ -92,19 +92,37 @@ jobs:
         if: inputs.strict == true
         run: bun run --filter '*' build
 
+      # cortexkit/subconscious is a private repo, so the job-scoped
+      # GITHUB_TOKEN cannot read its releases. Family convention (also used
+      # by cortexkit-e2e / llm-runner / ai-proxy): mint a ~1h fine-grained
+      # cortexkit-ci App installation token per job — no PAT rotation.
+      # Secrets are absent on fork/contributor PRs (and until the repo gets
+      # them): skip the mint + fetch then (the subc e2e suites skip loudly)
+      # instead of failing CI. When the token IS minted, any fetch failure
+      # stays a hard failure.
+      - name: Check cross-repo app secrets
+        id: app_secrets
+        env:
+          APP_ID: ${{ secrets.CK_CI_APP_ID }}
+        run: echo "present=${APP_ID:+true}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint cross-repo read token
+        id: app_token
+        if: steps.app_secrets.outputs.present == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious
+
       - name: Fetch pinned subc-core
         id: subc_core
         env:
-          # cortexkit/subconscious is a private repo, so the job-scoped
-          # GITHUB_TOKEN cannot read its releases — the fetch needs the
-          # dedicated cross-repo read token. Fork/contributor PRs don't get
-          # repo secrets: skip the fetch there (the subc e2e suites then skip
-          # loudly) instead of failing their CI. When the token IS present,
-          # any fetch failure stays a hard job failure.
-          GH_TOKEN: ${{ secrets.SUBC_CORE_READ_TOKEN }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::notice::SUBC_CORE_READ_TOKEN not available (fork PR?) — subc e2e suites will skip"
+            echo "::notice::cross-repo token unavailable (fork PR?) — subc e2e suites will skip"
             echo "path=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -182,15 +200,32 @@ jobs:
           # See the Linux job: full core count on otherwise-idle CI runners.
           NEXTEST_TEST_THREADS: "num-cpus"
 
+      # See the Linux job: private-repo release read via the cortexkit-ci
+      # App token; absent secrets (fork PR / not yet configured) skip
+      # instead of failing.
+      - name: Check cross-repo app secrets
+        id: app_secrets
+        env:
+          APP_ID: ${{ secrets.CK_CI_APP_ID }}
+        run: echo "present=${APP_ID:+true}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint cross-repo read token
+        id: app_token
+        if: steps.app_secrets.outputs.present == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious
+
       - name: Fetch pinned subc-core
         id: subc_core
         env:
-          # See the Linux job: private-repo release read needs the dedicated
-          # cross-repo token; absent token (fork PR) skips instead of failing.
-          GH_TOKEN: ${{ secrets.SUBC_CORE_READ_TOKEN }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::notice::SUBC_CORE_READ_TOKEN not available (fork PR?) — subc e2e suites will skip"
+            echo "::notice::cross-repo token unavailable (fork PR?) — subc e2e suites will skip"
             echo "path=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
