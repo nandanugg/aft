@@ -3,7 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BridgePool } from "@cortexkit/aft-bridge";
+import { BridgePool, type AftTransportPool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
@@ -24,9 +24,12 @@ import {
   cleanupHarnesses,
   configureParamsFromLegacyOverrides,
   type E2EHarness,
+  type HarnessFactory,
   type PreparedBinary,
+  harnessPool,
   prepareBinary,
   readTextFile,
+  writeSubcHarnessConfig,
 } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
@@ -52,7 +55,7 @@ function createMockClient(): any {
   };
 }
 
-function createPluginContext(pool: BridgePool, storageDir: string): PluginContext {
+function createPluginContext(pool: AftTransportPool, storageDir: string): PluginContext {
   return { pool, client: createMockClient(), config: {} as PluginContext["config"], storageDir };
 }
 
@@ -70,7 +73,7 @@ function createSdkContext(directory: string): ToolContext {
 }
 
 async function waitForBridgeReady(
-  pool: BridgePool,
+  pool: AftTransportPool,
   directory: string,
   sessionId: string | undefined,
 ): Promise<void> {
@@ -89,24 +92,31 @@ async function createToolHarness(
   preset: FormatPreset,
   shims: FakeFormatterShim[] = [tsCollapseSpacesShim("biome")],
   configOverrides: Record<string, unknown> = { format_on_edit: true, validate_on_edit: "syntax" },
+  harnessFactory?: HarnessFactory,
 ): Promise<{
   h: E2EHarness;
   tools: ReturnType<typeof hoistedTools>;
   sdkCtx: ToolContext;
-  pool: BridgePool;
+  pool: AftTransportPool;
 }> {
-  const h = await createFormatHarness(preparedBinary, preset, shims);
-  const pool = new BridgePool(
-    h.binaryPath,
-    { timeoutMs: 20_000 },
-    configureParamsFromLegacyOverrides({
-      storage_dir: join(h.tempDir, ".storage"),
-      harness: "opencode",
-      ...configOverrides,
-    }),
-  );
+  const formatHarnessFactory: HarnessFactory | undefined = harnessFactory
+    ? (prepared, options) => harnessFactory(prepared, { ...options, timeoutMs: 20_000 })
+    : undefined;
+  const h = await createFormatHarness(preparedBinary, preset, shims, {
+    harnessFactory: formatHarnessFactory,
+  });
+  const configuredParams = configureParamsFromLegacyOverrides({
+    storage_dir: join(h.tempDir, ".storage"),
+    harness: "opencode",
+    ...configOverrides,
+  });
+  await writeSubcHarnessConfig(h, configuredParams);
+  const pool =
+    h.transport === "subc"
+      ? harnessPool(h)
+      : new BridgePool(h.binaryPath, { timeoutMs: 20_000 }, configuredParams);
   const sdkCtx = createSdkContext(h.tempDir);
-  await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
+  if (h.transport !== "subc") await waitForBridgeReady(pool, h.tempDir, sdkCtx.sessionID);
   return {
     h,
     tools: hoistedTools(createPluginContext(pool, join(h.tempDir, ".storage"))),
@@ -115,77 +125,91 @@ async function createToolHarness(
   };
 }
 
-maybeDescribe("e2e format_on_edit apply_patch", () => {
-  let preparedBinary: PreparedBinary = initialBinary;
-  const harnesses: E2EHarness[] = [];
-  const pools: BridgePool[] = [];
+export function runFormatOnEditApplyPatchSuite(
+  options: {
+    harnessFactory?: HarnessFactory;
+    name?: string;
+    skipSubcWriteSidecarGaps?: boolean;
+  } = {},
+): void {
+  maybeDescribe(options.name ?? "e2e format_on_edit apply_patch", () => {
+    const writeSidecarTest = options.skipSubcWriteSidecarGaps ? test.skip : test;
+    let preparedBinary: PreparedBinary = initialBinary;
+    const harnesses: E2EHarness[] = [];
+    const pools: AftTransportPool[] = [];
 
-  beforeAll(async () => {
-    preparedBinary = await prepareBinary();
-  });
+    beforeAll(async () => {
+      preparedBinary = await prepareBinary();
+    });
 
-  afterEach(async () => {
-    await Promise.allSettled(pools.splice(0, pools.length).map((pool) => pool.shutdown()));
-    await cleanupHarnesses(harnesses);
-  });
+    afterEach(async () => {
+      await Promise.allSettled(pools.splice(0, pools.length).map((pool) => pool.shutdown()));
+      await cleanupHarnesses(harnesses);
+    });
 
-  async function harness(
-    preset: FormatPreset,
-    shims?: FakeFormatterShim[],
-    configOverrides?: Record<string, unknown>,
-  ) {
-    const created = await createToolHarness(preparedBinary, preset, shims, configOverrides);
-    harnesses.push(created.h);
-    pools.push(created.pool);
-    return created;
-  }
+    async function harness(
+      preset: FormatPreset,
+      shims?: FakeFormatterShim[],
+      configOverrides?: Record<string, unknown>,
+    ) {
+      const created = await createToolHarness(
+        preparedBinary,
+        preset,
+        shims,
+        configOverrides,
+        options.harnessFactory,
+      );
+      harnesses.push(created.h);
+      if (created.h.transport !== "subc") pools.push(created.pool);
+      return created;
+    }
 
-  test("add hunk triggers formatter", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+    test("add hunk triggers formatter", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: new.ts
 +${FIXTURES.ts_deformatted.split("\n").join("\n+").trimEnd()}
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Created new.ts");
-    expect(await readTextFile(h.path("new.ts"))).toBe(
-      FIXTURES.ts_deformatted.replace(/ {2,}/g, " "),
-    );
-  });
+      expect(toolResultText(output)).toContain("Created new.ts");
+      expect(await readTextFile(h.path("new.ts"))).toBe(
+        FIXTURES.ts_deformatted.replace(/ {2,}/g, " "),
+      );
+    });
 
-  test("update hunk triggers formatter", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("existing.ts"), "export const value = 1;\n", "utf8");
+    test("update hunk triggers formatter", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+      await writeFile(h.path("existing.ts"), "export const value = 1;\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Update File: existing.ts
 @@
 -export const value = 1;
 +export    const   value   = 2;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Updated existing.ts");
-    expect(await readTextFile(h.path("existing.ts"))).toBe("export const value = 2;\n");
-  });
+      expect(toolResultText(output)).toContain("Updated existing.ts");
+      expect(await readTextFile(h.path("existing.ts"))).toBe("export const value = 2;\n");
+    });
 
-  test("multi-file Add+Update both format", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("old.ts"), "export const oldValue = 1;\n", "utf8");
+    test("multi-file Add+Update both format", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+      await writeFile(h.path("old.ts"), "export const oldValue = 1;\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: added.ts
 +export    const   added   = 1;
 *** Update File: old.ts
@@ -193,61 +217,61 @@ maybeDescribe("e2e format_on_edit apply_patch", () => {
 -export const oldValue = 1;
 +export    const   oldValue   = 2;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Created added.ts");
-    expect(toolResultText(output)).toContain("Updated old.ts");
-    expect(await readTextFile(h.path("added.ts"))).toBe("export const added = 1;\n");
-    expect(await readTextFile(h.path("old.ts"))).toBe("export const oldValue = 2;\n");
-  });
+      expect(toolResultText(output)).toContain("Created added.ts");
+      expect(toolResultText(output)).toContain("Updated old.ts");
+      expect(await readTextFile(h.path("added.ts"))).toBe("export const added = 1;\n");
+      expect(await readTextFile(h.path("old.ts"))).toBe("export const oldValue = 2;\n");
+    });
 
-  test("move hunk formats destination", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("from.ts"), "export const value = 1;\n", "utf8");
+    test("move hunk formats destination", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+      await writeFile(h.path("from.ts"), "export const value = 1;\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Update File: from.ts
 *** Move to: nested/to.ts
 @@
 -export const value = 1;
 +export    const   value   = 3;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Updated and moved from.ts → nested/to.ts");
-    await expect(readTextFile(h.path("from.ts"))).rejects.toThrow();
-    expect(await readTextFile(h.path("nested", "to.ts"))).toBe("export const value = 3;\n");
-  });
+      expect(toolResultText(output)).toContain("Updated and moved from.ts → nested/to.ts");
+      await expect(readTextFile(h.path("from.ts"))).rejects.toThrow();
+      expect(await readTextFile(h.path("nested", "to.ts"))).toBe("export const value = 3;\n");
+    });
 
-  test("delete hunk does NOT trigger formatter", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("delete-me.ts"), "export    const   gone   = 1;\n", "utf8");
-    await writeFile(h.path("kept.ts"), "export    const   kept   = 1;\n", "utf8");
+    test("delete hunk does NOT trigger formatter", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+      await writeFile(h.path("delete-me.ts"), "export    const   gone   = 1;\n", "utf8");
+      await writeFile(h.path("kept.ts"), "export    const   kept   = 1;\n", "utf8");
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Delete File: delete-me.ts
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Deleted delete-me.ts");
-    await expect(readTextFile(h.path("delete-me.ts"))).rejects.toThrow();
-    expect(await readTextFile(h.path("kept.ts"))).toBe("export    const   kept   = 1;\n");
-  });
+      expect(toolResultText(output)).toContain("Deleted delete-me.ts");
+      await expect(readTextFile(h.path("delete-me.ts"))).rejects.toThrow();
+      expect(await readTextFile(h.path("kept.ts"))).toBe("export    const   kept   = 1;\n");
+    });
 
-  test("mixed-language patch", async () => {
-    const rustShim: FakeFormatterShim = {
-      name: "rustfmt",
-      script: `#!/bin/sh
+    test("mixed-language patch", async () => {
+      const rustShim: FakeFormatterShim = {
+        name: "rustfmt",
+        script: `#!/bin/sh
 file="$1"
 cat > "$file" <<'EOF'
 fn main() {
@@ -255,106 +279,114 @@ fn main() {
 }
 EOF
 `,
-    };
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_AND_RUSTFMT_PRESET, [
-      tsCollapseSpacesShim("biome"),
-      rustShim,
-    ]);
+      };
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_AND_RUSTFMT_PRESET, [
+        tsCollapseSpacesShim("biome"),
+        rustShim,
+      ]);
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: src.ts
 +export    const   tsValue   = 1;
 *** Add File: main.rs
 +fn   main(){let    x=42;}
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Created src.ts");
-    expect(toolResultText(output)).toContain("Created main.rs");
-    expect(await readTextFile(h.path("src.ts"))).toBe("export const tsValue = 1;\n");
-    expect(await readTextFile(h.path("main.rs"))).toBe("fn main() {\n    let x = 42;\n}\n");
-  });
+      expect(toolResultText(output)).toContain("Created src.ts");
+      expect(toolResultText(output)).toContain("Created main.rs");
+      expect(await readTextFile(h.path("src.ts"))).toBe("export const tsValue = 1;\n");
+      expect(await readTextFile(h.path("main.rs"))).toBe("fn main() {\n    let x = 42;\n}\n");
+    });
 
-  test("patch with formatter excluded path", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_EXCLUDED_PRESET, [biomeExcludedPathShim()]);
-    await mkdir(h.path("scratch"), { recursive: true });
+    // SUBC GAP: direct native write responses over the subc route lack the
+    // `formatted` / `format_skipped_reason` sidecars asserted below.
+    writeSidecarTest("patch with formatter excluded path", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_EXCLUDED_PRESET, [
+        biomeExcludedPathShim(),
+      ]);
+      await mkdir(h.path("scratch"), { recursive: true });
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: scratch/foo.ts
 +export    const   foo   = 1;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Created scratch/foo.ts");
-    expect(await readTextFile(h.path("scratch", "foo.ts"))).toBe("export    const   foo   = 1;\n");
-    const response = await h.bridge.send("write", {
-      file: h.path("scratch", "probe.ts"),
-      content: "export    const   probe   = 1;\n",
-    });
-    expect(response.formatted).toBe(false);
-    expect(response.format_skipped_reason).toBe("formatter_excluded_path");
-  });
-
-  test("patch with formatter timeout", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [hangingFormatterShim()], {
-      format_on_edit: true,
-      validate_on_edit: "syntax",
+      expect(toolResultText(output)).toContain("Created scratch/foo.ts");
+      expect(await readTextFile(h.path("scratch", "foo.ts"))).toBe(
+        "export    const   foo   = 1;\n",
+      );
+      const response = await h.bridge.send("write", {
+        file: h.path("scratch", "probe.ts"),
+        content: "export    const   probe   = 1;\n",
+      });
+      expect(response.formatted).toBe(false);
+      expect(response.format_skipped_reason).toBe("formatter_excluded_path");
     });
 
-    await expect(
-      tools.apply_patch.execute(
-        {
-          patchText: `*** Begin Patch
+    test("patch with formatter timeout", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [hangingFormatterShim()], {
+        format_on_edit: true,
+        validate_on_edit: "syntax",
+      });
+
+      await expect(
+        tools.apply_patch.execute(
+          {
+            patchText: `*** Begin Patch
 *** Add File: timeout.ts
 +export    const   slow   = 1;
 *** End Patch`,
-        },
-        sdkCtx,
-      ),
-    ).rejects.toThrow("timed out");
+          },
+          sdkCtx,
+        ),
+      ).rejects.toThrow("timed out");
 
-    expect(await readTextFile(h.path("timeout.ts"))).toBe("export    const   slow   = 1;\n");
-  }, 25_000);
+      expect(await readTextFile(h.path("timeout.ts"))).toBe("export    const   slow   = 1;\n");
+    }, 25_000);
 
-  test("patch with formatter generic error", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [genericErrorFormatterShim()]);
+    // SUBC GAP: direct native write responses over the subc route lack the
+    // `formatted` / `format_skipped_reason` sidecars asserted below.
+    writeSidecarTest("patch with formatter generic error", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [genericErrorFormatterShim()]);
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: error.ts
 +export    const   badFormat   = 1;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Created error.ts");
-    expect(await readTextFile(h.path("error.ts"))).toBe("export    const   badFormat   = 1;\n");
-    const response = await h.bridge.send("write", {
-      file: h.path("error-probe.ts"),
-      content: "export    const   badFormat   = 2;\n",
+      expect(toolResultText(output)).toContain("Created error.ts");
+      expect(await readTextFile(h.path("error.ts"))).toBe("export    const   badFormat   = 1;\n");
+      const response = await h.bridge.send("write", {
+        file: h.path("error-probe.ts"),
+        content: "export    const   badFormat   = 2;\n",
+      });
+      expect(response.formatted).toBe(false);
+      expect(response.format_skipped_reason).toBe("error");
     });
-    expect(response.formatted).toBe(false);
-    expect(response.format_skipped_reason).toBe("error");
-  });
 
-  test("patch preview failure does not format or apply earlier hunks", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("target.ts"), "export const target = 1;\n", "utf8");
+    test("patch preview failure does not format or apply earlier hunks", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+      await writeFile(h.path("target.ts"), "export const target = 1;\n", "utf8");
 
-    await expect(
-      tools.apply_patch.execute(
-        {
-          patchText: `*** Begin Patch
+      await expect(
+        tools.apply_patch.execute(
+          {
+            patchText: `*** Begin Patch
 *** Add File: ok.ts
 +export    const   ok   = 1;
 *** Update File: target.ts
@@ -362,52 +394,59 @@ EOF
 -export const missing = 1;
 +export    const   target   = 2;
 *** End Patch`,
-        },
-        sdkCtx,
-      ),
-    ).rejects.toThrow("Failed to update target.ts");
+          },
+          sdkCtx,
+        ),
+      ).rejects.toThrow("Failed to update target.ts");
 
-    await expect(readTextFile(h.path("ok.ts"))).rejects.toThrow();
-    expect(await readTextFile(h.path("target.ts"))).toBe("export const target = 1;\n");
-  });
+      await expect(readTextFile(h.path("ok.ts"))).rejects.toThrow();
+      expect(await readTextFile(h.path("target.ts"))).toBe("export const target = 1;\n");
+    });
 
-  test("patch where ALL hunks fail does NOT format anything", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
-    await writeFile(h.path("unchanged.ts"), "export    const   unchanged   = 1;\n", "utf8");
+    test("patch where ALL hunks fail does NOT format anything", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET);
+      await writeFile(h.path("unchanged.ts"), "export    const   unchanged   = 1;\n", "utf8");
 
-    await expect(
-      tools.apply_patch.execute(
-        {
-          patchText: `*** Begin Patch
+      await expect(
+        tools.apply_patch.execute(
+          {
+            patchText: `*** Begin Patch
 *** Update File: unchanged.ts
 @@
 -export const missing = 1;
 +export    const   changed   = 2;
 *** End Patch`,
-        },
-        sdkCtx,
-      ),
-    ).rejects.toThrow("Failed to update unchanged.ts");
-    expect(await readTextFile(h.path("unchanged.ts"))).toBe("export    const   unchanged   = 1;\n");
-  });
-
-  test("format_on_edit=false config", async () => {
-    const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [tsCollapseSpacesShim("biome")], {
-      format_on_edit: false,
-      validate_on_edit: "syntax",
+          },
+          sdkCtx,
+        ),
+      ).rejects.toThrow("Failed to update unchanged.ts");
+      expect(await readTextFile(h.path("unchanged.ts"))).toBe(
+        "export    const   unchanged   = 1;\n",
+      );
     });
 
-    const output = await tools.apply_patch.execute(
-      {
-        patchText: `*** Begin Patch
+    test("format_on_edit=false config", async () => {
+      const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [tsCollapseSpacesShim("biome")], {
+        format_on_edit: false,
+        validate_on_edit: "syntax",
+      });
+
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: disabled.ts
 +export    const   disabled   = 1;
 *** End Patch`,
-      },
-      sdkCtx,
-    );
+        },
+        sdkCtx,
+      );
 
-    expect(toolResultText(output)).toContain("Created disabled.ts");
-    expect(await readTextFile(h.path("disabled.ts"))).toBe("export    const   disabled   = 1;\n");
+      expect(toolResultText(output)).toContain("Created disabled.ts");
+      expect(await readTextFile(h.path("disabled.ts"))).toBe("export    const   disabled   = 1;\n");
+    });
   });
-});
+}
+
+if (process.env.AFT_OPENCODE_E2E_IMPORT_ONLY !== "1") {
+  runFormatOnEditApplyPatchSuite();
+}

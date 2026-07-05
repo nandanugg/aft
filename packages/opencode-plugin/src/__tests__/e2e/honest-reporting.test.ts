@@ -3,7 +3,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BridgePool } from "@cortexkit/aft-bridge";
+import { BridgePool, type AftTransportPool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { astTools } from "../../tools/ast.js";
 import { importTools } from "../../tools/imports.js";
@@ -14,7 +14,9 @@ import {
   cleanupHarnesses,
   createHarness,
   type E2EHarness,
+  type HarnessFactory,
   type PreparedBinary,
+  harnessPool,
   prepareBinary,
 } from "./helpers.js";
 
@@ -28,7 +30,7 @@ function createMockClient(): any {
   };
 }
 
-function createPluginContext(pool: BridgePool, storageDir: string): PluginContext {
+function createPluginContext(pool: AftTransportPool, storageDir: string): PluginContext {
   return {
     pool,
     client: createMockClient(),
@@ -50,7 +52,7 @@ function createSdkContext(directory: string): ToolContext {
   };
 }
 
-async function waitForBridgeReady(pool: BridgePool, directory: string): Promise<void> {
+async function waitForBridgeReady(pool: AftTransportPool, directory: string): Promise<void> {
   const response = await pool.getBridge(directory).send("ping", {
     session_id: "honest-reporting-e2e",
   });
@@ -61,171 +63,184 @@ async function waitForBridgeReady(pool: BridgePool, directory: string): Promise<
   }
 }
 
-maybeDescribe("e2e honest reporting surfaces", () => {
-  let preparedBinary: PreparedBinary = initialBinary;
-  const harnesses: E2EHarness[] = [];
-  const pools: BridgePool[] = [];
+export function runHonestReportingSuite(
+  options: { harnessFactory?: HarnessFactory; name?: string } = {},
+): void {
+  maybeDescribe(options.name ?? "e2e honest reporting surfaces", () => {
+    let preparedBinary: PreparedBinary = initialBinary;
+    const harnesses: E2EHarness[] = [];
+    const pools: AftTransportPool[] = [];
 
-  beforeAll(async () => {
-    preparedBinary = await prepareBinary();
-  });
+    beforeAll(async () => {
+      preparedBinary = await prepareBinary();
+    });
 
-  afterEach(async () => {
-    await Promise.allSettled(pools.splice(0, pools.length).map((pool) => pool.shutdown()));
-    await cleanupHarnesses(harnesses);
-  });
+    afterEach(async () => {
+      await Promise.allSettled(pools.splice(0, pools.length).map((pool) => pool.shutdown()));
+      await cleanupHarnesses(harnesses);
+    });
 
-  async function toolHarness() {
-    const h = await createHarness(preparedBinary, { fixtureNames: [], timeoutMs: 20_000 });
-    harnesses.push(h);
-    const storageDir = join(h.tempDir, ".storage");
-    const pool = new BridgePool(
-      h.binaryPath,
-      { timeoutMs: 20_000 },
-      {
-        storage_dir: storageDir,
-        harness: "opencode",
-      },
-    );
-    pools.push(pool);
-    const pluginContext = createPluginContext(pool, storageDir);
-    await waitForBridgeReady(pool, h.tempDir);
-    return {
-      h,
-      sdkCtx: createSdkContext(h.tempDir),
-      tools: {
-        ...readingTools(pluginContext),
-        ...astTools(pluginContext),
-        ...importTools(pluginContext),
-      },
-    };
-  }
-
-  test("aft_outline directory mode returns complete true below walk cap", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await mkdir(h.path("outline-small"), { recursive: true });
-    await writeFile(
-      h.path("outline-small", "good.ts"),
-      "export function good() { return 1; }\n",
-      "utf8",
-    );
-    await writeFile(h.path("outline-small", "bad.ts"), "export function bad( {\n", "utf8");
-
-    const output = toolResultText(
-      await tools.aft_outline.execute({ target: "outline-small" }, sdkCtx),
-    );
-    const response = JSON.parse(output) as Record<string, unknown>;
-
-    expect(response.complete).toBe(true);
-    expect(response.walk_truncated).toBe(false);
-    const skipped = response.skipped_files as Array<{ file: string; reason: string }>;
-    expect(skipped).toHaveLength(1);
-    expect(skipped[0].file).toMatch(/outline-small[/\\]bad\.ts$/);
-    expect(skipped[0].reason).toBe("parse_error");
-    expect(String(response.text)).toContain("good.ts");
-    expect(String(response.text)).toContain("good");
-  });
-
-  test("aft_outline directory mode returns complete false when Rust walk truncates", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await mkdir(h.path("outline-large"), { recursive: true });
-    for (let index = 0; index < 205; index += 1) {
-      await writeFile(
-        h.path("outline-large", `file-${String(index).padStart(3, "0")}.ts`),
-        `export const value${index} = ${index};\n`,
-        "utf8",
-      );
+    async function toolHarness() {
+      const h = await (options.harnessFactory ?? createHarness)(preparedBinary, {
+        fixtureNames: [],
+        timeoutMs: 20_000,
+      });
+      harnesses.push(h);
+      const storageDir = join(h.tempDir, ".storage");
+      const pool =
+        h.transport === "subc"
+          ? harnessPool(h)
+          : new BridgePool(
+              h.binaryPath,
+              { timeoutMs: 20_000 },
+              { storage_dir: storageDir, harness: "opencode" },
+            );
+      if (h.transport !== "subc") pools.push(pool);
+      const pluginContext = createPluginContext(pool, storageDir);
+      if (h.transport !== "subc") await waitForBridgeReady(pool, h.tempDir);
+      return {
+        h,
+        sdkCtx: createSdkContext(h.tempDir),
+        tools: {
+          ...readingTools(pluginContext),
+          ...astTools(pluginContext),
+          ...importTools(pluginContext),
+        },
+      };
     }
 
-    const output = toolResultText(
-      await tools.aft_outline.execute({ target: "outline-large" }, sdkCtx),
-    );
-    const response = JSON.parse(output) as Record<string, unknown>;
+    test("aft_outline directory mode returns complete true below walk cap", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await mkdir(h.path("outline-small"), { recursive: true });
+      await writeFile(
+        h.path("outline-small", "good.ts"),
+        "export function good() { return 1; }\n",
+        "utf8",
+      );
+      await writeFile(h.path("outline-small", "bad.ts"), "export function bad( {\n", "utf8");
 
-    expect(response.complete).toBe(false);
-    expect(response.walk_truncated).toBe(true);
-    expect(Array.isArray(response.skipped_files)).toBe(true);
-    expect(String(response.text)).toContain("file-000.ts");
+      const output = toolResultText(
+        await tools.aft_outline.execute({ target: "outline-small" }, sdkCtx),
+      );
+      const response = JSON.parse(output) as Record<string, unknown>;
+
+      expect(response.complete).toBe(true);
+      expect(response.walk_truncated).toBe(false);
+      const skipped = response.skipped_files as Array<{ file: string; reason: string }>;
+      expect(skipped).toHaveLength(1);
+      expect(skipped[0].file).toMatch(/outline-small[/\\]bad\.ts$/);
+      expect(skipped[0].reason).toBe("parse_error");
+      expect(String(response.text)).toContain("good.ts");
+      expect(String(response.text)).toContain("good");
+    });
+
+    test("aft_outline directory mode returns complete false when Rust walk truncates", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await mkdir(h.path("outline-large"), { recursive: true });
+      for (let index = 0; index < 205; index += 1) {
+        await writeFile(
+          h.path("outline-large", `file-${String(index).padStart(3, "0")}.ts`),
+          `export const value${index} = ${index};\n`,
+          "utf8",
+        );
+      }
+
+      const output = toolResultText(
+        await tools.aft_outline.execute({ target: "outline-large" }, sdkCtx),
+      );
+      const response = JSON.parse(output) as Record<string, unknown>;
+
+      expect(response.complete).toBe(false);
+      expect(response.walk_truncated).toBe(true);
+      expect(Array.isArray(response.skipped_files)).toBe(true);
+      expect(String(response.text)).toContain("file-000.ts");
+    });
+
+    test("aft_outline single file target keeps text output behavior", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await writeFile(h.path("single.ts"), "export function single() { return 1; }\n", "utf8");
+
+      const output = toolResultText(
+        await tools.aft_outline.execute({ target: "single.ts" }, sdkCtx),
+      );
+
+      expect(() => JSON.parse(output)).toThrow();
+      expect(output).toContain("single.ts");
+      expect(output).toContain("single");
+    });
+
+    test("aft_outline array target keeps multi-file text output behavior", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await writeFile(h.path("array-a.ts"), "export function arrayA() { return 1; }\n", "utf8");
+      await writeFile(h.path("array-b.ts"), "export function arrayB() { return 2; }\n", "utf8");
+
+      const output = toolResultText(
+        await tools.aft_outline.execute(
+          { target: [h.path("array-a.ts"), h.path("array-b.ts")] },
+          sdkCtx,
+        ),
+      );
+
+      expect(() => JSON.parse(output)).toThrow();
+      expect(output).toContain("array-a.ts");
+      expect(output).toContain("array-b.ts");
+      expect(output).toContain("arrayA");
+      expect(output).toContain("arrayB");
+    });
+
+    test("ast_grep_search reports no_files_matched_scope separately from zero hits", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await mkdir(h.path("python-only"), { recursive: true });
+      await writeFile(h.path("python-only", "sample.py"), "print('hello')\n", "utf8");
+
+      const output = toolResultText(
+        await tools.ast_grep_search.execute(
+          { pattern: "console.log($MSG)", lang: "typescript", paths: ["python-only"] },
+          sdkCtx,
+        ),
+      );
+
+      expect(output).toContain("No files matched the scope");
+      expect(output).not.toContain("No matches found (searched");
+    });
+
+    test("ast_grep_search reports searched-zero-hit result for valid scope", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await writeFile(h.path("valid.ts"), "export const value = 1;\n", "utf8");
+
+      const output = toolResultText(
+        await tools.ast_grep_search.execute(
+          { pattern: "console.log($MSG)", lang: "typescript", paths: ["valid.ts"] },
+          sdkCtx,
+        ),
+      );
+
+      expect(output).toContain("No matches found (searched 1 files)");
+      expect(output).not.toContain("No files matched the scope");
+    });
+
+    test("aft_import remove reports successful no-op when import is absent", async () => {
+      const { h, tools, sdkCtx } = await toolHarness();
+      await writeFile(
+        h.path("imports.ts"),
+        "import { present } from 'pkg';\nconsole.log(present);\n",
+        "utf8",
+      );
+
+      const output = toolResultText(
+        await tools.aft_import.execute(
+          { op: "remove", filePath: "imports.ts", module: "missing-pkg" },
+          sdkCtx,
+        ),
+      );
+      expect(() => JSON.parse(output)).toThrow();
+      expect(output).toContain("not present missing-pkg");
+      expect(output).toContain(`file ${await realpath(h.path("imports.ts"))}`);
+      expect(output).toContain("scope entire import");
+    });
   });
+}
 
-  test("aft_outline single file target keeps text output behavior", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("single.ts"), "export function single() { return 1; }\n", "utf8");
-
-    const output = toolResultText(await tools.aft_outline.execute({ target: "single.ts" }, sdkCtx));
-
-    expect(() => JSON.parse(output)).toThrow();
-    expect(output).toContain("single.ts");
-    expect(output).toContain("single");
-  });
-
-  test("aft_outline array target keeps multi-file text output behavior", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("array-a.ts"), "export function arrayA() { return 1; }\n", "utf8");
-    await writeFile(h.path("array-b.ts"), "export function arrayB() { return 2; }\n", "utf8");
-
-    const output = toolResultText(
-      await tools.aft_outline.execute(
-        { target: [h.path("array-a.ts"), h.path("array-b.ts")] },
-        sdkCtx,
-      ),
-    );
-
-    expect(() => JSON.parse(output)).toThrow();
-    expect(output).toContain("array-a.ts");
-    expect(output).toContain("array-b.ts");
-    expect(output).toContain("arrayA");
-    expect(output).toContain("arrayB");
-  });
-
-  test("ast_grep_search reports no_files_matched_scope separately from zero hits", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await mkdir(h.path("python-only"), { recursive: true });
-    await writeFile(h.path("python-only", "sample.py"), "print('hello')\n", "utf8");
-
-    const output = toolResultText(
-      await tools.ast_grep_search.execute(
-        { pattern: "console.log($MSG)", lang: "typescript", paths: ["python-only"] },
-        sdkCtx,
-      ),
-    );
-
-    expect(output).toContain("No files matched the scope");
-    expect(output).not.toContain("No matches found (searched");
-  });
-
-  test("ast_grep_search reports searched-zero-hit result for valid scope", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(h.path("valid.ts"), "export const value = 1;\n", "utf8");
-
-    const output = toolResultText(
-      await tools.ast_grep_search.execute(
-        { pattern: "console.log($MSG)", lang: "typescript", paths: ["valid.ts"] },
-        sdkCtx,
-      ),
-    );
-
-    expect(output).toContain("No matches found (searched 1 files)");
-    expect(output).not.toContain("No files matched the scope");
-  });
-
-  test("aft_import remove reports successful no-op when import is absent", async () => {
-    const { h, tools, sdkCtx } = await toolHarness();
-    await writeFile(
-      h.path("imports.ts"),
-      "import { present } from 'pkg';\nconsole.log(present);\n",
-      "utf8",
-    );
-
-    const output = toolResultText(
-      await tools.aft_import.execute(
-        { op: "remove", filePath: "imports.ts", module: "missing-pkg" },
-        sdkCtx,
-      ),
-    );
-    expect(() => JSON.parse(output)).toThrow();
-    expect(output).toContain("not present missing-pkg");
-    expect(output).toContain(`file ${await realpath(h.path("imports.ts"))}`);
-    expect(output).toContain("scope entire import");
-  });
-});
+if (process.env.AFT_OPENCODE_E2E_IMPORT_ONLY !== "1") {
+  runHonestReportingSuite();
+}

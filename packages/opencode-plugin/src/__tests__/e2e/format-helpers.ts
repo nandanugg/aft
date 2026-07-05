@@ -18,7 +18,9 @@ import {
   configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
+  type HarnessFactory,
   type PreparedBinary,
+  writeSubcHarnessConfig,
 } from "./helpers.js";
 
 /**
@@ -208,9 +210,15 @@ export async function createFormatHarness(
    * path — the symlink would otherwise make the real formatter discoverable
    * and cause `formatted: true` instead.
    */
-  suppressRealToolSymlinks = false,
+  options:
+    | boolean
+    | { suppressRealToolSymlinks?: boolean; harnessFactory?: HarnessFactory } = false,
 ): Promise<E2EHarness> {
-  const harness = await createHarness(preparedBinary, {
+  const suppressRealToolSymlinks =
+    typeof options === "boolean" ? options : (options.suppressRealToolSymlinks ?? false);
+  const harnessFactory =
+    typeof options === "boolean" ? createHarness : (options.harnessFactory ?? createHarness);
+  const harness = await harnessFactory(preparedBinary, {
     fixtureNames: [],
     timeoutMs: 30_000,
   });
@@ -268,10 +276,9 @@ export async function createFormatHarness(
   if (preset.explicitChecker) {
     configureParams.checker = preset.explicitChecker;
   }
-  const configResp = await harness.bridge.send(
-    "configure",
-    configureParamsFromLegacyOverrides(configureParams),
-  );
+  const configuredParams = configureParamsFromLegacyOverrides(configureParams);
+  await writeSubcHarnessConfig(harness, configuredParams);
+  const configResp = await harness.bridge.send("configure", configuredParams);
   if (configResp.success === false) {
     throw new Error(`bridge configure failed: ${(configResp as { message?: string }).message}`);
   }

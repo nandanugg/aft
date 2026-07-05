@@ -1,15 +1,24 @@
 import { spawn } from "node:child_process";
 import { constants, type Dirent } from "node:fs";
-import { access, cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import {
+  type AftProjectTransport,
+  type AftTransportPool,
   BinaryBridge,
   type BridgeOptions,
+  createAftTransportPool,
   inlineUserConfigTier,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
 import { bridgeLogger } from "../../logger.js";
+import {
+  prepareSubcLane,
+  startSubcRig,
+  type PreparedSubcLane,
+  type SubcRig,
+} from "../../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
 // "[aft] invalidated 7 files") into $TMPDIR/aft-plugin-test.log instead of
@@ -50,6 +59,7 @@ const FALLBACK_BINARY = resolve(homedir(), ".cargo/bin", AFT_BINARY_NAME);
 const PROJECT_ROOT = resolve(import.meta.dir, "../../../../../");
 const FIXTURES_DIR = resolve(import.meta.dir, "./fixtures");
 const DEFAULT_TIMEOUT_MS = 15_000;
+const SUBC_DEFAULT_SESSION_ID = "__default__";
 const OUTLINE_EXTENSIONS = new Set([
   ".ts",
   ".tsx",
@@ -208,10 +218,32 @@ export interface PreparedBinary {
   buildAttempted: boolean;
 }
 
+export type HarnessTransport = "ndjson" | "subc";
+
+export interface CreateHarnessOptions {
+  fixtureNames?: string[];
+  timeoutMs?: number;
+  tempPrefix?: string;
+  bridgeOptions?: BridgeOptions;
+  transport?: HarnessTransport;
+  configOverrides?: Record<string, unknown>;
+}
+
+export type HarnessFactory = (
+  preparedBinary: PreparedBinary,
+  options?: CreateHarnessOptions,
+) => Promise<E2EHarness>;
+
+export interface PreparedSubcHarness {
+  skipReason?: string;
+  buildAttempted: boolean;
+}
+
 export interface E2EHarness {
   readonly binaryPath: string;
-  readonly bridge: BinaryBridge;
+  readonly bridge: AftProjectTransport;
   readonly tempDir: string;
+  readonly transport: HarnessTransport;
   path(...segments: string[]): string;
   relativePath(...segments: string[]): string;
   cleanup(): Promise<void>;
@@ -225,34 +257,80 @@ export interface ReadLikePluginOptions {
 }
 
 let preparedBinaryPromise: Promise<PreparedBinary> | null = null;
+let sharedSubcRigPromise: Promise<SubcRig> | null = null;
+let sharedSubcRig: SubcRig | null = null;
+let sharedSubcRigBinaryPath: string | null = null;
+let sharedSubcCleanupPromise: Promise<void> | null = null;
+let sharedSubcCleanupRegistered = false;
 
 export function prepareBinary(): Promise<PreparedBinary> {
   preparedBinaryPromise ??= prepareBinaryOnce();
   return preparedBinaryPromise;
 }
 
+export async function prepareSubcHarness(
+  preparedBinary: PreparedBinary,
+): Promise<PreparedSubcHarness> {
+  if (!preparedBinary.binaryPath) {
+    return {
+      buildAttempted: preparedBinary.buildAttempted,
+      skipReason: preparedBinary.skipReason ?? "aft binary unavailable",
+    };
+  }
+
+  const lane = await prepareSubcLane();
+  if (!lane.subcCorePath) {
+    return {
+      buildAttempted: lane.buildAttempted,
+      skipReason: lane.skipReason ?? "subc-core binary unavailable",
+    };
+  }
+
+  return { buildAttempted: lane.buildAttempted || preparedBinary.buildAttempted };
+}
+
+export async function cleanupSharedSubcRig(): Promise<void> {
+  if (sharedSubcCleanupPromise) return sharedSubcCleanupPromise;
+  const rigPromise = sharedSubcRigPromise;
+  sharedSubcRigPromise = null;
+  sharedSubcRigBinaryPath = null;
+  sharedSubcCleanupPromise = (async () => {
+    const rig = sharedSubcRig ?? (rigPromise ? await rigPromise.catch(() => null) : null);
+    sharedSubcRig = null;
+    if (rig) await rig.cleanup();
+  })();
+  try {
+    await sharedSubcCleanupPromise;
+  } finally {
+    sharedSubcCleanupPromise = null;
+  }
+}
+
 export async function createHarness(
   preparedBinary: PreparedBinary,
-  options?: {
-    fixtureNames?: string[];
-    timeoutMs?: number;
-    tempPrefix?: string;
-    bridgeOptions?: BridgeOptions;
-  },
+  options: CreateHarnessOptions = {},
 ): Promise<E2EHarness> {
   if (!preparedBinary.binaryPath) {
     throw new Error(preparedBinary.skipReason ?? "aft binary unavailable");
   }
 
+  const transport = options.transport ?? "ndjson";
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const configOverrides = { harness: "opencode", ...(options.configOverrides ?? {}) };
+
   // Keep e2e projects outside both the repository and OS temp directories so
   // external-directory tests cover ordinary out-of-project paths.
   const tempDir = await mkdtemp(
-    join(dirname(PROJECT_ROOT), `.${options?.tempPrefix ?? "aft-plugin-e2e-"}`),
+    join(dirname(PROJECT_ROOT), `.${options.tempPrefix ?? "aft-plugin-e2e-"}`),
   );
 
-  let bridge: BinaryBridge | undefined;
+  let standaloneBridge: BinaryBridge | undefined;
+  let pool: AftTransportPool | undefined;
+  let bridge: AftProjectTransport | undefined;
+  const subcSessions = new Set<string>();
+
   try {
-    await copyFixturesToTempDir(tempDir, options?.fixtureNames);
+    await copyFixturesToTempDir(tempDir, options.fixtureNames);
 
     // Redirect the search index cache to a temp dir so tests don't pollute the
     // user's ~/.cache/aft/index/. Pass AFT_CACHE_DIR via the bridge's per-child
@@ -261,17 +339,41 @@ export async function createHarness(
     // before the child ever inherits it — and process.env is process-global, so
     // concurrent harnesses would race. childEnv is applied at spawn time, scoped
     // to this child only.
-    bridge = new BinaryBridge(
-      preparedBinary.binaryPath,
-      tempDir,
-      {
-        timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
-        ...(options?.bridgeOptions ?? {}),
-      },
-      { harness: "opencode" },
-    );
+    const poolOptions: BridgeOptions = {
+      timeoutMs,
+      childEnv: { AFT_CACHE_DIR: join(tempDir, ".aft-cache") },
+      ...(options.bridgeOptions ?? {}),
+    };
+
+    if (transport === "subc") {
+      await writeSubcProjectConfig(tempDir, configOverrides);
+      const rig = await sharedSubcRigFor(preparedBinary);
+      pool = await createAftTransportPool({
+        harness: "opencode",
+        binaryPath: preparedBinary.binaryPath,
+        poolOptions,
+        configOverrides,
+        subcConnectionFile: rig.connectionFile,
+      });
+      bridge = trackSubcSessions(
+        pool.getBridge(tempDir),
+        subcSessions,
+        tempDir,
+        rig.configHome,
+        timeoutMs,
+      );
+    } else {
+      standaloneBridge = new BinaryBridge(
+        preparedBinary.binaryPath,
+        tempDir,
+        poolOptions,
+        configOverrides,
+      );
+      bridge = standaloneBridge;
+    }
   } catch (err) {
+    await pool?.shutdown().catch(() => undefined);
+    await standaloneBridge?.shutdown().catch(() => undefined);
     await safeRemoveDir(tempDir);
     throw err;
   }
@@ -280,11 +382,19 @@ export async function createHarness(
     binaryPath: preparedBinary.binaryPath,
     bridge,
     tempDir,
+    transport,
     path: (...segments: string[]) => resolve(tempDir, ...segments),
     relativePath: (...segments: string[]) => segments.join("/"),
     cleanup: async () => {
       try {
-        await bridge.shutdown();
+        if (pool) {
+          await Promise.allSettled(
+            Array.from(subcSessions, (session) => pool?.closeSession(tempDir, session)),
+          );
+          await pool.shutdown();
+        } else {
+          await standaloneBridge?.shutdown();
+        }
       } catch {
         // ignore cleanup errors
       } finally {
@@ -292,6 +402,193 @@ export async function createHarness(
       }
     },
   };
+}
+
+function registerSharedSubcCleanup(): void {
+  if (sharedSubcCleanupRegistered) return;
+  sharedSubcCleanupRegistered = true;
+  process.once("beforeExit", () => {
+    void cleanupSharedSubcRig();
+  });
+}
+
+async function sharedSubcRigFor(preparedBinary: PreparedBinary): Promise<SubcRig> {
+  if (!preparedBinary.binaryPath) {
+    throw new Error(preparedBinary.skipReason ?? "aft binary unavailable");
+  }
+
+  if (sharedSubcRig && sharedSubcRigBinaryPath === preparedBinary.binaryPath) {
+    return sharedSubcRig;
+  }
+  if (sharedSubcRig && sharedSubcRigBinaryPath !== preparedBinary.binaryPath) {
+    await cleanupSharedSubcRig();
+  }
+  if (!sharedSubcRigPromise) {
+    const binaryPath = preparedBinary.binaryPath;
+    sharedSubcRigBinaryPath = binaryPath;
+    sharedSubcRigPromise = (async () => {
+      const lane = await prepareSubcLane();
+      if (!lane.subcCorePath) {
+        throw new Error(lane.skipReason ?? "subc-core binary unavailable");
+      }
+      const preparedLane: PreparedSubcLane = {
+        aftBinaryPath: binaryPath,
+        subcCorePath: lane.subcCorePath,
+        buildAttempted: lane.buildAttempted || preparedBinary.buildAttempted,
+      };
+      const rig = await startSubcRig(preparedLane);
+      sharedSubcRig = rig;
+      registerSharedSubcCleanup();
+      return rig;
+    })().catch((err) => {
+      sharedSubcRigPromise = null;
+      sharedSubcRigBinaryPath = null;
+      throw err;
+    });
+  }
+
+  return sharedSubcRigPromise;
+}
+
+function trackSubcSessions(
+  bridge: AftProjectTransport,
+  sessions: Set<string>,
+  projectRoot: string,
+  configHome: string,
+  defaultTimeoutMs: number,
+): AftProjectTransport {
+  const remember = (session: string | undefined): void => {
+    sessions.add(session && session.length > 0 ? session : SUBC_DEFAULT_SESSION_ID);
+  };
+  const withDefaultTimeout = <T extends { timeoutMs?: number; transportTimeoutMs?: number }>(
+    options: T | undefined,
+  ): T | undefined => {
+    if (options?.timeoutMs !== undefined || options?.transportTimeoutMs !== undefined) {
+      return options;
+    }
+    return { ...(options ?? ({} as T)), timeoutMs: defaultTimeoutMs };
+  };
+  return {
+    getCwd: () => bridge.getCwd(),
+    getStatusBar: () => bridge.getStatusBar(),
+    getCachedStatus: () => bridge.getCachedStatus(),
+    cacheStatusSnapshot: (snapshot) => bridge.cacheStatusSnapshot(snapshot),
+    send: async (command, params = {}, options) => {
+      remember(typeof params.session_id === "string" ? params.session_id : undefined);
+      if (command === "configure") {
+        await writeSubcProjectConfig(projectRoot, params);
+        await writeSubcUserConfig(configHome, params);
+      }
+      return bridge.send(command, params, withDefaultTimeout(options));
+    },
+    toolCall: async (sessionId, name, rawArgs, options) => {
+      remember(sessionId);
+      return bridge.toolCall(sessionId, name, rawArgs, withDefaultTimeout(options));
+    },
+  };
+}
+
+export function harnessPool(harness: E2EHarness): AftTransportPool {
+  return {
+    getBridge: () => harness.bridge,
+    getActiveBridgeForRoot: () => harness.bridge,
+    toolCall: (_projectRoot, runtime, name, rawArgs, options) =>
+      harness.bridge.toolCall(runtime.sessionID, name, rawArgs, options),
+    setConfigureOverride: () => {},
+    replaceBinary: async (path) => path,
+    shutdown: async () => {},
+    closeSession: async () => {},
+  };
+}
+
+export async function writeSubcHarnessConfig(
+  harness: E2EHarness,
+  configureParams: Record<string, unknown>,
+): Promise<void> {
+  if (harness.transport !== "subc") return;
+  await writeSubcProjectConfig(harness.tempDir, configureParams);
+}
+
+async function writeSubcUserConfig(
+  configHome: string,
+  configureParams: Record<string, unknown>,
+): Promise<void> {
+  if (typeof configureParams.cortexkit_user_config_path !== "string") return;
+  const doc = await projectConfigDocFromConfigureParams(configureParams);
+  if (Object.keys(doc).length === 0) return;
+  const configDir = join(configHome, "cortexkit");
+  const configPath = join(configDir, "aft.jsonc");
+  let existing: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(await readFile(configPath, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      existing = parsed as Record<string, unknown>;
+    }
+  } catch {
+    existing = {};
+  }
+  await mkdir(configDir, { recursive: true });
+  await writeFile(configPath, JSON.stringify({ ...existing, ...doc }, null, 2), "utf8");
+}
+
+async function writeSubcProjectConfig(
+  projectRoot: string,
+  configureParams: Record<string, unknown>,
+): Promise<void> {
+  const doc = await projectConfigDocFromConfigureParams(configureParams);
+  if (Object.keys(doc).length === 0) return;
+  const configDir = join(projectRoot, ".cortexkit");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(join(configDir, "aft.jsonc"), JSON.stringify(doc, null, 2), "utf8");
+}
+
+async function projectConfigDocFromConfigureParams(
+  configureParams: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const doc: Record<string, unknown> = {};
+  const tiers = configureParams.config;
+  if (Array.isArray(tiers)) {
+    for (const tier of tiers) {
+      if (!tier || typeof tier !== "object") continue;
+      const rawDoc = (tier as { doc?: unknown }).doc;
+      if (typeof rawDoc !== "string") continue;
+      try {
+        const parsed = JSON.parse(rawDoc) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          Object.assign(doc, parsed as Record<string, unknown>);
+        }
+      } catch {
+        // Ignore invalid inline config docs; the standalone bridge will surface
+        // them through configure, and subc parity should not invent a fallback.
+      }
+    }
+  }
+
+  const userConfigPath = configureParams.cortexkit_user_config_path;
+  if (typeof userConfigPath === "string" && userConfigPath.length > 0) {
+    try {
+      const parsed = JSON.parse(await readFile(userConfigPath, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        Object.assign(doc, parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Invalid file handling belongs to `configure`, which already reports bad
+      // user config files; this subc mirror must not invent a fallback.
+    }
+  }
+
+  const excluded = new Set<string>([
+    ...GROUP_A_CONFIGURE_KEYS,
+    ...LEGACY_CONFIG_KEYS,
+    "config",
+    "project_root",
+    "session_id",
+    "cortexkit_user_config_path",
+  ]);
+  for (const [key, value] of Object.entries(configureParams)) {
+    if (!excluded.has(key)) doc[key] = value;
+  }
+  return doc;
 }
 
 export async function cleanupHarnesses(harnesses: E2EHarness[]): Promise<void> {
@@ -340,7 +637,7 @@ export function lineNumberRangeText(text: string, startLine: number, endLine?: n
 }
 
 export async function sendReadLikePlugin(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   filePath: string,
   options: ReadLikePluginOptions = {},
 ): Promise<Record<string, unknown>> {
@@ -365,7 +662,7 @@ export async function sendReadLikePlugin(
 }
 
 export async function sendOutlineDirectoryLikePlugin(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   directory: string,
 ): Promise<Record<string, unknown>> {
   const files = await discoverOutlineFiles(directory);
@@ -373,7 +670,7 @@ export async function sendOutlineDirectoryLikePlugin(
 }
 
 export async function sendZoomMultiSymbolLikePlugin(
-  bridge: BinaryBridge,
+  bridge: AftProjectTransport,
   filePath: string,
   symbols: string[],
   contextLines?: number,

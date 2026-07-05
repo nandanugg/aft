@@ -14,6 +14,7 @@ import {
   cleanupHarnesses,
   createHarness,
   type E2EHarness,
+  type HarnessFactory,
   type PreparedBinary,
   prepareBinary,
 } from "./helpers.js";
@@ -80,159 +81,173 @@ async function createFixtureProject(harness: E2EHarness): Promise<void> {
   ]);
 }
 
-maybeDescribe("e2e read-only spine tool_call cutover", () => {
-  let preparedBinary: PreparedBinary = initialBinary;
-  const harnesses: E2EHarness[] = [];
+export function runReadOnlySpineToolcallSuite(
+  options: { harnessFactory?: HarnessFactory; name?: string } = {},
+): void {
+  maybeDescribe(options.name ?? "e2e read-only spine tool_call cutover", () => {
+    let preparedBinary: PreparedBinary = initialBinary;
+    const harnesses: E2EHarness[] = [];
 
-  beforeAll(async () => {
-    preparedBinary = await prepareBinary();
-  });
-
-  afterEach(async () => {
-    await cleanupHarnesses(harnesses);
-  });
-
-  async function harness(): Promise<E2EHarness> {
-    const created = await createHarness(preparedBinary, {
-      fixtureNames: [],
-      timeoutMs: 20_000,
-      tempPrefix: "aft-plugin-readonly-spine-",
+    beforeAll(async () => {
+      preparedBinary = await prepareBinary();
     });
-    harnesses.push(created);
-    await createFixtureProject(created);
-    return created;
-  }
 
-  test("grep returns server-rendered matches through tool_call", async () => {
-    const h = await harness();
-    const tools = searchTools(createPluginContext(h));
+    afterEach(async () => {
+      await cleanupHarnesses(harnesses);
+    });
 
-    const output = await tools.grep.execute(
-      { pattern: "tool_call_grep_marker", path: "src" },
-      createToolContext(h),
-    );
+    async function harness(): Promise<E2EHarness> {
+      const created = await (options.harnessFactory ?? createHarness)(preparedBinary, {
+        fixtureNames: [],
+        timeoutMs: 20_000,
+        tempPrefix: "aft-plugin-readonly-spine-",
+      });
+      harnesses.push(created);
+      await createFixtureProject(created);
+      return created;
+    }
 
-    expect(output).toContain("tool_call_grep_marker");
-    expect(output).toContain("Found 1 match across 1 file");
+    test("grep returns server-rendered matches through tool_call", async () => {
+      const h = await harness();
+      const tools = searchTools(createPluginContext(h));
+
+      const output = await tools.grep.execute(
+        { pattern: "tool_call_grep_marker", path: "src" },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("tool_call_grep_marker");
+      expect(output).toContain("Found 1 match across 1 file");
+    });
+
+    test("grep appends the plugin-side skipped path footer after tool_call", async () => {
+      const h = await harness();
+      const tools = searchTools(createPluginContext(h));
+
+      const output = await tools.grep.execute(
+        { pattern: "tool_call_grep_marker", path: "src missing-dir" },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("tool_call_grep_marker");
+      expect(output).toContain("Found 1 match across 1 file");
+      expect(output).toContain("Skipped 1 path not found: missing-dir");
+    });
+
+    test("aft_search returns server-rendered literal search text through tool_call", async () => {
+      const h = await harness();
+      const tools = semanticTools(createPluginContext(h));
+
+      const output = await tools.aft_search.execute(
+        { query: "tool_call_search_marker", hint: "literal", topK: 5 },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("tool_call_search_marker");
+      expect(output).toContain("Found ");
+    });
+
+    test("aft_inspect returns server-rendered todos details through tool_call", async () => {
+      const h = await harness();
+      const tools = inspectTools(createPluginContext(h));
+
+      const output = await tools.aft_inspect.execute(
+        { sections: "todos", topK: 5 },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("TODOs: 1");
+      expect(output).toContain("src/hit.ts:9 TODO cutover inspect marker");
+    });
+
+    test("aft_outline returns single-file Text output through tool_call", async () => {
+      const h = await harness();
+      const tools = readingTools(createPluginContext(h));
+
+      const output = await tools.aft_outline.execute(
+        { target: "src/hit.ts" },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("hit.ts");
+      expect(output).toContain("toolCallOutlineFunction");
+      expect(output).toContain("ToolCallOutlineService");
+    });
+
+    test("aft_outline returns structured directory JSON through tool_call", async () => {
+      const h = await harness();
+      const tools = readingTools(createPluginContext(h));
+
+      const output = await tools.aft_outline.execute({ target: "src" }, createToolContext(h));
+      const parsed = JSON.parse(output) as {
+        success?: boolean;
+        complete?: boolean;
+        text?: string;
+        skipped_files?: unknown[];
+      };
+
+      expect(parsed.success).toBe(true);
+      expect(parsed.complete).toBe(true);
+      expect(parsed.text).toContain("src/");
+      expect(parsed.text).toContain("hit.ts");
+      expect(parsed.text).toContain("toolCallOutlineFunction");
+      expect(parsed.text).not.toContain("hit.test.ts");
+      expect(parsed.skipped_files).toEqual([]);
+    });
+
+    test("aft_outline files:true returns the server-rendered files tree through tool_call", async () => {
+      const h = await harness();
+      const tools = readingTools(createPluginContext(h));
+
+      const output = await tools.aft_outline.execute(
+        { target: "src", files: true },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("typescript");
+      expect(output).toContain("hit.ts");
+      expect(output).toContain("other.ts");
+      expect(output).toContain("hit.test.ts");
+    });
+
+    test("aft_outline returns multi-file Text output for array targets through tool_call", async () => {
+      const h = await harness();
+      const tools = readingTools(createPluginContext(h));
+
+      const output = await tools.aft_outline.execute(
+        { target: ["src/hit.ts", "src/other.ts"] },
+        createToolContext(h),
+      );
+
+      expect(output).toContain("src/");
+      expect(output).toContain("hit.ts");
+      expect(output).toContain("toolCallOutlineFunction");
+      expect(output).toContain("other.ts");
+      expect(output).toContain("toolCallOutlineOther");
+    });
+
+    test("aft_outline includeTests controls directory test-file visibility through tool_call", async () => {
+      const h = await harness();
+      const tools = readingTools(createPluginContext(h));
+
+      const withoutTests = JSON.parse(
+        await tools.aft_outline.execute({ target: "src" }, createToolContext(h)),
+      ) as { text?: string };
+      const withTests = JSON.parse(
+        await tools.aft_outline.execute(
+          { target: "src", includeTests: true },
+          createToolContext(h),
+        ),
+      ) as { text?: string };
+
+      expect(withoutTests.text).not.toContain("hit.test.ts");
+      expect(withoutTests.text).not.toContain("toolCallOutlineTestOnly");
+      expect(withTests.text).toContain("hit.test.ts");
+      expect(withTests.text).toContain("toolCallOutlineTestOnly");
+    });
   });
+}
 
-  test("grep appends the plugin-side skipped path footer after tool_call", async () => {
-    const h = await harness();
-    const tools = searchTools(createPluginContext(h));
-
-    const output = await tools.grep.execute(
-      { pattern: "tool_call_grep_marker", path: "src missing-dir" },
-      createToolContext(h),
-    );
-
-    expect(output).toContain("tool_call_grep_marker");
-    expect(output).toContain("Found 1 match across 1 file");
-    expect(output).toContain("Skipped 1 path not found: missing-dir");
-  });
-
-  test("aft_search returns server-rendered literal search text through tool_call", async () => {
-    const h = await harness();
-    const tools = semanticTools(createPluginContext(h));
-
-    const output = await tools.aft_search.execute(
-      { query: "tool_call_search_marker", hint: "literal", topK: 5 },
-      createToolContext(h),
-    );
-
-    expect(output).toContain("tool_call_search_marker");
-    expect(output).toContain("Found ");
-  });
-
-  test("aft_inspect returns server-rendered todos details through tool_call", async () => {
-    const h = await harness();
-    const tools = inspectTools(createPluginContext(h));
-
-    const output = await tools.aft_inspect.execute(
-      { sections: "todos", topK: 5 },
-      createToolContext(h),
-    );
-
-    expect(output).toContain("TODOs: 1");
-    expect(output).toContain("src/hit.ts:9 TODO cutover inspect marker");
-  });
-
-  test("aft_outline returns single-file Text output through tool_call", async () => {
-    const h = await harness();
-    const tools = readingTools(createPluginContext(h));
-
-    const output = await tools.aft_outline.execute({ target: "src/hit.ts" }, createToolContext(h));
-
-    expect(output).toContain("hit.ts");
-    expect(output).toContain("toolCallOutlineFunction");
-    expect(output).toContain("ToolCallOutlineService");
-  });
-
-  test("aft_outline returns structured directory JSON through tool_call", async () => {
-    const h = await harness();
-    const tools = readingTools(createPluginContext(h));
-
-    const output = await tools.aft_outline.execute({ target: "src" }, createToolContext(h));
-    const parsed = JSON.parse(output) as {
-      success?: boolean;
-      complete?: boolean;
-      text?: string;
-      skipped_files?: unknown[];
-    };
-
-    expect(parsed.success).toBe(true);
-    expect(parsed.complete).toBe(true);
-    expect(parsed.text).toContain("src/");
-    expect(parsed.text).toContain("hit.ts");
-    expect(parsed.text).toContain("toolCallOutlineFunction");
-    expect(parsed.text).not.toContain("hit.test.ts");
-    expect(parsed.skipped_files).toEqual([]);
-  });
-
-  test("aft_outline files:true returns the server-rendered files tree through tool_call", async () => {
-    const h = await harness();
-    const tools = readingTools(createPluginContext(h));
-
-    const output = await tools.aft_outline.execute(
-      { target: "src", files: true },
-      createToolContext(h),
-    );
-
-    expect(output).toContain("typescript");
-    expect(output).toContain("hit.ts");
-    expect(output).toContain("other.ts");
-    expect(output).toContain("hit.test.ts");
-  });
-
-  test("aft_outline returns multi-file Text output for array targets through tool_call", async () => {
-    const h = await harness();
-    const tools = readingTools(createPluginContext(h));
-
-    const output = await tools.aft_outline.execute(
-      { target: ["src/hit.ts", "src/other.ts"] },
-      createToolContext(h),
-    );
-
-    expect(output).toContain("src/");
-    expect(output).toContain("hit.ts");
-    expect(output).toContain("toolCallOutlineFunction");
-    expect(output).toContain("other.ts");
-    expect(output).toContain("toolCallOutlineOther");
-  });
-
-  test("aft_outline includeTests controls directory test-file visibility through tool_call", async () => {
-    const h = await harness();
-    const tools = readingTools(createPluginContext(h));
-
-    const withoutTests = JSON.parse(
-      await tools.aft_outline.execute({ target: "src" }, createToolContext(h)),
-    ) as { text?: string };
-    const withTests = JSON.parse(
-      await tools.aft_outline.execute({ target: "src", includeTests: true }, createToolContext(h)),
-    ) as { text?: string };
-
-    expect(withoutTests.text).not.toContain("hit.test.ts");
-    expect(withoutTests.text).not.toContain("toolCallOutlineTestOnly");
-    expect(withTests.text).toContain("hit.test.ts");
-    expect(withTests.text).toContain("toolCallOutlineTestOnly");
-  });
-});
+if (process.env.AFT_OPENCODE_E2E_IMPORT_ONLY !== "1") {
+  runReadOnlySpineToolcallSuite();
+}

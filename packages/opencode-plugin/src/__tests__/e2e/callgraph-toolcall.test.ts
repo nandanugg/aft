@@ -10,6 +10,7 @@ import {
   cleanupHarnesses,
   createHarness,
   type E2EHarness,
+  type HarnessFactory,
   type PreparedBinary,
   prepareBinary,
 } from "./helpers.js";
@@ -41,112 +42,123 @@ function createToolContext(harness: E2EHarness): ToolContext {
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-maybeDescribe("e2e aft_callgraph tool_call cutover", () => {
-  let preparedBinary: PreparedBinary = initialBinary;
-  const harnesses: E2EHarness[] = [];
+export function runCallgraphToolcallSuite(
+  options: { harnessFactory?: HarnessFactory; name?: string } = {},
+): void {
+  maybeDescribe(options.name ?? "e2e aft_callgraph tool_call cutover", () => {
+    let preparedBinary: PreparedBinary = initialBinary;
+    const harnesses: E2EHarness[] = [];
 
-  beforeAll(async () => {
-    preparedBinary = await prepareBinary();
-  });
-
-  afterEach(async () => {
-    await cleanupHarnesses(harnesses);
-  });
-
-  async function harness(): Promise<E2EHarness> {
-    const created = await createHarness(preparedBinary, {
-      fixtureNames: ["sample.ts"],
-      timeoutMs: 20_000,
-      tempPrefix: "aft-plugin-callgraph-toolcall-",
+    beforeAll(async () => {
+      preparedBinary = await prepareBinary();
     });
-    harnesses.push(created);
-    return created;
-  }
 
-  async function runCallgraph(
-    h: E2EHarness,
-    args: Record<string, unknown>,
-    options: { allowBuilding?: boolean } = {},
-  ): Promise<string> {
-    const tools = navigationTools(createPluginContext(h));
-    for (let attempt = 0; attempt < 20; attempt++) {
-      const output = (await tools.aft_callgraph.execute(args, createToolContext(h))) as string;
-      if (options.allowBuilding || !output.includes("callgraph_building")) return output;
-      await delay(250);
+    afterEach(async () => {
+      await cleanupHarnesses(harnesses);
+    });
+
+    async function harness(): Promise<E2EHarness> {
+      const created = await (options.harnessFactory ?? createHarness)(preparedBinary, {
+        fixtureNames: ["sample.ts"],
+        timeoutMs: 20_000,
+        tempPrefix: "aft-plugin-callgraph-toolcall-",
+      });
+      harnesses.push(created);
+      return created;
     }
-    throw new Error("callgraph store did not become ready for the e2e fixture");
-  }
 
-  test("callers returns server-rendered hits through tool_call", async () => {
-    const h = await harness();
+    async function runCallgraph(
+      h: E2EHarness,
+      args: Record<string, unknown>,
+      options: { allowBuilding?: boolean } = {},
+    ): Promise<string> {
+      const tools = navigationTools(createPluginContext(h));
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const output = (await tools.aft_callgraph.execute(args, createToolContext(h))) as string;
+        if (options.allowBuilding || !output.includes("callgraph_building")) return output;
+        await delay(250);
+      }
+      throw new Error("callgraph store did not become ready for the e2e fixture");
+    }
 
-    const output = await runCallgraph(h, {
-      op: "callers",
-      filePath: "sample.ts",
-      symbol: "normalize",
+    test("callers returns server-rendered hits through tool_call", async () => {
+      const h = await harness();
+
+      const output = await runCallgraph(h, {
+        op: "callers",
+        filePath: "sample.ts",
+        symbol: "normalize",
+      });
+
+      expect(output).toContain("caller");
+      expect(output).toContain("funcB");
     });
 
-    expect(output).toContain("caller");
-    expect(output).toContain("funcB");
-  });
+    test("call_tree returns forward calls through tool_call", async () => {
+      const h = await harness();
 
-  test("call_tree returns forward calls through tool_call", async () => {
-    const h = await harness();
+      const output = await runCallgraph(h, {
+        op: "call_tree",
+        filePath: "sample.ts",
+        symbol: "funcB",
+      });
 
-    const output = await runCallgraph(h, {
-      op: "call_tree",
-      filePath: "sample.ts",
-      symbol: "funcB",
+      expect(output).toContain("funcB");
+      expect(output).toContain("normalize");
     });
 
-    expect(output).toContain("funcB");
-    expect(output).toContain("normalize");
-  });
+    test("trace_to_symbol returns a path through tool_call", async () => {
+      const h = await harness();
 
-  test("trace_to_symbol returns a path through tool_call", async () => {
-    const h = await harness();
+      const output = await runCallgraph(h, {
+        op: "trace_to_symbol",
+        filePath: "sample.ts",
+        symbol: "funcC",
+        toSymbol: "decorate",
+        toFile: "sample.ts",
+      });
 
-    const output = await runCallgraph(h, {
-      op: "trace_to_symbol",
-      filePath: "sample.ts",
-      symbol: "funcC",
-      toSymbol: "decorate",
-      toFile: "sample.ts",
+      expect(output).toMatch(/\d+ hops?/);
+      expect(output).toContain("funcC");
+      expect(output).toContain("decorate");
     });
 
-    expect(output).toMatch(/\d+ hops?/);
-    expect(output).toContain("funcC");
-    expect(output).toContain("decorate");
+    test("symbol_not_found is returned as plain text instead of thrown", async () => {
+      const h = await harness();
+      await runCallgraph(h, { op: "callers", filePath: "sample.ts", symbol: "normalize" });
+
+      const output = await runCallgraph(
+        h,
+        { op: "callers", filePath: "sample.ts", symbol: "doesNotExist" },
+        { allowBuilding: true },
+      );
+
+      expect(output).toContain("symbol_not_found");
+      expect(output).toContain("doesNotExist");
+    });
+
+    test("genuine argument errors throw", async () => {
+      const h = await harness();
+      const tools = navigationTools(createPluginContext(h));
+      const context = createToolContext(h);
+
+      await expect(
+        tools.aft_callgraph.execute({ op: "callers", filePath: "", symbol: "normalize" }, context),
+      ).rejects.toThrow("'filePath' is required");
+
+      await expect(
+        tools.aft_callgraph.execute(
+          { op: "not_an_op", filePath: "sample.ts", symbol: "normalize" } as Record<
+            string,
+            unknown
+          >,
+          context,
+        ),
+      ).rejects.toThrow();
+    });
   });
+}
 
-  test("symbol_not_found is returned as plain text instead of thrown", async () => {
-    const h = await harness();
-    await runCallgraph(h, { op: "callers", filePath: "sample.ts", symbol: "normalize" });
-
-    const output = await runCallgraph(
-      h,
-      { op: "callers", filePath: "sample.ts", symbol: "doesNotExist" },
-      { allowBuilding: true },
-    );
-
-    expect(output).toContain("symbol_not_found");
-    expect(output).toContain("doesNotExist");
-  });
-
-  test("genuine argument errors throw", async () => {
-    const h = await harness();
-    const tools = navigationTools(createPluginContext(h));
-    const context = createToolContext(h);
-
-    await expect(
-      tools.aft_callgraph.execute({ op: "callers", filePath: "", symbol: "normalize" }, context),
-    ).rejects.toThrow("'filePath' is required");
-
-    await expect(
-      tools.aft_callgraph.execute(
-        { op: "not_an_op", filePath: "sample.ts", symbol: "normalize" } as Record<string, unknown>,
-        context,
-      ),
-    ).rejects.toThrow();
-  });
-});
+if (process.env.AFT_OPENCODE_E2E_IMPORT_ONLY !== "1") {
+  runCallgraphToolcallSuite();
+}
