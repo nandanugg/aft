@@ -23,7 +23,7 @@ use aft::subc::{run_subc_mode, run_subc_mode_for_test};
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
-use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
+use subc_protocol::session::{HealthReport, ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
     BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -1503,6 +1503,26 @@ fn subc_bridge_new_manifest_tools_route_in_production() {
 }
 
 #[test]
+fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
+    run_subc_bridge_production_test(
+        "subc_bridge_module_hello_advertises_health_and_tool_descriptions",
+        Duration::from_secs(30),
+        drive_module_hello_health_manifest_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_health_check_returns_root_status_report() {
+    run_subc_bridge_production_test(
+        "subc_bridge_health_check_returns_root_status_report",
+        Duration::from_secs(30),
+        drive_health_check_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_mutating_internal_error_is_not_fatal_teardown() {
     run_subc_bridge_test(
         "subc_bridge_mutating_internal_error_is_not_fatal_teardown",
@@ -1888,7 +1908,9 @@ async fn drive_s1_rejection_daemon(
     drop(stream);
 }
 
-async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
+async fn open_fake_daemon_session_with_hello(
+    input: FakeDaemonInput,
+) -> (FakeDaemonSession, ModuleHelloBody) {
     let FakeDaemonInput {
         listener,
         key,
@@ -1917,7 +1939,7 @@ async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
     let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
     assert_eq!(hello.header.ty, FrameType::Hello);
     let hello_body: ModuleHelloBody = serde_json::from_slice(&hello.body).expect("hello body");
-    let _: ModuleManifest = hello_body.manifest;
+    let _: &ModuleManifest = &hello_body.manifest;
     send_frame(
         &mut stream,
         Frame::build(
@@ -1937,18 +1959,26 @@ async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
     )
     .await;
 
-    FakeDaemonSession {
-        stream,
-        root1,
-        root2,
-        failed_root,
-        push_burst_root,
-        slow_root,
-        callgraph_root,
-        callgraph_file,
-        state,
-        executor,
-    }
+    (
+        FakeDaemonSession {
+            stream,
+            root1,
+            root2,
+            failed_root,
+            push_burst_root,
+            slow_root,
+            callgraph_root,
+            callgraph_file,
+            state,
+            executor,
+        },
+        hello_body,
+    )
+}
+
+async fn open_fake_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
+    let (session, _) = open_fake_daemon_session_with_hello(input).await;
+    session
 }
 
 async fn bind_route1(stream: &mut tokio::net::TcpStream, root1: &std::path::Path) {
@@ -4274,6 +4304,128 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
+    let (FakeDaemonSession { mut stream, .. }, hello_body) =
+        open_fake_daemon_session_with_hello(input).await;
+
+    let control_ops = hello_body
+        .control_ops
+        .expect("module hello should advertise supported control ops");
+    assert!(
+        control_ops.iter().any(|op| op == "route.bind"),
+        "route.bind missing from control_ops: {control_ops:?}"
+    );
+    assert!(
+        control_ops.iter().any(|op| op == "route.status"),
+        "route.status missing from control_ops: {control_ops:?}"
+    );
+    assert!(
+        control_ops.iter().any(|op| op == "health.check"),
+        "health.check missing from control_ops: {control_ops:?}"
+    );
+
+    let tools = match hello_body.manifest.provides.first() {
+        Some(subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. }) => tools,
+        other => panic!("expected first provider role to be ToolProvider, got {other:?}"),
+    };
+    assert_eq!(tools.len(), 21, "expected 21 manifest tools");
+    for tool in tools {
+        assert!(
+            tool.description
+                .as_deref()
+                .is_some_and(|description| !description.is_empty()),
+            "tool {} should have a non-empty description",
+            tool.name
+        );
+    }
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_health_check_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+
+    send_route_bind_with_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+            "inspect": { "enabled": false },
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (report, metrics) = loop {
+        send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
+        let report = expect_health_check_report(&mut stream, 20).await;
+        let metrics = report.metrics.clone().expect("health check metrics");
+        if report.status == subc_protocol::session::HealthStatus::Ok {
+            break (report, metrics);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "health check should settle to ok for disabled components: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
+    assert_eq!(metrics.get("root_count").and_then(Value::as_u64), Some(1));
+    assert_eq!(metrics.get("actor_count").and_then(Value::as_u64), Some(1));
+    let roots = metrics
+        .get("roots")
+        .and_then(Value::as_array)
+        .expect("health metrics roots array");
+    assert_eq!(
+        roots.len(),
+        1,
+        "expected one root health entry: {metrics:?}"
+    );
+    let root = &roots[0];
+    let expected_root = std::fs::canonicalize(&root1).unwrap_or(root1.clone());
+    assert_eq!(
+        root.get("project_root").and_then(Value::as_str),
+        Some(expected_root.to_string_lossy().as_ref())
+    );
+    assert_eq!(root.get("actor_count").and_then(Value::as_u64), Some(1));
+    assert_eq!(root.get("state").and_then(Value::as_str), Some("ready"));
+    assert_eq!(
+        root.pointer("/search_index/status").and_then(Value::as_str),
+        Some("disabled")
+    );
+    assert_eq!(
+        root.pointer("/semantic_index/status")
+            .and_then(Value::as_str),
+        Some("disabled")
+    );
+    assert_eq!(
+        root.pointer("/callgraph_store/status")
+            .and_then(Value::as_str),
+        Some("disabled")
+    );
+    assert_eq!(
+        root.pointer("/tier2/status").and_then(Value::as_str),
+        Some("disabled")
+    );
+    assert!(root
+        .pointer("/bash/running")
+        .and_then(Value::as_u64)
+        .is_some());
+    assert!(root
+        .pointer("/bash/pending_completions")
+        .and_then(Value::as_u64)
+        .is_some());
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_manifest_reachability_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -4504,6 +4656,37 @@ async fn poll_manifest_callgraph_until_ready(
         );
     }
     panic!("callgraph store did not become ready for manifest reachability test");
+}
+
+async fn send_control_request(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    request: ModuleControlRequest,
+) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            corr,
+            serde_json::to_vec(&request).expect("control request body"),
+        )
+        .expect("control request frame"),
+    )
+    .await;
+}
+
+async fn expect_health_check_report(stream: &mut tokio::net::TcpStream, corr: u64) -> HealthReport {
+    let frame = read_frame_timeout(stream, "health.check response").await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    assert_eq!(frame.header.corr, corr);
+    let response: ModuleControlResponse =
+        serde_json::from_slice(&frame.body).expect("health.check response body");
+    response
+        .health_report()
+        .expect("health.check response should carry a HealthReport")
 }
 
 async fn send_route_bind(
@@ -6154,4 +6337,78 @@ fn is_callgraph_building(response: &Value) -> bool {
 
 fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
+}
+
+/// Regression: the top-level `preview` control must reach the dispatcher.
+/// When ToolCallRequest dropped the field, plugin preview calls mutated disk
+/// before the permission prompt and the follow-up apply failed as not-found.
+#[test]
+fn subc_bridge_preview_write_does_not_touch_disk() {
+    run_subc_bridge_production_test(
+        "subc_bridge_preview_write_does_not_touch_disk",
+        Duration::from_secs(30),
+        drive_preview_write_daemon,
+        |_, _, _| {},
+    );
+}
+
+async fn drive_preview_write_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    let target = root1.join("preview-target.txt");
+
+    // Preview: must succeed, must NOT create the file.
+    let body = json!({
+        "name": "write",
+        "arguments": { "filePath": target.to_string_lossy(), "content": "hello preview\n" },
+        "preview": true,
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            1,
+            102,
+            serde_json::to_vec(&body).expect("preview tool call body"),
+        )
+        .expect("preview tool call frame"),
+    )
+    .await;
+    let preview_resp = read_frame_timeout(&mut stream, "preview write response").await;
+    assert_eq!(preview_resp.header.corr, 102);
+    assert!(
+        !tool_result_is_error(&preview_resp),
+        "preview write should succeed: {:?}",
+        tool_result_text(&preview_resp)
+    );
+    assert!(
+        !target.exists(),
+        "preview write must not touch disk (preview control was dropped on the wire)"
+    );
+
+    // Apply (no preview flag): same call mutates disk.
+    let apply = call_tool_frame(
+        &mut stream,
+        1,
+        103,
+        "write",
+        json!({ "filePath": target.to_string_lossy(), "content": "hello preview\n" }),
+        "apply write",
+    )
+    .await;
+    assert!(
+        !tool_result_is_error(&apply),
+        "apply write should succeed: {:?}",
+        tool_result_text(&apply)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("apply write exists"),
+        "hello preview\n"
+    );
+
+    send_connection_goodbye(&mut stream).await;
 }
