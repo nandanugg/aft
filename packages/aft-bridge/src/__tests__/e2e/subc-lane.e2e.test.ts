@@ -4,10 +4,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-
-import { createAftTransportPool } from "../../transport-factory.js";
 import type { AftProjectTransport, AftTransportPool, ToolCallResult } from "../../transport.js";
-import { prepareSubcLane, startSubcRig, type PreparedSubcLane, type SubcRig } from "./subc-rig.js";
+import { createAftTransportPool } from "../../transport-factory.js";
+import { type PreparedSubcLane, prepareSubcLane, type SubcRig, startSubcRig } from "./subc-rig.js";
 
 const initialPrepared = await prepareSubcLane();
 const maybeDescribe = initialPrepared.skipReason ? describe.skip : describe;
@@ -110,25 +109,21 @@ maybeDescribe(describeName, () => {
     expect(await readFile(patchTarget, "utf8")).toBe("after\n");
   });
 
-  test(
-    "long wait:true bash honors transportTimeoutMs beyond the subc default deadline",
-    async () => {
-      const transport = await bridge();
-      const started = Date.now();
-      const result = await transport.toolCall(
-        "long-bash",
-        "bash",
-        { command: "sleep 34; echo long-bash-ok", wait: true, timeout: 120_000 },
-        { transportTimeoutMs: 130_000 },
-      );
-      const elapsed = Date.now() - started;
+  test("long wait:true bash honors transportTimeoutMs beyond the subc default deadline", async () => {
+    const transport = await bridge();
+    const started = Date.now();
+    const result = await transport.toolCall(
+      "long-bash",
+      "bash",
+      { command: "sleep 34; echo long-bash-ok", wait: true, timeout: 120_000 },
+      { transportTimeoutMs: 130_000 },
+    );
+    const elapsed = Date.now() - started;
 
-      expect(result.success).toBe(true);
-      expect(JSON.stringify(result)).toContain("long-bash-ok");
-      expect(elapsed).toBeGreaterThanOrEqual(33_000);
-    },
-    60_000,
-  );
+    expect(result.success).toBe(true);
+    expect(JSON.stringify(result)).toContain("long-bash-ok");
+    expect(elapsed).toBeGreaterThanOrEqual(33_000);
+  }, 60_000);
 
   test("bash permission_required loop can be regranted with permissions_granted", async () => {
     const transport = await bridge();
@@ -201,7 +196,9 @@ function permissionPatterns(result: ToolCallResult): string[] {
   return asks.flatMap((ask) => {
     if (!ask || typeof ask !== "object") return [];
     const patterns = (ask as { patterns?: unknown }).patterns;
-    return Array.isArray(patterns) ? patterns.filter((p): p is string => typeof p === "string") : [];
+    return Array.isArray(patterns)
+      ? patterns.filter((p): p is string => typeof p === "string")
+      : [];
   });
 }
 
@@ -212,10 +209,14 @@ async function waitForCompletion(
   timeoutMs: number,
 ): Promise<Record<string, unknown>> {
   let lastDrain: Record<string, unknown> = {};
-  await waitFor(async () => {
-    lastDrain = await transport.send("bash_drain_completions", { session_id: session });
-    return completionTaskIds(lastDrain).includes(taskId);
-  }, timeoutMs, `completion ${taskId}`);
+  await waitFor(
+    async () => {
+      lastDrain = await transport.send("bash_drain_completions", { session_id: session });
+      return completionTaskIds(lastDrain).includes(taskId);
+    },
+    timeoutMs,
+    `completion ${taskId}`,
+  );
   return lastDrain;
 }
 

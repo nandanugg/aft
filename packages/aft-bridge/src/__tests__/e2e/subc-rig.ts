@@ -1,10 +1,10 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 
-import { SubcClient, type CatalogEntry } from "@cortexkit/subc-client";
+import { type CatalogEntry, SubcClient } from "@cortexkit/subc-client";
 
 const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
 const SUBC_BINARY_NAME = process.platform === "win32" ? "subc-core.exe" : "subc-core";
@@ -391,8 +391,7 @@ async function resolveFetchedSubcCoreCachePath(): Promise<{
   if (!target) {
     return {
       path: null,
-      unavailableReason:
-        `the pinned fetch cache only publishes darwin-arm64 and linux-x64 assets (current: ${process.platform}/${process.arch})`,
+      unavailableReason: `the pinned fetch cache only publishes darwin-arm64 and linux-x64 assets (current: ${process.platform}/${process.arch})`,
     };
   }
 
@@ -423,7 +422,7 @@ async function readPinnedSubcCoreTag(): Promise<string | null> {
 async function readPinnedSubcCoreTagOnce(): Promise<string | null> {
   try {
     const script = await readFile(FETCH_SUBC_CORE_SCRIPT, "utf8");
-    const match = script.match(/^SUBC_CORE_TAG=["\']?([^"\'\n]+)["\']?$/m);
+    const match = script.match(/^SUBC_CORE_TAG=["']?([^"'\n]+)["']?$/m);
     return match?.[1] ?? null;
   } catch {
     return null;

@@ -4,15 +4,14 @@ import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-
-import { createAftTransportPool } from "../../transport-factory.js";
 import type { AftProjectTransport, AftTransportPool, ToolCallResult } from "../../transport.js";
+import { createAftTransportPool } from "../../transport-factory.js";
 import {
-  prepareSubcLane,
-  startSubcRig,
   type AftModuleRuntime,
   type PreparedSubcLane,
+  prepareSubcLane,
   type SubcRig,
+  startSubcRig,
 } from "./subc-rig.js";
 
 const initialPrepared = await prepareSubcLane();

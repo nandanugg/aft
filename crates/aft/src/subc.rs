@@ -3423,16 +3423,25 @@ fn is_subc_agent_core_tool(name: &str) -> bool {
 /// must reach dispatch over subc, otherwise an idle agent can never drain a
 /// completion the wake lane nudges it about.
 ///
-/// This is a DELIBERATELY TIGHT allowlist (exactly these two names), kept
-/// separate from the agent core-tool gate so it cannot widen the fail-closed
-/// backstop in `handle_tool_call`. Both are session-scoped (the bind session is
-/// reinjected by `run_tool_call`, overriding any body `session_id`) and touch
-/// only the per-session completion registry — they carry NO config/trust surface,
-/// so admitting them does not reopen the `configure`-bypass hole the gate exists
-/// to close. Lanes are already assigned: `bash_drain_completions` = PureRead,
-/// `bash_ack_completions` = Mutating (see `command_lane`).
+/// This is a DELIBERATELY TIGHT allowlist, kept separate from the agent
+/// core-tool gate so it cannot widen the fail-closed backstop in
+/// `handle_tool_call`. Every entry is session-scoped (the bind session is
+/// reinjected by `run_tool_call`, overriding any body `session_id`) and
+/// carries NO config/trust surface, so admitting them does not reopen the
+/// `configure`-bypass hole the gate exists to close:
+/// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
+///   registry plumbing for the bg_events wake lane.
+/// - `undo_preview` / `checkpoint_paths`: read-only permission-preview reads
+///   over the session's own backup/checkpoint state — the plugin safety tool
+///   calls them BEFORE `aft_safety undo`/`restore` to know which paths to ask
+///   permission for. Without them, safety undo/restore fails over subc.
+/// Lanes are already assigned in `command_lane` (drain/undo_preview/
+/// checkpoint_paths = PureRead, ack = Mutating).
 fn is_subc_native_plumbing_tool(name: &str) -> bool {
-    matches!(name, "bash_drain_completions" | "bash_ack_completions")
+    matches!(
+        name,
+        "bash_drain_completions" | "bash_ack_completions" | "undo_preview" | "checkpoint_paths"
+    )
 }
 
 fn command_lane(command: &str) -> Lane {
@@ -4752,13 +4761,17 @@ mod tests {
     }
 
     #[test]
-    fn native_plumbing_allowlist_admits_exactly_drain_and_ack() {
+    fn native_plumbing_allowlist_admits_exactly_drain_ack_and_safety_previews() {
         // BC2: the route gate admits a name when it's an agent core tool OR a
-        // native plumbing command. These two carry no agent surface and no
+        // native plumbing command. These carry no agent surface and no
         // config/trust surface, so they're admitted to dispatch over a bound
         // route while everything else (notably `configure`) stays fail-closed.
         assert!(is_subc_native_plumbing_tool("bash_drain_completions"));
         assert!(is_subc_native_plumbing_tool("bash_ack_completions"));
+        // Safety-tool permission previews: read-only, session-scoped. Without
+        // these, aft_safety undo/restore breaks over the subc transport.
+        assert!(is_subc_native_plumbing_tool("undo_preview"));
+        assert!(is_subc_native_plumbing_tool("checkpoint_paths"));
 
         // The allowlist is TIGHT — it must not admit the config-bypass vector
         // the fail-closed gate exists to block, nor any other native command.

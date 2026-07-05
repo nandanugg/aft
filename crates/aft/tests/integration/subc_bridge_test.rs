@@ -4390,9 +4390,17 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     );
     let root = &roots[0];
     let expected_root = std::fs::canonicalize(&root1).unwrap_or(root1.clone());
+    // fs::canonicalize returns a \\?\ verbatim path on Windows while the
+    // health snapshot reports the module's de-verbatimed root; compare with
+    // the prefix stripped instead of asserting the raw canonical string.
+    let strip_verbatim = |s: &str| s.trim_start_matches(r"\\?\").to_string();
+    let reported_root = root
+        .get("project_root")
+        .and_then(Value::as_str)
+        .map(strip_verbatim);
     assert_eq!(
-        root.get("project_root").and_then(Value::as_str),
-        Some(expected_root.to_string_lossy().as_ref())
+        reported_root,
+        Some(strip_verbatim(&expected_root.to_string_lossy()))
     );
     assert_eq!(root.get("actor_count").and_then(Value::as_u64), Some(1));
     assert_eq!(root.get("state").and_then(Value::as_str), Some("ready"));
