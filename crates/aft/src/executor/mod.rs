@@ -231,6 +231,16 @@ impl Executor {
             .collect()
     }
 
+    /// Snapshot the registered root ids paired with their actor contexts.
+    pub fn actor_entries(&self) -> Vec<(ProjectRootId, Arc<AppContext>)> {
+        let state = self.inner.state.lock();
+        state
+            .actors
+            .iter()
+            .map(|(root_id, actor_state)| (root_id.clone(), Arc::clone(&actor_state.ctx)))
+            .collect()
+    }
+
     pub fn submit(
         &self,
         root_id: ProjectRootId,

@@ -2,7 +2,8 @@
   "status": {
     "type": "object",
     "properties": {},
-    "additionalProperties": false
+    "additionalProperties": false,
+    "description": "Show AFT status, index health, cache usage, and runtime details"
   },
   "bash": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -65,7 +66,8 @@
     },
     "required": [
       "command"
-    ]
+    ],
+    "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead."
   },
   "read": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -102,7 +104,8 @@
     },
     "required": [
       "filePath"
-    ]
+    ],
+    "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n"
   },
   "write": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -120,7 +123,8 @@
     "required": [
       "filePath",
       "content"
-    ]
+    ],
+    "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool."
   },
   "edit": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -171,7 +175,8 @@
           "additionalProperties": {}
         }
       }
-    }
+    },
+    "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nMode priority: appendContent > edits > symbol (without oldString) > oldString (find/replace). If none match, the call is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating the file if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type) with new content.\n   Includes decorators, attributes, and doc comments in the replacement range.\n   **Important:** You must NOT provide `oldString` when using symbol mode — if present, the tool silently falls back to find/replace mode.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — pass `filePath` + `oldString` + `newString`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify which one with `occurrence` or use `replaceAll: true`.\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"const x = 1\", \"newString\": \"const x = 2\" }`\n\n5. **Replace all occurrences** — add `replaceAll: true`\n   Replaces every occurrence of `oldString` in the file.\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"oldName\", \"newString\": \"newName\", \"replaceAll\": true }`\n\n6. **Select specific occurrence** — add `occurrence: N` (0-indexed)\n   When multiple matches exist, select the Nth one (0 = first, 1 = second, etc.).\n   Example: `{ \"filePath\": \"src/app.ts\", \"oldString\": \"TODO\", \"newString\": \"DONE\", \"occurrence\": 0 }`\n\nNote: Modes 5 and 6 are options on mode 4 (find/replace) — they require `oldString`.\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available."
   },
   "apply_patch": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -184,7 +189,8 @@
     },
     "required": [
       "patchText"
-    ]
+    ],
+    "description": "Use the `apply_patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nWithin that envelope, you get a sequence of file operations.\nYou MUST include a header to specify the action you are taking.\nEach operation starts with one of three headers:\n\n*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).\n*** Delete File: <path> - remove an existing file. Nothing follows.\n*** Update File: <path> - patch an existing file in place (optionally with a rename).\n*** Move to: <path> - after update file header, renames the file.\n\n\nExample patch:\n\n```\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n```\n\n**Behavior:**\n- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. Use `aft_safety` undo if you need to revert the applied changes.\n- Files are backed up before modification\n- Parent directories are created automatically for new files\n- Fuzzy matching for context anchors (handles whitespace and Unicode differences)\n\n**It is important to remember:**\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even when creating a new file\n\nEdits return as soon as the write completes unless `lsp.diagnostics_on_edit` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits."
   },
   "grep": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -202,7 +208,8 @@
     },
     "required": [
       "pattern"
-    ]
+    ],
+    "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Capped at 100 matches; if you hit the cap, narrow with `path` or `include` and re-run."
   },
   "glob": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -217,7 +224,8 @@
     },
     "required": [
       "pattern"
-    ]
+    ],
+    "description": "Find files matching a glob pattern. Returns matching file paths sorted by modification time."
   },
   "search": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -254,7 +262,8 @@
     },
     "required": [
       "query"
-    ]
+    ],
+    "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nSet hint to 'regex', 'literal', or 'semantic' to force a lane."
   },
   "outline": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -285,7 +294,8 @@
     },
     "required": [
       "target"
-    ]
+    ],
+    "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline all source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory"
   },
   "zoom": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -365,7 +375,8 @@
         "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
         "type": "boolean"
       }
-    }
+    },
+    "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ filePath, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ filePath, symbol }` or an array of them."
   },
   "inspect": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -405,7 +416,8 @@
         "exclusiveMinimum": 0,
         "maximum": 100
       }
-    }
+    },
+    "description": "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\nCategories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Rust module cycles are out of scope for `cycles`.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting."
   },
   "callgraph": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -462,7 +474,8 @@
       "op",
       "filePath",
       "symbol"
-    ]
+    ],
+    "description": "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\nUse aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\nOps:\n- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n- 'call_tree': What a function calls (forward traversal). Use to understand a function's dependencies before modifying it.\n- 'trace_to': How execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toFile' to disambiguate.\n- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\nAll ops require both 'filePath' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\nMarkers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.\n"
   },
   "conflicts": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -472,7 +485,8 @@
         "description": "Optional path inside the git repository or worktree to inspect (absolute or relative to project root). Conflicts are discovered from that repository's top level. Defaults to the session project root.",
         "type": "string"
       }
-    }
+    },
+    "description": "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call. Conflicts are discovered from the git repository's top level. By default it inspects the session's project repository; pass `path` to inspect a different repository or git worktree (e.g. where a rebase/merge is running)."
   },
   "ast_search": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -521,7 +535,8 @@
     "required": [
       "pattern",
       "lang"
-    ]
+    ],
+    "description": "Search code patterns across filesystem using AST-aware matching. Supports 9 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'"
   },
   "ast_replace": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -573,7 +588,8 @@
       "pattern",
       "rewrite",
       "lang"
-    ]
+    ],
+    "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements."
   },
   "delete": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -594,7 +610,8 @@
     },
     "required": [
       "files"
-    ]
+    ],
+    "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`."
   },
   "move": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -612,7 +629,8 @@
     "required": [
       "filePath",
       "destination"
-    ]
+    ],
+    "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead."
   },
   "import": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -685,7 +703,8 @@
     "required": [
       "op",
       "filePath"
-    ]
+    ],
+    "description": "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, and Vue.\n\nOps:\n- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'filePath'. Use aft_safety checkpoint/undo for recovery before broad cleanup."
   },
   "refactor": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -742,7 +761,8 @@
     "required": [
       "op",
       "filePath"
-    ]
+    ],
+    "description": "Workspace-wide refactoring that updates imports and references across files.\n\nOps:\n- 'move': move a top-level symbol (not nested functions or class methods) to another file, rewriting imports workspace-wide. A checkpoint is created first. To move/rename a whole file, use aft_move.\n- 'extract': extract a line range into a new function with auto-detected parameters (TS/JS/TSX, Python).\n- 'inline': replace a function call with the function's body."
   },
   "safety": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -777,6 +797,7 @@
     },
     "required": [
       "op"
-    ]
+    ],
+    "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'filePath' is omitted (typical), or undo the last edit to one file when 'filePath' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'filePath'.\n- 'checkpoint': Save a named snapshot of tracked files. Requires 'name'. Optional 'files' to snapshot specific files only.\n- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback."
   }
 }

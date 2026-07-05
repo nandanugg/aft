@@ -25,6 +25,8 @@ describe("subc tool schemas artifact", () => {
     for (const name of SUBC_BARE_TOOL_NAMES) {
       expect(parsed[name]).toBeDefined();
       expect(parsed[name].type).toBe("object");
+      expect(typeof parsed[name].description).toBe("string");
+      expect((parsed[name].description as string).length).toBeGreaterThan(0);
     }
     expect(Object.keys(parsed).sort()).toEqual([...SUBC_BARE_TOOL_NAMES].sort());
   });

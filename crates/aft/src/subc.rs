@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::config_resolve::ConfigTier;
-use crate::context::{App, AppContext, ProgressSender};
+use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
 use crate::executor::{Executor, Lane};
 use crate::jsonc::strip_jsonc;
 use crate::log_ctx;
@@ -37,7 +37,10 @@ use subc_protocol::manifest::{
     Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
     ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
 };
-use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
+use subc_protocol::session::{
+    HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
+    MODULE_CONTROL_OP_HEALTH_CHECK,
+};
 use subc_protocol::{
     ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, PROTOCOL_VERSION,
 };
@@ -1238,13 +1241,13 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // ModuleHello: register as a tool provider. control_ops:None = full baseline.
+    // ModuleHello: register as a tool provider and advertise the supported control-plane operations.
     // Echo the one-time launch nonce the daemon injected via SUBC_LAUNCH_NONCE so a
     // reserved module_id's HELLO is accepted; absent for non-reserved/self-connect.
     let hello = ModuleHelloBody {
         manifest: build_manifest(),
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: None,
+        control_ops: control_ops(),
         launch_nonce: std::env::var("SUBC_LAUNCH_NONCE").ok(),
     };
     let hello_frame = Frame::build(
@@ -1902,10 +1905,10 @@ async fn handle_route_bind_completion(
     Ok(())
 }
 
-/// channel-0 control request — currently only RouteBind. Reconciles the route's
-/// RootConfig through the executor's Mutating lane and resolves completion on a
-/// loop-owned control-completion channel so slow configure jobs do not block the
-/// transport loop.
+/// channel-0 control requests: RouteBind plus the cached health probe. RouteBind
+/// still reconciles the route's RootConfig through the executor's Mutating lane
+/// and resolves completion on a loop-owned control-completion channel so slow
+/// configure jobs do not block the transport loop.
 async fn handle_control_request(
     tx: &mpsc::Sender<Frame>,
     frame: &Frame,
@@ -2116,6 +2119,21 @@ async fn handle_control_request(
             });
 
             Ok(())
+        }
+        ModuleControlRequest::HealthCheck {} => {
+            let report = build_health_report(executor);
+            let body = serde_json::to_vec(&ModuleControlResponse::from(report))
+                .map_err(SubcError::Json)?;
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                frame.header.flags,
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(SubcError::FrameBuild)?;
+            send_frame(tx, response).await
         }
     }
 }
@@ -3523,6 +3541,14 @@ fn tool_schema(name: &str) -> Value {
     })
 }
 
+fn tool_description(name: &str) -> Option<String> {
+    SUBC_TOOL_SCHEMAS
+        .get(name)
+        .and_then(|schema| schema.get("description"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// AFT's subc-mode capability manifest. It uses bare internal tool names
 /// because the gateway adds any `aft_` prefix for agent-facing displays; AFT
 /// schedules concurrent calls itself; the gateway runs AFT directly without a
@@ -3530,6 +3556,7 @@ fn tool_schema(name: &str) -> Value {
 fn build_manifest() -> ModuleManifest {
     let tool = |name: &str, execution_mode: ExecutionMode| Tool {
         name: name.to_string(),
+        description: tool_description(name),
         execution_mode,
         schema: tool_schema(name),
     };
@@ -3588,6 +3615,44 @@ fn build_manifest() -> ModuleManifest {
             },
         },
     }
+}
+
+fn build_health_report(executor: &Executor) -> HealthReport {
+    let mut roots: Vec<RootHealthSnapshot> = executor
+        .actor_entries()
+        .into_iter()
+        .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
+        .collect();
+    roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
+
+    let all_roots_ready = roots.iter().all(RootHealthSnapshot::is_fully_ready);
+    let detail = if roots.is_empty() || all_roots_ready {
+        None
+    } else {
+        Some("one or more root actors are still warming, degraded, or busy".to_string())
+    };
+
+    HealthReport {
+        status: if all_roots_ready {
+            HealthStatus::Ok
+        } else {
+            HealthStatus::Degraded
+        },
+        detail,
+        metrics: Some(json!({
+            "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
+            "root_count": roots.len(),
+            "roots": roots,
+        })),
+    }
+}
+
+fn control_ops() -> Option<Vec<String>> {
+    Some(vec![
+        "route.bind".to_string(),
+        "route.status".to_string(),
+        MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
+    ])
 }
 
 fn control_flags() -> Flags {
@@ -4589,6 +4654,12 @@ mod tests {
             let tool = by_name
                 .get(name)
                 .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(
+                tool.description
+                    .as_deref()
+                    .is_some_and(|description| !description.is_empty()),
+                "{name} must carry a non-empty manifest description"
+            );
             assert!(
                 !is_bare_placeholder_schema(&tool.schema),
                 "{name} must not use bare placeholder schema"

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use registry::{BgCompletion, BgTaskRegistry};
+pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BgTaskInfo {

@@ -23,6 +23,8 @@ import type { PluginContext } from "./types.js";
 
 const z = tool.schema;
 
+const STATUS_DESCRIPTION = "Show AFT status, index health, cache usage, and runtime details";
+
 const STATUS_SCHEMA = {
   type: "object",
   properties: {},
@@ -71,8 +73,11 @@ export function makeSubcSchemaStubCtx(): PluginContext {
 
 function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
   const wrapped = z.object(def.args);
-  const jsonSchema = z.toJSONSchema(wrapped, { io: "input" });
-  return jsonSchema as Record<string, unknown>;
+  const jsonSchema = z.toJSONSchema(wrapped, { io: "input" }) as Record<string, unknown>;
+  if (typeof def.description === "string" && def.description.length > 0) {
+    return { ...jsonSchema, description: def.description };
+  }
+  return jsonSchema;
 }
 
 /**
@@ -141,7 +146,7 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   };
 
   return {
-    status: { ...STATUS_SCHEMA },
+    status: { ...STATUS_SCHEMA, description: STATUS_DESCRIPTION },
     bash: bashSchema,
     read: argsToJsonSchema(read),
     write: argsToJsonSchema(write),

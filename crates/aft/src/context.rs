@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::backup::hash_session;
 use crate::backup::BackupStore;
-use crate::bash_background::{BgCompletion, BgTaskRegistry};
+use crate::bash_background::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
 use crate::callgraph_store::{CallGraphStore, CallGraphStoreError};
 use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
@@ -66,6 +67,77 @@ struct StatusBarTier2 {
     duplicates: Option<usize>,
     todos: Option<usize>,
     stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RootHealthState {
+    Ready,
+    Busy,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HealthComponentSnapshot {
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Tier2HealthSnapshot {
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RootHealthSnapshot {
+    pub project_root: String,
+    pub actor_count: usize,
+    pub state: RootHealthState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_index: Option<HealthComponentSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_index: Option<HealthComponentSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callgraph_store: Option<HealthComponentSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier2: Option<Tier2HealthSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bash: Option<BgTaskHealthCounts>,
+}
+
+impl RootHealthSnapshot {
+    fn busy(project_root: &Path) -> Self {
+        Self {
+            project_root: project_root.display().to_string(),
+            actor_count: 1,
+            state: RootHealthState::Busy,
+            search_index: None,
+            semantic_index: None,
+            callgraph_store: None,
+            tier2: None,
+            bash: None,
+        }
+    }
+
+    pub fn is_fully_ready(&self) -> bool {
+        let component_is_satisfied =
+            |status: &HealthComponentSnapshot| matches!(status.status, "ready" | "disabled");
+        let tier2_is_satisfied =
+            |tier2: &Tier2HealthSnapshot| matches!(tier2.status, "ready" | "disabled");
+
+        matches!(self.state, RootHealthState::Ready)
+            && self
+                .search_index
+                .as_ref()
+                .is_some_and(component_is_satisfied)
+            && self
+                .semantic_index
+                .as_ref()
+                .is_some_and(component_is_satisfied)
+            && self
+                .callgraph_store
+                .as_ref()
+                .is_some_and(component_is_satisfied)
+            && self.tier2.as_ref().is_some_and(tier2_is_satisfied)
+    }
 }
 
 pub struct StatusEmitter {
@@ -881,6 +953,99 @@ impl AppContext {
             todos,
             tier2_stale,
         })
+    }
+
+    pub fn try_health_snapshot(&self, project_root: &Path) -> RootHealthSnapshot {
+        let config = match self.config.try_read() {
+            Ok(guard) => Arc::clone(&*guard),
+            Err(_) => return RootHealthSnapshot::busy(project_root),
+        };
+        let search_index = match self.search_index.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSnapshot::busy(project_root),
+        };
+        let search_index_rx = match self.search_index_rx.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSnapshot::busy(project_root),
+        };
+        let semantic_status = match self.semantic_index_status.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSnapshot::busy(project_root),
+        };
+        let callgraph_store = match self.callgraph_store.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSnapshot::busy(project_root),
+        };
+        let callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
+            Some(guard) => guard,
+            None => return RootHealthSnapshot::busy(project_root),
+        };
+        let tier2 = match self.status_bar_tier2.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSnapshot::busy(project_root),
+        };
+        let bash = match self.bash_background.try_health_counts() {
+            Some(counts) => counts,
+            None => return RootHealthSnapshot::busy(project_root),
+        };
+
+        let search_index_status = if search_index.as_ref().is_some_and(|index| index.ready) {
+            "ready"
+        } else if config.search_index
+            || search_index.as_ref().is_some()
+            || search_index_rx.as_ref().is_some()
+        {
+            "building"
+        } else {
+            "disabled"
+        };
+        let semantic_index_status = match &*semantic_status {
+            SemanticIndexStatus::Ready { .. } => "ready",
+            SemanticIndexStatus::Building { .. } => "building",
+            SemanticIndexStatus::Disabled => "disabled",
+            SemanticIndexStatus::Failed(_) => "degraded",
+        };
+        let callgraph_store_status = if callgraph_store.as_ref().is_some() {
+            "ready"
+        } else if callgraph_store_rx.is_some() || config.callgraph_store {
+            "building"
+        } else {
+            "disabled"
+        };
+        let tier2_status = if !config.inspect.enabled
+            || (tier2.dead_code.is_none()
+                && tier2.unused_exports.is_none()
+                && tier2.duplicates.is_none())
+        {
+            "disabled"
+        } else if tier2.dead_code.is_some()
+            && tier2.unused_exports.is_some()
+            && tier2.duplicates.is_some()
+            && !tier2.stale
+        {
+            "ready"
+        } else {
+            "building"
+        };
+
+        RootHealthSnapshot {
+            project_root: project_root.display().to_string(),
+            actor_count: 1,
+            state: RootHealthState::Ready,
+            search_index: Some(HealthComponentSnapshot {
+                status: search_index_status,
+            }),
+            semantic_index: Some(HealthComponentSnapshot {
+                status: semantic_index_status,
+            }),
+            callgraph_store: Some(HealthComponentSnapshot {
+                status: callgraph_store_status,
+            }),
+            tier2: Some(Tier2HealthSnapshot {
+                status: tier2_status,
+            }),
+            bash: Some(bash),
+        }
     }
 
     pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {

@@ -114,6 +114,12 @@ pub struct BgTaskSnapshot {
     pub pty_screen: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BgTaskHealthCounts {
+    pub running: usize,
+    pub pending_completions: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalOutputKind {
     Compressed,
@@ -2665,6 +2671,20 @@ impl BgTaskRegistry {
     fn task_for_session(&self, task_id: &str, session_id: &str) -> Option<Arc<BgTask>> {
         self.task(task_id)
             .filter(|task| task.session_id == session_id)
+    }
+
+    pub fn try_health_counts(&self) -> Option<BgTaskHealthCounts> {
+        let running = self
+            .inner
+            .tasks
+            .try_lock()
+            .ok()
+            .map(|tasks| tasks.values().filter(|task| task.is_running()).count())?;
+        let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
+        Some(BgTaskHealthCounts {
+            running,
+            pending_completions,
+        })
     }
 
     fn running_count(&self) -> usize {

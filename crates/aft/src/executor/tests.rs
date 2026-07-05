@@ -79,6 +79,28 @@ fn actor_contexts_returns_registered_contexts() {
 }
 
 #[test]
+fn actor_entries_return_roots_and_contexts() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_dir_a, root_a) = test_root("entries-a");
+    let (_dir_b, root_b) = test_root("entries-b");
+    let ctx_a = test_ctx();
+    let ctx_b = test_ctx();
+
+    assert!(executor.register_actor(root_a.clone(), Arc::clone(&ctx_a)));
+    assert!(executor.register_actor(root_b.clone(), Arc::clone(&ctx_b)));
+
+    let entries = executor.actor_entries();
+
+    assert_eq!(entries.len(), 2);
+    assert!(entries
+        .iter()
+        .any(|(root, ctx)| root == &root_a && Arc::ptr_eq(ctx, &ctx_a)));
+    assert!(entries
+        .iter()
+        .any(|(root, ctx)| root == &root_b && Arc::ptr_eq(ctx, &ctx_b)));
+}
+
+#[test]
 fn cross_actor_isolation() {
     let executor = test_executor(4, 2, 3, 2);
     let (_dir_a, root_a) = test_root("isolation-a");
