@@ -668,7 +668,10 @@ mod tests {
             nearby_string: None,
         };
         let s = serde_json::to_string(&edge).unwrap();
-        assert!(!s.contains("nearby_string"), "nearby_string=None should be omitted: {s}");
+        assert!(
+            !s.contains("nearby_string"),
+            "nearby_string=None should be omitted: {s}"
+        );
     }
 
     #[test]
@@ -689,7 +692,10 @@ mod tests {
             nearby_string: Some("send-email".to_string()),
         };
         let s = serde_json::to_string(&edge).unwrap();
-        assert!(s.contains("nearby_string"), "nearby_string=Some should be present: {s}");
+        assert!(
+            s.contains("nearby_string"),
+            "nearby_string=Some should be present: {s}"
+        );
         assert!(s.contains("send-email"));
     }
 
@@ -703,7 +709,10 @@ mod tests {
         assert_eq!(out, again);
         // All edges should have nearby_string=None (old format)
         for e in &out.edges {
-            assert_eq!(e.nearby_string, None, "old-format edges should have no nearby_string");
+            assert_eq!(
+                e.nearby_string, None,
+                "old-format edges should have no nearby_string"
+            );
         }
     }
 

@@ -945,9 +945,8 @@ impl AppContext {
     /// Receiver slot for an in-flight helper run installed by configure.
     pub fn go_helper_rx(
         &self,
-    ) -> &parking_lot::Mutex<
-        Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>,
-    > {
+    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<Result<HelperOutput, HelperError>>>>
+    {
         &self.go_helper_rx
     }
 
