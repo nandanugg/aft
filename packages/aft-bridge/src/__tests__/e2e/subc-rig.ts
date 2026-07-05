@@ -1,8 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 
 import { SubcClient, type CatalogEntry } from "@cortexkit/subc-client";
 
@@ -22,12 +22,39 @@ const DEFAULT_SUBC_DEBUG = resolve(
   SUBC_BINARY_NAME,
 );
 const START_TIMEOUT_MS = 20_000;
+const CONTROL_TIMEOUT_MS = 5_000;
 
 export interface PreparedSubcLane {
   aftBinaryPath: string | null;
   subcCorePath: string | null;
   skipReason?: string;
   buildAttempted: boolean;
+}
+
+export interface ProjectFixtureOptions {
+  /** Number of extra small files to create under nested bulk directories. */
+  fileCount?: number;
+  /** Number of first-level bulk directories used to spread file creation. */
+  nestedDirs?: number;
+}
+
+export interface SubcSupervisorModule {
+  module_id: string;
+  state?: string;
+  enabled?: boolean;
+  live?: boolean;
+  restart_count?: number;
+  restartCount?: number;
+  pid?: number;
+  [key: string]: unknown;
+}
+
+export interface AftModuleRuntime {
+  pid: number;
+  command: string;
+  restartCount: number | null;
+  supervisor: SubcSupervisorModule | null;
+  catalogReady: boolean;
 }
 
 export interface SubcRig {
@@ -39,7 +66,32 @@ export interface SubcRig {
   readonly projectDir: string;
   readonly connectionFile: string;
   readonly daemonPid: number | undefined;
+  createProject(name: string, options?: ProjectFixtureOptions): Promise<string>;
+  listSupervisorModules(): Promise<SubcSupervisorModule[]>;
+  aftModuleRuntime(): Promise<AftModuleRuntime | null>;
+  waitForAftModuleRuntime(timeoutMs?: number): Promise<AftModuleRuntime>;
+  waitForAftModuleRestart(
+    previous: AftModuleRuntime,
+    timeoutMs?: number,
+  ): Promise<AftModuleRuntime>;
+  waitForAftCatalog(timeoutMs?: number): Promise<void>;
+  restartDaemon(): Promise<void>;
   cleanup(): Promise<void>;
+}
+
+interface DaemonDirs {
+  homeDir: string;
+  configHome: string;
+  runtimeDir: string;
+  dataHome: string;
+  stderrPath: string;
+  connectionFile: string;
+}
+
+interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  command: string;
 }
 
 let preparedPromise: Promise<PreparedSubcLane> | null = null;
@@ -66,7 +118,6 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   const stderrPath = join(tempDir, "subc-core.stderr.log");
 
   await mkdir(join(configHome, "cortexkit"), { recursive: true });
-  await mkdir(join(projectDir, ".cortexkit"), { recursive: true });
   await Promise.all([mkdir(homeDir, { recursive: true }), mkdir(runtimeDir, { recursive: true })]);
   await Promise.all([mkdir(dataHome, { recursive: true }), mkdir(cacheDir, { recursive: true })]);
 
@@ -85,18 +136,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     ),
     "utf8",
   );
-  await writeFile(
-    join(projectDir, ".cortexkit", "aft.jsonc"),
-    JSON.stringify({ search_index: false, semantic_search: false }, null, 2),
-    "utf8",
-  );
-  await writeFile(join(projectDir, "seed.txt"), "seed\n", "utf8");
-  await runGit(projectDir, ["init", "-q", "-b", "main"]);
-  await runGit(projectDir, ["config", "user.email", "subc-lane@example.com"]);
-  await runGit(projectDir, ["config", "user.name", "Subc Lane"]);
-  await runGit(projectDir, ["config", "commit.gpgsign", "false"]);
-  await runGit(projectDir, ["add", "."]);
-  await runGit(projectDir, ["commit", "-q", "-m", "seed"]);
+  await setupProjectFixture(projectDir);
 
   await writeFile(
     join(configHome, "cortexkit", "subc.jsonc"),
@@ -126,16 +166,18 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     "utf8",
   );
 
+  const daemonDirs: DaemonDirs = {
+    homeDir,
+    configHome,
+    runtimeDir,
+    dataHome,
+    stderrPath,
+    connectionFile,
+  };
+
   let daemon: ChildProcessWithoutNullStreams | null = null;
   try {
-    daemon = await spawnReadyDaemon(prepared.subcCorePath, {
-      homeDir,
-      configHome,
-      runtimeDir,
-      dataHome,
-      stderrPath,
-      connectionFile,
-    });
+    daemon = await spawnReadyDaemon(prepared.subcCorePath, daemonDirs);
   } catch (err) {
     await safeRemoveDir(tempDir);
     throw err;
@@ -150,7 +192,34 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     dataHome,
     projectDir,
     connectionFile,
-    daemonPid: daemon.pid,
+    get daemonPid() {
+      return daemon?.pid;
+    },
+    createProject: async (name, options) => {
+      const fixtureDir = join(tempDir, name);
+      await setupProjectFixture(fixtureDir, options);
+      return fixtureDir;
+    },
+    listSupervisorModules: () => listSupervisorModules(connectionFile),
+    aftModuleRuntime: () =>
+      readAftModuleRuntime(connectionFile, daemon?.pid, prepared.aftBinaryPath),
+    waitForAftModuleRuntime: (timeoutMs = START_TIMEOUT_MS) =>
+      waitForAftModuleRuntime(connectionFile, daemon?.pid, prepared.aftBinaryPath, timeoutMs),
+    waitForAftModuleRestart: (previous, timeoutMs = 30_000) =>
+      waitForAftModuleRestart(
+        connectionFile,
+        daemon?.pid,
+        prepared.aftBinaryPath,
+        previous,
+        timeoutMs,
+      ),
+    waitForAftCatalog: (timeoutMs = START_TIMEOUT_MS) =>
+      waitForAftCatalog(connectionFile, daemon, [], timeoutMs),
+    restartDaemon: async () => {
+      if (cleaned) throw new Error("subc rig already cleaned up");
+      await stopDaemon(daemon);
+      daemon = await spawnReadyDaemon(prepared.subcCorePath, daemonDirs);
+    },
     cleanup: async () => {
       if (cleaned) return;
       cleaned = true;
@@ -160,10 +229,65 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   };
 }
 
+async function setupProjectFixture(
+  projectDir: string,
+  options: ProjectFixtureOptions = {},
+): Promise<void> {
+  await mkdir(join(projectDir, ".cortexkit"), { recursive: true });
+  await writeFile(
+    join(projectDir, ".cortexkit", "aft.jsonc"),
+    JSON.stringify({ search_index: false, semantic_search: false }, null, 2),
+    "utf8",
+  );
+  await writeFile(join(projectDir, "seed.txt"), "seed\n", "utf8");
+  if (options.fileCount && options.fileCount > 0) {
+    await writeBulkFixtureFiles(projectDir, options.fileCount, options.nestedDirs ?? 40);
+  }
+  await runGit(projectDir, ["init", "-q", "-b", "main"]);
+  await runGit(projectDir, ["config", "user.email", "subc-lane@example.com"]);
+  await runGit(projectDir, ["config", "user.name", "Subc Lane"]);
+  await runGit(projectDir, ["config", "commit.gpgsign", "false"]);
+  await runGit(projectDir, ["add", "."]);
+  await runGit(projectDir, ["commit", "-q", "-m", "seed"]);
+}
+
+async function writeBulkFixtureFiles(
+  projectDir: string,
+  fileCount: number,
+  nestedDirs: number,
+): Promise<void> {
+  const batch: Array<Promise<void>> = [];
+  for (let i = 0; i < fileCount; i++) {
+    const dir = join(
+      projectDir,
+      "bulk",
+      `dir-${String(i % nestedDirs).padStart(2, "0")}`,
+      `sub-${String(Math.floor(i / nestedDirs) % 10).padStart(2, "0")}`,
+    );
+    batch.push(
+      (async () => {
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          join(dir, `file-${String(i).padStart(4, "0")}.txt`),
+          `bulk file ${i}\n`,
+          "utf8",
+        );
+      })(),
+    );
+    if (batch.length >= 100) await Promise.all(batch.splice(0));
+  }
+  await Promise.all(batch);
+}
+
 async function prepareSubcLaneOnce(): Promise<PreparedSubcLane> {
   const subc = await resolveSubcCore();
   if (!subc.path) {
-    return { aftBinaryPath: null, subcCorePath: null, skipReason: subc.skipReason, buildAttempted: false };
+    return {
+      aftBinaryPath: null,
+      subcCorePath: null,
+      skipReason: subc.skipReason,
+      buildAttempted: false,
+    };
   }
 
   const aft = await prepareAftBinary();
@@ -229,14 +353,7 @@ async function prepareAftBinary(): Promise<{
 
 async function spawnReadyDaemon(
   subcCorePath: string,
-  dirs: {
-    homeDir: string;
-    configHome: string;
-    runtimeDir: string;
-    dataHome: string;
-    stderrPath: string;
-    connectionFile: string;
-  },
+  dirs: DaemonDirs,
 ): Promise<ChildProcessWithoutNullStreams> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -273,32 +390,176 @@ async function spawnReadyDaemon(
 
 async function waitForAftCatalog(
   connectionFile: string,
-  daemon: ChildProcessWithoutNullStreams,
+  daemon: ChildProcessWithoutNullStreams | null,
   stderrChunks: string[],
   timeoutMs: number,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError = "connection file not ready";
   while (Date.now() < deadline) {
-    if (daemon.exitCode !== null) {
+    if (daemon && daemon.exitCode !== null) {
       throw new Error(
         `subc-core exited before aft registered (exit ${daemon.exitCode}); stderr:\n${stderrChunks.join("")}`,
       );
     }
-    let client: SubcClient | null = null;
     try {
-      client = await SubcClient.connect({ connectionFile, handshakeTimeoutMs: 1_000 });
-      const entries = await client.catalogList("aft");
-      if (entries.some(isAftToolProvider)) return;
-      lastError = `catalog missing aft tool_provider; saw ${JSON.stringify(entries)}`;
+      if (await catalogHasAft(connectionFile)) return;
+      lastError = "catalog missing aft tool_provider";
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
-    } finally {
-      client?.close();
     }
     await sleep(200);
   }
   throw new Error(`timed out waiting for aft in subc catalog: ${lastError}`);
+}
+
+async function catalogHasAft(connectionFile: string): Promise<boolean> {
+  let client: SubcClient | null = null;
+  try {
+    client = await SubcClient.connect({ connectionFile, handshakeTimeoutMs: 1_000 });
+    const entries = await client.catalogList("aft");
+    return entries.some(isAftToolProvider);
+  } finally {
+    client?.close();
+  }
+}
+
+async function listSupervisorModules(connectionFile: string): Promise<SubcSupervisorModule[]> {
+  let client: SubcClient | null = null;
+  try {
+    client = await SubcClient.connect({ connectionFile, handshakeTimeoutMs: 1_000 });
+    const reply = await client.request(
+      0,
+      { op: "supervisor.list" },
+      { timeoutMs: CONTROL_TIMEOUT_MS },
+    );
+    if (!reply || typeof reply !== "object") return [];
+    const modules = (reply as { modules?: unknown }).modules;
+    if (!Array.isArray(modules)) return [];
+    return modules.filter(isSupervisorModule);
+  } finally {
+    client?.close();
+  }
+}
+
+async function readAftModuleRuntime(
+  connectionFile: string,
+  daemonPid: number | undefined,
+  aftBinaryPath: string,
+): Promise<AftModuleRuntime | null> {
+  let modules: SubcSupervisorModule[] = [];
+  let catalogReady = false;
+  try {
+    modules = await listSupervisorModules(connectionFile);
+  } catch {
+    // During daemon restarts the control socket can vanish between polls.
+  }
+  try {
+    catalogReady = await catalogHasAft(connectionFile);
+  } catch {
+    catalogReady = false;
+  }
+
+  const supervisor = modules.find((module) => module.module_id === "aft") ?? null;
+  const supervisorPid = numberField(supervisor?.pid);
+  const processInfo = daemonPid
+    ? await findAftModuleProcess(daemonPid, aftBinaryPath).catch(() => null)
+    : null;
+  const pid = supervisorPid ?? processInfo?.pid;
+  if (pid === undefined) return null;
+
+  return {
+    pid,
+    command: processInfo?.command ?? "",
+    restartCount:
+      numberField(supervisor?.restart_count) ?? numberField(supervisor?.restartCount) ?? null,
+    supervisor,
+    catalogReady,
+  };
+}
+
+async function waitForAftModuleRuntime(
+  connectionFile: string,
+  daemonPid: number | undefined,
+  aftBinaryPath: string,
+  timeoutMs: number,
+): Promise<AftModuleRuntime> {
+  const deadline = Date.now() + timeoutMs;
+  let lastRuntime: AftModuleRuntime | null = null;
+  while (Date.now() < deadline) {
+    lastRuntime = await readAftModuleRuntime(connectionFile, daemonPid, aftBinaryPath);
+    if (lastRuntime?.catalogReady) return lastRuntime;
+    await sleep(200);
+  }
+  throw new Error(`timed out waiting for aft module runtime; last=${JSON.stringify(lastRuntime)}`);
+}
+
+async function waitForAftModuleRestart(
+  connectionFile: string,
+  daemonPid: number | undefined,
+  aftBinaryPath: string,
+  previous: AftModuleRuntime,
+  timeoutMs: number,
+): Promise<AftModuleRuntime> {
+  const deadline = Date.now() + timeoutMs;
+  let lastRuntime: AftModuleRuntime | null = null;
+  while (Date.now() < deadline) {
+    lastRuntime = await readAftModuleRuntime(connectionFile, daemonPid, aftBinaryPath);
+    const restartCountAdvanced =
+      previous.restartCount === null ||
+      lastRuntime?.restartCount === null ||
+      (lastRuntime?.restartCount ?? previous.restartCount) > previous.restartCount;
+    if (lastRuntime?.catalogReady && lastRuntime.pid !== previous.pid && restartCountAdvanced) {
+      return lastRuntime;
+    }
+    await sleep(200);
+  }
+  throw new Error(`timed out waiting for aft module restart; last=${JSON.stringify(lastRuntime)}`);
+}
+
+async function findAftModuleProcess(
+  daemonPid: number,
+  aftBinaryPath: string,
+): Promise<ProcessInfo | null> {
+  const rows = await listProcessTable();
+  const descendants = new Set<number>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if ((row.ppid === daemonPid || descendants.has(row.ppid)) && !descendants.has(row.pid)) {
+        descendants.add(row.pid);
+        changed = true;
+      }
+    }
+  }
+  return (
+    rows.find(
+      (row) => descendants.has(row.pid) && isAftProcessCommand(row.command, aftBinaryPath),
+    ) ?? null
+  );
+}
+
+async function listProcessTable(): Promise<ProcessInfo[]> {
+  if (process.platform === "win32") return [];
+  const result = await runProcess("ps", ["-eo", "pid=,ppid=,command="], PROJECT_ROOT);
+  if (result.code !== 0) throw new Error(`ps failed (${result.code}): ${result.output}`);
+  return result.output
+    .split("\n")
+    .flatMap((line): ProcessInfo[] => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!match) return [];
+      return [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] ?? "" }];
+    })
+    .filter((row) => Number.isFinite(row.pid) && Number.isFinite(row.ppid));
+}
+
+function isAftProcessCommand(command: string, aftBinaryPath: string): boolean {
+  const executable = command.split(/\s+/, 1)[0] ?? "";
+  return (
+    executable === aftBinaryPath ||
+    (basename(executable) === AFT_BINARY_NAME && command.includes(" --subc "))
+  );
 }
 
 function isAftToolProvider(entry: CatalogEntry): boolean {
@@ -310,6 +571,18 @@ function isAftToolProvider(entry: CatalogEntry): boolean {
       return (role as { role?: unknown }).role === "tool_provider";
     })
   );
+}
+
+function isSupervisorModule(value: unknown): value is SubcSupervisorModule {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { module_id?: unknown }).module_id === "string"
+  );
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 async function stopDaemon(daemon: ChildProcessWithoutNullStreams | null): Promise<void> {
@@ -351,7 +624,9 @@ async function runProcess(
       stderr += chunk.toString("utf8");
     });
     child.on("error", (error) => resolveRun({ code: 1, output: error.message }));
-    child.on("close", (code) => resolveRun({ code: code ?? 1, output: `${stdout}${stderr}`.trim() }));
+    child.on("close", (code) =>
+      resolveRun({ code: code ?? 1, output: `${stdout}${stderr}`.trim() }),
+    );
   });
 }
 
