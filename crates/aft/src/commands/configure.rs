@@ -2383,7 +2383,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
 
-    if !home_match {
+    if !home_match && go_helper::looks_like_go_project(&root_path) {
         let helper_root = root_path.clone();
         let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
         let helper_cache =

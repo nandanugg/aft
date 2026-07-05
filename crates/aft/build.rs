@@ -23,9 +23,18 @@ fn main() {
     };
 
     // Re-run if sources change (keeps incremental builds fast).
-    println!("cargo:rerun-if-changed={}", go_helper_dir.join("main.go").display());
-    println!("cargo:rerun-if-changed={}", go_helper_dir.join("go.mod").display());
-    println!("cargo:rerun-if-changed={}", go_helper_dir.join("go.sum").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_helper_dir.join("main.go").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_helper_dir.join("go.mod").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        go_helper_dir.join("go.sum").display()
+    );
 
     // Check for Go toolchain.
     let has_go = Command::new("go")
