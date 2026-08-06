@@ -301,7 +301,7 @@ call_aft() {
   # when aft exits right after answering the command — cache never gets
   # written, and cross-package interface calls stay unresolved.
   local config_req
-  config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:true}')
+  config_req=$(jq -cn --arg root "$work_dir" '{id:"cfg",command:"configure",harness:"runner",project_root:$root,wait_for_helper:true}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
@@ -312,7 +312,9 @@ call_aft() {
   # drop everything else (tree-sitter warnings, etc.). Without this the
   # first query on a large project looks like a hang — configure can take
   # 10+ seconds and there's nothing to see until the response arrives.
-  local result=$( (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2> >(grep --line-buffered '^\[aft\]' >&2) | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
+  # Keep a first-run callgraph build in this process; otherwise the wrapper
+  # exits on `callgraph_building` and kills the build before it can persist.
+  local result=$( (echo "$config_req"; echo "$cmd_req") | AFT_CALLGRAPH_BUILD_WAIT_MS=60000 "$AFT_BINARY" 2> >(grep --line-buffered '^\[aft\]' >&2) | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
 
   # Check success
   local success=$(echo "$result" | jq -r '.success // false')
@@ -595,7 +597,7 @@ call_aft() {
   local cmd="$1"
   local params="$2"
 
-  local config_req=$(jq -cn --arg root "$WORK_DIR" '{id:"cfg",command:"configure",project_root:$root}')
+  local config_req=$(jq -cn --arg root "$WORK_DIR" '{id:"cfg",command:"configure",harness:"runner",project_root:$root}')
   local cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # awk avoids the SIGPIPE-from-head-under-pipefail trap that silently killed large responses.

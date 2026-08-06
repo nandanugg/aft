@@ -74,7 +74,7 @@ call_aft() {
   # helper indexing even though the command does not use graph data.
   local config_req
   local cmd_req
-  config_req=$(jq -cn --arg root "$work_dir" --argjson wait "$wait_for_helper" '{id:"cfg",command:"configure",project_root:$root,wait_for_helper:$wait}')
+  config_req=$(jq -cn --arg root "$work_dir" --argjson wait "$wait_for_helper" '{id:"cfg",command:"configure",harness:"runner",project_root:$root,wait_for_helper:$wait}')
   cmd_req=$(echo "$params" | jq -c --arg cmd "$cmd" '{id:"cmd",command:$cmd} + .')
 
   # `awk '… exit'` drains stdin safely; `grep | head -1` under `set -o pipefail`
@@ -85,8 +85,10 @@ call_aft() {
   # drop everything else (tree-sitter warnings, etc.). Without this the
   # first query on a large project looks like a hang — configure can take
   # 10+ seconds and there's nothing to see until the response arrives.
+  # Keep a first-run callgraph build in this process; otherwise the wrapper
+  # exits on `callgraph_building` and kills the build before it can persist.
   local result
-  result=$( (echo "$config_req"; echo "$cmd_req") | "$AFT_BINARY" 2> >(grep --line-buffered '^\[aft\]' >&2) | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
+  result=$( (echo "$config_req"; echo "$cmd_req") | AFT_CALLGRAPH_BUILD_WAIT_MS=60000 "$AFT_BINARY" 2> >(grep --line-buffered '^\[aft\]' >&2) | awk '/"id":"cmd"/ {print; found=1; exit} END {exit !found}')
 
   # Check success
   local success
