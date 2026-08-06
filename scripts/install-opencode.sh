@@ -16,9 +16,10 @@ CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
 CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 SERVER_PLUGIN_SOURCE_PATH="$AFT_ROOT/packages/opencode-plugin/src/index.ts"
-TUI_PLUGIN_SOURCE_PATH="$AFT_ROOT/packages/opencode-plugin/src/tui/index.tsx"
+TUI_PLUGIN_SOURCE_PATH="$AFT_ROOT/packages/opencode-plugin/src/tui/entry.mjs"
 SERVER_PLUGIN_PATH="$AFT_ROOT/packages/opencode-plugin/dist/index.js"
-TUI_PLUGIN_PATH="$AFT_ROOT/packages/opencode-plugin/dist/tui.js"
+TUI_PLUGIN_PATH="$TUI_PLUGIN_SOURCE_PATH"
+TUI_COMPILED_PATH="$AFT_ROOT/packages/opencode-plugin/src/tui-compiled/index.tsx"
 WRAPPER_TEMPLATE="$AFT_ROOT/templates/aft-wrapper.sh"
 AFT_CLI_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aft/bin"
 AFT_CLI_WRAPPER="$AFT_CLI_DIR/aft"
@@ -291,6 +292,7 @@ build_plugin_packages
 
 [ -f "$SERVER_PLUGIN_PATH" ] || error "Built server plugin entry not found at $SERVER_PLUGIN_PATH"
 [ -f "$TUI_PLUGIN_PATH" ] || error "Built TUI plugin entry not found at $TUI_PLUGIN_PATH"
+[ -f "$TUI_COMPILED_PATH" ] || error "Built TUI compiled entry not found at $TUI_COMPILED_PATH"
 
 if command -v go >/dev/null 2>&1; then
   info "Building aft-go-helper (Go interface-dispatch resolver)..."
