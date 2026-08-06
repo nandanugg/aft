@@ -22,6 +22,7 @@
 <p align="center">
   <a href="#what-is-aft">What is AFT?</a> ·
   <a href="#quick-start">Quick Start</a> ·
+  <a href="#this-fork-go-accuracy-and-local-agent-integrations">This Fork</a> ·
   <a href="#part-of-cortexkit">CortexKit</a> ·
   <a href="#-sensory-cortex-perceive">Sensory</a> ·
   <a href="#-motor-cortex-act">Motor</a> ·
@@ -55,17 +56,59 @@ AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai
 ## Quick start
 
 ```bash
-npx @cortexkit/aft@latest setup
+git clone https://github.com/nandanugg/aft.git
+cd aft
+
+./scripts/install-claude.sh    # Claude Code
+# ./scripts/install-codex.sh   # Codex
+# ./scripts/install-opencode.sh # OpenCode
 ```
 
-Auto-detects which harnesses you have installed and configures each one. On the next session start, the `aft` binary downloads if needed and all tools come online. Target a specific harness with `--harness opencode` or `--harness pi`.
+Run the installer for each host you use. The scripts build this checkout's Rust binary and optional Go helper, install the `aft` wrapper, and configure the host-specific guidance or hooks. Re-running an installer updates the existing installation; each has a matching `scripts/uninstall-*.sh`.
 
-**What setup does to each host:**
+**What the installers configure:**
 
-- **OpenCode**: replaces built-in `read`, `write`, `edit`, and `apply_patch` with AFT-backed versions, and adds the `aft_` family on top.
-- **Pi**: replaces built-in `read`, `write`, `edit`, and `grep`, and adds the `aft_` family on top.
+- **Claude Code**: installs the local CLI wrapper, outline-first instructions, session reminder, and one-shot discovery gate.
+- **Codex**: installs the local CLI wrapper, global AFT instructions, and prompt/session guidance hooks.
+- **OpenCode**: builds and installs the local plugin, replaces supported built-in tool slots with AFT-backed versions, and adds the `aft_` family.
 
-See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`, and cache-management commands.
+These commands install this fork. To install the published upstream release instead, use `npx @cortexkit/aft@latest setup` and see the upstream [CLI reference](docs/cli.md).
+
+---
+
+## This fork: Go accuracy and local-agent integrations
+
+This repository is [nandanugg/aft](https://github.com/nandanugg/aft), an accuracy-focused fork that is regularly rebased onto [cortexkit/aft](https://github.com/cortexkit/aft). Everything described elsewhere in this README comes from upstream unless called out here.
+
+The fork adds a Go analysis sidecar and source-checkout installers for agent hosts that are not covered by the published upstream setup flow.
+
+| Area | Difference from upstream |
+|---|---|
+| **Go sidecar** | Includes `aft-go-helper`, built on the Go toolchain's SSA and class-hierarchy analysis. It extracts static, concrete-receiver, and interface-dispatch calls, plus dispatch, goroutine, and defer edge metadata that tree-sitter alone cannot type-resolve. |
+| **Go fallback resolution** | Extends the native graph with same-file and same-package sibling resolution, and treats exported Go and Rust methods as externally callable entry points. |
+| **Local host installers** | Provides checkout-based install/uninstall scripts for Claude Code, Codex, and OpenCode. They build the Rust binary and Go helper, install the `aft` wrapper, and configure host-specific guidance or hooks without publishing fork packages. |
+| **Agent steering** | Ships an outline-first discovery protocol, session reminders, and a one-shot Claude Code discovery gate intended to reduce whole-file reads and encourage verification against current code. |
+
+For Go module roots, configure checks for `go.mod` before doing any sidecar or artifact-cache work. If Go or the helper is unavailable, AFT falls back to its native tree-sitter graph without failing configuration. The helper requires Go 1.22+ and can be selected explicitly with `AFT_GO_HELPER_PATH`.
+
+> [!IMPORTANT]
+> After the v0.49 rebase, the sidecar is built, run, and cached, but its output is not yet projected into upstream's new persistent callgraph store. The native Go fallback-resolution changes above are active. Full sidecar projection—and the experimental `dispatched_by`, `dispatches`, `implementations`, `writers`, and `similar` wrapper commands—should be treated as follow-up work rather than part of the stable tool surface.
+
+<details>
+<summary>Historical accuracy study</summary>
+
+The fork originated from a five-iteration documentation study. Claude Code ran in isolated containers with this fork, upstream AFT, [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp), or [Serena](https://github.com/oraios/serena). Factual claims in generated settlement-flow documentation were checked against a 473-file Go service with roughly 10,000 symbols.
+
+| Tool | Wrong-rate (lower is better) | Stale-oracle catches (higher is better) |
+|---|---:|---:|
+| **nandanugg/aft (study version)** | **18.0%** | **16** |
+| codebase-memory-mcp | 20.2% | 12 |
+| cortexkit/aft (study baseline) | 22.6% | 3 |
+| Serena | 23.7% | 3 |
+
+“Stale-oracle catches” counts cases where generated documentation disagreed with prior knowledge and current code confirmed the generated result. These are historical measurements from the pre-v0.49 fork, not a benchmark of the current rebased branches.
+
+</details>
 
 ---
 
@@ -165,7 +208,7 @@ Objective-C `.h` headers continue to use the C grammar in v1, so Objective-C int
 
 Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 
-YAML, TOML, XML, env files, lockfiles, and other plain text/config formats are not code-indexed languages today: they do not have symbol outlines, zoom targets, AST patterns, semantic embeddings, call graphs, imports, or refactors. Use `aft read`, `aft grep`, or `aft glob` for those files. LSP support is separate from code indexing, so YAML diagnostics via `yaml-language-server` do not imply YAML support in `aft_outline`/`aft_zoom`.
+TOML, XML, env files, lockfiles, and other unlisted plain text/config formats are not code-indexed languages today: they do not have symbol outlines, zoom targets, AST patterns, semantic embeddings, call graphs, imports, or refactors. Use `aft read`, `aft grep`, or `aft glob` for those files. LSP support is separate from code indexing; consult the table above for AFT's structural language coverage.
 
 ---
 
