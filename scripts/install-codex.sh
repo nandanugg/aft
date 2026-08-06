@@ -41,6 +41,7 @@ escape_sed_replacement() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//&/\\&}"
+  value="${value//|/\\|}"
   printf '%s' "$value"
 }
 
@@ -368,10 +369,7 @@ if [ ! -e "$CODEX_CONFIG_FILE" ]; then
 fi
 
 # Install the aft wrapper.
-escaped_binary="$(escape_sed_replacement "$AFT_BINARY")"
-WRAPPER_TEMP_FILE="$(mktemp)"
-sed "s|__AFT_BINARY_PATH__|$escaped_binary|g" "$WRAPPER_TEMPLATE" > "$WRAPPER_TEMP_FILE"
-overwrite_file "$WRAPPER_TEMP_FILE" "$CODEX_BIN_DIR/aft"
+install_templated_file "$WRAPPER_TEMPLATE" "$CODEX_BIN_DIR/aft" "$AFT_BINARY"
 chmod +x "$CODEX_BIN_DIR/aft"
 info "Installed CLI wrapper: $CODEX_BIN_DIR/aft"
 

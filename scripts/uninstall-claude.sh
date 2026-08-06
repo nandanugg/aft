@@ -63,7 +63,10 @@ remove_symlink_if_target() {
 # Remove @AFT.md from CLAUDE.md
 if [ -f "$CLAUDE_DIR/CLAUDE.md" ]; then
     if grep -q "@AFT.md" "$CLAUDE_DIR/CLAUDE.md"; then
-        sed -i '' '/@AFT.md/d' "$CLAUDE_DIR/CLAUDE.md"
+        TEMP_FILE="$(mktemp)"
+        sed '/@AFT.md/d' "$CLAUDE_DIR/CLAUDE.md" > "$TEMP_FILE"
+        cat "$TEMP_FILE" > "$CLAUDE_DIR/CLAUDE.md"
+        rm -f "$TEMP_FILE"
         info "Removed @AFT.md from CLAUDE.md"
     fi
 fi

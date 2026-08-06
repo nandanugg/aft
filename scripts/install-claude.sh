@@ -35,6 +35,7 @@ escape_sed_replacement() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//&/\\&}"
+  value="${value//|/\\|}"
   printf '%s' "$value"
 }
 
@@ -172,9 +173,11 @@ install_templated_file() {
   local target="$2"
   local replacement="$3"
   local escaped
+  local temp_file
   escaped="$(escape_sed_replacement "$replacement")"
-  cp "$source" "$target"
-  sed -i '' "s|__AFT_BINARY_PATH__|$escaped|g" "$target"
+  temp_file="$(mktemp)"
+  sed "s|__AFT_BINARY_PATH__|$escaped|g" "$source" > "$temp_file"
+  overwrite_file "$temp_file" "$target"
   chmod +x "$target"
 }
 
@@ -568,8 +571,7 @@ esac
 WRAPPER_EOF
 
 # Replace placeholder with actual binary path
-sed -i '' "s|__AFT_BINARY_PATH__|$AFT_BINARY|g" "$HOOKS_DIR/aft"
-chmod +x "$HOOKS_DIR/aft"
+install_templated_file "$HOOKS_DIR/aft" "$HOOKS_DIR/aft" "$AFT_BINARY"
 info "Installed CLI wrapper: $HOOKS_DIR/aft"
 
 # Write aft-hook.sh
@@ -664,8 +666,7 @@ case "$TOOL_NAME" in
 esac
 HOOK_EOF
 
-sed -i '' "s|__AFT_BINARY_PATH__|$AFT_BINARY|g" "$HOOKS_DIR/aft-hook.sh"
-chmod +x "$HOOKS_DIR/aft-hook.sh"
+install_templated_file "$HOOKS_DIR/aft-hook.sh" "$HOOKS_DIR/aft-hook.sh" "$AFT_BINARY"
 info "Installed hook script: $HOOKS_DIR/aft-hook.sh"
 
 # SessionStart reminder + PreToolUse discovery gate — nudge the agent
