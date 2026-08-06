@@ -17,8 +17,6 @@ CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
 CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 SESSION_REMINDER_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-reminder.sh"
-SESSION_END_TEMPLATE="$AFT_ROOT/templates/claude/aft-session-end.sh"
-SESSION_RUNTIME_TEMPLATE="$AFT_ROOT/templates/aft-session-runtime.sh"
 DISCOVERY_GATE_TEMPLATE="$AFT_ROOT/templates/claude/aft-code-discovery-gate.sh"
 
 # Colors
@@ -673,14 +671,15 @@ info "Installed hook script: $HOOKS_DIR/aft-hook.sh"
 # toward AFT semantic tools before it reaches for raw Grep/Glob/Read.
 # Modeled on codebase-memory-mcp's equivalent pair.
 if [ -f "$SESSION_REMINDER_TEMPLATE" ]; then
-    install_templated_file "$SESSION_RUNTIME_TEMPLATE" "$HOOKS_DIR/aft-session-runtime.sh" "$AFT_BINARY"
     install_templated_file "$SESSION_REMINDER_TEMPLATE" "$HOOKS_DIR/aft-session-reminder.sh" "$AFT_BINARY"
-    install_templated_file "$SESSION_END_TEMPLATE" "$HOOKS_DIR/aft-session-end.sh" "$AFT_BINARY"
     info "Installed hook script: $HOOKS_DIR/aft-session-reminder.sh"
-    info "Installed hook script: $HOOKS_DIR/aft-session-end.sh"
 else
     warn "Missing template: $SESSION_REMINDER_TEMPLATE — skipping session reminder"
 fi
+
+# Remove lifecycle hooks left by older fork installs. The current Go helper is
+# invoked by configure and no longer has session lease commands.
+rm -f "$HOOKS_DIR/aft-session-runtime.sh" "$HOOKS_DIR/aft-session-end.sh"
 
 if [ -f "$DISCOVERY_GATE_TEMPLATE" ]; then
     cp "$DISCOVERY_GATE_TEMPLATE" "$HOOKS_DIR/aft-code-discovery-gate.sh"
@@ -929,11 +928,7 @@ if [ -f "$SETTINGS_FILE" ]; then
               | map(select((.command // "") | contains("aft-session-end.sh")))
               | length as $aft
           | if $aft > 0 then empty else $entry end
-        )) + [
-          {
-            "hooks": [{"type": "command", "command": ($hooks_dir + "/aft-session-end.sh"), "timeout": 5}]
-          }
-        ]
+        ))
       )
     ' "$SETTINGS_FILE" > "$TEMP_FILE"
 
@@ -985,11 +980,6 @@ else
         "matcher": "compact",
         "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-reminder.sh", "timeout": 300}]
       }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [{"type": "command", "command": "$HOOKS_DIR/aft-session-end.sh", "timeout": 5}]
-      }
     ]
   }
 }
@@ -1010,9 +1000,7 @@ echo ""
 echo "Installed files:"
 echo "  $HOOKS_DIR/aft                         - CLI wrapper"
 echo "  $HOOKS_DIR/aft-hook.sh                 - Grep/Glob interceptor (routes through AFT)"
-echo "  $HOOKS_DIR/aft-session-runtime.sh      - Shared session lifecycle helper"
-echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart prewarm + reminder"
-echo "  $HOOKS_DIR/aft-session-end.sh          - SessionEnd cleanup hook"
+echo "  $HOOKS_DIR/aft-session-reminder.sh     - SessionStart reminder"
 echo "  $HOOKS_DIR/aft-code-discovery-gate.sh  - PreToolUse gate (nudges toward AFT tools once per session)"
 echo "  $CLAUDE_DIR/AFT.md                     - Claude instructions"
 echo "  $CLAUDE_DIR/settings.json              - Hook configuration"

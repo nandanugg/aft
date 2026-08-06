@@ -22,10 +22,8 @@ CLI_PATH_BLOCK_START="# >>> aft-cli >>>"
 CLI_PATH_BLOCK_END="# <<< aft-cli <<<"
 
 WRAPPER_TEMPLATE="$AFT_ROOT/templates/aft-wrapper.sh"
-SESSION_RUNTIME_TEMPLATE="$AFT_ROOT/templates/aft-session-runtime.sh"
 CODEX_AFT_TEMPLATE="$AFT_ROOT/templates/codex/AFT.md"
 SESSION_START_TEMPLATE="$AFT_ROOT/templates/codex/aft-codex-session-start.sh"
-STOP_TEMPLATE="$AFT_ROOT/templates/codex/aft-codex-stop.sh"
 USER_PROMPT_TEMPLATE="$AFT_ROOT/templates/codex/aft-codex-user-prompt-submit.sh"
 
 RED='\033[0;31m'
@@ -375,15 +373,14 @@ info "Installed CLI wrapper: $CODEX_BIN_DIR/aft"
 
 # Install Codex-specific instructions and hooks.
 copy_if_changed "$CODEX_AFT_TEMPLATE" "$CODEX_AFT_DOC"
-install_templated_file "$SESSION_RUNTIME_TEMPLATE" "$CODEX_HOOKS_DIR/aft-session-runtime.sh" "$AFT_BINARY"
 install_templated_file "$SESSION_START_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" "$AFT_BINARY"
-install_templated_file "$STOP_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-stop.sh" "$AFT_BINARY"
 copy_if_changed "$USER_PROMPT_TEMPLATE" "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh"
 chmod +x \
-  "$CODEX_HOOKS_DIR/aft-session-runtime.sh" \
   "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" \
-  "$CODEX_HOOKS_DIR/aft-codex-stop.sh" \
   "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh"
+# Remove lifecycle hooks left by older fork installs. The current Go helper is
+# invoked by configure and no longer has session lease commands.
+rm -f "$CODEX_HOOKS_DIR/aft-session-runtime.sh" "$CODEX_HOOKS_DIR/aft-codex-stop.sh"
 info "Installed Codex hook scripts and AFT.md"
 
 if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
@@ -420,7 +417,6 @@ if [ -f "$CODEX_HOOKS_FILE" ]; then
   TEMP_FILE="$(mktemp)"
   jq \
     --arg session_cmd "$CODEX_HOOKS_DIR/aft-codex-session-start.sh" \
-    --arg stop_cmd "$CODEX_HOOKS_DIR/aft-codex-stop.sh" \
     --arg prompt_cmd "$CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh" \
     '
       .hooks = (.hooks // {}) |
@@ -447,17 +443,7 @@ if [ -f "$CODEX_HOOKS_FILE" ]; then
           . as $entry |
           (($entry.hooks // []) | map(select((.command // "") | contains("aft-codex-stop.sh"))) | length) as $aft |
           if $aft > 0 then empty else $entry end
-        )) + [
-          {
-            "hooks": [
-              {
-                "type": "command",
-                "command": $stop_cmd,
-                "timeout": 5
-              }
-            ]
-          }
-        ]
+        ))
       ) |
       .hooks.UserPromptSubmit = (
         ((.hooks.UserPromptSubmit // []) | map(
@@ -495,17 +481,6 @@ else
         ]
       }
     ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CODEX_HOOKS_DIR/aft-codex-stop.sh",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -535,9 +510,7 @@ echo -e "${GREEN}AFT Codex integration installed successfully!${NC}"
 echo ""
 echo "Installed files:"
 echo "  $CODEX_BIN_DIR/aft                         - CLI wrapper"
-echo "  $CODEX_HOOKS_DIR/aft-session-runtime.sh   - Shared session lifecycle helper"
 echo "  $CODEX_HOOKS_DIR/aft-codex-session-start.sh - SessionStart hook"
-echo "  $CODEX_HOOKS_DIR/aft-codex-stop.sh        - Stop hook (session lease heartbeat)"
 echo "  $CODEX_HOOKS_DIR/aft-codex-user-prompt-submit.sh - UserPromptSubmit hook"
 echo "  $CODEX_AFT_DOC                            - Codex AFT instructions"
 echo "  $CODEX_HOOKS_FILE                         - Codex hook configuration"
@@ -548,7 +521,7 @@ if [ -n "$GO_HELPER_BINARY" ] && [ -x "$GO_HELPER_BINARY" ]; then
 fi
 echo ""
 echo "Notes:"
-echo "  Codex hooks now prewarm AFT-Go on SessionStart and refresh the lease on Stop."
+echo "  Codex hooks load AFT guidance on SessionStart and UserPromptSubmit."
 echo "  They do not transparently replace Codex's non-Bash file tools."
 echo "  Go helper support is available through aft-go-helper when Go is installed."
 echo ""
