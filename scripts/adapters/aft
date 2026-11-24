@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# aft shim: runs `<install dir>/aft cli "$@"` (and `<install dir>/aft warmup …` for upstream's warmup).
+# Installed as <prefix>/bin/aft. The real binary is <prefix>/libexec/aft-adapters/aft.
+# Set AFT_ADAPTERS_BIN to use another binary.
+set -eu
+
+# Resolve symlinks by hand (macOS readlink has no -f on older systems).
+self=$0
+while [ -L "$self" ]; do
+	link=$(readlink "$self")
+	case $link in
+		/*) self=$link ;;
+		*) self=$(dirname "$self")/$link ;;
+	esac
+done
+bin_dir=$(cd "$(dirname "$self")" && pwd)
+real=${AFT_ADAPTERS_BIN:-$bin_dir/../libexec/aft-adapters/aft}
+
+if [ ! -x "$real" ]; then
+	echo "aft: cannot find the aft binary at $real (run scripts/adapters/install.sh)" >&2
+	exit 127
+fi
+# Semantic search: point aft to the ONNX Runtime and the model that install.sh put next to the binary.
+# A value the caller already set wins.
+libexec=$(dirname "$real")
+if [ -z "${ORT_DYLIB_PATH:-}" ]; then
+	for lib in "$libexec"/onnxruntime/*/libonnxruntime.dylib "$libexec"/onnxruntime/*/libonnxruntime.so; do
+		[ -f "$lib" ] && export ORT_DYLIB_PATH=$lib
+	done
+fi
+if [ -z "${FASTEMBED_CACHE_DIR:-}" ] && [ -d "$libexec/models" ]; then
+	export FASTEMBED_CACHE_DIR=$libexec/models
+fi
+# `warmup` is upstream's own subcommand (it builds the indexes, for example `--only semantic`); `aft cli` has no
+# such command, so pass it to the binary as it is.
+if [ "${1:-}" = warmup ]; then
+	exec "$real" "$@"
+fi
+exec "$real" cli "$@"
