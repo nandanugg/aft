@@ -93,12 +93,17 @@ fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(tree) => {
             note_callgraph_served(ctx, "call_tree", 0, "ok");
-            serialized_response_with_view(
-                &req.id,
+            crate::commands::data_callgraph::lang_adapters::finish_reply(
+                req,
                 "call_tree",
-                &tree,
-                data_view.as_ref(),
-                &[&file_path],
+                &snapshot,
+                serialized_response_with_view(
+                    &req.id,
+                    "call_tree",
+                    &tree,
+                    data_view.as_ref(),
+                    &[&file_path],
+                ),
             )
         }
         Err(error) => store_error_response(&req.id, "call_tree", error),

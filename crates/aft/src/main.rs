@@ -332,6 +332,11 @@ fn main() {
         }
     }
 
+    // adapter layer: `aft adapters|facts|cli|guide` (language adapters) exit here.
+    if let Some(code) = aft::commands::data_callgraph::lang_adapters::route_subcommand(std::env::args_os().collect()) {
+        std::process::exit(code);
+    }
+
     // Help and option errors must exit before storage, PATH, logging, or even
     // capturing the executable used by serving and maintenance commands.
     if let Some(code) = cli::help::handle_first_arg(std::env::args().nth(1).as_deref()) {

@@ -135,10 +135,15 @@ fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
             match serialized_value(&req.id, "trace_data", &result) {
                 Ok(mut value) => {
                     trace::attach_trace_data_envelope(&mut value, envelope.as_ref());
-                    crate::commands::callgraph_store_adapter::response_with_view(
-                        Response::success(&req.id, value),
-                        data_view.as_ref(),
-                        &[&file_path],
+                    crate::commands::data_callgraph::lang_adapters::finish_reply(
+                        req,
+                        "trace_data",
+                        &snapshot,
+                        crate::commands::callgraph_store_adapter::response_with_view(
+                            Response::success(&req.id, value),
+                            data_view.as_ref(),
+                            &[&file_path],
+                        ),
                     )
                 }
                 Err(response) => response,

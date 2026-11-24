@@ -99,6 +99,6 @@ pub mod zoom;
 #[cfg(test)]
 mod storage_floor_tests;
 
-pub(crate) mod data_callgraph;
+pub mod data_callgraph;
 pub(crate) mod data_search;
 pub mod parent_query;

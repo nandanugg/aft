@@ -184,7 +184,7 @@ fn data_layer_callgraph(
         }
         return gap_response(req, operation, gaps);
     };
-    let reader = view.callgraph();
+    let reader = crate::commands::data_callgraph::lang_adapters::graph::AdapterGraph::new(view.callgraph());
     let answer = run_operation(req, ctx, session, operation, &reader, child, file, symbol);
     // A file whose part of the call graph could not be read was seen as
     // absent, so the answer cannot be trusted.

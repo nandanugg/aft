@@ -13,11 +13,14 @@ use crate::data_layer::checkout::CheckoutView;
 use crate::data_layer::query::{SliceReader, SliceSource};
 use crate::data_layer::runtime::Fresh;
 
+// adapter layer: language adapters (docs/adapters/CONTRACT.md).
+pub mod lang_adapters;
+
 /// The data layer's call-graph reader.
 pub(crate) type DataGraph = SliceReader<Arc<dyn SliceSource + Send + Sync>>;
 
 /// The reader a call-graph command answers from.
-pub(crate) type OpsGraph = DataGraph;
+pub(crate) type OpsGraph = lang_adapters::graph::AdapterGraph;
 
 /// What the data layer offers a call-graph command.
 pub(crate) enum Access {
@@ -141,7 +144,7 @@ pub(crate) fn ops_graph(
                     return Err(not_indexed_response(req_id, operation, ctx, &path));
                 }
             }
-            Ok((reader, Some(view)))
+            Ok((lang_adapters::graph::AdapterGraph::new(reader), Some(view)))
         }
         // No checkout answers: the call graph is switched off, or the root
         // has no checkout of its own (it could not be bound, or is a parent

@@ -186,12 +186,17 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     match outcome {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to_symbol", 0, "ok");
-            serialized_response_with_view(
-                &req.id,
+            crate::commands::data_callgraph::lang_adapters::finish_reply(
+                req,
                 "trace_to_symbol",
-                &result,
-                data_view.as_ref(),
-                &queried,
+                &store,
+                serialized_response_with_view(
+                    &req.id,
+                    "trace_to_symbol",
+                    &result,
+                    data_view.as_ref(),
+                    &queried,
+                ),
             )
         }
         Err(error) => store_error_response(&req.id, "trace_to_symbol", error),

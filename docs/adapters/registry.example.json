@@ -1,0 +1,74 @@
+{
+  "adapters": [
+    {
+      "contract": 1,
+      "language": "go",
+      "root_markers": ["go.mod"],
+      "command": ["/opt/aft/adapters/go/aft-go-adapter", "--root", "{root}"],
+      "toolchain_id_command": ["go", "env", "GOVERSION"],
+      "env": {
+        "GOPROXY": "off",
+        "GONOPROXY": "none",
+        "GOSUMDB": "off",
+        "GOTOOLCHAIN": "local",
+        "GOFLAGS": "-mod=readonly"
+      },
+      "timeout_s": 120,
+      "query_wait_s": 20,
+      "failure_cooldown_s": 600,
+      "hidden_tags": ["mock"],
+      "facts": [
+        {
+          "kind": "registers",
+          "description": "registration site -> handler it registers; label = route, topic or job key (constants resolved)",
+          "hidden_tags": ["mock"],
+          "aliases": [
+            {"name": "dispatches", "by": "label"},
+            {"name": "dispatched_by", "by": "object"}
+          ]
+        },
+        {
+          "kind": "implements",
+          "description": "type -> interface it implements",
+          "hidden_tags": ["mock"],
+          "aliases": [
+            {"name": "implementations", "by": "object"}
+          ]
+        },
+        {
+          "kind": "writes",
+          "description": "function -> package variable or struct field it writes",
+          "hidden_tags": ["init"],
+          "aliases": [
+            {"name": "writers", "by": "object"}
+          ]
+        },
+        {
+          "kind": "returns",
+          "description": "function -> one return path; label = simplified path condition",
+          "aliases": [
+            {"name": "returns", "by": "subject"}
+          ]
+        },
+        {
+          "kind": "flows",
+          "description": "value -> value it flows into (assignment, argument, field, Unmarshal-family write); follow with --depth",
+          "lookup": "inside",
+          "aliases": [
+            {"name": "flows", "by": "subject"}
+          ]
+        }
+      ]
+    },
+    {
+      "contract": 1,
+      "language": "javascript",
+      "root_markers": ["package.json"],
+      "command": ["node", "/opt/aft/adapters/js/aft-js-adapter.js", "--root", "{root}"],
+      "toolchain_id_command": ["node", "--version"],
+      "timeout_s": 120,
+      "query_wait_s": 20,
+      "failure_cooldown_s": 600
+    }
+  ]
+}
