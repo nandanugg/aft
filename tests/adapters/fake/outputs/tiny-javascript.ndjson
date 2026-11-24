@@ -1,0 +1,4 @@
+{"type": "header", "contract": 1, "language": "javascript", "tool": "fake-adapter", "tool_version": "0"}
+{"type": "analysed", "files": ["lib.js", "main.js"]}
+{"type": "site", "file": "main.js", "line": 4, "col": 16, "name": "helper", "targets": [{"file": "lib.js", "line": 1, "col": 10, "name": "helper", "kind": "require", "tags": []}]}
+{"type": "end", "sites": 1, "targets": 1, "facts": 0, "analysed_files": 2, "unanalysed_files": 0}

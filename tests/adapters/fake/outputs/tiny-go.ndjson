@@ -1,0 +1,6 @@
+{"type": "header", "contract": 1, "language": "go", "tool": "fake-adapter", "tool_version": "0"}
+{"type": "analysed", "files": ["a.go", "b.go"]}
+{"type": "site", "file": "a.go", "line": 9, "col": 35, "name": "Do", "targets": [{"file": "a.go", "line": 7, "col": 13, "name": "Do", "kind": "interface", "tags": []}]}
+{"type": "site", "file": "b.go", "line": 3, "col": 31, "name": "Use", "targets": [{"file": "a.go", "line": 9, "col": 6, "name": "Use", "kind": "static", "tags": []}]}
+{"type": "fact", "kind": "implements", "subject": {"file": "a.go", "line": 5, "col": 6}, "subject_name": "impl", "object": {"file": "a.go", "line": 3, "col": 6}, "object_name": "Doer", "label": "Doer", "tags": []}
+{"type": "end", "sites": 2, "targets": 2, "facts": 1, "analysed_files": 2, "unanalysed_files": 0}

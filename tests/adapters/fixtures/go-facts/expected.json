@@ -1,0 +1,1216 @@
+{
+ "source": {
+  "branch": "backup/main-before-origin-rebase-20260705",
+  "commit": "6bd5b9f47",
+  "flows_cases_from": {
+   "branch": "feat/go-vta-helper",
+   "commit": "1c33802fb",
+   "same_tests_on": "feat/trace-data-patterns beb0929cb"
+  }
+ },
+ "cases": [
+  {
+   "kind": "site_tags",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:20 TestCallContextErrorBranch",
+   "caller_name": "Handle",
+   "site": {
+    "file": "error_branch.go",
+    "line": 16,
+    "col": 10
+   },
+   "callee_name": "cleanup",
+   "tags": [
+    "in_error_branch"
+   ],
+   "optional": true,
+   "optional_why": "old test only logs and passes when the edge is not emitted (same-package filter)",
+   "id": "c001"
+  },
+  {
+   "kind": "site_tags",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:62 TestCallContextLoop",
+   "caller_name": "RangeLoop",
+   "site": {
+    "file": "loop_body.go",
+    "line": 11,
+    "col": 10
+   },
+   "callee_name": "process",
+   "tags": [
+    "in_loop"
+   ],
+   "optional": true,
+   "optional_why": "old test only logs and passes when the edge is not emitted (same-package filter)",
+   "id": "c002"
+  },
+  {
+   "kind": "site_tags",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:88 TestCallContextDefer",
+   "caller_name": "WithDefer",
+   "site": {
+    "file": "defer_call.go",
+    "line": 9,
+    "col": 14
+   },
+   "callee_name": "closer",
+   "tags": [
+    "in_defer"
+   ],
+   "edge_kind": "defer",
+   "optional": true,
+   "optional_why": "old test only logs and passes when the edge is not emitted (same-package filter)",
+   "id": "c003"
+  },
+  {
+   "kind": "site_tags",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:114 TestCallContextGoroutine",
+   "caller_name": "SpawnWorker",
+   "site": {
+    "file": "goroutine_spawn.go",
+    "line": 9,
+    "col": 11
+   },
+   "callee_name": "worker",
+   "tags": [
+    "in_goroutine"
+   ],
+   "edge_kind": "goroutine",
+   "optional": true,
+   "optional_why": "old test only logs and passes when the edge is not emitted (same-package filter)",
+   "id": "c004"
+  },
+  {
+   "kind": "site_tags",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:141 TestCallContextNestedConditions",
+   "caller_name": "DeepNested",
+   "site": {
+    "file": "nested_conditions.go",
+    "line": 16,
+    "col": 14
+   },
+   "callee_name": "handleErr",
+   "tags": [
+    "in_error_branch"
+   ],
+   "optional": true,
+   "optional_why": "old test only logs and passes when the edge is not emitted (same-package filter)",
+   "min_branch_depth": 3,
+   "min_branch_depth_note": "old field branch_depth >= 3; no tag in the new contract, keep as a numeric check only if the adapter has one",
+   "id": "c005"
+  },
+  {
+   "kind": "returns",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:167 TestReturnPathAnalysis",
+   "subject_name": "MultiReturn",
+   "subject": {
+    "file": "return_paths.go",
+    "line": 9,
+    "col": 6
+   },
+   "min_count": 4,
+   "count_note": "old test: len(returns) >= 4 (source has 4 return statements: lines 11,14,17,19)",
+   "id": "c006"
+  },
+  {
+   "kind": "returns",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:167 TestReturnPathAnalysis",
+   "subject_name": "MultiReturn",
+   "subject": {
+    "file": "return_paths.go",
+    "line": 9,
+    "col": 6
+   },
+   "label_contains_any": [
+    "err",
+    "!= nil"
+   ],
+   "label_note": "at least one return site has a path condition containing 'err' or '!= nil'",
+   "id": "c007"
+  },
+  {
+   "kind": "returns",
+   "module": "controlflow",
+   "from": "go-helper/controlflow_test.go:212 TestReturnPathPhiSplit",
+   "subject_name": "PhiReturn",
+   "subject": {
+    "file": "phi_return.go",
+    "line": 4,
+    "col": 6
+   },
+   "min_count": 1,
+   "count_note": "old test only requires >= 1 return entry (comment says SSA may split a phi return)",
+   "id": "c008"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:35 TestDispatchEdgesAsynq",
+   "subject": {
+    "file": "asynq.go",
+    "line": 13,
+    "col": 16
+   },
+   "subject_name": "RegisterHandlers",
+   "object_name": "HandleTaskA",
+   "object": {
+    "file": "asynq.go",
+    "line": 9,
+    "col": 6
+   },
+   "label": "TypeTaskA",
+   "id": "c009"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:35 TestDispatchEdgesAsynq",
+   "subject": {
+    "file": "asynq.go",
+    "line": 14,
+    "col": 16
+   },
+   "subject_name": "RegisterHandlers",
+   "object_name": "HandleTaskB",
+   "object": {
+    "file": "asynq.go",
+    "line": 10,
+    "col": 6
+   },
+   "label": "TypeTaskB",
+   "id": "c010"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:75 TestDispatchEdgesHTTP",
+   "subject": {
+    "file": "http.go",
+    "line": 11,
+    "col": 16
+   },
+   "subject_name": "RegisterHTTPHandlers",
+   "object_name": "handleHome",
+   "object": {
+    "file": "http.go",
+    "line": 7,
+    "col": 6
+   },
+   "label": "/",
+   "id": "c011"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:75 TestDispatchEdgesHTTP",
+   "subject": {
+    "file": "http.go",
+    "line": 12,
+    "col": 16
+   },
+   "subject_name": "RegisterHTTPHandlers",
+   "object_name": "handleAPI",
+   "object": {
+    "file": "http.go",
+    "line": 8,
+    "col": 6
+   },
+   "label": "/api",
+   "id": "c012"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:184 TestTypedConstNearbyString",
+   "subject": {
+    "file": "asynq_typed_const.go",
+    "line": 28,
+    "col": 16
+   },
+   "subject_name": "RegisterTypedHandlers",
+   "object_name": "HandleOrderSyncTask",
+   "object": {
+    "file": "asynq_typed_const.go",
+    "line": 23,
+    "col": 6
+   },
+   "label": "order_sync:order_id",
+   "note": "label is the value of the typed constant TypeOrderSync wrapped in string(...)",
+   "id": "c013"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:184 TestTypedConstNearbyString",
+   "subject": {
+    "file": "asynq_typed_const.go",
+    "line": 29,
+    "col": 16
+   },
+   "subject_name": "RegisterTypedHandlers",
+   "object_name": "HandleOrderCancelTask",
+   "object": {
+    "file": "asynq_typed_const.go",
+    "line": 24,
+    "col": 6
+   },
+   "label": "order_cancel:order_id",
+   "note": "label is the value of the typed constant TypeOrderCancel wrapped in string(...)",
+   "id": "c014"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:247 TestDispatchedViaNoStringConst",
+   "subject": {
+    "file": "no_string_const.go",
+    "line": 17,
+    "col": 16
+   },
+   "subject_name": "RegisterNoKey",
+   "object_name": "HandleNoKey",
+   "object": {
+    "file": "no_string_const.go",
+    "line": 12,
+    "col": 6
+   },
+   "label": null,
+   "label_absent": true,
+   "via_nonempty": true,
+   "id": "c015"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:278 TestDispatchedViaInterfaceSite",
+   "subject": {
+    "file": "interface_dispatch_site.go",
+    "line": 20,
+    "col": 12
+   },
+   "subject_name": "UseDispatcher",
+   "object_name": "HandleViaInterface",
+   "object": {
+    "file": "interface_dispatch_site.go",
+    "line": 15,
+    "col": 6
+   },
+   "label": "interface-dispatch-key",
+   "via_contains": "Register",
+   "id": "c016"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:340 TestClosureMethodDispatchResolvesConcreteMethod",
+   "subject": {
+    "file": "closure_method_dispatch.go",
+    "line": 16,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_method_dispatch.go",
+    "line": 13,
+    "col": 29
+   },
+   "label": "/closure-method",
+   "object_receiver": "ClosureMethodHandler",
+   "note": "closure registered with HandleFunc forwards to handler.Serve(); the target is the concrete method ClosureMethodHandler.Serve",
+   "id": "c017"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:364 TestClosureInterfaceDispatchResolvesConcreteMethods",
+   "subject": {
+    "file": "closure_interface_dispatch.go",
+    "line": 24,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureInterfaceMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_interface_dispatch.go",
+    "line": 17,
+    "col": 26
+   },
+   "label": "/closure-interface",
+   "object_receiver": "ClosureIfaceAlpha",
+   "id": "c018"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:364 TestClosureInterfaceDispatchResolvesConcreteMethods",
+   "subject": {
+    "file": "closure_interface_dispatch.go",
+    "line": 24,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureInterfaceMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_interface_dispatch.go",
+    "line": 21,
+    "col": 25
+   },
+   "label": "/closure-interface",
+   "object_receiver": "ClosureIfaceBeta",
+   "id": "c019"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "closure_interface_dispatch.go",
+    "line": 24,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureInterfaceMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_interface_dispatch.go",
+    "line": 17,
+    "col": 26
+   },
+   "label": "/closure-interface",
+   "via": "(*example.com/dispatch.ClosureIfaceMux).HandleFunc",
+   "object_receiver": "ClosureIfaceAlpha",
+   "id": "c020"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "closure_interface_dispatch.go",
+    "line": 24,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureInterfaceMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_interface_dispatch.go",
+    "line": 21,
+    "col": 25
+   },
+   "label": "/closure-interface",
+   "via": "(*example.com/dispatch.ClosureIfaceMux).HandleFunc",
+   "object_receiver": "ClosureIfaceBeta",
+   "id": "c021"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "closure_interface_dispatch.go",
+    "line": 24,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureInterfaceMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_method_dispatch.go",
+    "line": 13,
+    "col": 29
+   },
+   "label": "/closure-interface",
+   "via": "(*example.com/dispatch.ClosureIfaceMux).HandleFunc",
+   "object_receiver": "ClosureMethodHandler",
+   "unsure": "the golden file lists ClosureMethodHandler.Serve as a target of the interface closure (any type with Serve() error, class-hierarchy over-approximation). The test asserts it only through the whole-file comparison.",
+   "id": "c022"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "closure_method_dispatch.go",
+    "line": 16,
+    "col": 16
+   },
+   "subject_name": "RegisterClosureMethod",
+   "object_name": "Serve",
+   "object": {
+    "file": "closure_method_dispatch.go",
+    "line": 13,
+    "col": 29
+   },
+   "label": "/closure-method",
+   "via": "(*example.com/dispatch.ClosureMethodMux).HandleFunc",
+   "object_receiver": "ClosureMethodHandler",
+   "id": "c023"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "http.go",
+    "line": 12,
+    "col": 16
+   },
+   "subject_name": "RegisterHTTPHandlers",
+   "object_name": "handleAPI",
+   "object": {
+    "file": "http.go",
+    "line": 8,
+    "col": 6
+   },
+   "label": "/api",
+   "via": "(*net/http.ServeMux).HandleFunc",
+   "id": "c024"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "http.go",
+    "line": 11,
+    "col": 16
+   },
+   "subject_name": "RegisterHTTPHandlers",
+   "object_name": "handleHome",
+   "object": {
+    "file": "http.go",
+    "line": 7,
+    "col": 6
+   },
+   "label": "/",
+   "via": "(*net/http.ServeMux).HandleFunc",
+   "id": "c025"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "asynq.go",
+    "line": 13,
+    "col": 16
+   },
+   "subject_name": "RegisterHandlers",
+   "object_name": "HandleTaskA",
+   "object": {
+    "file": "asynq.go",
+    "line": 9,
+    "col": 6
+   },
+   "label": "TypeTaskA",
+   "via": "(*example.com/dispatch.ServeMux).HandleFunc",
+   "id": "c026"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "asynq.go",
+    "line": 14,
+    "col": 16
+   },
+   "subject_name": "RegisterHandlers",
+   "object_name": "HandleTaskB",
+   "object": {
+    "file": "asynq.go",
+    "line": 10,
+    "col": 6
+   },
+   "label": "TypeTaskB",
+   "via": "(*example.com/dispatch.ServeMux).HandleFunc",
+   "id": "c027"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "no_string_const.go",
+    "line": 17,
+    "col": 16
+   },
+   "subject_name": "RegisterNoKey",
+   "object_name": "HandleNoKey",
+   "object": {
+    "file": "no_string_const.go",
+    "line": 12,
+    "col": 6
+   },
+   "label": null,
+   "via": "(*example.com/dispatch.NoStringMux).AddHandler",
+   "label_absent": true,
+   "unsure": "fixture comment line 15 says via = example.com/dispatch.(*NoStringMux).AddHandler; the golden file has (*example.com/dispatch.NoStringMux).AddHandler. Golden is what the test checks.",
+   "id": "c028"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "asynq_typed_const.go",
+    "line": 28,
+    "col": 16
+   },
+   "subject_name": "RegisterTypedHandlers",
+   "object_name": "HandleOrderSyncTask",
+   "object": {
+    "file": "asynq_typed_const.go",
+    "line": 23,
+    "col": 6
+   },
+   "label": "order_sync:order_id",
+   "via": "(*example.com/dispatch.TypedMux).HandleFunc",
+   "id": "c029"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "asynq_typed_const.go",
+    "line": 29,
+    "col": 16
+   },
+   "subject_name": "RegisterTypedHandlers",
+   "object_name": "HandleOrderCancelTask",
+   "object": {
+    "file": "asynq_typed_const.go",
+    "line": 24,
+    "col": 6
+   },
+   "label": "order_cancel:order_id",
+   "via": "(*example.com/dispatch.TypedMux).HandleFunc",
+   "id": "c030"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "subject": {
+    "file": "interface_dispatch_site.go",
+    "line": 20,
+    "col": 12
+   },
+   "subject_name": "UseDispatcher",
+   "object_name": "HandleViaInterface",
+   "object": {
+    "file": "interface_dispatch_site.go",
+    "line": 15,
+    "col": 6
+   },
+   "label": "interface-dispatch-key",
+   "via": "(example.com/dispatch.Dispatcher).Register",
+   "id": "c031"
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:221 TestDispatchedViaPresent",
+   "count": 13,
+   "filter": "all registers facts in module dispatch (golden has 13 'dispatches' edges)",
+   "invariant": "every registers fact has a non-empty via",
+   "id": "c032",
+   "optional": true,
+   "optional_why": "C0: the exact count 13 includes the CHA over-approximate target the fork recorded as unsure (closure Serve); a better adapter may emit fewer. Kept as information, not a gate."
+  },
+  {
+   "kind": "registers",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:162 TestBadAnonymousClosure",
+   "absent": true,
+   "subject_name": "badAnonymousClosure",
+   "subject": {
+    "file": "bad.go",
+    "line": 13,
+    "col": 12
+   },
+   "filter": "no registers fact has an empty/anonymous object_name",
+   "note": "r.Register(\"key\",\"cat\",func(){...}) with an anonymous closure must not produce a registers fact with an empty handler",
+   "id": "c033"
+  },
+  {
+   "kind": "site",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:108 TestDispatchEdgesGoroutineDefer",
+   "caller_name": "StartWorkers",
+   "site": {
+    "file": "goroutine.go",
+    "line": 10,
+    "col": 15
+   },
+   "callee_name": "workerLoop",
+   "target": {
+    "file": "goroutine.go",
+    "line": 5,
+    "col": 6
+   },
+   "edge_kind": "goroutine",
+   "id": "c034"
+  },
+  {
+   "kind": "site",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:108 TestDispatchEdgesGoroutineDefer",
+   "caller_name": "StartWorkers",
+   "site": {
+    "file": "goroutine.go",
+    "line": 11,
+    "col": 12
+   },
+   "callee_name": "process",
+   "target": {
+    "file": "goroutine.go",
+    "line": 7,
+    "col": 6
+   },
+   "edge_kind": "goroutine",
+   "id": "c035"
+  },
+  {
+   "kind": "site",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:108 TestDispatchEdgesGoroutineDefer",
+   "caller_name": "WithDefer",
+   "site": {
+    "file": "goroutine.go",
+    "line": 15,
+    "col": 15
+   },
+   "callee_name": "cleanup",
+   "target": {
+    "file": "goroutine.go",
+    "line": 6,
+    "col": 6
+   },
+   "edge_kind": "defer",
+   "id": "c036"
+  },
+  {
+   "kind": "site_tags",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "caller_name": "StartWorkers",
+   "site": {
+    "file": "goroutine.go",
+    "line": 10,
+    "col": 15
+   },
+   "callee_name": "workerLoop",
+   "tags": [
+    "in_goroutine"
+   ],
+   "edge_kind": "goroutine",
+   "id": "c037"
+  },
+  {
+   "kind": "site_tags",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "caller_name": "StartWorkers",
+   "site": {
+    "file": "goroutine.go",
+    "line": 11,
+    "col": 12
+   },
+   "callee_name": "process",
+   "tags": [
+    "in_goroutine"
+   ],
+   "edge_kind": "goroutine",
+   "id": "c038"
+  },
+  {
+   "kind": "site_tags",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "caller_name": "WithDefer",
+   "site": {
+    "file": "goroutine.go",
+    "line": 15,
+    "col": 15
+   },
+   "callee_name": "cleanup",
+   "tags": [
+    "in_defer"
+   ],
+   "edge_kind": "defer",
+   "id": "c039"
+  },
+  {
+   "kind": "site",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:398 TestDispatchGoldenJSON",
+   "count": 3,
+   "filter": "goroutine+defer edges in module dispatch (golden has exactly 2 goroutine and 1 defer)",
+   "id": "c040"
+  },
+  {
+   "kind": "site",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:308 TestInterfaceFieldDispatchPreservesMultipleConcreteTargets",
+   "caller_name": "Run",
+   "site": {
+    "file": "interface_field_dispatch.go",
+    "line": 24,
+    "col": 24
+   },
+   "callee_name": "Handle",
+   "target": {
+    "file": "interface_field_dispatch.go",
+    "line": 13,
+    "col": 20
+   },
+   "edge_kind": "interface",
+   "callee_receiver": "AlphaWorker",
+   "note": "r.worker.Handle(v) through the FieldWorker field; one edge per concrete implementation",
+   "id": "c041"
+  },
+  {
+   "kind": "site",
+   "module": "dispatch",
+   "from": "go-helper/dispatch_test.go:308 TestInterfaceFieldDispatchPreservesMultipleConcreteTargets",
+   "caller_name": "Run",
+   "site": {
+    "file": "interface_field_dispatch.go",
+    "line": 24,
+    "col": 24
+   },
+   "callee_name": "Handle",
+   "target": {
+    "file": "interface_field_dispatch.go",
+    "line": 17,
+    "col": 19
+   },
+   "edge_kind": "interface",
+   "callee_receiver": "BetaWorker",
+   "note": "r.worker.Handle(v) through the FieldWorker field; one edge per concrete implementation",
+   "id": "c042"
+  },
+  {
+   "kind": "implements",
+   "module": "impls",
+   "from": "go-helper/impls_test.go:35 TestImplementsCrossPackage",
+   "subject_name": "StoreImpl",
+   "subject": {
+    "file": "impl/impl.go",
+    "line": 9,
+    "col": 6
+   },
+   "object_name": "Storer",
+   "object": {
+    "file": "storer.go",
+    "line": 6,
+    "col": 6
+   },
+   "methods": [
+    "Create",
+    "Delete"
+   ],
+   "receiver": "*example.com/impls/impl.StoreImpl",
+   "id": "c043"
+  },
+  {
+   "kind": "implements",
+   "module": "impls",
+   "from": "go-helper/impls_test.go:35 TestImplementsCrossPackage",
+   "subject_name": "ValueImpl",
+   "subject": {
+    "file": "impl/impl.go",
+    "line": 17,
+    "col": 6
+   },
+   "object_name": "Storer",
+   "object": {
+    "file": "storer.go",
+    "line": 6,
+    "col": 6
+   },
+   "methods": [
+    "Create",
+    "Delete"
+   ],
+   "receiver": "example.com/impls/impl.ValueImpl",
+   "id": "c044"
+  },
+  {
+   "kind": "implements",
+   "module": "impls",
+   "from": "go-helper/impls_test.go:80 TestImplementsSameFileIncluded",
+   "subject_name": "localImpl",
+   "subject": {
+    "file": "storer.go",
+    "line": 25,
+    "col": 6
+   },
+   "object_name": "Storer",
+   "object": {
+    "file": "storer.go",
+    "line": 6,
+    "col": 6
+   },
+   "methods": [
+    "Create",
+    "Delete"
+   ],
+   "receiver": "*example.com/impls.localImpl",
+   "unsure": "test only checks that SOME implements edge has receiver localImpl (pointer or value form); the interface and methods are inferred from the fixture (localImpl has Create/Delete only, so Storer). The fixture comment on storer.go:23 says the opposite (must NOT emit); the test comment and assertion say MUST.",
+   "id": "c045"
+  },
+  {
+   "kind": "implements",
+   "module": "impls",
+   "from": "go-helper/impls_test.go:109 TestImplementsEmbeddedInterface",
+   "subject_name": "CompositeImpl",
+   "subject": {
+    "file": "impl/impl.go",
+    "line": 29,
+    "col": 6
+   },
+   "object_name": "CompositeIface",
+   "object": {
+    "file": "storer.go",
+    "line": 18,
+    "col": 6
+   },
+   "methods": [
+    "Ping",
+    "Fetch"
+   ],
+   "receiver": "*example.com/impls/impl.CompositeImpl",
+   "note": "Ping comes from the embedded interface Embedded",
+   "id": "c046"
+  },
+  {
+   "kind": "implements",
+   "module": "impls",
+   "from": "go-helper/impls_test.go:167 TestImplementsReceiverType",
+   "subject_name": "StoreImpl",
+   "subject": {
+    "file": "impl/impl.go",
+    "line": 9,
+    "col": 6
+   },
+   "object_name": "Storer",
+   "object": {
+    "file": "storer.go",
+    "line": 6,
+    "col": 6
+   },
+   "methods": [
+    "Create",
+    "Delete"
+   ],
+   "receiver": "*example.com/impls/impl.StoreImpl",
+   "receiver_form": "pointer",
+   "assertion": "edges whose interface is Storer include a pointer-receiver StoreImpl edge",
+   "id": "c047"
+  },
+  {
+   "kind": "implements",
+   "module": "impls",
+   "from": "go-helper/impls_test.go:167 TestImplementsReceiverType",
+   "subject_name": "ValueImpl",
+   "subject": {
+    "file": "impl/impl.go",
+    "line": 17,
+    "col": 6
+   },
+   "object_name": "Storer",
+   "object": {
+    "file": "storer.go",
+    "line": 6,
+    "col": 6
+   },
+   "methods": [
+    "Create",
+    "Delete"
+   ],
+   "receiver": "example.com/impls/impl.ValueImpl",
+   "receiver_form": "value",
+   "assertion": "edges whose interface is Storer include a value-receiver ValueImpl edge",
+   "id": "c048"
+  },
+  {
+   "kind": "writes",
+   "module": "writes",
+   "from": "go-helper/writes_test.go:13 TestWritesEdgesCrossPackage",
+   "subject_name": "StartServer",
+   "subject": {
+    "file": "server/server.go",
+    "line": 8,
+    "col": 6
+   },
+   "object_name": "HandlerRegistry",
+   "object": {
+    "file": "registry/registry.go",
+    "line": 5,
+    "col": 5
+   },
+   "id": "c049"
+  },
+  {
+   "kind": "writes",
+   "module": "writes",
+   "from": "go-helper/writes_test.go:13 TestWritesEdgesCrossPackage",
+   "subject_name": "StartServer",
+   "subject": {
+    "file": "server/server.go",
+    "line": 8,
+    "col": 6
+   },
+   "object_name": "DefaultConfig",
+   "object": {
+    "file": "registry/registry.go",
+    "line": 8,
+    "col": 5
+   },
+   "id": "c050"
+  },
+  {
+   "kind": "writes",
+   "module": "writes",
+   "from": "go-helper/writes_test.go:13 TestWritesEdgesCrossPackage",
+   "subject_name": "initRegistry",
+   "subject": {
+    "file": "server/server.go",
+    "line": 19,
+    "col": 6
+   },
+   "subject_alt_name": "init",
+   "subject_alt": {
+    "file": "server/server.go",
+    "line": 25,
+    "col": 6
+   },
+   "object_name": "GroupedVarA",
+   "object": {
+    "file": "registry/registry.go",
+    "line": 15,
+    "col": 2
+   },
+   "note": "old test accepts either initRegistry or init as the writer (SSA may collapse the init chain)",
+   "id": "c051"
+  },
+  {
+   "kind": "writes",
+   "module": "writes",
+   "from": "go-helper/writes_test.go:13 TestWritesEdgesCrossPackage",
+   "subject_name": "initRegistry",
+   "subject": {
+    "file": "server/server.go",
+    "line": 19,
+    "col": 6
+   },
+   "subject_alt_name": "init",
+   "subject_alt": {
+    "file": "server/server.go",
+    "line": 25,
+    "col": 6
+   },
+   "object_name": "GroupedVarB",
+   "object": {
+    "file": "registry/registry.go",
+    "line": 16,
+    "col": 2
+   },
+   "note": "old test accepts either initRegistry or init as the writer (SSA may collapse the init chain)",
+   "id": "c052"
+  },
+  {
+   "kind": "writes",
+   "module": "writes",
+   "from": "go-helper/writes_test.go:59 TestWritesEdgesSamePackageDropped",
+   "absent": true,
+   "subject_name": "samePackageWriter",
+   "subject": {
+    "file": "registry/registry.go",
+    "line": 24,
+    "col": 6
+   },
+   "object_name": "HandlerRegistry",
+   "object": {
+    "file": "registry/registry.go",
+    "line": 5,
+    "col": 5
+   },
+   "note": "writer and variable are in the same package: old helper dropped the edge (tree-sitter side handled it). Test asserts no writes edge with this caller. The new adapter may legitimately emit it; decide before using as a gate.",
+   "id": "c053",
+   "optional": true,
+   "optional_why": "C0: encodes the old helper's same-package filter (writes in the same package were dropped by design). The new adapter may emit same-package writes, which `writers` users want. Kept as information, not a gate."
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1208 callgraph_trace_data_reference_arg",
+   "function": "refArgCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 16,
+    "col": 6
+   },
+   "subject_name": "u",
+   "object_name": "user",
+   "note": "ref arg: saveRef(&u) maps u into saveRef's parameter user",
+   "flow_type": "parameter",
+   "callee": "saveRef",
+   "approximate": false,
+   "id": "c054"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1241 callgraph_trace_data_field_access_arg",
+   "function": "fieldArgCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 23,
+    "col": 6
+   },
+   "subject_name": "u",
+   "object_name": "name",
+   "note": "field arg: consumeString(u.Name) maps u into consumeString's parameter name",
+   "flow_type": "parameter",
+   "callee": "consumeString",
+   "approximate": true,
+   "id": "c055"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1275 callgraph_trace_data_struct_literal_assign",
+   "function": "structLitCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 31,
+    "col": 6
+   },
+   "subject_name": "name",
+   "object_name": "w",
+   "note": "struct wrap: w := Wrapper{Name: name}",
+   "flow_type": "assignment",
+   "approximate": true,
+   "id": "c056"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1275 callgraph_trace_data_struct_literal_assign",
+   "function": "structLitCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 31,
+    "col": 6
+   },
+   "subject_name": "w",
+   "object_name": "wr",
+   "note": "struct wrap: the new binding w reaches saveWrapper's parameter wr",
+   "flow_type": "parameter",
+   "callee": "saveWrapper",
+   "id": "c057"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1318 callgraph_trace_data_pointer_write_intrinsic",
+   "function": "pointerWriteCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 40,
+    "col": 6
+   },
+   "subject_name": "raw",
+   "object_name": "user",
+   "note": "Unmarshal-family: json.Unmarshal(raw, &user) binds raw into user",
+   "flow_type": "writer or assignment (either accepted)",
+   "id": "c058"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1318 callgraph_trace_data_pointer_write_intrinsic",
+   "function": "pointerWriteCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 40,
+    "col": 6
+   },
+   "subject_name": "user",
+   "object_name": "u",
+   "note": "Unmarshal-family: user then reaches consumeUser's parameter u",
+   "flow_type": "parameter",
+   "callee": "consumeUser",
+   "id": "c059"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1358 callgraph_trace_data_method_receiver",
+   "function": "methodReceiverCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 50,
+    "col": 6
+   },
+   "subject_name": "u",
+   "object_name": "u",
+   "note": "receiver: u.saveMethod(Ctx{}) maps u into the method receiver (named u in saveMethod)",
+   "flow_type": "parameter",
+   "callee": "saveMethod",
+   "id": "c060"
+  },
+  {
+   "kind": "flows",
+   "module": "data_flow",
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1387 callgraph_trace_data_field_write",
+   "function": "fieldWriteCase",
+   "function_pos": {
+    "file": "data_flow_patterns.go",
+    "line": 62,
+    "col": 6
+   },
+   "subject_name": "name",
+   "object_name": "m.Account",
+   "note": "field write: m.Account = name",
+   "flow_type": "field_write",
+   "symbol": "fieldWriteCase",
+   "id": "c061"
+  }
+ ],
+ "not_translated": [
+  {
+   "from": "go-helper/controlflow_test.go:20 TestCallContextErrorBranch (second half)",
+   "why": "Handle return info is only logged; no assertion (old comment says path condition 'err == nil' but nothing checks it)"
+  },
+  {
+   "from": "go-helper/controlflow_test.go:196 TestNoCallContextFlag",
+   "why": "asserts the old -no-call-context / -no-return-analysis CLI flags drop context and returns; the new contract has no such flags"
+  },
+  {
+   "from": "go-helper/dispatch_test.go:142 TestNoDispatchesFlag",
+   "why": "asserts the old -no-dispatches CLI flag; the new contract has no such flag"
+  },
+  {
+   "from": "go-helper/impls_test.go:146 TestNoImplementsFlag",
+   "why": "asserts the old -no-implements CLI flag; the new contract has no such flag"
+  },
+  {
+   "from": "go-helper/writes_test.go:81 TestNoWritesFlag",
+   "why": "asserts the old -no-writes CLI flag; the new contract has no such flag"
+  },
+  {
+   "from": "crates/aft/tests/integration/callgraph_test.rs (branch feat/go-vta-helper, absent on backup) :1156 callgraph_trace_data_approximation etc. (other trace_data tests)",
+   "why": "out of scope: only the six data_flow_patterns.go tests were requested; other trace_data tests use other fixtures"
+  }
+ ]
+}
