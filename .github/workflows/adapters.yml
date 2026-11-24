@@ -1,0 +1,181 @@
+# CI of this fork: upstream aft plus the language-adapter layer.
+#
+# It tests only the systems that the fork releases binaries for:
+#   darwin-arm64 (macos-15), linux-x64 (ubuntu-24.04), linux-arm64 (ubuntu-24.04-arm)
+# and only the languages that have an adapter: Go and JavaScript (CommonJS).
+# Windows, Intel macOS and other CPUs are not supported: there is no release binary and no test. Build aft yourself
+# for them (`scripts/adapters/install.sh --binary <file>`).
+#
+# Upstream's own workflows (.github/workflows/*.yml except this file) are turned off in the Actions settings of this
+# repository. They test upstream's full platform list and upstream's exact replies. The adapter layer adds fields to
+# some replies, and it does not build on Windows. See .agents/skills/update-upstream/SKILL.md, "Fork CI".
+#
+# What runs (all of it is in tests/adapters/; the scripts print one PASS/FAIL line per check):
+#   adapters     accept_R1 (registry, runner, overlay, unit tests), W1 (aft cli, guide, install), G1 (Go adapter),
+#                G2 (JavaScript adapter), K1 (update-upstream skill), P1 (install from bash, zsh and fish)
+#   passthrough  accept_R2: replies equal stock upstream where no adapter applies, and upstream's test targets T1-T4
+# Checks on private real repositories print SKIP here (they need AFT_ACCEPT_CASES).
+name: Adapters (supported platforms)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adapters-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The same Rust as scripts/adapters/release.Dockerfile (Cargo.toml rust-version is 1.92).
+  RUST_VERSION: "1.96.0"
+  CARGO_TERM_COLOR: never
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+
+jobs:
+  adapters:
+    name: adapters (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, os: macos-15 }
+          - { platform: linux-x64, os: ubuntu-24.04 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Full history and tags: the scripts compare with the upstream base commit, and K1 reads upstream tags.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # K1 replays the fact collector on ranges between upstream release tags; this fork does not carry all of them.
+      # They are fetched into this runner only.
+      - name: Upstream release tags (for K1)
+        run: git fetch --quiet --no-tags https://github.com/cortexkit/aft.git '+refs/tags/v*:refs/tags/v*'
+
+      - name: Tools (Rust, zsh, fish)
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends zsh fish lld
+          else
+            brew install fish
+          fi
+          echo "AFT_ACCEPT_WORK=$RUNNER_TEMP/accept" >> "$GITHUB_ENV"
+
+      # Upstream's grammar-loader workflow: a debug test binary of this crate is larger than an AArch64 direct
+      # call can reach, and GNU ld fails ("relocation truncated to fit"). lld adds range-extension thunks.
+      - name: Link with lld on Linux arm64
+        if: matrix.platform == 'linux-arm64'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: adapters/go/go.mod
+          cache-dependency-path: adapters/go/go.sum
+
+      # The acceptance scripts run Go with no network (GOPROXY=off): the modules must be in the module cache.
+      - name: Go modules of the Go adapter
+        run: |
+          (cd adapters/go && go mod download)
+          (cd adapters/go/testdata/external && go mod download)
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: adapters-${{ matrix.platform }}
+
+      - name: Build aft (dev profile)
+        run: cargo build --locked -p agent-file-tools --bin aft
+
+      - name: accept_R1 (registry, runner, overlay; unit tests of the adapter layer)
+        if: ${{ !cancelled() }}
+        run: bash tests/adapters/accept_R1.sh
+      - name: accept_W1 (aft cli, aft guide, install and uninstall)
+        if: ${{ !cancelled() }}
+        run: bash tests/adapters/accept_W1.sh
+      - name: accept_G1 (Go adapter)
+        if: ${{ !cancelled() }}
+        run: bash tests/adapters/accept_G1.sh
+      - name: accept_G2 (JavaScript adapter)
+        if: ${{ !cancelled() }}
+        run: bash tests/adapters/accept_G2.sh
+      - name: accept_K1 (update-upstream skill)
+        if: ${{ !cancelled() }}
+        run: bash tests/adapters/accept_K1.sh
+      # The release folder holds this job's dev build under the release asset name of this platform.
+      - name: accept_P1 (install from bash, zsh and fish; semantic search)
+        if: ${{ !cancelled() }}
+        run: |
+          rel="$RUNNER_TEMP/release"
+          mkdir -p "$rel"
+          cp target/debug/aft "$rel/aft-${{ matrix.platform }}"
+          (cd "$rel" && shasum -a 256 "aft-${{ matrix.platform }}" > checksums.sha256)
+          AFT_RELEASE_DIR="$rel" bash tests/adapters/accept_P1.sh
+
+  passthrough:
+    name: passthrough (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, os: macos-15 }
+          - { platform: linux-x64, os: ubuntu-24.04 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Two debug builds and the test builds of T1-T4 need more disk than a Linux runner has free.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / | tail -n 1
+
+      - name: Tools (Rust)
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          echo "AFT_ACCEPT_WORK=$RUNNER_TEMP/accept" >> "$GITHUB_ENV"
+
+      - name: Link with lld on Linux arm64
+        if: matrix.platform == 'linux-arm64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends lld
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: passthrough-${{ matrix.platform }}
+
+      # STOCK_AFT: upstream at the base commit, in its own worktree and target dir (never a build of the fork).
+      - name: Build stock upstream aft at the base commit
+        run: |
+          base=$(sed -n 's/^BASE_COMMIT=//p' tests/adapters/lib/common.sh)
+          git worktree add --detach "$RUNNER_TEMP/stock" "$base"
+          (cd "$RUNNER_TEMP/stock" && CARGO_TARGET_DIR="$RUNNER_TEMP/stock-target" cargo build --locked -p agent-file-tools --bin aft)
+          echo "STOCK_AFT=$RUNNER_TEMP/stock-target/debug/aft" >> "$GITHUB_ENV"
+
+      - name: accept_R2 (replies pass through where no adapter applies; upstream T1-T4)
+        run: bash tests/adapters/accept_R2.sh

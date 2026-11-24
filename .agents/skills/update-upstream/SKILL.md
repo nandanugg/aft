@@ -126,6 +126,7 @@ Our files:
 - `docs/adapters/` contract, guide, example registry.
 - `tests/adapters/` acceptance scripts, fake adapters, fixtures.
 - `.agents/skills/update-upstream/` this skill and `rebase-check.sh`.
+- `.github/workflows/adapters.yml` the fork's CI (see "Fork CI" below).
 
 Runtime places:
 
@@ -145,6 +146,24 @@ Runtime places:
   they never run adapters by hand.
 - Maintainers of the fork: they run this skill when upstream has a new tag.
 - Adapter authors: anyone who adds a language. They read `docs/adapters/CONTRACT.md` and add a registry entry.
+
+## Fork CI
+
+The fork supports only what it releases: darwin-arm64, linux-x64 and linux-arm64, with the Go and JavaScript
+adapters. Windows and other systems are not supported; their users build aft themselves.
+
+- `.github/workflows/adapters.yml` runs our acceptance scripts on those three platforms (job `adapters`) and
+  accept_R2 with a stock build of the base commit (job `passthrough`).
+- Upstream's own workflows are turned off in the fork's Actions settings, not edited (an edit conflicts at every
+  merge). Two of their failures are known and accepted: the Windows jobs do not compile (`std::os::unix` in
+  `lang_adapters/`), and upstream tests that compare a whole JSON reply fail where our layer adds `adapters` and
+  `text` (for example `data_layer::grammar_tests::audit::luau_s4_trace_to_symbol_…`, a `wasm-grammars` test).
+- A merge can bring a NEW upstream workflow file. GitHub turns it on, and it runs on the next push. Before you push
+  (step 9), list the workflows and turn off each upstream one:
+  `gh workflow list --all --repo <fork>` and `gh workflow disable <name> --repo <fork>`. Only "Adapters (supported
+  platforms)" stays on.
+- When the fork changes its release platforms, change the matrix of `adapters.yml`, the table in
+  `docs/adapters/INSTALL.md` and `scripts/adapters/build-release.sh` together.
 
 ## Upgrade procedure
 
@@ -261,6 +280,7 @@ did not run and why.
 ### 9. Push
 
 Only after the report is accepted by the maintainer, and only with their consent. This skill never pushes.
+Before the push, turn off any new upstream workflow (see "Fork CI").
 
 ## Severity table
 

@@ -13,7 +13,7 @@
 #   scripts/adapters/install.sh --prefix <dir> (--release-url <url> | --binary <file>) [--without-semantic]   (platform detected; tests/adapters/accept_P1.sh covers shells and Linux)
 #       By default it also installs ONNX Runtime and the embedding model under <prefix>/libexec/aft-adapters
 #       (pinned https downloads; this test downloads them once) and the shim points aft to them.
-#       release: <url>/aft-darwin-arm64 + <url>/checksums.sha256 (curl; file:// works); a checksum
+#       release: <url>/aft-<platform> + <url>/checksums.sha256 (curl; file:// works); a checksum
 #       mismatch stops it before anything is installed. Installs <prefix>/libexec/aft-adapters/aft,
 #       <prefix>/libexec/aft-adapters/adapters-registry.json, the adapters that exist in adapters/,
 #       <prefix>/bin/aft (shim), and <prefix>/share/aft-adapters/install-manifest.txt.
@@ -101,8 +101,16 @@ head1=$(grep -m 1 -v '^[[:space:]]*$' "$TREE/docs/adapters/GUIDE.md")
 [ $rc = 0 ] && grep -q impl "$WORK/facts.out" && pass "cli facts implements --label Doer lists impl" || fail "cli facts: rc=$rc $(head -c 200 "$WORK/facts.out")"
 
 # --- 4. install from a file:// release; checksum mismatch stops it; uninstall removes exactly it ---
-REL="$WORK/release"; mkdir -p "$REL"; cp "$A" "$REL/aft-darwin-arm64"
-( cd "$REL" && shasum -a 256 aft-darwin-arm64 > checksums.sha256 )
+# The release asset name of this machine, as install.sh computes it.
+case "$(uname -s)-$(uname -m)" in
+	Darwin-arm64) PLATFORM=darwin-arm64 ;;
+	Darwin-x86_64) PLATFORM=darwin-x64 ;;
+	Linux-x86_64 | Linux-amd64) PLATFORM=linux-x64 ;;
+	Linux-aarch64 | Linux-arm64) PLATFORM=linux-arm64 ;;
+	*) PLATFORM=unknown ;;
+esac
+REL="$WORK/release"; mkdir -p "$REL"; cp "$A" "$REL/aft-$PLATFORM"
+( cd "$REL" && shasum -a 256 "aft-$PLATFORM" > checksums.sha256 )
 PREFIX="$WORK/prefix"; mkdir -p "$PREFIX"; touch "$PREFIX/.keep-before"
 snap() { (cd "$1" && find . -print | LC_ALL=C sort); }
 # HOME without Go's own telemetry counters: `go build` (the Go adapter build) writes them under
@@ -120,7 +128,7 @@ fi
 ! grep -q 'LOCAL-ADDENDUM-MARKER' "$WORK/guide-installed.out" && [ ! -e "$PREFIX/libexec/aft-adapters/guide.local.md" ] \
 	&& pass "install without --guide-local: no addendum file, none in aft guide" || fail "an addendum appeared without --guide-local"
 # Semantic search is installed by default, inside the prefix, and the shim points aft to it.
-ORT_LIB=$(ls "$PREFIX"/libexec/aft-adapters/onnxruntime/*/libonnxruntime.dylib 2> /dev/null | head -n 1)
+ORT_LIB=$(ls "$PREFIX"/libexec/aft-adapters/onnxruntime/*/libonnxruntime.dylib "$PREFIX"/libexec/aft-adapters/onnxruntime/*/libonnxruntime.so 2> /dev/null | head -n 1)
 MODEL=$(ls "$PREFIX"/libexec/aft-adapters/models/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/*/model.onnx 2> /dev/null | head -n 1)
 [ -n "$ORT_LIB" ] && [ -n "$MODEL" ] && pass "install put ONNX Runtime and the embedding model inside the prefix" || fail "install did not put ONNX Runtime and the model in the prefix"
 grep -qF "$ORT_LIB" "$PREFIX/share/aft-adapters/install-manifest.txt" && grep -qF "$MODEL" "$PREFIX/share/aft-adapters/install-manifest.txt" \
@@ -201,8 +209,8 @@ if "$SCRIPTS/install.sh" --prefix "$PREFIX4" --release-url "file://$REL" --witho
 else
 	fail "install --guide-local: $(tail -n 3 "$WORK/install-guide.out" | tr '\n' ' ')"
 fi
-BAD="$WORK/release-bad"; mkdir -p "$BAD"; cp "$A" "$BAD/aft-darwin-arm64"
-echo "0000000000000000000000000000000000000000000000000000000000000000  aft-darwin-arm64" > "$BAD/checksums.sha256"
+BAD="$WORK/release-bad"; mkdir -p "$BAD"; cp "$A" "$BAD/aft-$PLATFORM"
+echo "0000000000000000000000000000000000000000000000000000000000000000  aft-$PLATFORM" > "$BAD/checksums.sha256"
 PREFIX2="$WORK/prefix2"; mkdir -p "$PREFIX2"
 if "$SCRIPTS/install.sh" --prefix "$PREFIX2" --release-url "file://$BAD" > "$WORK/install-bad.out" 2>&1; then
 	fail "install accepted a checksum mismatch"

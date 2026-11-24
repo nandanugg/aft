@@ -39,6 +39,9 @@ REAL_GOMODCACHE=$(go env GOMODCACHE 2> /dev/null)
 REAL_GOCACHE=$(go env GOCACHE 2> /dev/null)
 REAL_GOENV=$(go env GOENV 2> /dev/null)
 REAL_CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
+# rustup reads its toolchains from RUSTUP_HOME (default $HOME/.rustup). Both stores are exported now, so cargo still
+# finds its toolchain and crates after isolate() moves HOME (with rustup, a moved HOME means "no default toolchain").
+export CARGO_HOME="$REAL_CARGO_HOME" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 # heavy <command...>: one heavy job, through AFT_ACCEPT_HEAVY when it is set.
 heavy() { if [ -n "${AFT_ACCEPT_HEAVY:-}" ]; then "$AFT_ACCEPT_HEAVY" "$@"; else "$@"; fi; }
 BASE_COMMIT=f5ecf51b5
@@ -127,7 +130,7 @@ thin_rust() {
 
 # upstream_files_within <allowed path>...: every changed upstream file (outside our own directories)
 # is in the allowed list.
-OUR_DIRS='^(crates/aft/src/commands/data_callgraph/lang_adapters/|docs/adapters/|tests/adapters/|adapters/|scripts/adapters/|\.agents/skills/update-upstream/)'
+OUR_DIRS='^(crates/aft/src/commands/data_callgraph/lang_adapters/|docs/adapters/|tests/adapters/|adapters/|scripts/adapters/|\.agents/skills/update-upstream/|\.github/workflows/adapters\.yml$)'
 upstream_files_within() {
 	local changed extra=""
 	changed=$( { git -C "$TREE" diff --name-only "$BASE_COMMIT"; git -C "$TREE" ls-files --others --exclude-standard; } | sort -u | grep -Ev "$OUR_DIRS" || true)

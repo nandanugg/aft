@@ -13,6 +13,9 @@ under one folder, the prefix. It writes nothing outside the prefix and changes n
 | Linux (Ubuntu, Debian, Arch) | x86_64 | `aft-linux-x64` | yes |
 | Linux (Ubuntu, Debian, Arch) | aarch64 | `aft-linux-arm64` | yes |
 
+Only the systems with a release binary in this table are supported and tested (`.github/workflows/adapters.yml`).
+Windows and other CPUs are not supported. To use aft there, build it yourself and install it with `--binary`.
+
 The install script runs with bash 3.2 or newer (the `/bin/bash` of macOS works). You can start it from bash, zsh
 or fish: it is a bash script with a shebang.
 

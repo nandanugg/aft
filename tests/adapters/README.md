@@ -18,4 +18,7 @@
 - `fixtures/`: `tiny-mixed` (Go + JS root) and `go-facts/` (fork testdata + expected facts, decision L). The
   real-repository fixtures (overlays, JavaScript known answers) are in the consumer's private case pack.
 
+CI: `.github/workflows/adapters.yml` runs these scripts on the supported platforms only (darwin-arm64,
+linux-x64, linux-arm64), without the private case pack, so the real-repository checks print SKIP there.
+
 The contract itself is `docs/adapters/CONTRACT.md`. The install guide is `docs/adapters/INSTALL.md`.
