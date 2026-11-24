@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# build-release.sh --out <dir> [--platform <p>]...
+# build-release.sh --out <dir> [--platform <p>]... | build-release.sh --out <dir> --kit-only
 #
-# Builds the aft release binaries into <dir>, one file per platform, and writes <dir>/checksums.sha256
-# (format of `shasum -a 256`: "<sha256>  <file name>"). install.sh --release-url reads those two things.
+# Builds the aft release binaries into <dir>, one file per platform, plus the install kit, and writes
+# <dir>/checksums.sha256 (format of `shasum -a 256`: "<sha256>  <file name>"). install.sh --release-url reads the
+# binary and checksums.sha256.
 #   <p> is linux-x64, linux-arm64 or darwin-arm64 (the option can repeat).
 #   Default: linux-x64 and linux-arm64, plus darwin-arm64 when the host is macOS on arm64.
-#   Output names: aft-linux-x64, aft-linux-arm64, aft-darwin-arm64.
+#   Output names: aft-linux-x64, aft-linux-arm64, aft-darwin-arm64, aft-install-kit.tar.gz.
+#
+# The install kit (aft-install-kit.tar.gz) is always written: the files that install.sh needs from the source tree
+# (scripts/adapters, the adapter sources without their tests, docs/adapters, LICENSE), from the commit HEAD, under
+# the folder aft-install-kit/. With it, a machine installs without a clone of this repository:
+#   tar -xzf aft-install-kit.tar.gz && aft-install-kit/scripts/adapters/install.sh --prefix <dir> --release-url <url>
+# Release assets come from a commit: the script stops when those paths have uncommitted changes.
+# --kit-only writes only the kit and its line in checksums.sha256 (no binary, no container engine needed).
 #
 # Linux platforms: built in a container from scripts/adapters/release.Dockerfile (old glibc, pinned Rust).
 #   The engine is a setting: AFT_CONTAINER_ENGINE (default: docker). Only flags that podman also accepts are used.
@@ -30,7 +38,7 @@
 set -eu
 
 usage() {
-	echo "usage: build-release.sh --out <dir> [--platform linux-x64|linux-arm64|darwin-arm64]..." >&2
+	echo "usage: build-release.sh --out <dir> [--platform linux-x64|linux-arm64|darwin-arm64]... | --out <dir> --kit-only" >&2
 	exit 2
 }
 die() {
@@ -40,9 +48,11 @@ die() {
 
 out=""
 platforms=""
+kit_only=0
 while [ $# -gt 0 ]; do
 	case $1 in
 		--out) [ $# -ge 2 ] || usage; out=$2; shift 2 ;;
+		--kit-only) kit_only=1; shift ;;
 		--platform)
 			[ $# -ge 2 ] || usage
 			case $2 in
@@ -54,8 +64,9 @@ while [ $# -gt 0 ]; do
 	esac
 done
 [ -n "$out" ] || usage
+[ "$kit_only" = 0 ] || [ -z "$platforms" ] || usage
 
-if [ -z "$platforms" ]; then
+if [ "$kit_only" = 0 ] && [ -z "$platforms" ]; then
 	platforms="linux-x64 linux-arm64"
 	if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
 		platforms="$platforms darwin-arm64"
@@ -93,6 +104,17 @@ build_linux() { # $1 = x64 or arm64
 	rm -rf "$tmp"
 }
 
+# The kit paths, also used by the uncommitted-changes check below.
+kit_paths="LICENSE scripts/adapters docs/adapters adapters"
+build_kit() {
+	echo "== install kit: git archive of HEAD ($sha)"
+	# --format=tar.gz compresses with git's default "gzip -cn" (no time stamp: the same commit gives the same file).
+	# shellcheck disable=SC2086 # kit_paths is a list of paths without spaces
+	git -C "$root" archive --format=tar.gz --prefix=aft-install-kit/ -o "$out/aft-install-kit.tar.gz" HEAD -- $kit_paths \
+		':(exclude)adapters/go/testdata' ':(exclude)adapters/js/test' ':(exclude)adapters/go/*_test.go' \
+		|| die "git archive failed for the install kit"
+}
+
 build_darwin_arm64() {
 	[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "darwin-arm64 can only be built on a macOS arm64 host"
 	command -v cargo >/dev/null 2>&1 || die "cargo not found (needed for darwin-arm64)"
@@ -122,6 +144,9 @@ build_darwin_arm64() {
 }
 
 # Check the tools before any long build.
+command -v git >/dev/null 2>&1 && [ -n "$sha" ] || die "the install kit needs git and a checkout with a commit"
+# shellcheck disable=SC2086
+git -C "$root" diff --quiet HEAD -- $kit_paths || die "uncommitted changes in: $kit_paths (commit them first)"
 case " $platforms " in
 	*" linux-"*)
 		command -v "$engine" >/dev/null 2>&1 || die "container engine '$engine' not found (set AFT_CONTAINER_ENGINE)"
@@ -139,12 +164,14 @@ for p in $platforms; do
 		darwin-arm64) build_darwin_arm64 ;;
 	esac
 done
+build_kit
 
-# checksums.sha256 lists exactly the files built now.
+# checksums.sha256 lists exactly the files built now (the binaries and the kit).
 if command -v sha256sum >/dev/null 2>&1; then sum="sha256sum"; else sum="shasum -a 256"; fi
 : >"$out/checksums.sha256"
 for p in $platforms; do
 	(cd "$out" && $sum "aft-$p" >>checksums.sha256)
 done
+(cd "$out" && $sum aft-install-kit.tar.gz >>checksums.sha256)
 echo "== done: $out"
 cat "$out/checksums.sha256"

@@ -49,6 +49,20 @@ yourself (no checksum).
 
 The prefix may contain letters, digits and `. _ / + @ = , -` and space.
 
+Without a clone: each release also has `aft-install-kit.tar.gz`. It holds the install scripts and the adapter
+sources of that release, and its sha256 is in `checksums.sha256`:
+
+```sh
+url=<release url>
+curl -fsSLO "$url/aft-install-kit.tar.gz" && curl -fsSLO "$url/checksums.sha256"
+grep ' aft-install-kit.tar.gz$' checksums.sha256 | shasum -a 256 -c -
+tar -xzf aft-install-kit.tar.gz
+aft-install-kit/scripts/adapters/install.sh --prefix "$HOME/.local/aft" --release-url "$url"
+```
+
+`<release url>` can be `https://github.com/<owner>/aft/releases/latest/download`: GitHub sends it to the newest
+release.
+
 Options:
 
 - `--without-semantic`: skip ONNX Runtime and the embedding model. `aft search` then ranks by words only.
